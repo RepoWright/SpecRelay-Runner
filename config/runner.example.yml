@@ -1,0 +1,61 @@
+# SpecRelay runner — example configuration.
+#
+# This is the ONE operator-facing runner config example. Platform no longer ships
+# a competing one: `bin/platform runner once|loop` was removed in MVP-0015 and
+# Platform's `config/runner.example.yml` went with it.
+#
+# Copy this to a real path (e.g. ~/.specrelay/runner.yml), point the runner at it
+# with `--config <path>` or SPECRELAY_RUNNER_CONFIG, and edit the values.
+#
+# This file carries NO secret. Every credential is read from an environment
+# variable this file only NAMES — never store a token here or commit one.
+
+platform:
+  # Where Platform is reachable. For local development this is the loopback dev
+  # server started by ./bin/dev (the primary environment is 3100; a task
+  # environment leases its own port, e.g. 3300 — check ./bin/dev status).
+  base_url: http://127.0.0.1:3100
+  # FALLBACK only: the env var holding the shared development runner API token.
+  # Used only when no registered credential is present (see runner.credential_env).
+  # This is a local/demo path, not a per-runner trust boundary.
+  token_env: SPECRELAY_RUNNER_API_TOKEN
+
+runner:
+  id: local-dev-runner-1
+  display_name: Local Developer Runner
+  # PRIMARY: the env var holding this runner's registered credential, issued once
+  # by `specrelay-runner register` and never stored in this file.
+  credential_env: SPECRELAY_RUNNER_CREDENTIAL
+  # The env var holding the one-time registration token, read only by `register`.
+  registration_token_env: SPECRELAY_RUNNER_REGISTRATION_TOKEN
+  # For an assigned_to_me policy, set one of these to match the Jira assignee
+  # identity Platform normalized (account id preferred). Omit for all_eligible.
+  # operator_email: you@example.com
+  # operator_account_id: 5b10ac8d82e05b22cc7d4ef5
+  claim_policy:
+    mode: all_eligible        # all_eligible | assigned_to_me
+  # Optional, NON-SECRET executor override. Omit it to use the executor Platform
+  # resolved for the workspace — which for the seeded Tiny Demo is this
+  # repository's own deterministic fixture, named by the bare command
+  # `specrelay-fake-executor` and resolved against this repository's bin/. That
+  # is why the Tiny Demo needs no absolute-path override from you.
+  #
+  # Set it to point at a REAL provider CLI for a real AI run. The provider
+  # authenticates from YOUR OWN environment on this machine; no credential is
+  # ever read from this file or from Platform.
+  #
+  # executor:
+  #   provider: claude
+  #   command: claude
+  #   args: [--print, --dangerously-skip-permissions]
+  #   prompt_delivery: argument      # argument | file_argument | stdin
+  #   timeout_seconds: 900
+  #   env: {}                        # extra NON-SECRET process env only
+
+# Optional map of workspace_key -> physical local workspace root. This is the
+# explicit, operator-owned mapping the runner needs and never guesses — Platform
+# cannot know where you checked a project out. If omitted, the runner resolves the
+# root from SPECRELAY_RUNNER_WORKSPACE_ROOT_<WORKSPACE_KEY> or
+# SPECRELAY_RUNNER_WORKSPACE_ROOT instead; the two are equivalent.
+workspace_roots:
+  tiny-demo-workspace: /absolute/path/to/tiny-demo-workspace
