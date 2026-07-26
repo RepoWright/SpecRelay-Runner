@@ -12,6 +12,7 @@ require "specrelay_runner"
 require_relative "support/fake_platform"
 require_relative "support/demo_workspace"
 require_relative "support/fake_github"
+require_relative "support/fake_claude_cli"
 
 # Build a claim payload shaped like the Platform RunPayload for a task, pointing
 # the executor at the given fake-executor command.

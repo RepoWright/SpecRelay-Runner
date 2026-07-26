@@ -38,19 +38,42 @@ runner:
   # resolved for the workspace — which for the seeded Tiny Demo is this
   # repository's own deterministic fixture, named by the bare command
   # `specrelay-fake-executor` and resolved against this repository's bin/. That
-  # is why the Tiny Demo needs no absolute-path override from you.
+  # is why the Tiny Demo needs no absolute-path override from you. Leaving this
+  # commented out is the OFFLINE/REGRESSION path: it never invokes Claude Code and
+  # never requires it to be installed or authenticated.
   #
-  # Set it to point at a REAL provider CLI for a real AI run. The provider
-  # authenticates from YOUR OWN environment on this machine; no credential is
-  # ever read from this file or from Platform.
+  # Uncomment it to run the ONE supported real provider profile: Claude Code
+  # (MVP-0016). This exact shape is what the runner accepts — it is a validated
+  # profile, not an arbitrary command string:
   #
   # executor:
-  #   provider: claude
-  #   command: claude
+  #   provider: claude               # the only supported real provider
+  #   command: claude                # or an absolute path whose basename is `claude`
   #   args: [--print, --dangerously-skip-permissions]
-  #   prompt_delivery: argument      # argument | file_argument | stdin
+  #   prompt_delivery: argument      # MUST be `argument` for this profile
   #   timeout_seconds: 900
   #   env: {}                        # extra NON-SECRET process env only
+  #
+  # Why each constraint exists — the runner REFUSES a profile that breaks them:
+  #   - `--print` (or `-p`) is required: the run must be non-interactive.
+  #   - `prompt_delivery: argument` keeps the prompt ONE distinct argv element.
+  #     No shell, no interpolation, so prompt content cannot inject a command.
+  #   - `command`'s basename must be `claude`; another CLI is refused, never
+  #     silently substituted.
+  #   - Refused flags: --output-format, --input-format (text output is the
+  #     supported evidence format), --mcp-config, --strict-mcp-config,
+  #     --bg/--background, --chrome, --remote-control, --tmux, and
+  #     -c/--continue/-r/--resume/--fork-session/--session-id (an implicit
+  #     resumed conversation must not influence an automated run).
+  #   - `env:` must carry NO credential. It travels to Platform in the claim
+  #     request, so the runner fails closed rather than redacting afterwards.
+  #
+  # Claude authenticates from YOUR OWN environment on this machine (the operator's
+  # existing `claude auth login` session). No credential is ever read from this
+  # file, sent to Platform, or written into a report. Before claiming, the runner
+  # checks `claude --version` and `claude auth status` and records only a
+  # classification — the raw auth output (which carries your account email and
+  # org) is discarded.
 
 # Optional map of workspace_key -> physical local workspace root. This is the
 # explicit, operator-owned mapping the runner needs and never guesses — Platform

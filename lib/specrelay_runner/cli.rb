@@ -78,8 +78,14 @@ module SpecrelayRunner
       return USAGE_ERROR if config.nil?
 
       auth = config.resolve_auth(env: env)
-      client = PlatformClient.new(base_url: config.base_url, token: auth.token)
       announce(config, auth)
+      # MVP-0016: when this runner selected the real Claude Code profile, prove the
+      # local dependency is ready BEFORE asking Platform for work. Claiming first
+      # and discovering a missing CLI afterwards burns a real run and leaves it
+      # stuck; this exits non-zero having sent no claim request at all.
+      return RUN_FAILED unless executor_ready?(config)
+
+      client = PlatformClient.new(base_url: config.base_url, token: auth.token)
       result = client.claim(config.claim_runner_params)
       unless result.claimed?
         out.puts "no eligible work (Platform authorized no run under this runner's policy)."
@@ -87,12 +93,38 @@ module SpecrelayRunner
       end
 
       execute(config, client, result.payload)
+    rescue ClaudeProfile::Error => e
+      err.puts "Invalid executor profile: #{e.message}"
+      USAGE_ERROR
     rescue Config::Error => e
       err.puts "Invalid runner config: #{e.message}"
       USAGE_ERROR
     rescue PlatformClient::Error => e
       err.puts "Runner failed: #{e.message}"
       RUN_FAILED
+    end
+
+    # The local, no-edit readiness gate for the real provider profile. Returns true
+    # immediately when no real profile is selected, so the deterministic
+    # fake-executor regression path never requires Claude Code to be installed or
+    # authenticated. Only classifications are printed — never probe output, which
+    # carries the operator's account identity.
+    def executor_ready?(config)
+      profile = config.selected_claude_profile
+      return true if profile.nil?
+
+      out.puts "Executor: #{profile.describe}"
+      readiness = profile.readiness(env: env)
+      out.puts "Readiness: #{readiness.summary}"
+      return true if readiness.ready?
+
+      # stdout is block-buffered when redirected while stderr is not, so the
+      # classification would otherwise appear AFTER the remedy in a merged
+      # operator log — exactly the ordering that makes such a log hard to read.
+      out.flush if out.respond_to?(:flush)
+      err.puts "Claude Code is not ready on this host — no run was claimed and nothing was executed."
+      err.puts "Remedy: #{readiness.remedy}"
+      false
     end
 
     def execute(config, client, payload)

@@ -101,6 +101,24 @@ module SpecrelayRunner
     # Platform Runner::Config expects it. The runner does not interpret policy.
     def claim_runner_params = runner
 
+    # The operator's optional, NON-SECRET `runner.executor:` override block. It is
+    # logical config only (provider/command/args/prompt delivery/timeout/env) and
+    # is sent to Platform, which merges it over the workspace's stored executor
+    # config to produce the effective claim payload.
+    def executor_override
+      value = runner["executor"]
+      value.is_a?(Hash) ? value.transform_keys(&:to_s) : {}
+    end
+
+    # The real Claude Code profile this runner selected locally (MVP-0016), or nil
+    # when it selected no real provider — the deterministic fake-executor
+    # regression path, which must never require Claude to be installed. Raises
+    # ClaudeProfile::Error when the operator selected `provider: claude` with an
+    # argv this runner refuses to launch.
+    def selected_claude_profile
+      ClaudeProfile.selected?(executor_override) ? ClaudeProfile.new(executor_override) : nil
+    end
+
     # Resolve the Platform API token from the environment (never the file). A
     # blank token is a clear operator error surfaced before any HTTP call. This is
     # the development-token fallback resolver; see #resolve_auth for the primary

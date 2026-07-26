@@ -115,6 +115,99 @@ bin/platform runner sweep-leases               # reclaim lapsed leases
 bin/platform runners issue-registration-token|list|revoke|rotate-credential
 ```
 
+## The real provider: one Claude Code profile
+
+The runner supports exactly **one** real provider profile — Claude Code — and it
+is a *validated* profile, not an arbitrary command string that happens to work on
+your laptop. Supporting a second provider requires its own approved
+specification; there is no plugin registry and no auto-detection here on purpose.
+
+Select it in your own runner config:
+
+```yaml
+runner:
+  executor:
+    provider: claude
+    command: claude                  # or an absolute path whose basename is `claude`
+    args: [--print, --dangerously-skip-permissions]
+    prompt_delivery: argument
+    timeout_seconds: 900
+    env: {}
+```
+
+`SpecrelayRunner::ClaudeProfile` ([lib](lib/specrelay_runner/claude_profile.rb)) is
+the only place that knows anything Claude-specific. `Executor` and `CommandRunner`
+stay provider-agnostic — they launch an argv array and nothing more.
+
+### It refuses a profile that breaks the bounded contract
+
+These are enforced, with a test per flag, not documented hopes:
+
+- `--print`/`-p` is **required** (non-interactive), and `prompt_delivery` must be
+  `argument` so the prompt stays one distinct argv element — no shell, no
+  interpolation, no `eval`.
+- `command`'s basename must be `claude`. Another CLI is refused rather than
+  silently executed.
+- Refused flags: `--output-format`, `--input-format`, `--mcp-config`,
+  `--strict-mcp-config`, `--bg`/`--background`, `--chrome`, `--remote-control`,
+  `--tmux`, `-c`/`--continue`/`-r`/`--resume`/`--fork-session`/`--session-id`.
+- `env:` must carry **no credential** — that block travels to Platform in the
+  claim request, so the runner fails closed instead of redacting afterwards.
+
+### Readiness is checked before any claim
+
+With this profile selected, `claim-once` runs a local, no-edit readiness check
+and **exits non-zero having sent no claim request at all** if it fails. It runs
+exactly two bounded metadata commands, `claude --version` and
+`claude auth status`, and nothing else — no prompt, no inference, no repository
+access, no claim consumed.
+
+```text
+Executor: claude claude --print --dangerously-skip-permissions (prompt via argument)
+Readiness: claude=available, auth=authenticated
+```
+
+Only a classification is recorded: `available`, `unavailable`, `authenticated`,
+`not_authenticated`, or `check_failed`. `claude auth status` returns your account
+email, org id, and org name — the runner reads a single boolean out of it and
+**discards the rest**. It never reaches a console, log, report, event, or Platform.
+
+Not ready gives you the classification and a remedy (`install Claude Code so
+`claude` resolves on this runner's PATH`, or `run `claude auth login` as this
+runner's operator on this host`).
+
+Both the readiness probe and the executor launch resolve `claude` through the
+**same** effective `PATH`, so readiness can never pass against one CLI while
+execution runs another.
+
+### It fails closed on an unexpected claim payload
+
+Platform is authoritative for the effective executor policy (it merges your
+`executor:` override over the workspace definition). If the claimed payload is not
+the profile you selected — say the workspace still resolves to the fake executor —
+the runner refuses to launch it and reports `preflight_failed`. No worktree, no
+executor launch, no report, no branch or pull request, no Jira transition. It
+prints the exact `bin/platform runner release <task>` recovery command.
+
+### Failures after the claim are classified honestly
+
+| Classification | Meaning |
+| --- | --- |
+| `executor_unavailable` | the CLI could not be started on this host at all |
+| `executor_not_authenticated` | the CLI's own output shows an auth failure |
+| `executor_timeout` | `timeout_seconds` elapsed; the child process group was killed |
+| `executor_failed` | any other non-zero exit |
+
+Each uploads a failed terminal result and report: the run stays out of review,
+Jira does not advance, and nothing reviewable is published. A real model that
+produces no usable change is a **valid failed run**, not a reason to fall back to
+the fake executor.
+
+Reports keep redacted command metadata (the prompt appears only as `<PROMPT>`),
+exit status, duration, a bounded redacted transcript, diff, test output, terminal
+result, and publication facts. They never carry provider credentials, raw auth
+output, account identity, hidden reasoning, tool-call streams, or session ids.
+
 ## The deterministic demo executor
 
 [`bin/specrelay-fake-executor`](bin/specrelay-fake-executor) applies scripted
@@ -122,9 +215,11 @@ find-and-replace edits from its environment so the whole pipeline can be tested
 and demonstrated without a real AI provider.
 
 **It is not the real product executor.** It does not read a specification, reason,
-or write code. A real run configures a real provider CLI as the executor command
-(for example `claude`), which authenticates from your own environment on this
-machine — never from a value in the config or from Platform.
+or write code. It remains required for offline and regression coverage, and a run
+that uses it **never invokes the Claude readiness checks** — you do not need Claude
+Code installed or authenticated to run the deterministic demo. Changing your own
+runner-local real override cannot alter the Platform-seeded fake Tiny Demo
+workspace definition, so the two stay independently runnable.
 
 Platform's seeded Tiny Demo workspace names it by the **bare** command
 `specrelay-fake-executor`; the runner resolves a bundled bare name against this
@@ -292,6 +387,8 @@ lib/specrelay_runner/
   config.rb                     # local YAML config (secrets from ENV only)
   platform_client.rb            # the ONLY Platform touchpoint (HTTP/JSON)
   command_runner.rb             # safe argv process launch + timeout
+  claude_profile.rb             # the ONE real provider profile: validation,
+                                #   readiness, fail-closed match, classification
   workspace.rb                  # worktree create + git diff capture
   executor.rb                   # launch the configured executor with the prompt
   report_bundle.rb              # build manifest + evidence, base64 for upload
@@ -306,6 +403,7 @@ lib/specrelay_runner/
 test/                           # minitest: fake Platform HTTP server + real git flow
   support/fake_platform.rb      # a real HTTP server on an ephemeral loopback port
   support/fake_github.rb        # a real bare remote + scriptable fake `gh`
+  support/fake_claude_cli.rb    # an on-disk executable named `claude` (no inference)
 ```
 
 ## Tests
@@ -327,7 +425,13 @@ ruby -Itest test/lease_test.rb
 ruby -Itest test/protocol_flow_test.rb
 ruby -Itest test/publication_flow_test.rb
 ruby -Itest test/redaction_test.rb
+ruby -Itest test/claude_profile_test.rb
+ruby -Itest test/real_executor_flow_test.rb
 ```
+
+The suite never invokes the operator's real Claude Code, real account, or any
+inference: `real_executor_flow_test.rb` strips every directory holding a real
+`claude` out of the child `PATH` and prepends its own on-disk double.
 
 Style: `rubocop` (see [`.rubocop.yml`](.rubocop.yml), which inherits the same
 `rubocop-rails-omakase` baseline as Platform and re-enables the maintainability
@@ -370,6 +474,24 @@ What each suite proves:
 - **`lease_test.rb`** proves the heartbeater renews on Platform's advertised
   cadence and that the runner stops and uploads nothing when Platform signals the
   claim is no longer live.
+- **`claude_profile_test.rb`** (MVP-0016) covers the real profile as a unit: the
+  accepted argv, a refusal for every forbidden flag and for a credential in `env:`,
+  the readiness classifications (ready / unavailable / not authenticated / timed
+  out) through an **injected** command seam that mutates no ENV and needs no live
+  CLI, proof that the readiness result carries no account detail and runs only the
+  two bounded metadata probes, the fail-closed payload comparison, and the four
+  failure classifications.
+- **`real_executor_flow_test.rb`** (MVP-0016) drives the real profile through the
+  whole runner against an on-disk executable named `claude`, so PATH resolution,
+  readiness, argv assembly, worktree creation, the real test command, and report
+  upload are all the runner's real code. It proves a readiness failure performs
+  **zero** Platform requests and creates no worktree; that the fake-executor path
+  never invokes the CLI at all; that a claimed payload which is not the selected
+  profile is refused without executing it; that the prompt arrives as one distinct
+  argv element and is stored only as `<PROMPT>`; that a non-zero exit, an auth
+  failure, a real wall-clock timeout, and a CLI that disappears after the claim
+  each produce a correctly classified failed report with no pull request; and that
+  no account identity, auth output, or leaked token ever reaches the upload.
 
 ## Related
 

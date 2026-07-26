@@ -23,14 +23,25 @@ module SpecrelayRunner
     # documented Tiny Demo path needs no absolute-path override from the operator.
     BUNDLED_BIN = File.expand_path("../../bin", __dir__)
 
-    Result = Struct.new(:exit_code, :stdout, :stderr, :duration_seconds, :timed_out, :argv, keyword_init: true) do
-      def success? = !timed_out && exit_code == 0
+    # `launch_error` is set when the configured executable could not be started at
+    # all (it is not installed on this host, or not executable). It is a distinct
+    # fact from "the executor ran and failed", so the terminal report can say
+    # `executor_unavailable` instead of blaming the task — and, critically, the
+    # runner reports it instead of dying on an unhandled Errno and leaving the run
+    # stuck CLAIMED forever.
+    Result = Struct.new(:exit_code, :stdout, :stderr, :duration_seconds, :timed_out, :argv, :launch_error,
+                        keyword_init: true) do
+      def success? = !timed_out && launch_error.nil? && exit_code == 0
     end
 
-    def initialize(config:, worktree_path:, staging_dir:)
+    # `env` is the runner's effective process environment. It is threaded in
+    # explicitly (not read from the global ENV) so the PATH the readiness probe
+    # resolved `claude` on is the same PATH this launch resolves it on.
+    def initialize(config:, worktree_path:, staging_dir:, env: ENV)
       @config = config
       @worktree_path = worktree_path.to_s
       @staging_dir = staging_dir.to_s
+      @env = env
     end
 
     # prompt_text is the approved-spec-derived handoff prompt (with a runner-local
@@ -46,6 +57,11 @@ module SpecrelayRunner
       Result.new(exit_code: result.exit_code, stdout: result.stdout, stderr: result.stderr,
                  duration_seconds: result.duration_seconds, timed_out: result.timed_out,
                  argv: sanitized_argv(prompt_path))
+    rescue SystemCallError => e
+      # The executable is absent or not runnable on this host. Reported as a
+      # failed attempt with a redacted reason, never raised: an unhandled Errno
+      # here would kill the runner mid-claim and leave the run stuck on Platform.
+      launch_failure(e, prompt_path)
     end
 
     # The executable to launch. A bare name that this repository ships resolves to
@@ -54,26 +70,73 @@ module SpecrelayRunner
     # PATH/filesystem lookup. Never a shell string.
     def command
       raw = config.fetch("command", "claude").to_s
-      bundled(raw) || raw
+      self.class.bundled(raw) || raw
+    end
+
+    # The absolute file a configured command will ACTUALLY launch, resolved exactly
+    # the way #command + Process.spawn resolve it: a bundled bare name first, then
+    # the effective PATH. Returns nil when nothing executable resolves.
+    #
+    # This is the one authoritative answer to "which file are we about to run", and
+    # it is deliberately shared with ClaudeProfile so the readiness probe, the
+    # fail-closed comparison, and the launch all reason about the SAME file. When
+    # they disagreed, readiness could pass against one `claude` while execution ran
+    # another (review-001 finding F1).
+    #
+    # Symlinks are resolved, so two paths naming the same executable compare equal.
+    def self.resolve_command(raw, env: ENV)
+      raw = raw.to_s.strip
+      return nil if raw.empty?
+
+      candidate = raw.include?(File::SEPARATOR) ? File.expand_path(raw) : (bundled(raw) || path_lookup(raw, env))
+      return nil unless candidate && File.executable?(candidate)
+
+      File.realpath(candidate)
+    rescue SystemCallError
+      nil
+    end
+
+    # An executable this repository ships, or nil. A name containing a separator is
+    # never ours to resolve.
+    def self.bundled(raw)
+      return nil if raw.to_s.include?(File::SEPARATOR)
+
+      path = File.join(BUNDLED_BIN, raw.to_s)
+      File.executable?(path) ? path : nil
+    end
+
+    def self.path_lookup(raw, env)
+      env["PATH"].to_s.split(File::PATH_SEPARATOR).each do |dir|
+        next if dir.to_s.strip.empty?
+
+        candidate = File.join(dir, raw)
+        return candidate if File.executable?(candidate)
+      end
+      nil
     end
 
     private
 
-    def bundled(raw)
-      return nil if raw.include?(File::SEPARATOR)
-
-      path = File.join(BUNDLED_BIN, raw)
-      File.executable?(path) ? path : nil
+    def launch_failure(error, prompt_path)
+      reason = Redaction.redact("could not launch the configured executor: #{error.message}")
+      Result.new(exit_code: nil, stdout: "", stderr: reason, duration_seconds: 0.0,
+                 timed_out: false, argv: sanitized_argv(prompt_path), launch_error: reason)
     end
 
-    attr_reader :config, :worktree_path, :staging_dir
+    attr_reader :config, :worktree_path, :staging_dir, :env
 
     def args = Array(config["args"]).map(&:to_s)
     def prompt_delivery = %w[argument file_argument stdin].include?(config["prompt_delivery"].to_s) ? config["prompt_delivery"].to_s : "argument"
     def stdin_prompt? = prompt_delivery == "stdin"
     def timeout_seconds = (config["timeout_seconds"].to_i.positive? ? config["timeout_seconds"].to_i : 1800)
     def extra_env = (config["env"] || {}).to_h.transform_keys(&:to_s).transform_values(&:to_s)
-    def process_env = { "PATH" => ENV["PATH"].to_s }.merge(extra_env)
+
+    # Process.spawn MERGES this hash into the inherited environment (it does not
+    # clear it — `unsetenv_others` is deliberately not set), so a real provider
+    # keeps the operator's own HOME/XDG/keychain context and authenticates as
+    # itself. The runner therefore never has to read, copy, or forward a provider
+    # credential to give the executor a working login (MVP-0016).
+    def process_env = { "PATH" => env["PATH"].to_s }.merge(extra_env)
 
     def write_prompt(text)
       path = File.join(staging_dir, "executor-prompt.md")
