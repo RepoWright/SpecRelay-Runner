@@ -1,0 +1,11 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# The standalone SpecRelay runner command (MVP-0010). Deliberately a plain
+# Ruby program with NO Bundler/Rails boot — it runs on a developer machine and
+# reaches Platform only over HTTP. This is the "developer-machine style command"
+# the spec requires as proof of process separation.
+
+require_relative "../lib/specrelay_runner"
+
+exit SpecrelayRunner::CLI.run(ARGV)

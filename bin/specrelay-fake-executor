@@ -1,0 +1,89 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# A deterministic, credential-free stand-in executor (MVP-0007; moved into the
+# runner repository in MVP-0015). It proves the Platform/runner contract without
+# invoking any real AI provider, so automated tests and the Tiny Demo never
+# depend on remote AI.
+#
+# THIS IS NOT THE REAL PRODUCT EXECUTOR. It applies scripted find-and-replace
+# edits from its environment; it does not read a specification, reason, or write
+# code. It exists so the pipeline around a real executor can be tested and
+# demonstrated deterministically. A real run configures a real provider CLI as
+# the executor command (e.g. `claude`), which authenticates from the operator's
+# own environment on this machine.
+#
+# It ships in the runner's own bin/ so `specrelay-runner` resolves the bare name
+# `specrelay-fake-executor` without the operator supplying an absolute path —
+# Platform cannot know where this repository is checked out on your host.
+#
+# It runs in the worktree (the runner sets the working directory) and is driven
+# entirely by non-secret environment configured on the executor config `env`:
+#
+#   FAKE_EXECUTOR_MODE       "success" (default) | "fail"
+#   FAKE_EXECUTOR_EDITS_JSON JSON array of { "file", "from", "to" } edits applied
+#                            idempotently in success mode. Omit for a no-op
+#                            success. Example:
+#                              [{"file":"demo-app/index.html","from":"Hello Demo","to":"Hello SpecRelay Demo"}]
+#   FAKE_EXECUTOR_FAIL_MESSAGE  message printed to stderr in fail mode.
+#   FAKE_EXECUTOR_ECHO          optional string echoed verbatim to stdout (used to
+#                               exercise transcript redaction deterministically;
+#                               never set by a real provider).
+#   FAKE_EXECUTOR_SLEEP_SECONDS optional integer hold (MVP-0012). The executor
+#                               sleeps this long before applying edits, so a run
+#                               leasing demo can observe heartbeat renewal while a
+#                               claim is held and land an expiry/cancellation during
+#                               execution. Timing-only; it never changes the result.
+#
+# The prompt file path is passed as the final argument (prompt_delivery:
+# file_argument); it is read only to echo a confirmation, never interpreted.
+
+require "json"
+
+mode = ENV.fetch("FAKE_EXECUTOR_MODE", "success").downcase
+prompt_path = ARGV.last
+
+if prompt_path && File.file?(prompt_path)
+  first_line = File.foreach(prompt_path).first.to_s.strip
+  warn "[fake-executor] read prompt (#{first_line})"
+end
+
+# MVP-0012 deterministic hold: keep the claim busy so heartbeat renewal is visible
+# and cancellation/expiry can be exercised mid-execution. Non-secret, timing-only.
+sleep_seconds = ENV.fetch("FAKE_EXECUTOR_SLEEP_SECONDS", "0").to_i
+if sleep_seconds.positive?
+  warn "[fake-executor] holding for #{sleep_seconds}s (FAKE_EXECUTOR_SLEEP_SECONDS)"
+  sleep(sleep_seconds)
+end
+
+echo = ENV["FAKE_EXECUTOR_ECHO"].to_s
+puts echo unless echo.empty?
+
+if mode == "fail"
+  warn(ENV.fetch("FAKE_EXECUTOR_FAIL_MESSAGE", "[fake-executor] simulated executor failure"))
+  exit 3
+end
+
+edits = JSON.parse(ENV.fetch("FAKE_EXECUTOR_EDITS_JSON", "[]"))
+raise "FAKE_EXECUTOR_EDITS_JSON must be a JSON array" unless edits.is_a?(Array)
+
+changed = 0
+edits.each do |edit|
+  file = edit.fetch("file")
+  from = edit.fetch("from")
+  to = edit.fetch("to")
+  unless File.file?(file)
+    warn "[fake-executor] target file not found: #{file}"
+    exit 4
+  end
+
+  content = File.read(file)
+  next unless content.include?(from) # idempotent: already applied
+
+  File.write(file, content.gsub(from, to))
+  changed += 1
+  puts "[fake-executor] applied edit to #{file}"
+end
+
+puts "[fake-executor] success mode complete (#{changed} file(s) changed)"
+exit 0

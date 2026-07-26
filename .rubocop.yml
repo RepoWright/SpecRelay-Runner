@@ -1,0 +1,61 @@
+# RuboCop for the standalone runner.
+#
+# Why this file exists: the runner lives in the development workspace, NOT in
+# specrelay-platform, so `bin/rubocop` in the Platform container inspects **zero**
+# runner files. Rounds 002 and 003 reported "RuboCop, no offenses" from that run
+# while the Ruby they changed was entirely runner code — the check was real but it
+# was not looking at the changed files. This makes CR-002's "RuboCop on changed
+# Ruby" reproducible rather than a claim.
+#
+# It inherits the same `rubocop-rails-omakase` baseline as
+# `specrelay-platform/.rubocop.yml` so the two codebases share one house style
+# (notably double-quoted strings), then re-enables the same six maintainability
+# metrics `docs/rails-engineering-standard.md` mandates, at its thresholds.
+#
+# The Rails-specific departments in the omakase gem are inert here: the runner is
+# deliberately Rails-free and ActiveRecord-free (asserted by protocol_flow_test),
+# so no Rails cop has anything to match.
+inherit_gem: { rubocop-rails-omakase: rubocop.yml }
+
+AllCops:
+  TargetRubyVersion: 3.4
+  NewCops: enable
+  Exclude:
+    - "config/**/*"
+
+# Omakase disables the Metrics department wholesale; these re-enable only the
+# signals the engineering standard names, at its exact thresholds. Test files are
+# excluded from length metrics only: a behavioural test file legitimately grows
+# with the number of scenarios it proves, and splitting one to satisfy a line count
+# would hide the coverage rather than improve it. Complexity metrics still apply to
+# tests, because a convoluted test is a real problem.
+Metrics/ClassLength:
+  Max: 150
+  Exclude:
+    - "test/**/*"
+
+Metrics/ModuleLength:
+  Max: 150
+  Exclude:
+    - "test/**/*"
+
+Metrics/MethodLength:
+  Max: 20
+  Exclude:
+    - "test/**/*"
+
+Metrics/AbcSize:
+  Max: 20
+
+Metrics/CyclomaticComplexity:
+  Max: 8
+
+Metrics/PerceivedComplexity:
+  Max: 8
+
+# The fake `gh` and the demo executor are Ruby source embedded in heredocs and
+# written to disk as separate programs; they are data from this file's point of
+# view, and their internal style is not this project's to enforce.
+Lint/InterpolationCheck:
+  Exclude:
+    - "test/support/**/*"
