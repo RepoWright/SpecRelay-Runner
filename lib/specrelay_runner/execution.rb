@@ -24,6 +24,12 @@ module SpecrelayRunner
     # uploads NO success report.
     Aborted = Class.new(StandardError)
 
+    # Raised when the executor Platform actually resolved is not the real provider
+    # profile this runner selected locally (MVP-0016). The runner refuses to launch
+    # it: executing an unexpected command — or silently falling back to the fake
+    # executor — would produce evidence that lies about what ran.
+    ExecutorMismatch = Class.new(StandardError)
+
     Result = Struct.new(:outcome, :message, keyword_init: true) do
       def success? = outcome == :completed
     end
@@ -47,6 +53,7 @@ module SpecrelayRunner
     end
 
     def call
+      guard_selected_executor!
       root = @config.workspace_root(@workspace.fetch("workspace_key"), env: @env)
       Dir.mktmpdir("specrelay-runner-") do |staging|
         start_heartbeater
@@ -54,6 +61,8 @@ module SpecrelayRunner
       end
     rescue Aborted => e
       aborted_result(e)
+    rescue ExecutorMismatch => e
+      executor_mismatch_failure(e)
     rescue Config::Error, Workspace::Error => e
       # A pre-execution local failure AFTER the claim already succeeded: the
       # workspace root is not mapped, or the worktree could not be created. Left
@@ -113,6 +122,31 @@ module SpecrelayRunner
                  message: "Runner outcome: preflight_failed (local workspace not ready; claim not executed).")
     end
 
+    # Fail closed before anything happens: no worktree, no executor launch, no
+    # report, no publication, no Jira transition. Only checked when this runner
+    # selected a real provider profile — the fake-executor regression path is
+    # unaffected.
+    def guard_selected_executor!
+      profile = config.selected_claude_profile
+      return if profile.nil?
+
+      reason = profile.mismatch_reason(payload.fetch("executor"))
+      raise ExecutorMismatch, reason if reason
+    end
+
+    def executor_mismatch_failure(error)
+      log("Refusing to execute #{run['task_id']}: #{Redaction.redact(error.message)}")
+      log("Nothing ran: no worktree was created, no report was uploaded, and Jira was not advanced.")
+      log("The run is still CLAIMED on Platform. To recover:")
+      log("  1) Align the executor policy — this runner's `executor:` override, or the")
+      log("     workspace definition's executor_config on the Platform host.")
+      log("  2) Release the claim on the Platform host so the run is claimable again:")
+      log("       bin/platform runner release #{run['task_id']}")
+      log("  3) Re-run: specrelay-runner claim-once --config <path>")
+      Result.new(outcome: :preflight_failed,
+                 message: "Runner outcome: preflight_failed (claimed executor is not the selected profile; nothing executed).")
+    end
+
     def run_flow(root, staging)
       emit("attempt.started", "Runner #{runner_name} started an attempt for #{run['task_id']}", phase: "attempt")
 
@@ -125,7 +159,8 @@ module SpecrelayRunner
       # BEFORE running tests or uploading anything (MVP-0012).
       check_stop!
       unless executor_result.success?
-        return failed_report(root, worktree, executor_result, executor_failure(executor_result))
+        return failed_report(root, worktree, executor_result, executor_failure(executor_result),
+                             classification: executor_classification(executor_result))
       end
 
       changes = Workspace.new(root: root, canonical_branch: run["canonical_branch"], create_command: "").capture_changes(worktree.path)
@@ -229,7 +264,7 @@ module SpecrelayRunner
     end
 
     def run_executor(worktree, staging)
-      Executor.new(config: payload.fetch("executor"), worktree_path: worktree.path, staging_dir: staging)
+      Executor.new(config: payload.fetch("executor"), worktree_path: worktree.path, staging_dir: staging, env: env)
               .run(prompt_text(worktree.path))
     end
 
@@ -267,7 +302,7 @@ module SpecrelayRunner
     # A failed executor: emit the terminal event and upload a failed report + a
     # failed terminal envelope so Platform records the attempt (run marked FAILED;
     # Jira is not advanced).
-    def failed_report(root, worktree, executor_result, message)
+    def failed_report(root, worktree, executor_result, message, classification: ClaudeProfile::EXECUTOR_FAILED)
       log(message)
       changes = Workspace.new(root: root, canonical_branch: run["canonical_branch"], create_command: "").capture_changes(worktree.path)
       test = { command: workspace.fetch("test_command"), exit_code: nil, output: "" }
@@ -277,9 +312,23 @@ module SpecrelayRunner
                                   worktree_path: worktree.path, failure_details: message)
       terminal = terminal_result(status: ReportBundle::STATUS_FAILED, final_sequence: emitter.sequence,
                                  exit_code: executor_result.exit_code, base_commit: worktree.base_commit,
-                                 changes: changes, error_classification: "executor_failed")
+                                 changes: changes, error_classification: classification)
       client.submit_report(claim: claim, bundle: bundle, terminal_result: terminal)
       Result.new(outcome: :executor_failed, message: message)
+    end
+
+    # Which local condition actually failed. Timeout and "could not launch it at
+    # all" are provider-agnostic facts; the real profile refines the remaining
+    # non-zero exit into an authentication problem when its own captured output
+    # says so, so an expired login is not reported as a task failure.
+    def executor_classification(result)
+      profile = config.selected_claude_profile
+      return profile.classify_failure(result) if profile
+
+      return ClaudeProfile::EXECUTOR_UNAVAILABLE if result.launch_error
+      return ClaudeProfile::EXECUTOR_TIMEOUT if result.timed_out
+
+      ClaudeProfile::EXECUTOR_FAILED
     end
 
     def terminal_result(status:, final_sequence:, exit_code:, base_commit:, changes:,
@@ -389,6 +438,8 @@ module SpecrelayRunner
     def log(message) = io.puts(Redaction.redact(message.to_s))
 
     def executor_failure(result)
+      return Redaction.redact("the #{provider} executor could not be started: #{result.launch_error}") if result.launch_error
+
       reason = result.timed_out ? "executor timed out" : "executor exited #{result.exit_code}"
       Redaction.redact([ reason, first_line(result.stderr, result.stdout) ].reject { |s| s.to_s.empty? }.join(": "))
     end

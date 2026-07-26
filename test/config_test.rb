@@ -105,4 +105,69 @@ class ConfigTest < Minitest::Test
     assert_equal "srt_one-time", config.registration_token(env: { "MY_REG_TOKEN" => "srt_one-time" })
     assert_raises(SpecrelayRunner::Config::Error) { config.registration_token(env: {}) }
   end
+
+  # --- selecting the real executor profile (MVP-0016) ------------------------
+
+  def config_with_executor(block)
+    SpecrelayRunner::Config.load(write_config(<<~YAML))
+      platform:
+        base_url: http://127.0.0.1:3300
+      runner:
+        id: r1
+        display_name: Runner One
+        claim_policy:
+          mode: all_eligible
+        executor:
+      #{block.lines.map { |line| "      #{line}" }.join.rstrip}
+    YAML
+  end
+
+  # No override at all: the deterministic fake-executor regression path, which must
+  # never require Claude Code to be installed or authenticated.
+  def test_no_executor_override_selects_no_real_profile
+    config = SpecrelayRunner::Config.load(write_config(valid_config))
+
+    assert_empty config.executor_override
+    assert_nil config.selected_claude_profile
+  end
+
+  def test_a_non_claude_override_selects_no_real_profile
+    config = config_with_executor(<<~YAML)
+      provider: fake
+      command: specrelay-fake-executor
+    YAML
+
+    assert_equal "fake", config.executor_override["provider"]
+    assert_nil config.selected_claude_profile
+  end
+
+  def test_a_claude_override_selects_the_real_profile
+    config = config_with_executor(<<~YAML)
+      provider: claude
+      command: claude
+      args: [--print, --dangerously-skip-permissions]
+      prompt_delivery: argument
+      timeout_seconds: 900
+      env: {}
+    YAML
+
+    profile = config.selected_claude_profile
+    refute_nil profile
+    assert_equal %w[--print --dangerously-skip-permissions], profile.args
+    # The override is non-secret logical config and is what Platform merges.
+    assert_equal 900, config.executor_override["timeout_seconds"]
+  end
+
+  # A selected profile the runner refuses to launch is an operator config error,
+  # surfaced by the CLI before any Platform request.
+  def test_an_unsafe_claude_override_raises
+    config = config_with_executor(<<~YAML)
+      provider: claude
+      command: claude
+      args: [--print, --resume]
+    YAML
+
+    error = assert_raises(SpecrelayRunner::ClaudeProfile::Error) { config.selected_claude_profile }
+    assert_match(/--resume/, error.message)
+  end
 end
