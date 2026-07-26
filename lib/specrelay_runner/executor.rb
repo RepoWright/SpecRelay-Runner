@@ -70,7 +70,49 @@ module SpecrelayRunner
     # PATH/filesystem lookup. Never a shell string.
     def command
       raw = config.fetch("command", "claude").to_s
-      bundled(raw) || raw
+      self.class.bundled(raw) || raw
+    end
+
+    # The absolute file a configured command will ACTUALLY launch, resolved exactly
+    # the way #command + Process.spawn resolve it: a bundled bare name first, then
+    # the effective PATH. Returns nil when nothing executable resolves.
+    #
+    # This is the one authoritative answer to "which file are we about to run", and
+    # it is deliberately shared with ClaudeProfile so the readiness probe, the
+    # fail-closed comparison, and the launch all reason about the SAME file. When
+    # they disagreed, readiness could pass against one `claude` while execution ran
+    # another (review-001 finding F1).
+    #
+    # Symlinks are resolved, so two paths naming the same executable compare equal.
+    def self.resolve_command(raw, env: ENV)
+      raw = raw.to_s.strip
+      return nil if raw.empty?
+
+      candidate = raw.include?(File::SEPARATOR) ? File.expand_path(raw) : (bundled(raw) || path_lookup(raw, env))
+      return nil unless candidate && File.executable?(candidate)
+
+      File.realpath(candidate)
+    rescue SystemCallError
+      nil
+    end
+
+    # An executable this repository ships, or nil. A name containing a separator is
+    # never ours to resolve.
+    def self.bundled(raw)
+      return nil if raw.to_s.include?(File::SEPARATOR)
+
+      path = File.join(BUNDLED_BIN, raw.to_s)
+      File.executable?(path) ? path : nil
+    end
+
+    def self.path_lookup(raw, env)
+      env["PATH"].to_s.split(File::PATH_SEPARATOR).each do |dir|
+        next if dir.to_s.strip.empty?
+
+        candidate = File.join(dir, raw)
+        return candidate if File.executable?(candidate)
+      end
+      nil
     end
 
     private
@@ -79,13 +121,6 @@ module SpecrelayRunner
       reason = Redaction.redact("could not launch the configured executor: #{error.message}")
       Result.new(exit_code: nil, stdout: "", stderr: reason, duration_seconds: 0.0,
                  timed_out: false, argv: sanitized_argv(prompt_path), launch_error: reason)
-    end
-
-    def bundled(raw)
-      return nil if raw.include?(File::SEPARATOR)
-
-      path = File.join(BUNDLED_BIN, raw)
-      File.executable?(path) ? path : nil
     end
 
     attr_reader :config, :worktree_path, :staging_dir, :env

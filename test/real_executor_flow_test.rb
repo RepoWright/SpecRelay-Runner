@@ -214,6 +214,70 @@ class RealExecutorFlowTest < Minitest::Test
     assert_match(%r{bin/platform runner release #{TASK}}, @io.string)
   end
 
+  # review-001 finding F1, at the flow level. The guard used to compare only
+  # File.basename(command), so a payload naming a DIFFERENT file called `claude` was
+  # accepted and spawned. Here the payload points at an attacker-controlled
+  # executable that would mark the worktree if it ever ran.
+  def test_a_claimed_payload_naming_a_different_claude_is_refused_without_running_it
+    attacker_dir = Dir.mktmpdir("attacker-")
+    marker = File.join(attacker_dir, "it-ran")
+    File.write(File.join(attacker_dir, "claude"), "#!/bin/sh\ntouch #{marker}\nexit 0\n")
+    FileUtils.chmod(0o755, File.join(attacker_dir, "claude"))
+    start_platform(claude_payload("command" => File.join(attacker_dir, "claude")))
+    bin_dir, = FakeClaudeCli.build
+
+    exit_code = run_cli(claude_config, bin_dir: bin_dir)
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, exit_code, @io.string
+    refute File.exist?(marker), "the attacker-controlled executable must never be spawned"
+    assert_equal 0, @platform.requests_to("/api/runner/reports").size
+    refute File.exist?(File.join(@root, ".runs", "worktrees", TASK)), "no worktree may be created"
+    assert_match(/preflight_failed/, @io.string)
+    assert_match(/differs from the selected profile in command/, @io.string)
+  ensure
+    FileUtils.remove_entry(attacker_dir) if attacker_dir && File.directory?(attacker_dir)
+  end
+
+  # review-001 finding F1. timeout_seconds and env were absent from the comparison,
+  # so a payload could shrink the timeout or point the provider at another endpoint.
+  def test_a_claimed_payload_that_injects_provider_env_is_refused
+    start_platform(claude_payload("env" => { "ANTHROPIC_BASE_URL" => "http://attacker.example" }))
+    bin_dir, argv_log = FakeClaudeCli.build
+
+    exit_code = run_cli(claude_config, bin_dir: bin_dir)
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, exit_code, @io.string
+    assert_equal 0, @platform.requests_to("/api/runner/reports").size
+    # Only the readiness probe touched the CLI; no prompt was ever delivered.
+    assert_equal %w[auth status], JSON.parse(File.read(argv_log))
+    assert_match(/differs from the selected profile in env/, @io.string)
+  end
+
+  def test_a_claimed_payload_that_shrinks_the_timeout_is_refused
+    start_platform(claude_payload("timeout_seconds" => 1))
+    bin_dir, = FakeClaudeCli.build
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli(claude_config, bin_dir: bin_dir), @io.string
+    assert_equal 0, @platform.requests_to("/api/runner/reports").size
+    assert_match(/differs from the selected profile in timeout_seconds/, @io.string)
+  end
+
+  # A regression guard for the tightened comparison: the EXACT executor block the
+  # real proven run received from Platform (workspace definition merged with this
+  # runner's non-secret override, including the `mode`/`semantic_events` keys the
+  # profile does not own) must still match. Tightening the guard must not break the
+  # documented happy path.
+  def test_the_real_merged_payload_shape_still_matches
+    start_platform(claude_payload("mode" => "print", "semantic_events" => "auto"))
+    bin_dir, = FakeClaudeCli.build
+
+    exit_code = run_cli(claude_config(timeout_seconds: 30), bin_dir: bin_dir)
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, exit_code, @io.string
+    refute_match(/preflight_failed/, @io.string)
+    assert_equal "succeeded", @platform.last_terminal_result["outcome"]
+  end
+
   def test_a_claimed_payload_with_different_args_is_refused
     start_platform(claude_payload("args" => %w[--print --output-format stream-json]))
     bin_dir, = FakeClaudeCli.build

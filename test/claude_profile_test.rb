@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require_relative "test_helper"
+require "fileutils"
 
 # MVP-0016 — the one supported REAL provider profile, as a unit.
 #
@@ -16,7 +17,23 @@ class ClaudeProfileTest < Minitest::Test
     "prompt_delivery" => "argument", "timeout_seconds" => 900, "env" => {}
   }.freeze
 
+  # An environment in which nothing resolves, so `Executor.resolve_command` returns
+  # nil and both the readiness probe and the identity comparison fall back to the
+  # configured name. That keeps these unit tests independent of whatever `claude`
+  # happens to be installed on the machine running them.
+  NO_PATH = { "PATH" => "" }.freeze
+
   def profile(overrides = {}) = SpecrelayRunner::ClaudeProfile.new(PROFILE.merge(overrides))
+
+  # Build a real executable named `claude` in its own directory and return
+  # [bin_dir, env] so a test can exercise genuine path resolution.
+  def resolvable_claude
+    dir = Dir.mktmpdir("resolvable-claude-")
+    path = File.join(dir, "claude")
+    File.write(path, "#!/bin/sh\nexit 0\n")
+    FileUtils.chmod(0o755, path)
+    [ dir, { "PATH" => dir } ]
+  end
 
   # A probe stub: maps the argv it is handed to a canned CommandRunner::Result.
   def probe(version:, auth: nil)
@@ -116,7 +133,7 @@ class ClaudeProfileTest < Minitest::Test
   # --- readiness (acceptance criterion 2) ------------------------------------
 
   def test_ready_when_the_cli_is_installed_and_logged_in
-    readiness = profile.readiness(probe: probe(version: result, auth: result(stdout: auth_json(true))))
+    readiness = profile.readiness(env: NO_PATH, probe: probe(version: result, auth: result(stdout: auth_json(true))))
 
     assert readiness.ready?
     assert_equal "claude=available, auth=authenticated", readiness.summary
@@ -125,7 +142,7 @@ class ClaudeProfileTest < Minitest::Test
 
   # The absent-CLI case: the probe reports it could not launch the executable at all.
   def test_unavailable_when_the_cli_cannot_be_launched
-    readiness = profile.readiness(probe: probe(version: nil))
+    readiness = profile.readiness(env: NO_PATH, probe: probe(version: nil))
 
     refute readiness.ready?
     assert_equal "unavailable", readiness.version
@@ -133,13 +150,13 @@ class ClaudeProfileTest < Minitest::Test
   end
 
   def test_unavailable_when_the_version_probe_exits_non_zero
-    readiness = profile.readiness(probe: probe(version: result(exit_code: 1)))
+    readiness = profile.readiness(env: NO_PATH, probe: probe(version: result(exit_code: 1)))
 
     assert_equal "unavailable", readiness.version
   end
 
   def test_not_authenticated_when_the_auth_probe_reports_logged_out
-    readiness = profile.readiness(probe: probe(version: result, auth: result(stdout: auth_json(false))))
+    readiness = profile.readiness(env: NO_PATH, probe: probe(version: result, auth: result(stdout: auth_json(false))))
 
     refute readiness.ready?
     assert_equal "not_authenticated", readiness.auth
@@ -147,13 +164,13 @@ class ClaudeProfileTest < Minitest::Test
   end
 
   def test_not_authenticated_when_the_auth_probe_exits_non_zero
-    readiness = profile.readiness(probe: probe(version: result, auth: result(exit_code: 1)))
+    readiness = profile.readiness(env: NO_PATH, probe: probe(version: result, auth: result(exit_code: 1)))
 
     assert_equal "not_authenticated", readiness.auth
   end
 
   def test_check_failed_when_a_probe_times_out
-    timed = profile.readiness(probe: probe(version: result, auth: result(timed_out: true)))
+    timed = profile.readiness(env: NO_PATH, probe: probe(version: result, auth: result(timed_out: true)))
 
     refute timed.ready?
     assert_equal "check_failed", timed.auth
@@ -161,7 +178,7 @@ class ClaudeProfileTest < Minitest::Test
   end
 
   def test_check_failed_when_the_version_probe_times_out
-    timed = profile.readiness(probe: probe(version: result(timed_out: true)))
+    timed = profile.readiness(env: NO_PATH, probe: probe(version: result(timed_out: true)))
 
     assert_equal "check_failed", timed.version
     # Auth was never probed, so it is reported as undetermined rather than as a
@@ -173,7 +190,7 @@ class ClaudeProfileTest < Minitest::Test
   # A future CLI whose status output shape changed must not read as a false
   # failure: exit status remains the contract.
   def test_authenticated_when_the_probe_succeeds_without_a_recognizable_field
-    readiness = profile.readiness(probe: probe(version: result, auth: result(stdout: "logged in as someone")))
+    readiness = profile.readiness(env: NO_PATH, probe: probe(version: result, auth: result(stdout: "logged in as someone")))
 
     assert_equal "authenticated", readiness.auth
   end
@@ -181,7 +198,7 @@ class ClaudeProfileTest < Minitest::Test
   # The readiness result carries ONLY classifications. The raw auth output holds
   # the operator's email/org and must not survive anywhere in the returned value.
   def test_readiness_never_carries_account_details
-    readiness = profile.readiness(probe: probe(version: result, auth: result(stdout: auth_json(true))))
+    readiness = profile.readiness(env: NO_PATH, probe: probe(version: result, auth: result(stdout: auth_json(true))))
     serialized = [ readiness.to_h.inspect, readiness.summary, readiness.remedy.to_s ].join(" ")
 
     refute_includes serialized, FakeClaudeCli::ACCOUNT_EMAIL
@@ -196,7 +213,7 @@ class ClaudeProfileTest < Minitest::Test
       seen << argv
       result(stdout: auth_json(true))
     end
-    profile.readiness(probe: probe)
+    profile.readiness(env: NO_PATH, probe: probe)
 
     assert_equal [ %w[claude --version], %w[claude auth status] ], seen
   end
@@ -204,38 +221,98 @@ class ClaudeProfileTest < Minitest::Test
   # --- fail-closed payload comparison (acceptance criterion 4) ---------------
 
   def test_no_mismatch_for_an_identical_claimed_payload
-    assert_nil profile.mismatch_reason(PROFILE.merge("mode" => "print", "semantic_events" => "auto"))
+    payload = PROFILE.merge("mode" => "print", "semantic_events" => "auto")
+
+    assert_nil profile.mismatch_reason(payload, env: NO_PATH)
   end
 
   def test_mismatch_when_the_claimed_payload_is_the_fake_executor
-    reason = profile.mismatch_reason("provider" => "fake", "command" => "specrelay-fake-executor",
-                                     "args" => [], "prompt_delivery" => "file_argument")
+    reason = profile.mismatch_reason({ "provider" => "fake", "command" => "specrelay-fake-executor",
+                                       "args" => [], "prompt_delivery" => "file_argument" }, env: NO_PATH)
 
     assert_match(/not a usable Claude Code profile/, reason)
   end
 
   def test_mismatch_when_the_claimed_payload_is_another_cli
-    reason = profile.mismatch_reason(PROFILE.merge("command" => "codex"))
+    reason = profile.mismatch_reason(PROFILE.merge("command" => "codex"), env: NO_PATH)
 
     assert_match(/not a usable Claude Code profile/, reason)
   end
 
   def test_mismatch_when_the_claimed_args_differ
-    reason = profile.mismatch_reason(PROFILE.merge("args" => %w[--print]))
+    reason = profile.mismatch_reason(PROFILE.merge("args" => %w[--print]), env: NO_PATH)
 
-    assert_match(/is not the selected profile/, reason)
+    assert_match(/differs from the selected profile in args/, reason)
   end
 
   def test_mismatch_when_the_claimed_payload_would_stream_json
-    reason = profile.mismatch_reason(PROFILE.merge("args" => %w[--print --output-format stream-json]))
+    reason = profile.mismatch_reason(PROFILE.merge("args" => %w[--print --output-format stream-json]), env: NO_PATH)
 
     assert_match(/--output-format/, reason)
   end
 
-  # An absolute host path and a bare name are the SAME executable for this
-  # comparison — an operator override of the path must not read as a mismatch.
-  def test_an_absolute_path_matches_the_bare_command
-    assert_nil profile("command" => "/opt/homebrew/bin/claude").mismatch_reason(PROFILE)
+  # review-001 finding F1. The guard used to compare only File.basename(command), so
+  # ANY file named `claude` anywhere on the host passed as a match and was then
+  # spawned. It must compare the executable that will actually run.
+  def test_mismatch_when_the_claimed_command_is_a_different_file_named_claude
+    dir, env = resolvable_claude                     # the selected profile's `claude`
+    attacker = Dir.mktmpdir("attacker-")
+    File.write(File.join(attacker, "claude"), "#!/bin/sh\necho pwned\n")
+    FileUtils.chmod(0o755, File.join(attacker, "claude"))
+
+    reason = profile.mismatch_reason(PROFILE.merge("command" => File.join(attacker, "claude")), env: env)
+
+    refute_nil reason, "a different executable named `claude` must NOT pass the guard"
+    assert_match(/differs from the selected profile in command/, reason)
+  ensure
+    FileUtils.remove_entry(dir) if dir && File.directory?(dir)
+    FileUtils.remove_entry(attacker) if attacker && File.directory?(attacker)
+  end
+
+  # The legitimate case the basename comparison was originally trying to allow: an
+  # absolute path naming the SAME file as the bare command still matches.
+  def test_an_absolute_path_to_the_same_executable_matches
+    dir, env = resolvable_claude
+
+    assert_nil profile.mismatch_reason(PROFILE.merge("command" => File.join(dir, "claude")), env: env)
+  ensure
+    FileUtils.remove_entry(dir) if dir && File.directory?(dir)
+  end
+
+  # review-001 finding F1. timeout_seconds and env were absent from the comparison, so
+  # a payload could shrink the timeout or inject provider environment with no mismatch.
+  def test_mismatch_when_the_claimed_payload_shrinks_the_timeout
+    reason = profile.mismatch_reason(PROFILE.merge("timeout_seconds" => 1), env: NO_PATH)
+
+    assert_match(/differs from the selected profile in timeout_seconds/, reason)
+  end
+
+  # ANTHROPIC_BASE_URL is not credential-shaped, so validation accepts it — which is
+  # exactly why the fail-closed comparison has to catch it.
+  def test_mismatch_when_the_claimed_payload_injects_provider_env
+    reason = profile.mismatch_reason(PROFILE.merge("env" => { "ANTHROPIC_BASE_URL" => "http://attacker.example" }),
+                                     env: NO_PATH)
+
+    assert_match(/differs from the selected profile in env/, reason)
+  end
+
+  # An omitted timeout must not read as a mismatch against the effective default the
+  # executor would apply anyway.
+  def test_an_omitted_timeout_matches_the_effective_default
+    bare = PROFILE.reject { |key, _| key == "timeout_seconds" }
+    selected = SpecrelayRunner::ClaudeProfile.new(bare)
+
+    assert_equal SpecrelayRunner::ClaudeProfile::DEFAULT_TIMEOUT_SECONDS, selected.timeout_seconds
+    assert_nil selected.mismatch_reason(bare.merge("timeout_seconds" => 1800), env: NO_PATH)
+  end
+
+  # The identity is what the guard compares; it must carry every launch-deciding
+  # dimension, not a subset.
+  def test_identity_covers_every_launch_deciding_dimension
+    identity = profile.identity(env: NO_PATH)
+
+    assert_equal SpecrelayRunner::ClaudeProfile::IDENTITY_FIELDS.length, identity.length
+    assert_equal [ "claude", "claude", %w[--print --dangerously-skip-permissions], "argument", 900, {} ], identity
   end
 
   # --- failure classification (acceptance criterion 5) -----------------------

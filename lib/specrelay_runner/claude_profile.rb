@@ -133,7 +133,14 @@ module SpecrelayRunner
       end
     end
 
-    attr_reader :command, :args, :prompt_delivery
+    # Mirrors Executor's fallback so `identity` compares effective values.
+    DEFAULT_TIMEOUT_SECONDS = 1800
+
+    # Labels for the identity tuple, so a mismatch names the dimension that differed
+    # instead of dumping two opaque arrays at the operator.
+    IDENTITY_FIELDS = %w[provider command args prompt_delivery timeout_seconds env].freeze
+
+    attr_reader :command, :args, :prompt_delivery, :timeout_seconds, :extra_env
 
     def initialize(executor_config)
       config = (executor_config || {}).to_h.transform_keys(&:to_s)
@@ -142,12 +149,30 @@ module SpecrelayRunner
       @command = presence(config["command"]) || EXECUTABLE
       @args = Array(config["args"]).map(&:to_s)
       @prompt_delivery = presence(config["prompt_delivery"]) || PROMPT_DELIVERY
+      # Effective values, mirroring Executor's own defaults, so the fail-closed
+      # comparison reflects what would REALLY happen rather than what was written.
+      @timeout_seconds = config["timeout_seconds"].to_i.positive? ? config["timeout_seconds"].to_i : DEFAULT_TIMEOUT_SECONDS
+      @extra_env = (config["env"] || {}).to_h.transform_keys(&:to_s).transform_values(&:to_s)
       validate!(config)
     end
 
-    # A stable, secret-free identity for the fields this profile owns. Two configs
-    # with the same fingerprint launch the same process the same way.
-    def fingerprint = [ PROVIDER, File.basename(command), args, prompt_delivery ]
+    # Every dimension that decides WHAT runs and HOW. Two configs with the same
+    # identity launch the same executable, the same way, under the same limit, with
+    # the same child environment.
+    #
+    # `command` is compared as the RESOLVED executable, not as a basename. Comparing
+    # basenames meant any file named `claude` anywhere on the host passed as a match
+    # and was then spawned; and omitting timeout/env let a payload shrink the timeout
+    # or inject provider environment (for example ANTHROPIC_BASE_URL, which is not
+    # credential-shaped and so passes validation) with no mismatch at all. Both were
+    # review-001 finding F1 against acceptance criterion 4.
+    #
+    # When a command cannot be resolved to a real file, the literal string is used
+    # instead: unresolvable never silently equals resolvable.
+    def identity(env: ENV)
+      [ PROVIDER, Executor.resolve_command(command, env: env) || command,
+        args, prompt_delivery, timeout_seconds, extra_env ]
+    end
 
     # A one-line, redacted description safe for a console line or a report field.
     def describe = Redaction.redact("#{PROVIDER} #{command} #{args.join(' ')} (prompt via #{prompt_delivery})")
@@ -159,23 +184,30 @@ module SpecrelayRunner
     # live CLI, no global process state in tests).
     def readiness(env: ENV, probe: nil)
       probe ||= self.class.default_probe(env: env)
-      version = classify_version(probe.call([ command, "--version" ]))
+      # Probe the file the LAUNCH will resolve to, not merely the configured name, so
+      # readiness cannot pass against a different `claude` than the one that will run
+      # (review-001 finding F1). Falls back to the raw name when nothing resolves, so
+      # the probe still runs and reports `unavailable` itself.
+      target = Executor.resolve_command(command, env: env) || command
+      version = classify_version(probe.call([ target, "--version" ]))
       # Auth cannot be established when the CLI itself is not runnable. Reported as
       # check_failed (the "could not determine" classification) rather than as a
       # login problem the operator would then chase in the wrong place.
       return Readiness.new(version: version, auth: CHECK_FAILED) unless version == AVAILABLE
 
-      Readiness.new(version: version, auth: classify_auth(probe.call([ command, "auth", "status" ])))
+      Readiness.new(version: version, auth: classify_auth(probe.call([ target, "auth", "status" ])))
     end
 
     # Why the executor Platform actually resolved is not this profile, or nil when
     # it is. This is the fail-closed gate: the runner refuses to launch a command
     # it did not select, instead of silently executing another CLI or the fake.
-    def mismatch_reason(payload_executor)
+    def mismatch_reason(payload_executor, env: ENV)
       claimed = self.class.new(payload_executor)
-      return nil if claimed.fingerprint == fingerprint
+      differing = differing_fields(claimed, env: env)
+      return nil if differing.empty?
 
-      "claimed executor #{claimed.describe} is not the selected profile #{describe}"
+      "claimed executor differs from the selected profile in #{differing.join(', ')} " \
+        "(claimed #{claimed.describe}; selected #{describe})"
     rescue Error => e
       "claimed executor is not a usable Claude Code profile (#{Redaction.redact(e.message)}); selected #{describe}"
     end
@@ -191,6 +223,15 @@ module SpecrelayRunner
     end
 
     private
+
+    # Which identity dimensions disagree, by name. `env` is reported without its
+    # values: an operator does not need them echoed, and they are not this method's
+    # to print.
+    def differing_fields(claimed, env:)
+      mine = identity(env: env)
+      theirs = claimed.identity(env: env)
+      IDENTITY_FIELDS.each_with_index.filter_map { |field, index| field if mine[index] != theirs[index] }
+    end
 
     def authentication_failure?(result)
       [ result.stderr, result.stdout ].any? { |text| text.to_s.match?(AUTH_FAILURE_HINT) }
@@ -208,8 +249,12 @@ module SpecrelayRunner
       raise Error, "executor.env must carry no credential (remove #{credential}); Claude authenticates from the operator environment" if credential
     end
 
-    # An operator may point at an absolute path, but the executable itself must be
-    # the Claude CLI — this is what refuses a silent substitution of another CLI.
+    # An operator may point at an absolute path, but the executable must still be
+    # NAMED `claude`, which is what refuses an obviously different CLI such as
+    # `codex`. This is a name check only and is deliberately NOT the fail-closed
+    # guard: a basename says nothing about which file will run. Refusing a claimed
+    # payload that would launch a different executable is `identity`/`mismatch_reason`
+    # (review-001 finding F1 — the previous comment here overclaimed).
     def claude_executable? = File.basename(command) == EXECUTABLE
     def non_interactive? = args.any? { |arg| PRINT_FLAGS.include?(flag_name(arg)) }
 

@@ -130,7 +130,9 @@ module SpecrelayRunner
       profile = config.selected_claude_profile
       return if profile.nil?
 
-      reason = profile.mismatch_reason(payload.fetch("executor"))
+      # Same env the executor will launch with, so the comparison resolves the very
+      # file that would run (review-001 finding F1).
+      reason = profile.mismatch_reason(payload.fetch("executor"), env: env)
       raise ExecutorMismatch, reason if reason
     end
 
