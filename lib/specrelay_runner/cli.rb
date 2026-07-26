@@ -2,11 +2,22 @@
 
 module SpecrelayRunner
   # The `specrelay-runner` command-line entry point for the standalone runner
-  # (MVP-0010). It is a thin adapter: parse argv, load local config, build the
+  # (MVP-0010). It is a thin adapter: parse argv, load local configuration, build the
   # Platform API client, claim at most one run, and — if claimed — execute it and
   # report back. It never reaches Platform except through PlatformClient.
   #
-  #   specrelay-runner claim-once --config <path>
+  # The NORMAL path is two commands and no files (MVP-0017):
+  #
+  #   specrelay-runner connect <enrollment-code>
+  #   specrelay-runner claim-once
+  #
+  # `connect` obtains everything from Platform, asks only for the local checkout, and
+  # stores the credential in the OS secret store; `claim-once` then reads that stored
+  # connection, so there is no YAML to author and no credential to export.
+  #
+  # `register --config <path>` and `claim-once --config <path>` remain as the
+  # ADVANCED/LEGACY path for an operator who already runs a hand-written config. They
+  # are supported, not recommended, and are not the documented setup route.
   #
   # Exit codes mirror the in-process runner: 0 = completed or nothing eligible,
   # 1 = a claimed execution did not complete successfully, 2 = config/usage error.
@@ -26,6 +37,7 @@ module SpecrelayRunner
     def run(argv)
       command, *rest = argv
       case command
+      when "connect" then connect(rest)
       when "register" then register(rest)
       when "claim-once" then claim_once(rest)
       when nil, "help", "-h", "--help" then print_help
@@ -38,10 +50,55 @@ module SpecrelayRunner
 
     attr_reader :out, :err, :env
 
-    # Enroll this runner with Platform using a one-time registration token (read
-    # from the environment, never the config file) and receive its durable
-    # per-runner credential. The credential is printed EXACTLY ONCE; the operator
-    # must store it in the credential env var. It is never written to disk here.
+    # The guided connection (MVP-0017). Every failure mode reports ONE focused, redacted
+    # remedy and leaves this runner not-ready rather than half-connected: an unsupported
+    # platform, a malformed/expired code, a checkout that is not the assigned repository,
+    # an unavailable or unauthenticated Claude, or a refused Keychain write.
+    def connect(args)
+      code = args.find { |arg| !arg.start_with?("-") }
+      return usage("usage: specrelay-runner connect <enrollment-code>") if code.nil?
+
+      result = Connect.call(code: code, out: out, err: err, env: env,
+                            checkout_path: option(args, "--checkout"))
+      print_connection(result)
+      result.ready? ? SUCCESS : RUN_FAILED
+    rescue SecretStore::UnsupportedPlatform => e
+      connect_failed("Cannot connect: #{e.message}", USAGE_ERROR)
+    rescue Connect::Error, SecretStore::Error, ConnectionStore::Error, PlatformClient::Error => e
+      connect_failed("Connection failed: #{Redaction.redact(e.message)}", RUN_FAILED)
+    end
+
+    # stdout is block-buffered when redirected while stderr is not, so without this flush the
+    # failure line appears BEFORE the assignment lines it refers to in a merged operator log —
+    # the same ordering problem `executor_ready?` already guards against.
+    def connect_failed(message, status)
+      out.flush if out.respond_to?(:flush)
+      err.puts message
+      status
+    end
+
+    # Prints the state PLATFORM decided, never the runner's own opinion, and never the
+    # credential (which is already in the Keychain by this point).
+    def print_connection(result)
+      out.puts ""
+      if result.ready?
+        out.puts "Connected. This machine is ready to execute #{result.workspace_key} work."
+        out.puts "Next: run `specrelay-runner claim-once` here, or leave it to your scheduler."
+        return
+      end
+
+      out.flush if out.respond_to?(:flush)
+      err.puts "Platform recorded this connection as #{result.state}" \
+               "#{" (#{result.failure_class})" if result.failure_class}."
+      err.puts "Remedy: #{Redaction.redact(result.detail.to_s)}" if result.detail.to_s.strip != ""
+    end
+
+    # ADVANCED / LEGACY (MVP-0011). Enroll with a one-time registration token read from
+    # the environment and receive the durable credential, printed EXACTLY ONCE for the
+    # operator to export. Superseded by `connect`, which needs no file and no exported
+    # credential — and, unlike this command, grants access to a specific workspace. A
+    # runner enrolled here holds no workspace grant and can claim nothing until it
+    # completes `connect`.
     def register(args)
       config = load_config(args)
       return USAGE_ERROR if config.nil?
@@ -71,10 +128,13 @@ module SpecrelayRunner
       out.puts ""
       out.puts "Export it before claiming work:"
       out.puts "  export #{config.credential_env}=<the value above>"
+      out.puts ""
+      out.puts "This runner has NO workspace access yet. Registration alone authorizes nothing:"
+      out.puts "run `specrelay-runner connect <enrollment-code>` for the workspace it should execute."
     end
 
     def claim_once(args)
-      config = load_config(args)
+      config = resolve_claim_config(args)
       return USAGE_ERROR if config.nil?
 
       auth = config.resolve_auth(env: env)
@@ -88,7 +148,7 @@ module SpecrelayRunner
       client = PlatformClient.new(base_url: config.base_url, token: auth.token)
       result = client.claim(config.claim_runner_params)
       unless result.claimed?
-        out.puts "no eligible work (Platform authorized no run under this runner's policy)."
+        out.puts not_claimed_message(result)
         return SUCCESS
       end
 
@@ -102,6 +162,13 @@ module SpecrelayRunner
     rescue PlatformClient::Error => e
       err.puts "Runner failed: #{e.message}"
       RUN_FAILED
+    end
+
+    # Print PLATFORM's reason for a not-claimed poll, so an unconnected runner is told to run
+    # `connect` rather than being left to read "nothing eligible" as a healthy idle.
+    def not_claimed_message(result)
+      reason = Redaction.redact(result.reason)
+      reason.strip.empty? ? "no eligible work (Platform authorized no run for this runner)." : "no work claimed: #{reason}"
     end
 
     # The local, no-edit readiness gate for the real provider profile. Returns true
@@ -134,6 +201,92 @@ module SpecrelayRunner
       result.success? ? SUCCESS : RUN_FAILED
     end
 
+    # Prefer the guided connection (MVP-0017); fall back to the advanced/legacy config
+    # file. An explicit `--config` (or SPECRELAY_RUNNER_CONFIG) always wins, so an
+    # operator who deliberately runs a hand-written config is never silently overridden by
+    # a stored connection.
+    def resolve_claim_config(args)
+      explicit = path_from(args) || Config.resolve_path(nil, env)
+      return load_config(args) if explicit.to_s.strip != ""
+
+      store = ConnectionStore.load(env: env)
+      return not_connected if store.connections.empty?
+
+      connection_config(store, args)
+    end
+
+    def not_connected
+      err.puts "this machine is not connected to a workspace."
+      err.puts "Run `specrelay-runner connect <enrollment-code>` — get the code from your " \
+               "project's setup page in Platform."
+      err.puts "(Advanced/legacy: point at a hand-written config with --config <path>.)"
+      nil
+    end
+
+    # Build a config from a stored connection, reading its credential from the OS secret
+    # store. Returns nil after printing ONE specific remedy when the connection cannot be
+    # used, so a normal user is never shown a config-file error they did not cause.
+    def connection_config(store, args)
+      connection = select_connection(store, option(args, "--workspace"))
+      return nil if connection.nil?
+
+      credential = stored_credential(connection)
+      return missing_credential(connection) if credential.nil?
+
+      Config.from_connection(connection, credential: credential)
+    rescue SecretStore::UnsupportedPlatform, SecretStore::Error => e
+      err.puts "Cannot read the stored runner credential: #{Redaction.redact(e.message)}"
+      nil
+    end
+
+    # The credential for this connection's RUNNER identity, falling back to the pre-round-003
+    # per-workspace account so a machine that connected under the old scheme keeps working
+    # (review-002, F3 residual). The credential is per runner, so keying it per workspace is what
+    # let a second workspace's connection orphan the first's stored copy.
+    def stored_credential(connection)
+      store = SecretStore.for(platform: RUBY_PLATFORM)
+      runner_public_id = connection.runner_public_id.to_s.strip
+      unless runner_public_id.empty?
+        value = store.read(account: SecretStore.account_for_runner(runner_public_id))
+        return value if value
+      end
+      store.read(account: SecretStore.legacy_account_for(connection.workspace_key))
+    end
+
+    # A named workspace, or the sole stored connection. Several connections with no
+    # `--workspace` is ambiguous, and guessing which workspace to claim for is exactly the
+    # inference this MVP removed — so it asks.
+    def select_connection(store, workspace_key)
+      requested = workspace_key.to_s.strip
+      unless requested.empty?
+        found = store.connection_for(requested)
+        return found if found
+
+        return unknown_workspace(store, requested)
+      end
+
+      store.sole_connection || ambiguous_workspace(store)
+    end
+
+    def unknown_workspace(store, requested)
+      err.puts "no connection for workspace '#{requested}'. Connected: " \
+               "#{store.connections.map(&:workspace_key).join(', ')}"
+      nil
+    end
+
+    def ambiguous_workspace(store)
+      err.puts "several workspaces are connected " \
+               "(#{store.connections.map(&:workspace_key).join(', ')}); " \
+               "choose one with --workspace <workspace-key>"
+      nil
+    end
+
+    def missing_credential(connection)
+      err.puts "no stored credential for workspace #{connection.workspace_key}. " \
+               "Reconnect it: specrelay-runner connect <enrollment-code>"
+      nil
+    end
+
     def load_config(args)
       Config.load(path_from(args), env: env)
     rescue Config::Error => e
@@ -141,11 +294,18 @@ module SpecrelayRunner
       nil
     end
 
+    def option(args, flag)
+      index = args.index(flag)
+      return args[index + 1] if index
+
+      args.find { |arg| arg.start_with?("#{flag}=") }&.split("=", 2)&.last
+    end
+
     def announce(config, auth)
       out.puts "SpecRelay standalone runner #{VERSION} (contract #{CONTRACT_VERSION})"
       out.puts "Platform: #{config.base_url}"
       out.puts "Runner:   #{config.runner['display_name']} (#{config.runner['id']})"
-      out.puts "Policy:   #{config.runner.dig('claim_policy', 'mode')}"
+      out.puts "Source:   #{config.connection ? "connected workspace #{config.connection.workspace_key}" : "config file #{config.source_path}"}"
       out.puts "Auth:     #{auth.mode == :registered ? 'registered runner credential' : 'development token (fallback)'}"
     end
 
@@ -165,7 +325,8 @@ module SpecrelayRunner
 
     def usage(message)
       err.puts message if message
-      err.puts "Usage: specrelay-runner claim-once --config <path>"
+      err.puts "Usage: specrelay-runner connect <enrollment-code>"
+      err.puts "       specrelay-runner claim-once [--workspace <workspace-key>]"
       USAGE_ERROR
     end
 
@@ -185,23 +346,49 @@ module SpecrelayRunner
         This is the one supported way to execute SpecRelay work. Platform's
         `bin/platform runner once|loop` no longer executes anything.
 
-        Usage:
-          specrelay-runner register --config <path>
-              Enroll this runner with Platform using a one-time registration
-              token (read from the env var named by runner.registration_token_env,
-              default SPECRELAY_RUNNER_REGISTRATION_TOKEN). Platform returns a
-              durable per-runner credential exactly once; export it into the
-              credential env var (default SPECRELAY_RUNNER_CREDENTIAL). Exits 0 on
-              success, 1 on a rejected token, 2 on a config/usage error.
+        Normal setup — two commands, no files to edit:
 
-          specrelay-runner claim-once --config <path>
+          specrelay-runner connect <enrollment-code>
+              Connect this machine to one workspace. Get the code from your
+              project's setup page in Platform ("Connect a Runner"); it is shown
+              once, works once, and expires shortly.
+
+              The command obtains the Platform endpoint and the project/workspace
+              assignment from the code exchange, asks you for ONE thing — the local
+              checkout directory for the assigned repository — validates that
+              checkout's remote and default branch against the assignment, checks
+              the assigned executor is ready, and stores this runner's durable
+              credential in the macOS Keychain. The credential is never printed,
+              never written to a file, and never exported.
+
+              macOS only in this release. On another system it stops before
+              registering rather than saving a plaintext credential. Exits 0 when
+              Platform records the runner ready, 1 otherwise, 2 on usage/platform.
+
+          specrelay-runner claim-once [--workspace <workspace-key>]
               Claim at most one eligible run (Platform decides), execute it, and
-              upload the report. Reads the Platform base URL + runner identity
-              from the config. Authenticates with the per-runner credential when
-              present (registered mode), otherwise the shared development token
-              (fallback) — both from the environment, never the file. Exits 0 on
+              upload the report. With no arguments it uses the connection created
+              by `connect`, reading the credential from the Keychain — no config
+              file, no exported credential, and no workspace-root variable.
+              --workspace picks one when several are connected. Exits 0 on
               completion or no eligible work, 1 on a failed execution, 2 on a
               config/usage error.
+
+        Advanced / legacy — supported for an existing hand-written setup, and NOT the
+        documented way to set a machine up:
+
+          specrelay-runner register --config <path>
+              Enroll with a one-time registration token (read from the env var named
+              by runner.registration_token_env, default
+              SPECRELAY_RUNNER_REGISTRATION_TOKEN) and PRINT the durable credential
+              once for you to export as SPECRELAY_RUNNER_CREDENTIAL. Unlike
+              `connect`, it grants no workspace access on its own: a runner enrolled
+              this way shows as `legacy setup` in Platform and can claim nothing
+              until it completes `connect` for a workspace.
+
+          specrelay-runner claim-once --config <path>
+              Claim using a hand-written config file and a credential from the
+              environment. An explicit --config always wins over a stored connection.
 
           specrelay-runner version
           specrelay-runner help

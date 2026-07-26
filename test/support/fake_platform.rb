@@ -17,6 +17,24 @@ class FakePlatform
   EXPECTED_REGISTRATION_TOKEN = "srt_fake-registration-token"
   ISSUED_CREDENTIAL = "src_fake-issued-credential"
 
+  # MVP-0017 guided connection. `enrollment_code` is the one-time code the runner
+  # presents to /enrollment; on success the fake issues ISSUED_CREDENTIAL and then
+  # accepts it as a registered bearer, exactly as Platform does. The readiness
+  # verdict is scripted per-instance so a test can prove the runner renders the
+  # state PLATFORM decided rather than its own opinion.
+  attr_accessor :enrollment_code, :readiness_verdict, :enrollment_status
+
+  # Round 002: the credential the fake believes this machine already holds. When the runner
+  # presents it on the exchange, the fake responds `credential_unchanged` and issues nothing —
+  # mirroring Platform's non-destructive reconnect (review-001 F3).
+  attr_accessor :held_credential
+
+  # Lets a test model a SECOND workspace on the same Platform and the same machine, which is the
+  # shape that used to orphan the first workspace's stored credential (review-002, F3 residual).
+  def claim_payload_workspace_key=(key)
+    @claim_payload["workspace"]["workspace_key"] = key
+  end
+
   attr_reader :requests
 
   # `token` is the shared development token (fallback mode). `registration_token`
@@ -24,11 +42,20 @@ class FakePlatform
   # fake issues ISSUED_CREDENTIAL, which it then also accepts as a registered
   # bearer for the remaining endpoints (registered mode).
   def initialize(claim_payload:, token: EXPECTED_TOKEN, registration_token: EXPECTED_REGISTRATION_TOKEN,
+                 enrollment_code: nil,
                  lease_signal: { "state" => "active", "cancel_requested" => false })
     @claim_payload = claim_payload
     @token = token
     @registration_token = registration_token
+    @enrollment_code = enrollment_code
+    @enrollment_status = 201
+    @readiness_verdict = { "state" => "ready", "failure_class" => nil,
+                           "detail" => "Runner validated its local checkout and reported the executor ready." }
     @requests = []
+    # Enrollment codes are SINGLE USE on real Platform, so they are here too. Without this the
+    # fake could not tell "the code was never spent" from "the code was spent and reused", and
+    # every "the same code still works" assertion would pass vacuously.
+    @consumed_codes = []
     @server = TCPServer.new("127.0.0.1", 0)
     @claimed = false
     @lease_signal = lease_signal
@@ -65,9 +92,16 @@ class FakePlatform
   end
 
   # Convenience accessors for assertions.
+  # A spent code is indistinguishable from a wrong one, as on real Platform.
+  def code_spent? = @consumed_codes.include?(@enrollment_code)
+  def spent_code = [ 401, { error: "invalid_enrollment_code" } ]
+
   def requests_to(path) = requests.select { |r| r[:path] == path }
   def last_report = requests_to("/api/runner/reports").last
   def last_registration = requests_to("/api/runner/registration").last
+  def last_enrollment = requests_to("/api/runner/enrollment").last
+  def last_enrollment_preview = requests_to("/api/runner/enrollment_preview").last
+  def last_readiness_report = requests_to("/api/runner/workspace_connections").last
 
   # MVP-0013: the v1 protocol events the runner sent (the `event` sub-hash of each
   # /events request), in receipt order, and the terminal-result envelope uploaded
@@ -119,16 +153,20 @@ class FakePlatform
   # credential, mirroring Platform's two authentication modes.
   def authorized?(request)
     presented = request[:headers]["authorization"].to_s
-    if request[:path].to_s.split("?").first == "/api/runner/registration"
-      presented == "Bearer #{@registration_token}"
-    else
-      presented == "Bearer #{@token}" || presented == "Bearer #{ISSUED_CREDENTIAL}"
+    case request[:path].to_s.split("?").first
+    when "/api/runner/registration" then presented == "Bearer #{@registration_token}"
+    when "/api/runner/enrollment", "/api/runner/enrollment_preview"
+      presented == "Bearer #{@enrollment_code}"
+    else presented == "Bearer #{@token}" || presented == "Bearer #{ISSUED_CREDENTIAL}"
     end
   end
 
   def route(request)
     case request[:path]
     when "/api/runner/registration" then registration
+    when "/api/runner/enrollment" then enrollment(request)
+    when "/api/runner/enrollment_preview" then code_spent? ? spent_code : [ 200, assignment ]
+    when "/api/runner/workspace_connections" then workspace_connection(request)
     when "/api/runner/claim" then claim
     when "/api/runner/events" then events(request)
     when "/api/runner/heartbeat" then [ 200, { acknowledged: true, state: "EXECUTING", lease: lease_signal } ]
@@ -142,6 +180,50 @@ class FakePlatform
              runner: { id: "local-dev-runner-1", public_id: "rnr_fake", display_name: "Local Developer Runner",
                        registered_at: "2026-07-24T00:00:00Z" },
              credential: ISSUED_CREDENTIAL, credential_env: "SPECRELAY_RUNNER_CREDENTIAL" } ]
+  end
+
+  # The non-secret assignment, identical for the preview and the exchange. The workspace block
+  # deliberately mirrors the claim payload's, so a connection and a later claim describe the same
+  # workspace.
+  def assignment
+    workspace = @claim_payload.fetch("workspace")
+    { contract_version: "mvp-0017",
+      platform: { base_url: base_url },
+      project: { slug: "tiny-demo", name: "Tiny Demo" },
+      workspace: workspace.slice("project_key", "workspace_key", "display_name",
+                                 "repository_url", "default_branch"),
+      executor: @claim_payload.fetch("executor") }
+  end
+
+  # MVP-0017 guided connection: consume the code and return the durable credential once — unless
+  # the runner presented the credential it already holds, in which case nothing is issued.
+  def enrollment(request)
+    return spent_code if code_spent?
+
+    # The held credential arrives in a HEADER, never the body (round 003, review-002 N1), so the
+    # fake reads it where Platform reads it.
+    presented = request.dig(:headers, "x-specrelay-runner-credential")
+    unchanged = !@held_credential.nil? && presented == @held_credential
+    @consumed_codes << @enrollment_code
+    [ @enrollment_status,
+      assignment.merge(
+        runner: { id: "host-runner", public_id: "rnr_fake", display_name: "host runner",
+                  connection_public_id: "rwc_fake", reconnected: unchanged },
+        credential: unchanged ? nil : ISSUED_CREDENTIAL,
+        credential_unchanged: unchanged
+      ) ]
+  end
+
+  # Platform — not the runner — decides the state, so the verdict is scripted here and
+  # the runner must render whatever comes back.
+  def workspace_connection(request)
+    [ 201, { contract_version: "mvp-0017",
+             connection: { public_id: "rwc_fake",
+                           workspace_key: request.dig(:body, "workspace_key"),
+                           state: readiness_verdict["state"],
+                           failure_class: readiness_verdict["failure_class"],
+                           detail: readiness_verdict["detail"],
+                           ready_at: "2026-07-26T00:00:00Z" } } ]
   end
 
   # MVP-0013 v1 event ingest: classify a repeat (attempt_id, sequence) as an

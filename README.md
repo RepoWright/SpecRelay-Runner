@@ -44,64 +44,159 @@ cd SpecRelay-Runner
 bin/specrelay-runner version
 ```
 
-## Configure
+## Usage — the normal path (MVP-0017)
 
-Copy [`config/runner.example.yml`](config/runner.example.yml) to a real path (for
-example `~/.specrelay/runner.yml`) and edit it. This is the **only** supported
-operator-facing runner config example.
+Two commands, no files to author, no credential to export.
 
-```bash
-cp config/runner.example.yml ~/.specrelay/runner.yml
-```
+### 1. Connect this machine to one workspace
 
-The config carries **no secret**. The registration token, the runner credential,
-and the development token are all read from environment variables the config
-*names*; none is ever written to the file. Point the runner at it with
-`--config <path>` or `SPECRELAY_RUNNER_CONFIG`.
-
-## Usage
-
-### 1. Register the runner (primary path)
-
-An operator issues a **one-time registration token** on Platform:
+An authenticated operator issues a one-time enrollment code from Platform's
+**Project setup -> Connect a Runner** screen and copies the single command it
+displays. Run it here:
 
 ```bash
-bin/platform runners issue-registration-token   # on the Platform host; printed once
+bin/specrelay-runner connect <one-time-enrollment-code>
 ```
 
-Then this runner enrolls with it and receives its **own credential exactly once**:
+It asks you for exactly **one** thing — the local checkout directory for the
+assigned repository — and derives everything else from the code exchange: the
+Platform endpoint (carried inside the code, so no `--platform` flag), the
+project/workspace assignment, the repository identity to validate against, and
+the executor profile to check.
 
-```bash
-export SPECRELAY_RUNNER_REGISTRATION_TOKEN=<the one-time token>
+Order of operations. Steps 1 to 4 change **nothing** — no code is consumed, no
+credential is issued, and no binding is touched — so a purely local failure costs
+the operator nothing and the same code still works:
 
-bin/specrelay-runner register --config ~/.specrelay/runner.yml
-# -> prints the per-runner credential once; store it:
-export SPECRELAY_RUNNER_CREDENTIAL=<the credential from the output>
-```
+1. confirm this platform supports guided secret storage (**macOS only** in this
+   release — see below);
+2. **preview** the code's assignment without consuming it
+   (`POST /api/runner/enrollment_preview`);
+3. validate the checkout: it must be a Git repository whose configured remote and
+   default branch match the assigned workspace. Remote comparison is identity-only
+   (`host/owner/repo`), so an `https` URL and an scp-like SSH remote for the same
+   repository match, while a different repository, owner, or host does not;
+4. run the bounded provider readiness checks **only** when the assigned executor
+   is the real Claude profile;
+5. prove the **Keychain accepts a write**, using a throwaway non-secret item — only when this
+   machine holds no credential yet, because that is when a write is certain to be needed;
+6. **exchange** the code, presenting the credential this machine already holds for this
+   Platform (if any) in the `X-SpecRelay-Runner-Credential` header, so Platform can recognise a
+   reconnect;
+7. store the durable credential in the **macOS Keychain** — skipped entirely when
+   Platform replied `credential_unchanged`, because there is nothing new to store;
+8. write non-secret connection facts to `~/.specrelay/runner/connections.json`
+   (mode `0600`, and you never need to edit it);
+9. report a bounded readiness result and print the state **Platform** decided.
 
-`register` exits `0` on success, `1` on a rejected/expired/used token, `2` on a
-config/usage error.
+Exit `0` when Platform records this machine ready, `1` otherwise, `2` on a
+usage/platform error.
+
+**Secret posture.** The durable credential is never printed, never written to
+YAML, a shell profile, Git, or a log, and never appears in an error message. It is
+also never an argv element: it is handed to the `security` tool on **stdin**, via that tool's
+interactive mode (`security -i`), because `security` documents `-w` as insecure and an argv
+element is visible in the process table to any process running as the same user.
+
+Interactive mode is used rather than a valueless `-w`: that form makes `security` *prompt*, and
+it reads the prompt with `readpassphrase(3)`, which opens **`/dev/tty`** and falls back to stdin
+only when no controlling terminal exists. In a real terminal the tool therefore never read the
+pipe and the connection hung until it timed out. Interactive mode involves no terminal at all.
+Because that mode splits its command line on whitespace, a value containing whitespace, a quote,
+or a backslash is refused rather than stored truncated, and **every write is read back and
+compared** before it is reported as saved. The local checkout path is
+stored **locally only** and is never sent to Platform, along with the Keychain
+service name, the credential, the provider account identity, and raw probe output.
+
+**Supported storage.** macOS only in this release. On any other system `connect`
+stops **before** registering with a clear message rather than saving a plaintext
+credential — there is no file-based fallback in the code at all
+([`lib/specrelay_runner/secret_store.rb`](lib/specrelay_runner/secret_store.rb)).
+
+**Retry is safe and idempotent.** A failure in steps 1 to 5 does not consume the
+code, so the operator simply runs the same command again. When a code *is*
+consumed, presenting the same machine-derived runner id updates that machine
+instead of creating a second one, and the single (runner, workspace) binding is
+reused.
+
+Step 5 exists because storage failing *after* the exchange is not merely inconvenient: Platform
+has already issued a credential this machine then fails to keep, which both spends the code and
+leaves any previously-ready connection unable to authenticate.
+
+**A reconnect does not replace a working credential.** Step 6 sends the credential this machine
+already holds; when Platform recognises it, nothing is rotated and step 7 is skipped. That is
+what stops a reconnect that fails later from taking a working machine offline.
+
+The credential is stored under ONE **runner-scoped** Keychain account
+(`runner:<runner-public-id>`), because that is its actual scope —
+`registered_runners.credential_digest` is per runner, not per workspace. Connecting a second
+workspace on the same machine therefore presents the credential it already has and leaves the
+first workspace authenticating. Pre-round-003 per-workspace accounts are still READ as a
+fallback — for **every** workspace this machine has connected at that Platform, not only the one
+being connected, so a machine whose credential still sits under another workspace's account is
+not rotated out from under itself.
+
+It travels in a **header**, never the request body, so it cannot reach Rails' parameter log.
 
 ### 2. Claim and execute work
 
 ```bash
+bin/specrelay-runner claim-once                    # uses the connection from step 1
+bin/specrelay-runner claim-once --workspace <key>  # when several are connected here
+```
+
+No config file, no exported credential, and no workspace-root environment
+variable: the credential is read from the Keychain and the workspace root is the
+checkout you validated. `claim-once` claims at most one eligible run (**Platform**
+decides which), executes it, and uploads the report. Exit `0` on completion or no
+eligible work, `1` on a failed execution, `2` on a config/usage error.
+
+When nothing was claimed it prints the reason **Platform** returned, so a machine
+that is not connected (or not ready) is told to run `connect` rather than reading a
+refusal as a healthy idle.
+
+Platform authorizes a claim only for a workspace this machine has explicitly
+connected to and been recorded `ready` for — and only while its reported
+repository identity still matches that workspace. A historical `all_eligible`
+claim policy grants nothing on its own.
+
+## ADVANCED / LEGACY: the hand-written config path
+
+Supported for an operator who already runs this setup. It is **not** the way to
+set a new machine up, and `register` alone authorizes no work.
+
+Copy [`config/runner.example.yml`](config/runner.example.yml) to a real path (for
+example `~/.specrelay/runner.yml`) and edit it. The config carries **no secret**:
+the registration token, the runner credential, and the development token are all
+read from environment variables the config only *names*. Point the runner at it
+with `--config <path>` or `SPECRELAY_RUNNER_CONFIG`; an explicit `--config` always
+wins over a stored connection.
+
+```bash
+# On Platform: issue a one-time registration token (printed once).
+bin/platform runners issue-registration-token
+
+# Here: enroll with it and capture the credential (printed exactly once).
+export SPECRELAY_RUNNER_REGISTRATION_TOKEN=<the one-time token>
+bin/specrelay-runner register --config ~/.specrelay/runner.yml
+export SPECRELAY_RUNNER_CREDENTIAL=<the credential from the output>
+
+# Claim with that config and credential.
 bin/specrelay-runner claim-once --config ~/.specrelay/runner.yml
 ```
 
-`claim-once` claims at most one eligible run (**Platform** decides which),
-executes it, and uploads the report. Exit `0` on completion or no eligible work,
-`1` on a failed execution, `2` on a config/usage error.
+`register` exits `0` on success, `1` on a rejected/expired/used token, `2` on a
+config/usage error. A machine enrolled this way displays as `legacy setup` in
+Platform and can claim **nothing** until it also completes
+`connect` for a workspace.
 
-**Auth mode is chosen automatically and printed on start.** If the credential env
-var (`runner.credential_env`, default `SPECRELAY_RUNNER_CREDENTIAL`) is set, the
-runner authenticates as its **registered runner**; otherwise it falls back to the
-shared **development token** (`platform.token_env`, default
-`SPECRELAY_RUNNER_API_TOKEN`) — a local/demo path only.
-
-The physical local workspace root is resolved, in order, from
+On this path the physical local workspace root is resolved, in order, from
 `SPECRELAY_RUNNER_WORKSPACE_ROOT_<WORKSPACE_KEY>`,
-`SPECRELAY_RUNNER_WORKSPACE_ROOT`, then the config's `workspace_roots` map. This
-is the one thing the runner needs from you and never guesses.
+`SPECRELAY_RUNNER_WORKSPACE_ROOT`, then the config's `workspace_roots` map. The
+shared **development token** (`platform.token_env`, default
+`SPECRELAY_RUNNER_API_TOKEN`) still authenticates API calls but, since MVP-0017,
+**cannot claim work**: it authenticates no machine identity, so it holds no
+workspace grant.
 
 ### There is no Platform-side execution command
 
@@ -383,8 +478,15 @@ bin/specrelay-fake-executor     # deterministic demo executor (NOT the real exec
 config/runner.example.yml       # the one operator-facing config example
 lib/specrelay_runner.rb         # requires
 lib/specrelay_runner/
-  cli.rb                        # argv -> config -> client -> claim/execute
-  config.rb                     # local YAML config (secrets from ENV only)
+  cli.rb                        # argv -> config/connection -> client -> claim/execute
+  connect.rb                    # the guided connection: code -> assignment ->
+                                #   checkout validation -> readiness -> Keychain
+  secret_store.rb               # macOS Keychain adapter; NO plaintext fallback, credential
+                                #   delivered on stdin (never argv), account per RUNNER identity
+  repository_check.rb           # local checkout identity validation (git, offline)
+  connection_store.rb           # non-secret local connection record (0600)
+  config.rb                     # local YAML config (secrets from ENV only), or
+                                #   built from a stored connection
   platform_client.rb            # the ONLY Platform touchpoint (HTTP/JSON)
   command_runner.rb             # safe argv process launch + timeout
   claude_profile.rb             # the ONE real provider profile: validation,
