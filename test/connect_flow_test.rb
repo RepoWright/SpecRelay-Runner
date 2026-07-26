@@ -32,12 +32,18 @@ class ConnectFlowTest < Minitest::Test
   # real SecretStore exposes. It is used INSTEAD of shelling out to `security` so the
   # suite never touches the developer's real Keychain or prompts for access.
   class FakeSecretStore
-    attr_reader :writes
+    attr_reader :writes, :probes
+    attr_writer :fail_probe
 
-    def initialize(fail_write: false)
+    # `fail_probe` defaults to `fail_write` because a Keychain that refuses writes refuses the
+    # writability probe too. They are separable so one example can model a Keychain that passes
+    # the pre-flight and then fails at the real write.
+    def initialize(fail_write: false, fail_probe: fail_write)
       @entries = {}
       @writes = []
+      @probes = 0
       @fail_write = fail_write
+      @fail_probe = fail_probe
     end
 
     def write(account:, credential:)
@@ -45,6 +51,15 @@ class ConnectFlowTest < Minitest::Test
 
       @writes << account
       @entries[account] = credential
+      true
+    end
+
+    # The real store writes, reads back, and deletes a throwaway item; the fake only has to
+    # record that the check happened and whether it passed.
+    def verify_writable!
+      @probes += 1
+      raise SpecrelayRunner::SecretStore::Error, "keychain access was denied" if @fail_probe
+
       true
     end
 
@@ -234,6 +249,85 @@ class ConnectFlowTest < Minitest::Test
     assert_empty platform.requests_to("/api/runner/workspace_connections")
   end
 
+  # --- the Keychain is proved writable BEFORE the code is spent --------------
+  #
+  # Reported from a real manual run after round 003: the Keychain write was broken on the
+  # operator's machine, and because it was attempted only AFTER the exchange, every retry
+  # needed a newly issued enrollment code. A local storage failure must cost nothing, exactly
+  # like the local checkout failures above.
+
+  def test_an_unwritable_keychain_fails_before_the_code_is_consumed
+    platform = start_platform
+    secret_store = FakeSecretStore.new(fail_write: true)
+
+    error = assert_raises(SpecrelayRunner::SecretStore::Error) do
+      connect(code: platform.enrollment_code, checkout: git_checkout, secret_store: secret_store)
+    end
+
+    assert_equal 1, secret_store.probes, "the writability check must run"
+    # The code was never exchanged, so it is still usable.
+    assert_empty platform.requests_to("/api/runner/enrollment")
+    assert_match(/code was NOT used/, error.message)
+    assert_empty secret_store.writes
+  end
+
+  def test_the_same_code_still_works_after_an_unwritable_keychain
+    platform = start_platform
+    code = platform.enrollment_code
+
+    assert_raises(SpecrelayRunner::SecretStore::Error) do
+      connect(code: code, checkout: git_checkout, secret_store: FakeSecretStore.new(fail_write: true))
+    end
+    result, = connect(code: code, checkout: git_checkout)
+
+    assert result.ready?, "the same code must still be usable after a Keychain failure"
+  end
+
+  # The check runs after every other local step, so an operator with a mistyped checkout hears
+  # about the checkout — not about the Keychain.
+  def test_the_writability_check_runs_only_once_every_local_step_has_passed
+    platform = start_platform
+    secret_store = FakeSecretStore.new
+
+    assert_raises(SpecrelayRunner::Connect::Error) do
+      connect(code: platform.enrollment_code, checkout: Dir.mktmpdir("not-a-repo"),
+              secret_store: secret_store)
+    end
+
+    assert_equal 0, secret_store.probes
+  end
+
+  # A reconnect writes nothing, so a Keychain check must not be able to block it. Otherwise a
+  # machine that already holds a working credential could be refused for a write it never makes.
+  def test_a_reconnect_that_keeps_its_credential_is_not_gated_on_writability
+    platform = start_platform
+    secret_store = FakeSecretStore.new
+    connect(code: platform.enrollment_code, checkout: git_checkout, secret_store: secret_store)
+    baseline_probes = secret_store.probes
+
+    platform.held_credential = FakePlatform::ISSUED_CREDENTIAL
+    platform.enrollment_code = code_for(platform.base_url)
+    secret_store.fail_probe = true
+
+    result, = connect(code: platform.enrollment_code, checkout: git_checkout, secret_store: secret_store)
+
+    assert result.ready?, "a reconnect must not be blocked by a check for a write it does not make"
+    assert_equal baseline_probes, secret_store.probes, "no probe may run when a credential is held"
+  end
+
+  # The pre-flight is not a substitute for handling a write that fails afterwards.
+  def test_a_keychain_that_passes_the_check_and_then_fails_still_refuses
+    platform = start_platform
+
+    assert_raises(SpecrelayRunner::SecretStore::Error) do
+      connect(code: platform.enrollment_code, checkout: git_checkout,
+              secret_store: FakeSecretStore.new(fail_write: true, fail_probe: false))
+    end
+
+    refute File.exist?(@state_file)
+    assert_empty platform.requests_to("/api/runner/workspace_connections")
+  end
+
   # --- review-001 F3: a failed attempt must cost the operator nothing --------
   #
   # Round 001 consumed the code and rotated the credential BEFORE validating locally, so a
@@ -380,6 +474,40 @@ class ConnectFlowTest < Minitest::Test
     assert result.ready?
     assert_equal FakePlatform::ISSUED_CREDENTIAL,
                  platform.last_enrollment.dig(:headers, "x-specrelay-runner-credential")
+  end
+
+  # Round 003 consulted the legacy account for the workspace being connected ONLY. A machine
+  # whose credential still sits under ANOTHER workspace's legacy account therefore presented
+  # nothing when connecting a new workspace, Platform issued a fresh credential, and the legacy
+  # copy went stale — reaching the same orphaning by a different route.
+  #
+  # Observed for real: a manual fresh-project connect rotated the credential on a machine whose
+  # only copy was a legacy entry, leaving an already-`ready` workspace unable to authenticate.
+  def test_a_legacy_credential_stored_for_another_workspace_is_still_presented
+    platform = start_platform
+    secret_store = FakeSecretStore.new
+    # A machine that connected under the pre-round-003 scheme: local state knows the runner
+    # identity and the FIRST workspace, and the credential lives under that workspace's account.
+    store.save(SpecrelayRunner::ConnectionStore::Connection.new(
+                 base_url: platform.base_url, runner_id: "host-runner", runner_public_id: "rnr_fake",
+                 runner_display_name: "host runner", project_slug: "tiny-demo",
+                 workspace_key: "first-workspace",
+                 repository_url: "https://github.com/SpecRelay/tiny-demo-runs",
+                 default_branch: "main", local_path: "/tmp/first",
+                 connected_at: "2026-07-26T00:00:00Z"
+               ))
+    secret_store.write(account: "workspace:first-workspace", credential: FakePlatform::ISSUED_CREDENTIAL)
+    platform.held_credential = FakePlatform::ISSUED_CREDENTIAL
+
+    # Connecting a DIFFERENT workspace on the same machine and Platform.
+    result, = connect(code: platform.enrollment_code, checkout: git_checkout, secret_store: secret_store)
+
+    assert result.ready?
+    assert_equal FakePlatform::ISSUED_CREDENTIAL,
+                 platform.last_enrollment.dig(:headers, "x-specrelay-runner-credential")
+    # Nothing rotated, so the first workspace's stored credential still authenticates.
+    assert_equal 1, secret_store.writes.size
+    assert_equal FakePlatform::ISSUED_CREDENTIAL, secret_store.read(account: "workspace:first-workspace")
   end
 
   def test_the_preview_carries_no_credential

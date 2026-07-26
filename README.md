@@ -78,23 +78,33 @@ the operator nothing and the same code still works:
    repository match, while a different repository, owner, or host does not;
 4. run the bounded provider readiness checks **only** when the assigned executor
    is the real Claude profile;
-5. **exchange** the code, presenting the credential this machine already holds for this
+5. prove the **Keychain accepts a write**, using a throwaway non-secret item — only when this
+   machine holds no credential yet, because that is when a write is certain to be needed;
+6. **exchange** the code, presenting the credential this machine already holds for this
    Platform (if any) in the `X-SpecRelay-Runner-Credential` header, so Platform can recognise a
    reconnect;
-6. store the durable credential in the **macOS Keychain** — skipped entirely when
+7. store the durable credential in the **macOS Keychain** — skipped entirely when
    Platform replied `credential_unchanged`, because there is nothing new to store;
-7. write non-secret connection facts to `~/.specrelay/runner/connections.json`
+8. write non-secret connection facts to `~/.specrelay/runner/connections.json`
    (mode `0600`, and you never need to edit it);
-8. report a bounded readiness result and print the state **Platform** decided.
+9. report a bounded readiness result and print the state **Platform** decided.
 
 Exit `0` when Platform records this machine ready, `1` otherwise, `2` on a
 usage/platform error.
 
 **Secret posture.** The durable credential is never printed, never written to
 YAML, a shell profile, Git, or a log, and never appears in an error message. It is
-also never an argv element: it is handed to the `security` tool on **stdin**,
-because `security` documents `-w` as insecure and an argv element is visible in the
-process table to any process running as the same user. The local checkout path is
+also never an argv element: it is handed to the `security` tool on **stdin**, via that tool's
+interactive mode (`security -i`), because `security` documents `-w` as insecure and an argv
+element is visible in the process table to any process running as the same user.
+
+Interactive mode is used rather than a valueless `-w`: that form makes `security` *prompt*, and
+it reads the prompt with `readpassphrase(3)`, which opens **`/dev/tty`** and falls back to stdin
+only when no controlling terminal exists. In a real terminal the tool therefore never read the
+pipe and the connection hung until it timed out. Interactive mode involves no terminal at all.
+Because that mode splits its command line on whitespace, a value containing whitespace, a quote,
+or a backslash is refused rather than stored truncated, and **every write is read back and
+compared** before it is reported as saved. The local checkout path is
 stored **locally only** and is never sent to Platform, along with the Keychain
 service name, the credential, the provider account identity, and raw probe output.
 
@@ -103,22 +113,28 @@ stops **before** registering with a clear message rather than saving a plaintext
 credential — there is no file-based fallback in the code at all
 ([`lib/specrelay_runner/secret_store.rb`](lib/specrelay_runner/secret_store.rb)).
 
-**Retry is safe and idempotent.** A failure in steps 1 to 4 does not consume the
+**Retry is safe and idempotent.** A failure in steps 1 to 5 does not consume the
 code, so the operator simply runs the same command again. When a code *is*
 consumed, presenting the same machine-derived runner id updates that machine
 instead of creating a second one, and the single (runner, workspace) binding is
 reused.
 
-**A reconnect does not replace a working credential.** Step 5 sends the credential this machine
-already holds; when Platform recognises it, nothing is rotated and step 6 is skipped. That is
+Step 5 exists because storage failing *after* the exchange is not merely inconvenient: Platform
+has already issued a credential this machine then fails to keep, which both spends the code and
+leaves any previously-ready connection unable to authenticate.
+
+**A reconnect does not replace a working credential.** Step 6 sends the credential this machine
+already holds; when Platform recognises it, nothing is rotated and step 7 is skipped. That is
 what stops a reconnect that fails later from taking a working machine offline.
 
 The credential is stored under ONE **runner-scoped** Keychain account
 (`runner:<runner-public-id>`), because that is its actual scope —
 `registered_runners.credential_digest` is per runner, not per workspace. Connecting a second
 workspace on the same machine therefore presents the credential it already has and leaves the
-first workspace authenticating. (Pre-round-003 per-workspace accounts are still READ as a
-fallback, so a machine that connected under the old scheme keeps working without reconnecting.)
+first workspace authenticating. Pre-round-003 per-workspace accounts are still READ as a
+fallback — for **every** workspace this machine has connected at that Platform, not only the one
+being connected, so a machine whose credential still sits under another workspace's account is
+not rotated out from under itself.
 
 It travels in a **header**, never the request body, so it cannot reach Rails' parameter log.
 

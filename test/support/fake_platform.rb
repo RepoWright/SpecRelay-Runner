@@ -52,6 +52,10 @@ class FakePlatform
     @readiness_verdict = { "state" => "ready", "failure_class" => nil,
                            "detail" => "Runner validated its local checkout and reported the executor ready." }
     @requests = []
+    # Enrollment codes are SINGLE USE on real Platform, so they are here too. Without this the
+    # fake could not tell "the code was never spent" from "the code was spent and reused", and
+    # every "the same code still works" assertion would pass vacuously.
+    @consumed_codes = []
     @server = TCPServer.new("127.0.0.1", 0)
     @claimed = false
     @lease_signal = lease_signal
@@ -88,6 +92,10 @@ class FakePlatform
   end
 
   # Convenience accessors for assertions.
+  # A spent code is indistinguishable from a wrong one, as on real Platform.
+  def code_spent? = @consumed_codes.include?(@enrollment_code)
+  def spent_code = [ 401, { error: "invalid_enrollment_code" } ]
+
   def requests_to(path) = requests.select { |r| r[:path] == path }
   def last_report = requests_to("/api/runner/reports").last
   def last_registration = requests_to("/api/runner/registration").last
@@ -157,7 +165,7 @@ class FakePlatform
     case request[:path]
     when "/api/runner/registration" then registration
     when "/api/runner/enrollment" then enrollment(request)
-    when "/api/runner/enrollment_preview" then [ 200, assignment ]
+    when "/api/runner/enrollment_preview" then code_spent? ? spent_code : [ 200, assignment ]
     when "/api/runner/workspace_connections" then workspace_connection(request)
     when "/api/runner/claim" then claim
     when "/api/runner/events" then events(request)
@@ -190,10 +198,13 @@ class FakePlatform
   # MVP-0017 guided connection: consume the code and return the durable credential once — unless
   # the runner presented the credential it already holds, in which case nothing is issued.
   def enrollment(request)
+    return spent_code if code_spent?
+
     # The held credential arrives in a HEADER, never the body (round 003, review-002 N1), so the
     # fake reads it where Platform reads it.
     presented = request.dig(:headers, "x-specrelay-runner-credential")
     unchanged = !@held_credential.nil? && presented == @held_credential
+    @consumed_codes << @enrollment_code
     [ @enrollment_status,
       assignment.merge(
         runner: { id: "host-runner", public_id: "rnr_fake", display_name: "host runner",

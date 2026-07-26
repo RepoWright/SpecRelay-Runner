@@ -4,20 +4,23 @@ require_relative "test_helper"
 
 # MVP-0017 — the macOS Keychain adapter seam.
 #
-# The `security` command itself is not invoked here: shelling out to the real tool would
-# touch the developer's Keychain and could raise an interactive prompt in CI. What must be
-# proved instead is everything around it — that the platform gate refuses a non-macOS host
-# with NO plaintext fallback, that the argv handed to the tool is an upsert which does NOT
-# contain the credential (round 002, review-001 F8: an argv element is visible in the process
-# table, and `security` documents `-w` as insecure for exactly that reason), that the value is
-# delivered on stdin instead, that a missing item is a normal empty result rather than an error,
-# and that a failure message never echoes the credential.
+# The real `security` command is not invoked here: shelling out to it would touch the
+# developer's Keychain and could raise an interactive prompt in CI. What is proved instead is
+# everything around the tool — the platform gate refuses a non-macOS host with NO plaintext
+# fallback; the argv handed to the tool never contains the credential (an argv element is
+# visible in the process table, review-001 F8); the value is delivered on stdin; every write is
+# read back and a mismatch is undone; a missing item is a normal empty result; and no failure
+# message ever echoes the credential.
+#
+# The one thing a fake runner CANNOT prove is how the real tool reads a prompt. That is what
+# shipped broken in round 002, and it is covered by `keychain_tty_test.rb` under a real pty.
 class SecretStoreTest < Minitest::Test
-  # Records the argv it was handed and returns a scripted result, so the exact command
-  # line the adapter builds is assertable.
+  SERVICE = SpecrelayRunner::SecretStore::SERVICE
+  ACCOUNT = "runner:rnr_ea88b7a19b174a9788acf36f2fac693d"
+
+  # Records argv AND stdin for every invocation and returns scripted results, so a test can
+  # assert both what the adapter put on the command line and what it deliberately kept off it.
   class RecordingRunner
-    # `stdins` is recorded alongside `invocations` so an example can assert both what the
-    # adapter put on the command line and what it deliberately kept off it.
     attr_reader :invocations, :stdins
 
     def initialize(results)
@@ -31,17 +34,19 @@ class SecretStoreTest < Minitest::Test
       @stdins << kwargs[:stdin_data]
       @results.shift
     end
-  end
 
-  # Every example drives exactly one invocation; asserting that keeps a silent extra call
-  # from passing as a match on the first one.
-  def single_invocation(runner)
-    assert_equal 1, runner.invocations.size
-    runner.invocations.first
+    # Every invocation's argv, flattened, for "the credential is nowhere in argv" assertions.
+    def all_argv = invocations.flatten
   end
 
   def ok(stdout: "") = SpecrelayRunner::CommandRunner::Result.new(exit_code: 0, stdout: stdout, stderr: "", timed_out: false)
   def failed(stderr: "") = SpecrelayRunner::CommandRunner::Result.new(exit_code: 44, stdout: "", stderr: stderr, timed_out: false)
+
+  # A runner scripted for a SUCCESSFUL write: the interactive upsert, then the verifying
+  # read-back returning what was stored.
+  def write_runner(stored:)
+    RecordingRunner.new([ ok, ok(stdout: "#{stored}\n") ])
+  end
 
   # --- the platform gate ----------------------------------------------------
 
@@ -61,44 +66,50 @@ class SecretStoreTest < Minitest::Test
     end
   end
 
-  # --- the argv handed to `security` ----------------------------------------
+  # --- how the credential is delivered --------------------------------------
 
-  def test_writes_an_upsert_that_keeps_the_credential_out_of_argv
-    runner = RecordingRunner.new([ ok ])
+  def test_the_write_is_an_interactive_invocation_with_nothing_secret_in_argv
+    runner = write_runner(stored: "src_abc")
     store = SpecrelayRunner::SecretStore.new(runner: runner)
 
-    assert store.write(account: "workspace:tiny-demo-workspace", credential: "src_abc")
+    assert store.write(account: ACCOUNT, credential: "src_abc")
 
-    argv = single_invocation(runner)
+    # THE point of this example: the credential is in no process's argv, so it is not visible
+    # in the process table (review-001 F8).
+    assert_equal %w[security -i], runner.invocations.first
+    refute runner.all_argv.any? { |element| element.include?("src_abc") },
+           "credential leaked into argv: #{runner.all_argv.inspect}"
+  end
 
-    assert_equal %w[security add-generic-password], argv.first(2)
+  def test_the_credential_is_delivered_on_stdin_as_an_upsert
+    runner = write_runner(stored: "src_abc")
+    SpecrelayRunner::SecretStore.new(runner: runner).write(account: ACCOUNT, credential: "src_abc")
+
+    command = runner.stdins.first
+
+    assert_equal "add-generic-password -a #{ACCOUNT} -s #{SERVICE} -U -w src_abc\n", command
     # `-U` is what makes a reconnect an upsert instead of a duplicate-item error.
-    assert_includes argv, "-U"
-    assert_equal [ "-s", SpecrelayRunner::SecretStore::SERVICE ], argv.values_at(argv.index("-s"), argv.index("-s") + 1)
-    # THE point of this example: the credential is nowhere in the process's argv, so it is not
-    # visible in the process table (review-001 F8).
-    refute_includes argv, "src_abc"
-    refute argv.any? { |element| element.include?("src_abc") }, "credential leaked into argv: #{argv.inspect}"
-    # `-w` is last and valueless, which is what makes `security` prompt and read stdin.
-    assert_equal "-w", argv.last
+    assert_includes command, " -U "
   end
 
-  def test_delivers_the_credential_on_stdin_twice_for_the_confirmation_prompt
-    runner = RecordingRunner.new([ ok ])
-    store = SpecrelayRunner::SecretStore.new(runner: runner)
+  # The regression guard for the shipped defect, at the unit level: a valueless `-w` means
+  # "prompt", and the real tool reads that prompt from /dev/tty, not from the pipe we control.
+  # Nothing in the write path may ever depend on being prompted again.
+  def test_the_write_never_asks_the_tool_to_prompt
+    runner = write_runner(stored: "src_abc")
+    SpecrelayRunner::SecretStore.new(runner: runner).write(account: ACCOUNT, credential: "src_abc")
 
-    store.write(account: "workspace:tiny-demo-workspace", credential: "src_abc")
-
-    # `security` prompts for the password and then for a confirmation.
-    assert_equal "src_abc\nsrc_abc\n", runner.stdins.first
+    refute_equal "-w", runner.invocations.first.last,
+                 "a trailing valueless -w makes `security` prompt on the terminal, not read stdin"
+    refute_includes runner.invocations.first, "add-generic-password"
   end
 
-  # Reading needs no stdin at all; only the write path prompts.
+  # Reading needs no stdin at all; only the write path carries one.
   def test_reading_sends_no_stdin
     runner = RecordingRunner.new([ ok(stdout: "src_abc\n") ])
     store = SpecrelayRunner::SecretStore.new(runner: runner)
 
-    store.read(account: "workspace:tiny-demo-workspace")
+    store.read(account: ACCOUNT)
 
     assert_nil runner.stdins.first
   end
@@ -107,21 +118,105 @@ class SecretStoreTest < Minitest::Test
     runner = RecordingRunner.new([ ok(stdout: "src_abc\n") ])
     store = SpecrelayRunner::SecretStore.new(runner: runner)
 
-    assert_equal "src_abc", store.read(account: "workspace:tiny-demo-workspace")
-    assert_equal %w[security find-generic-password], single_invocation(runner).first(2)
+    assert_equal "src_abc", store.read(account: ACCOUNT)
+    assert_equal %w[security find-generic-password], runner.invocations.first.first(2)
   end
 
   # A runner that has not connected yet is a normal state, not a failure.
   def test_reads_nil_when_no_item_is_stored
     store = SpecrelayRunner::SecretStore.new(runner: RecordingRunner.new([ failed(stderr: "item not found") ]))
 
-    assert_nil store.read(account: "workspace:tiny-demo-workspace")
+    assert_nil store.read(account: ACCOUNT)
   end
 
   def test_reads_nil_when_the_security_tool_cannot_be_launched
     store = SpecrelayRunner::SecretStore.new(runner: RecordingRunner.new([ nil ]))
 
-    assert_nil store.read(account: "workspace:tiny-demo-workspace")
+    assert_nil store.read(account: ACCOUNT)
+  end
+
+  # --- the write is verified, not assumed -----------------------------------
+
+  def test_a_write_is_read_back_before_it_is_reported_as_saved
+    runner = write_runner(stored: "src_abc")
+    SpecrelayRunner::SecretStore.new(runner: runner).write(account: ACCOUNT, credential: "src_abc")
+
+    assert_equal 2, runner.invocations.size, "the write must be verified by a read-back"
+    assert_equal %w[security find-generic-password], runner.invocations.last.first(2)
+  end
+
+  # `security -i` splits its command line on whitespace and still exits 0 after storing a
+  # truncated value — measured against the real tool. A stored value that is not the credential
+  # would surface much later as an unexplained authentication failure, so it is undone here.
+  def test_a_write_that_stored_something_else_is_removed_and_raises
+    runner = RecordingRunner.new([ ok, ok(stdout: "src_ab\n"), ok ])
+    store = SpecrelayRunner::SecretStore.new(runner: runner)
+
+    error = assert_raises(SpecrelayRunner::SecretStore::Error) do
+      store.write(account: ACCOUNT, credential: "src_abc")
+    end
+
+    assert_match(/did not store the runner credential exactly as issued/, error.message)
+    assert_equal %w[security delete-generic-password], runner.invocations.last.first(2)
+    refute_includes error.message, "src_abc"
+  end
+
+  # Refused up front rather than silently truncated.
+  def test_a_credential_the_tool_cannot_receive_intact_is_refused_without_writing
+    runner = RecordingRunner.new([ ok, ok ])
+    store = SpecrelayRunner::SecretStore.new(runner: runner)
+
+    [ "src_a b", "src_a\\b", "src_a\"b", "src_a'b", "src_a\tb" ].each do |credential|
+      error = assert_raises(SpecrelayRunner::SecretStore::Error) do
+        store.write(account: ACCOUNT, credential: credential)
+      end
+
+      assert_match(/whitespace, a quote, or a backslash/, error.message)
+      refute_includes error.message, credential
+    end
+
+    assert_empty runner.invocations, "nothing may be handed to the tool when the value is refused"
+  end
+
+  def test_an_empty_credential_is_refused
+    runner = RecordingRunner.new([ ok ])
+
+    assert_raises(SpecrelayRunner::SecretStore::Error) do
+      SpecrelayRunner::SecretStore.new(runner: runner).write(account: ACCOUNT, credential: "  ")
+    end
+    assert_empty runner.invocations
+  end
+
+  # --- the writability pre-flight -------------------------------------------
+
+  # `connect` calls this BEFORE spending the one-time enrollment code, so a machine whose
+  # Keychain cannot be written to fails at no cost.
+  def test_verifying_writability_uses_a_throwaway_item_and_removes_it
+    runner = RecordingRunner.new([ ok, ok(stdout: "#{SpecrelayRunner::SecretStore::PROBE_VALUE}\n"), ok ])
+    store = SpecrelayRunner::SecretStore.new(runner: runner)
+
+    assert store.verify_writable!
+
+    assert_equal %w[security -i], runner.invocations.first
+    assert_includes runner.stdins.first, SpecrelayRunner::SecretStore::PROBE_ACCOUNT
+    # The probe value is fixed and meaningless — a real credential is never used to test.
+    assert_includes runner.stdins.first, SpecrelayRunner::SecretStore::PROBE_VALUE
+    # And the probe item does not outlive the check.
+    assert_equal %w[security delete-generic-password], runner.invocations.last.first(2)
+    assert_includes runner.invocations.last, SpecrelayRunner::SecretStore::PROBE_ACCOUNT
+  end
+
+  def test_a_failed_writability_check_raises_and_still_removes_the_probe
+    runner = RecordingRunner.new([ failed(stderr: "User interaction is not allowed."), ok ])
+    store = SpecrelayRunner::SecretStore.new(runner: runner)
+
+    error = assert_raises(SpecrelayRunner::SecretStore::Error) do
+      store.verify_writable!
+    end
+
+    assert_match(/Keychain writability check/, error.message)
+    assert_match(/Unlock your login keychain/, error.message)
+    assert_equal %w[security delete-generic-password], runner.invocations.last.first(2)
   end
 
   # --- failure reporting ----------------------------------------------------
@@ -132,11 +227,11 @@ class SecretStoreTest < Minitest::Test
     )
 
     error = assert_raises(SpecrelayRunner::SecretStore::Error) do
-      store.write(account: "workspace:tiny-demo-workspace", credential: "src_super-secret")
+      store.write(account: ACCOUNT, credential: "src_super-secret")
     end
 
     assert_match(/macOS Keychain/, error.message)
-    assert_match(/choose Allow/, error.message)
+    assert_match(/Unlock your login keychain/, error.message)
     assert_match(/User interaction is not allowed/, error.message)
     refute_includes error.message, "src_super-secret"
   end
@@ -147,11 +242,21 @@ class SecretStoreTest < Minitest::Test
     )
 
     error = assert_raises(SpecrelayRunner::SecretStore::Error) do
-      store.write(account: "workspace:a", credential: "src_abc")
+      store.write(account: ACCOUNT, credential: "src_abc")
     end
 
     refute_includes error.message, "src_leaked-value-1234567890"
     assert_includes error.message, SpecrelayRunner::Redaction::REDACTION
+  end
+
+  def test_a_tool_that_cannot_be_launched_is_reported_as_such
+    store = SpecrelayRunner::SecretStore.new(runner: RecordingRunner.new([ nil ]))
+
+    error = assert_raises(SpecrelayRunner::SecretStore::Error) do
+      store.write(account: ACCOUNT, credential: "src_abc")
+    end
+
+    assert_match(/could not be run/, error.message)
   end
 
   # --- the account name is non-secret and RUNNER-scoped ---------------------
@@ -176,14 +281,24 @@ class SecretStoreTest < Minitest::Test
   end
 
   def test_nothing_writes_to_the_legacy_account_any_more
-    runner = RecordingRunner.new([ ok ])
+    runner = write_runner(stored: "src_abc")
     store = SpecrelayRunner::SecretStore.new(runner: runner)
 
     store.write(account: SpecrelayRunner::SecretStore.account_for_runner("rnr_x"), credential: "src_abc")
 
-    argv = single_invocation(runner)
+    assert_includes runner.stdins.first, "runner:rnr_x"
+    refute_includes runner.stdins.first, "workspace:"
+  end
 
-    assert_includes argv, "runner:rnr_x"
-    refute argv.any? { |element| element.start_with?("workspace:") }
+  # An account name is not attacker-controlled today, but it is interpolated into the same
+  # stdin command line, so it gets the same guard rather than a comment promising it is safe.
+  def test_an_account_name_that_could_alter_the_command_line_is_refused
+    runner = RecordingRunner.new([ ok, ok ])
+
+    assert_raises(SpecrelayRunner::SecretStore::Error) do
+      SpecrelayRunner::SecretStore.new(runner: runner)
+                                  .write(account: "runner:x -w injected", credential: "src_abc")
+    end
+    assert_empty runner.invocations
   end
 end

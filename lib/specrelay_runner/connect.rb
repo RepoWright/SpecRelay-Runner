@@ -19,16 +19,19 @@ module SpecrelayRunner
   #
   # Order is load-bearing and fails closed at each step:
   #
-  #   platform support check -> exchange the code -> ask for the checkout ->
-  #   validate the checkout -> provider readiness (only for the real Claude profile) ->
-  #   store the credential in the OS secret store -> save non-secret local state ->
-  #   report readiness to Platform
+  #   platform support check -> preview the code (does NOT consume it) ->
+  #   ask for the checkout -> validate the checkout ->
+  #   provider readiness (only for the real Claude profile) ->
+  #   prove the OS secret store is writable -> EXCHANGE the code ->
+  #   store the credential -> save non-secret local state -> report readiness to Platform
   #
-  # The unsupported-platform check runs FIRST, before any Platform call, so a
-  # non-macOS host never consumes a code it cannot finish using. The credential is
-  # stored BEFORE readiness is reported, so a runner Platform believes is ready can
-  # always authenticate. If a later step fails, Platform holds the connection in
-  # `pending`/`blocked` — never `ready` — and the operator reissues a code and retries.
+  # Every step that can fail for a purely local reason runs BEFORE the exchange, so a failed
+  # first connection costs nothing — not even the one-time code. The unsupported-platform check
+  # runs first, before any Platform call; the Keychain writability check runs last among the
+  # local steps, immediately before the code is spent. The credential is stored BEFORE readiness
+  # is reported, so a runner Platform believes is ready can always authenticate. If a step after
+  # the exchange fails, Platform holds the connection in `pending`/`blocked` — never `ready` —
+  # and the operator reissues a code and retries.
   #
   # Secret posture: the durable credential is never printed, never written to YAML, a
   # shell profile, Git, or a log, and never appears in an error message. The local
@@ -84,8 +87,13 @@ module SpecrelayRunner
       checkout = validated_checkout!(workspace)
       readiness = executor_readiness(assignment.fetch("executor", {}))
 
+      # What this machine already holds decides both whether a write will be needed and what
+      # the exchange presents, so it is resolved before anything is consumed.
+      held = held_credential(secret_store, workspace, origin)
+      verify_secret_storage!(secret_store) if held.nil?
+
       # Only now is anything consumed or changed.
-      enrolled = exchange(origin, workspace, secret_store)
+      enrolled = exchange(origin, held)
       persist(secret_store, enrolled, workspace, checkout)
       report(enrolled, workspace, checkout, readiness)
     end
@@ -134,11 +142,27 @@ module SpecrelayRunner
       assignment
     end
 
-    # Consume the code. The machine's EXISTING credential for this workspace is presented so
-    # Platform can recognise a reconnect and leave that credential alone; when it does,
-    # `credential_unchanged` comes back true and nothing in the secret store is touched.
-    def exchange(origin, workspace, secret_store)
-      held = held_credential(secret_store, workspace, origin)
+    # Prove local secret storage works BEFORE the one-time code is spent.
+    #
+    # Only when this machine holds no credential yet, because that is exactly when a write is
+    # certain to be needed; a reconnect that presents its held credential is not asked to write
+    # anything, so a Keychain check must not be able to block it.
+    #
+    # This ordering is the difference between a failed first connection costing nothing and
+    # costing a freshly issued code every retry — the state a real operator hit when the
+    # Keychain write itself was broken.
+    def verify_secret_storage!(secret_store)
+      secret_store.verify_writable!
+      out.puts "Keychain:           writable (checked before the enrollment code was used)"
+    rescue SecretStore::Error => e
+      raise SecretStore::Error,
+            "#{e.message} The enrollment code was NOT used, so the same command still works."
+    end
+
+    # Consume the code. The machine's EXISTING credential is presented so Platform can recognise
+    # a reconnect and leave that credential alone; when it does, `credential_unchanged` comes
+    # back true and nothing in the secret store is touched.
+    def exchange(origin, held)
       enrolled = client(origin, code).enroll(identity, current_credential: held)
       @credential = presence(enrolled["credential"]) || held
       raise Error, "Platform returned no usable credential for this machine" if @credential.nil?
@@ -162,24 +186,40 @@ module SpecrelayRunner
     # A store that cannot be read is treated as "none held", so a fresh credential is issued
     # rather than the connection failing.
     def held_credential(secret_store, workspace, origin)
-      runner_accounts(origin).each do |account|
+      candidate_accounts(origin, workspace).each do |account|
         value = secret_store.read(account: account)
         return value if value
       end
-      secret_store.read(account: SecretStore.legacy_account_for(workspace.fetch("workspace_key")))
+      nil
     rescue SecretStore::Error
       nil
+    end
+
+    # Runner-scoped accounts first, because that is where a credential is written today, then
+    # legacy per-workspace accounts for EVERY workspace this machine has connected at this
+    # origin — not only the one being connected.
+    #
+    # Round 003 checked the legacy account for the workspace being connected alone. A machine
+    # whose credential is still under `workspace:<some-other-workspace>` therefore presented
+    # nothing when connecting a NEW workspace, Platform issued a fresh credential, and the
+    # other workspace's stored copy went stale — the same orphaning the runner-scoped account
+    # was introduced to end, just reached by a different route.
+    def candidate_accounts(origin, workspace)
+      legacy_keys = origin_connections(origin).map(&:workspace_key) + [ workspace["workspace_key"] ]
+      runner_accounts(origin) +
+        legacy_keys.filter_map { |key| presence(key) }.uniq.map { |key| SecretStore.legacy_account_for(key) }
     end
 
     # Every runner-scoped account this machine could hold a credential under for this Platform.
     # Normally exactly one: a machine has one runner identity per Platform origin.
     def runner_accounts(origin)
-      store.connections
-           .select { |connection| connection.base_url == origin }
-           .filter_map { |connection| presence(connection.runner_public_id) }
-           .uniq
-           .map { |public_id| SecretStore.account_for_runner(public_id) }
+      origin_connections(origin)
+        .filter_map { |connection| presence(connection.runner_public_id) }
+        .uniq
+        .map { |public_id| SecretStore.account_for_runner(public_id) }
     end
+
+    def origin_connections(origin) = store.connections.select { |connection| connection.base_url == origin }
 
     # A reconnect that kept its existing credential says so, because "stored in the Keychain"
     # would imply a write that did not happen.
