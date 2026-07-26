@@ -138,7 +138,7 @@ module SpecrelayRunner
     # Platform can recognise a reconnect and leave that credential alone; when it does,
     # `credential_unchanged` comes back true and nothing in the secret store is touched.
     def exchange(origin, workspace, secret_store)
-      held = held_credential(secret_store, workspace)
+      held = held_credential(secret_store, workspace, origin)
       enrolled = client(origin, code).enroll(identity, current_credential: held)
       @credential = presence(enrolled["credential"]) || held
       raise Error, "Platform returned no usable credential for this machine" if @credential.nil?
@@ -148,13 +148,37 @@ module SpecrelayRunner
       enrolled
     end
 
-    # The credential this machine already holds for the assigned workspace, or nil. A store that
-    # cannot be read is treated as "none held", so a fresh credential is issued rather than the
-    # connection failing.
-    def held_credential(secret_store, workspace)
-      secret_store.read(account: SecretStore.account_for(workspace.fetch("workspace_key")))
+    # The credential this machine already holds for THIS Platform, or nil.
+    #
+    # The credential is per RUNNER, not per workspace, so it is looked up by the runner identity
+    # this machine already has for this Platform origin — found in the local connection store,
+    # from ANY workspace it has connected to. Round 002 looked only at the workspace being
+    # connected, so a first-time connection to a second workspace presented nothing, Platform
+    # rotated, and the first workspace's stored copy went stale (review-002, F3 residual).
+    #
+    # Legacy per-workspace entries are read as a fallback so a machine that connected under the
+    # old scheme keeps working without reconnecting.
+    #
+    # A store that cannot be read is treated as "none held", so a fresh credential is issued
+    # rather than the connection failing.
+    def held_credential(secret_store, workspace, origin)
+      runner_accounts(origin).each do |account|
+        value = secret_store.read(account: account)
+        return value if value
+      end
+      secret_store.read(account: SecretStore.legacy_account_for(workspace.fetch("workspace_key")))
     rescue SecretStore::Error
       nil
+    end
+
+    # Every runner-scoped account this machine could hold a credential under for this Platform.
+    # Normally exactly one: a machine has one runner identity per Platform origin.
+    def runner_accounts(origin)
+      store.connections
+           .select { |connection| connection.base_url == origin }
+           .filter_map { |connection| presence(connection.runner_public_id) }
+           .uniq
+           .map { |public_id| SecretStore.account_for_runner(public_id) }
     end
 
     # A reconnect that kept its existing credential says so, because "stored in the Keychain"
@@ -227,7 +251,7 @@ module SpecrelayRunner
     # secret store, so it cannot fail on a Keychain prompt it does not need.
     def persist(secret_store, assignment, workspace, checkout)
       unless @credential_unchanged
-        secret_store.write(account: SecretStore.account_for(workspace.fetch("workspace_key")),
+        secret_store.write(account: SecretStore.account_for_runner(runner_public_id!(assignment)),
                            credential: @credential)
       end
       store.save(ConnectionStore::Connection.new(
@@ -243,6 +267,14 @@ module SpecrelayRunner
                    local_path: checkout.fetch(:path), connected_at: Time.now.utc.iso8601
                  ))
       out.puts "Credential:         #{credential_line}"
+    end
+
+    # The runner identity Platform issued. Required, because it is the Keychain account name the
+    # credential is stored under — a missing one would silently store nothing findable.
+    def runner_public_id!(assignment)
+      assignment.dig("runner", "public_id").to_s.strip.tap do |public_id|
+        raise Error, "Platform returned no runner identity for this machine" if public_id.empty?
+      end
     end
 
     # Report facts, not a verdict. Platform re-checks the repository identity against its

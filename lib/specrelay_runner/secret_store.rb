@@ -81,9 +81,22 @@ module SpecrelayRunner
       value.empty? ? nil : value
     end
 
-    # The non-secret Keychain account name for one workspace. Deliberately derived from
-    # the workspace key only: no local path, no provider account, no operator email.
-    def self.account_for(workspace_key) = "workspace:#{workspace_key}"
+    # The non-secret Keychain account name for one RUNNER identity.
+    #
+    # Keyed by the runner's Platform-issued public id, because that is the credential's actual
+    # scope: `registered_runners.credential_digest` is per runner, not per workspace. Round 002
+    # keyed it per workspace, so a first-time connection to a second workspace rotated the shared
+    # credential and left the first workspace's stored copy stale — `claim-once --workspace A`
+    # then failed to authenticate (review-002, F3 residual).
+    #
+    # The public id is non-secret and carries no local path, provider account, or operator email,
+    # so the Keychain listing still leaks nothing about the operator's work.
+    def self.account_for_runner(runner_public_id) = "runner:#{runner_public_id}"
+
+    # The pre-round-003 per-workspace account name. Retained for READS only, so a machine that
+    # connected under the old scheme keeps authenticating without reconnecting; nothing writes
+    # here any more.
+    def self.legacy_account_for(workspace_key) = "workspace:#{workspace_key}"
 
     private
 

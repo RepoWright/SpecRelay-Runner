@@ -78,8 +78,9 @@ the operator nothing and the same code still works:
    repository match, while a different repository, owner, or host does not;
 4. run the bounded provider readiness checks **only** when the assigned executor
    is the real Claude profile;
-5. **exchange** the code, presenting the credential this machine already holds for
-   the assigned workspace (if any) so Platform can recognise a reconnect;
+5. **exchange** the code, presenting the credential this machine already holds for this
+   Platform (if any) in the `X-SpecRelay-Runner-Credential` header, so Platform can recognise a
+   reconnect;
 6. store the durable credential in the **macOS Keychain** — skipped entirely when
    Platform replied `credential_unchanged`, because there is nothing new to store;
 7. write non-secret connection facts to `~/.specrelay/runner/connections.json`
@@ -108,11 +109,18 @@ consumed, presenting the same machine-derived runner id updates that machine
 instead of creating a second one, and the single (runner, workspace) binding is
 reused.
 
-**A reconnect does not replace a working credential.** Step 5 sends the credential
-this machine already holds; when Platform recognises it, nothing is rotated and
-step 6 is skipped. That is what stops a reconnect that fails later from taking a
-working machine offline, and it means reconnecting workspace A never invalidates
-the credential stored for workspace B.
+**A reconnect does not replace a working credential.** Step 5 sends the credential this machine
+already holds; when Platform recognises it, nothing is rotated and step 6 is skipped. That is
+what stops a reconnect that fails later from taking a working machine offline.
+
+The credential is stored under ONE **runner-scoped** Keychain account
+(`runner:<runner-public-id>`), because that is its actual scope —
+`registered_runners.credential_digest` is per runner, not per workspace. Connecting a second
+workspace on the same machine therefore presents the credential it already has and leaves the
+first workspace authenticating. (Pre-round-003 per-workspace accounts are still READ as a
+fallback, so a machine that connected under the old scheme keeps working without reconnecting.)
+
+It travels in a **header**, never the request body, so it cannot reach Rails' parameter log.
 
 ### 2. Claim and execute work
 
@@ -457,8 +465,8 @@ lib/specrelay_runner/
   cli.rb                        # argv -> config/connection -> client -> claim/execute
   connect.rb                    # the guided connection: code -> assignment ->
                                 #   checkout validation -> readiness -> Keychain
-  secret_store.rb               # macOS Keychain adapter; NO plaintext fallback,
-                                #   credential delivered on stdin (never argv)
+  secret_store.rb               # macOS Keychain adapter; NO plaintext fallback, credential
+                                #   delivered on stdin (never argv), account per RUNNER identity
   repository_check.rb           # local checkout identity validation (git, offline)
   connection_store.rb           # non-secret local connection record (0600)
   config.rb                     # local YAML config (secrets from ENV only), or

@@ -230,14 +230,27 @@ module SpecrelayRunner
       connection = select_connection(store, option(args, "--workspace"))
       return nil if connection.nil?
 
-      credential = SecretStore.for(platform: RUBY_PLATFORM)
-                              .read(account: SecretStore.account_for(connection.workspace_key))
+      credential = stored_credential(connection)
       return missing_credential(connection) if credential.nil?
 
       Config.from_connection(connection, credential: credential)
     rescue SecretStore::UnsupportedPlatform, SecretStore::Error => e
       err.puts "Cannot read the stored runner credential: #{Redaction.redact(e.message)}"
       nil
+    end
+
+    # The credential for this connection's RUNNER identity, falling back to the pre-round-003
+    # per-workspace account so a machine that connected under the old scheme keeps working
+    # (review-002, F3 residual). The credential is per runner, so keying it per workspace is what
+    # let a second workspace's connection orphan the first's stored copy.
+    def stored_credential(connection)
+      store = SecretStore.for(platform: RUBY_PLATFORM)
+      runner_public_id = connection.runner_public_id.to_s.strip
+      unless runner_public_id.empty?
+        value = store.read(account: SecretStore.account_for_runner(runner_public_id))
+        return value if value
+      end
+      store.read(account: SecretStore.legacy_account_for(connection.workspace_key))
     end
 
     # A named workspace, or the sole stored connection. Several connections with no

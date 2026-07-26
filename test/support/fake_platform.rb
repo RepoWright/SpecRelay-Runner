@@ -29,6 +29,12 @@ class FakePlatform
   # mirroring Platform's non-destructive reconnect (review-001 F3).
   attr_accessor :held_credential
 
+  # Lets a test model a SECOND workspace on the same Platform and the same machine, which is the
+  # shape that used to orphan the first workspace's stored credential (review-002, F3 residual).
+  def claim_payload_workspace_key=(key)
+    @claim_payload["workspace"]["workspace_key"] = key
+  end
+
   attr_reader :requests
 
   # `token` is the shared development token (fallback mode). `registration_token`
@@ -184,7 +190,10 @@ class FakePlatform
   # MVP-0017 guided connection: consume the code and return the durable credential once — unless
   # the runner presented the credential it already holds, in which case nothing is issued.
   def enrollment(request)
-    unchanged = !@held_credential.nil? && request.dig(:body, "current_credential") == @held_credential
+    # The held credential arrives in a HEADER, never the body (round 003, review-002 N1), so the
+    # fake reads it where Platform reads it.
+    presented = request.dig(:headers, "x-specrelay-runner-credential")
+    unchanged = !@held_credential.nil? && presented == @held_credential
     [ @enrollment_status,
       assignment.merge(
         runner: { id: "host-runner", public_id: "rnr_fake", display_name: "host runner",

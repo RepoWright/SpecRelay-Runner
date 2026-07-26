@@ -19,6 +19,10 @@ module SpecrelayRunner
     Unauthorized = Class.new(Error)
     RequestFailed = Class.new(Error)
 
+    # The header the non-destructive reconnect uses to present the credential this machine
+    # already holds. Deliberately not the request body: see #enroll.
+    CURRENT_CREDENTIAL_HEADER = "X-SpecRelay-Runner-Credential"
+
     # A claimed run payload, or a not-claimed signal.
     ClaimResult = Struct.new(:claimed, :payload, keyword_init: true) do
       def claimed? = claimed
@@ -43,7 +47,7 @@ module SpecrelayRunner
     # Returns the parsed body, which carries the per-runner credential exactly
     # once. Raises Unauthorized (401) for an invalid/expired/used token.
     def register(runner_params)
-      status, body = post_json("/api/runner/registration", runner: runner_params)
+      status, body = post_json("/api/runner/registration", { runner: runner_params })
       status == 201 ? body : raise_for(status, body)
     end
 
@@ -64,9 +68,12 @@ module SpecrelayRunner
     # machine should keep using the credential it already holds (round 002, review-001 F3).
     # Raises Unauthorized (401) for an invalid, expired, or already-used code.
     def enroll(runner_params, current_credential: nil)
-      payload = { runner: runner_params }
-      payload[:current_credential] = current_credential if current_credential
-      status, body = post_json("/api/runner/enrollment", payload)
+      # The held credential travels in a HEADER, never the request body. Round 002 sent it as a
+      # body parameter, where Rails' parameter log wrote it in plaintext (review-002 N1). A header
+      # is not part of the logged parameters at all — the same reason the bearer token was always
+      # safe there.
+      headers = current_credential ? { CURRENT_CREDENTIAL_HEADER => current_credential } : {}
+      status, body = post_json("/api/runner/enrollment", { runner: runner_params }, headers: headers)
       status == 201 ? body : raise_for(status, body)
     end
 
@@ -76,14 +83,14 @@ module SpecrelayRunner
     # assumed.
     def report_workspace_readiness(workspace_key:, report:)
       status, body = post_json("/api/runner/workspace_connections",
-                               workspace_key: workspace_key, report: report)
+                               { workspace_key: workspace_key, report: report })
       status == 201 ? body : raise_for(status, body)
     end
 
     # POST /api/runner/claim. Returns a ClaimResult: claimed with the run payload,
     # or not claimed when Platform authorizes no eligible work under the policy.
     def claim(runner_params)
-      status, body = post_json("/api/runner/claim", runner: runner_params)
+      status, body = post_json("/api/runner/claim", { runner: runner_params })
       case status
       when 201 then ClaimResult.new(claimed: true, payload: body)
       when 200 then ClaimResult.new(claimed: false, payload: body)
@@ -105,7 +112,7 @@ module SpecrelayRunner
       attempt = 0
       begin
         attempt += 1
-        status, body = post_json("/api/runner/events", claim: claim, event: event)
+        status, body = post_json("/api/runner/events", { claim: claim, event: event })
         return body if status == 201
 
         raise_for(status, body)
@@ -120,7 +127,7 @@ module SpecrelayRunner
 
     # POST /api/runner/heartbeat.
     def heartbeat(claim:)
-      status, body = post_json("/api/runner/heartbeat", claim: claim)
+      status, body = post_json("/api/runner/heartbeat", { claim: claim })
       status == 200 ? body : raise_for(status, body)
     end
 
@@ -139,12 +146,16 @@ module SpecrelayRunner
 
     attr_reader :base, :token, :http
 
-    def post_json(path, payload)
+    # `payload` is always an explicit Hash at every call site: this method takes a keyword
+    # argument, so a trailing `key: value` list would be parsed as keywords rather than converted
+    # into the positional payload hash.
+    def post_json(path, payload, headers: {})
       uri = URI.join(base.to_s, path)
       request = Net::HTTP::Post.new(uri)
       request["Authorization"] = "Bearer #{token}"
       request["Content-Type"] = "application/json"
       request["Accept"] = "application/json"
+      headers.each { |name, value| request[name] = value }
       request.body = JSON.generate(payload)
 
       response = http.start(uri.host, uri.port, use_ssl: uri.scheme == "https",

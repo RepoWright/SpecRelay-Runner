@@ -106,8 +106,9 @@ class ConnectFlowTest < Minitest::Test
 
     assert result.ready?, "Platform reported #{result.state}: #{result.detail}"
     assert_equal "tiny-demo-workspace", result.workspace_key
-    # The credential reached the OS secret store, keyed by workspace and nothing else.
-    assert_equal [ "workspace:tiny-demo-workspace" ], secret_store.writes
+    # The credential reached the OS secret store, keyed by the RUNNER identity Platform issued —
+    # the credential's actual scope (round 003, review-002 F3 residual).
+    assert_equal [ "runner:rnr_fake" ], secret_store.writes
     # …and was never printed.
     refute_includes out, FakePlatform::ISSUED_CREDENTIAL
   end
@@ -292,8 +293,7 @@ class ConnectFlowTest < Minitest::Test
     # No second write: the machine kept what it had, so nothing could be invalidated.
     assert_equal 1, secret_store.writes.size
     assert_includes out, "unchanged"
-    assert_equal FakePlatform::ISSUED_CREDENTIAL,
-                 secret_store.read(account: "workspace:tiny-demo-workspace")
+    assert_equal FakePlatform::ISSUED_CREDENTIAL, secret_store.read(account: "runner:rnr_fake")
   end
 
   def test_a_reconnect_presents_the_held_credential_so_platform_can_recognise_it
@@ -304,8 +304,11 @@ class ConnectFlowTest < Minitest::Test
 
     connect(code: platform.enrollment_code, checkout: git_checkout, secret_store: secret_store)
 
+    # It travels in a HEADER, never the body, so Rails' parameter log can never contain it
+    # (round 003, review-002 N1).
     assert_equal FakePlatform::ISSUED_CREDENTIAL,
-                 platform.last_enrollment.fetch(:body)["current_credential"]
+                 platform.last_enrollment.dig(:headers, "x-specrelay-runner-credential")
+    refute_includes JSON.generate(platform.last_enrollment.fetch(:body)), "current_credential"
   end
 
   # A fresh machine has nothing to present, and must still be issued a credential.
@@ -315,9 +318,68 @@ class ConnectFlowTest < Minitest::Test
 
     connect(code: platform.enrollment_code, checkout: git_checkout, secret_store: secret_store)
 
-    assert_nil platform.last_enrollment.fetch(:body)["current_credential"]
+    assert_nil platform.last_enrollment.dig(:headers, "x-specrelay-runner-credential")
+    assert_equal FakePlatform::ISSUED_CREDENTIAL, secret_store.read(account: "runner:rnr_fake")
+  end
+
+  # --- review-002, F3 residual: a second workspace must not orphan the first ---
+  #
+  # The credential is per RUNNER, but round 002 stored it per WORKSPACE. Connecting a SECOND
+  # workspace on an already-registered machine presented nothing (there was no entry for the new
+  # workspace), so Platform rotated, and the first workspace's stored copy stopped
+  # authenticating — `claim-once --workspace <first>` then failed.
+
+  def test_connecting_a_second_workspace_leaves_the_first_workspace_authenticating
+    platform = start_platform
+    secret_store = FakeSecretStore.new
+    connect(code: platform.enrollment_code, checkout: git_checkout, secret_store: secret_store)
+    first_credential = secret_store.read(account: "runner:rnr_fake")
+
+    refute_nil first_credential
+
+    # A DIFFERENT workspace on the same Platform and the same machine.
+    platform.claim_payload_workspace_key = "second-workspace"
+    platform.held_credential = first_credential
+    platform.enrollment_code = code_for(platform.base_url)
+    result, = connect(code: platform.enrollment_code, checkout: git_checkout, secret_store: secret_store)
+
+    assert result.ready?
+    assert_equal "second-workspace", result.workspace_key
+    # The machine presented the credential it already held, so nothing was rotated…
+    assert_equal first_credential,
+                 platform.last_enrollment.dig(:headers, "x-specrelay-runner-credential")
+    # …and the single runner-scoped entry still holds it, so the FIRST workspace still works.
+    assert_equal first_credential, secret_store.read(account: "runner:rnr_fake")
+    assert_equal 1, secret_store.writes.size, "a second workspace must not rewrite the credential"
+  end
+
+  def test_both_stored_workspaces_resolve_the_same_credential
+    platform = start_platform
+    secret_store = FakeSecretStore.new
+    connect(code: platform.enrollment_code, checkout: git_checkout, secret_store: secret_store)
+    platform.claim_payload_workspace_key = "second-workspace"
+    platform.held_credential = secret_store.read(account: "runner:rnr_fake")
+    platform.enrollment_code = code_for(platform.base_url)
+    connect(code: platform.enrollment_code, checkout: git_checkout, secret_store: secret_store)
+
+    # Two stored connections, one runner identity, one credential.
+    assert_equal %w[second-workspace tiny-demo-workspace], store.connections.map(&:workspace_key).sort
+    assert_equal [ "rnr_fake" ], store.connections.map(&:runner_public_id).uniq
+  end
+
+  # A machine that connected under the pre-round-003 per-workspace scheme keeps working: the
+  # legacy account is still READ, so it presents its credential and is not rotated.
+  def test_reads_a_legacy_per_workspace_credential_so_an_existing_machine_keeps_working
+    platform = start_platform
+    secret_store = FakeSecretStore.new
+    secret_store.write(account: "workspace:tiny-demo-workspace", credential: FakePlatform::ISSUED_CREDENTIAL)
+    platform.held_credential = FakePlatform::ISSUED_CREDENTIAL
+
+    result, = connect(code: platform.enrollment_code, checkout: git_checkout, secret_store: secret_store)
+
+    assert result.ready?
     assert_equal FakePlatform::ISSUED_CREDENTIAL,
-                 secret_store.read(account: "workspace:tiny-demo-workspace")
+                 platform.last_enrollment.dig(:headers, "x-specrelay-runner-credential")
   end
 
   def test_the_preview_carries_no_credential

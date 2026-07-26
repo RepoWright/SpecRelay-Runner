@@ -154,14 +154,36 @@ class SecretStoreTest < Minitest::Test
     assert_includes error.message, SpecrelayRunner::Redaction::REDACTION
   end
 
-  # --- the account name is non-secret and workspace-scoped ------------------
+  # --- the account name is non-secret and RUNNER-scoped ---------------------
 
-  def test_the_keychain_account_names_only_the_workspace
-    account = SpecrelayRunner::SecretStore.account_for("tiny-demo-workspace")
+  # Round 003 (review-002, F3 residual): the credential is per RUNNER
+  # (`registered_runners.credential_digest`), so its Keychain account must be too. Keying it per
+  # workspace meant a first-time connection to a second workspace rotated the shared credential
+  # and orphaned the first workspace's stored copy.
+  def test_the_keychain_account_names_only_the_runner_identity
+    account = SpecrelayRunner::SecretStore.account_for_runner("rnr_ea88b7a19b174a9788acf36f2fac693d")
 
-    assert_equal "workspace:tiny-demo-workspace", account
+    assert_equal "runner:rnr_ea88b7a19b174a9788acf36f2fac693d", account
     # No local path, operator email, or provider account may appear in the key.
     refute_match(%r{/}, account)
     refute_includes account, "@"
+  end
+
+  # Retained for READS only, so a machine that connected under the old scheme keeps working.
+  def test_the_legacy_workspace_account_name_is_unchanged
+    assert_equal "workspace:tiny-demo-workspace",
+                 SpecrelayRunner::SecretStore.legacy_account_for("tiny-demo-workspace")
+  end
+
+  def test_nothing_writes_to_the_legacy_account_any_more
+    runner = RecordingRunner.new([ ok ])
+    store = SpecrelayRunner::SecretStore.new(runner: runner)
+
+    store.write(account: SpecrelayRunner::SecretStore.account_for_runner("rnr_x"), credential: "src_abc")
+
+    argv = single_invocation(runner)
+
+    assert_includes argv, "runner:rnr_x"
+    refute argv.any? { |element| element.start_with?("workspace:") }
   end
 end
