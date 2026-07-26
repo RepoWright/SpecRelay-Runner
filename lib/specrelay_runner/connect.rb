@@ -72,13 +72,22 @@ module SpecrelayRunner
 
     def call
       secret_store = resolve_secret_store
-      base_url = origin_from_code!
-      assignment = exchange(base_url)
+      origin = origin_from_code!
+
+      # Everything local happens against a PREVIEW, which does not consume the code (round 002,
+      # review-001 F3). Round 001 exchanged first, so a mistyped checkout or an unauthenticated
+      # provider spent the code and — for an already-connected machine — rotated its credential
+      # and demoted its grant. One typo took a working runner offline. Now a failure here costs
+      # nothing at all: the same code still works.
+      assignment = preview(origin)
       workspace = assignment.fetch("workspace")
       checkout = validated_checkout!(workspace)
       readiness = executor_readiness(assignment.fetch("executor", {}))
-      persist(secret_store, assignment, workspace, checkout)
-      report(assignment, workspace, checkout, readiness)
+
+      # Only now is anything consumed or changed.
+      enrolled = exchange(origin, workspace, secret_store)
+      persist(secret_store, enrolled, workspace, checkout)
+      report(enrolled, workspace, checkout, readiness)
     end
 
     private
@@ -117,13 +126,43 @@ module SpecrelayRunner
         "`specrelay-runner connect …` command from Platform project setup."
     end
 
-    def exchange(base_url)
-      out.puts "Connecting to #{base_url} as #{runner_display_name} (#{runner_id})…"
-      assignment = client(base_url, code).enroll(identity)
-      @credential = assignment.fetch("credential")
-      @base_url = presence(assignment.dig("platform", "base_url")) || base_url
+    # Read the assignment without consuming the code.
+    def preview(origin)
+      out.puts "Connecting to #{origin} as #{runner_display_name} (#{runner_id})…"
+      assignment = client(origin, code).preview_enrollment
       announce_assignment(assignment)
       assignment
+    end
+
+    # Consume the code. The machine's EXISTING credential for this workspace is presented so
+    # Platform can recognise a reconnect and leave that credential alone; when it does,
+    # `credential_unchanged` comes back true and nothing in the secret store is touched.
+    def exchange(origin, workspace, secret_store)
+      held = held_credential(secret_store, workspace)
+      enrolled = client(origin, code).enroll(identity, current_credential: held)
+      @credential = presence(enrolled["credential"]) || held
+      raise Error, "Platform returned no usable credential for this machine" if @credential.nil?
+
+      @credential_unchanged = enrolled["credential_unchanged"] ? true : false
+      @base_url = presence(enrolled.dig("platform", "base_url")) || origin
+      enrolled
+    end
+
+    # The credential this machine already holds for the assigned workspace, or nil. A store that
+    # cannot be read is treated as "none held", so a fresh credential is issued rather than the
+    # connection failing.
+    def held_credential(secret_store, workspace)
+      secret_store.read(account: SecretStore.account_for(workspace.fetch("workspace_key")))
+    rescue SecretStore::Error
+      nil
+    end
+
+    # A reconnect that kept its existing credential says so, because "stored in the Keychain"
+    # would imply a write that did not happen.
+    def credential_line
+      return "unchanged — this machine keeps the credential it already had" if @credential_unchanged
+
+      "stored in the macOS Keychain (never printed or written to a file)"
     end
 
     def announce_assignment(assignment)
@@ -184,10 +223,13 @@ module SpecrelayRunner
 
     # Credential first, then local state. A credential stored without local state leaves a
     # recoverable runner; local state pointing at a credential that was never stored would
-    # not authenticate.
+    # not authenticate. A reconnect that kept its existing credential writes nothing to the
+    # secret store, so it cannot fail on a Keychain prompt it does not need.
     def persist(secret_store, assignment, workspace, checkout)
-      secret_store.write(account: SecretStore.account_for(workspace.fetch("workspace_key")),
-                         credential: @credential)
+      unless @credential_unchanged
+        secret_store.write(account: SecretStore.account_for(workspace.fetch("workspace_key")),
+                           credential: @credential)
+      end
       store.save(ConnectionStore::Connection.new(
                    base_url: @base_url, runner_id: identity.fetch("id"),
                    runner_public_id: assignment.dig("runner", "public_id"),
@@ -200,7 +242,7 @@ module SpecrelayRunner
                    default_branch: workspace.fetch("default_branch"),
                    local_path: checkout.fetch(:path), connected_at: Time.now.utc.iso8601
                  ))
-      out.puts "Credential:         stored in the macOS Keychain (never printed or written to a file)"
+      out.puts "Credential:         #{credential_line}"
     end
 
     # Report facts, not a verdict. Platform re-checks the repository identity against its

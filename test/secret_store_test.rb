@@ -7,22 +7,28 @@ require_relative "test_helper"
 # The `security` command itself is not invoked here: shelling out to the real tool would
 # touch the developer's Keychain and could raise an interactive prompt in CI. What must be
 # proved instead is everything around it — that the platform gate refuses a non-macOS host
-# with NO plaintext fallback, that the argv handed to the tool is an upsert carrying the
-# credential as a distinct element (never a shell string), that a missing item is a normal
-# empty result rather than an error, and that a failure message never echoes the credential.
+# with NO plaintext fallback, that the argv handed to the tool is an upsert which does NOT
+# contain the credential (round 002, review-001 F8: an argv element is visible in the process
+# table, and `security` documents `-w` as insecure for exactly that reason), that the value is
+# delivered on stdin instead, that a missing item is a normal empty result rather than an error,
+# and that a failure message never echoes the credential.
 class SecretStoreTest < Minitest::Test
   # Records the argv it was handed and returns a scripted result, so the exact command
   # line the adapter builds is assertable.
   class RecordingRunner
-    attr_reader :invocations
+    # `stdins` is recorded alongside `invocations` so an example can assert both what the
+    # adapter put on the command line and what it deliberately kept off it.
+    attr_reader :invocations, :stdins
 
     def initialize(results)
       @results = results
       @invocations = []
+      @stdins = []
     end
 
-    def run(argv, **_kwargs)
+    def run(argv, **kwargs)
       @invocations << argv
+      @stdins << kwargs[:stdin_data]
       @results.shift
     end
   end
@@ -57,7 +63,7 @@ class SecretStoreTest < Minitest::Test
 
   # --- the argv handed to `security` ----------------------------------------
 
-  def test_writes_an_upsert_with_the_credential_as_a_distinct_argv_element
+  def test_writes_an_upsert_that_keeps_the_credential_out_of_argv
     runner = RecordingRunner.new([ ok ])
     store = SpecrelayRunner::SecretStore.new(runner: runner)
 
@@ -69,9 +75,32 @@ class SecretStoreTest < Minitest::Test
     # `-U` is what makes a reconnect an upsert instead of a duplicate-item error.
     assert_includes argv, "-U"
     assert_equal [ "-s", SpecrelayRunner::SecretStore::SERVICE ], argv.values_at(argv.index("-s"), argv.index("-s") + 1)
-    # The credential is its own element, so no shell can word-split or expand it.
-    assert_equal "src_abc", argv.last
-    assert_equal "-w", argv[-2]
+    # THE point of this example: the credential is nowhere in the process's argv, so it is not
+    # visible in the process table (review-001 F8).
+    refute_includes argv, "src_abc"
+    refute argv.any? { |element| element.include?("src_abc") }, "credential leaked into argv: #{argv.inspect}"
+    # `-w` is last and valueless, which is what makes `security` prompt and read stdin.
+    assert_equal "-w", argv.last
+  end
+
+  def test_delivers_the_credential_on_stdin_twice_for_the_confirmation_prompt
+    runner = RecordingRunner.new([ ok ])
+    store = SpecrelayRunner::SecretStore.new(runner: runner)
+
+    store.write(account: "workspace:tiny-demo-workspace", credential: "src_abc")
+
+    # `security` prompts for the password and then for a confirmation.
+    assert_equal "src_abc\nsrc_abc\n", runner.stdins.first
+  end
+
+  # Reading needs no stdin at all; only the write path prompts.
+  def test_reading_sends_no_stdin
+    runner = RecordingRunner.new([ ok(stdout: "src_abc\n") ])
+    store = SpecrelayRunner::SecretStore.new(runner: runner)
+
+    store.read(account: "workspace:tiny-demo-workspace")
+
+    assert_nil runner.stdins.first
   end
 
   def test_reads_the_stored_credential

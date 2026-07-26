@@ -233,6 +233,103 @@ class ConnectFlowTest < Minitest::Test
     assert_empty platform.requests_to("/api/runner/workspace_connections")
   end
 
+  # --- review-001 F3: a failed attempt must cost the operator nothing --------
+  #
+  # Round 001 consumed the code and rotated the credential BEFORE validating locally, so a
+  # mistyped checkout took a working runner offline. These assert the new order directly.
+
+  def test_a_local_failure_does_not_consume_the_code
+    platform = start_platform
+
+    assert_raises(SpecrelayRunner::Connect::Error) do
+      connect(code: platform.enrollment_code, checkout: git_checkout(remote: "https://github.com/x/wrong"))
+    end
+
+    # The preview was read; the consuming exchange was never called.
+    refute_empty platform.requests_to("/api/runner/enrollment_preview")
+    assert_empty platform.requests_to("/api/runner/enrollment")
+    assert_empty platform.requests_to("/api/runner/workspace_connections")
+  end
+
+  def test_the_same_code_still_works_after_a_local_failure
+    platform = start_platform
+    code = platform.enrollment_code
+
+    assert_raises(SpecrelayRunner::Connect::Error) do
+      connect(code: code, checkout: Dir.mktmpdir("not-a-repo"))
+    end
+    result, = connect(code: code, checkout: git_checkout)
+
+    assert result.ready?, "the same code must still be usable after a purely local failure"
+  end
+
+  def test_a_local_failure_writes_nothing_to_the_secret_store
+    platform = start_platform
+    secret_store = FakeSecretStore.new
+
+    assert_raises(SpecrelayRunner::Connect::Error) do
+      connect(code: platform.enrollment_code, checkout: Dir.mktmpdir("not-a-repo"),
+              secret_store: secret_store)
+    end
+
+    assert_empty secret_store.writes
+    refute File.exist?(@state_file)
+  end
+
+  def test_a_reconnect_keeps_the_credential_the_machine_already_holds
+    platform = start_platform
+    secret_store = FakeSecretStore.new
+    connect(code: platform.enrollment_code, checkout: git_checkout, secret_store: secret_store)
+    assert_equal 1, secret_store.writes.size
+
+    # Platform now recognises the held credential and issues nothing.
+    platform.held_credential = FakePlatform::ISSUED_CREDENTIAL
+    platform.enrollment_code = code_for(platform.base_url)
+    result, out, = connect(code: platform.enrollment_code, checkout: git_checkout,
+                           secret_store: secret_store)
+
+    assert result.ready?
+    # No second write: the machine kept what it had, so nothing could be invalidated.
+    assert_equal 1, secret_store.writes.size
+    assert_includes out, "unchanged"
+    assert_equal FakePlatform::ISSUED_CREDENTIAL,
+                 secret_store.read(account: "workspace:tiny-demo-workspace")
+  end
+
+  def test_a_reconnect_presents_the_held_credential_so_platform_can_recognise_it
+    platform = start_platform
+    secret_store = FakeSecretStore.new
+    connect(code: platform.enrollment_code, checkout: git_checkout, secret_store: secret_store)
+    platform.enrollment_code = code_for(platform.base_url)
+
+    connect(code: platform.enrollment_code, checkout: git_checkout, secret_store: secret_store)
+
+    assert_equal FakePlatform::ISSUED_CREDENTIAL,
+                 platform.last_enrollment.fetch(:body)["current_credential"]
+  end
+
+  # A fresh machine has nothing to present, and must still be issued a credential.
+  def test_a_first_connect_presents_no_credential_and_is_issued_one
+    platform = start_platform
+    secret_store = FakeSecretStore.new
+
+    connect(code: platform.enrollment_code, checkout: git_checkout, secret_store: secret_store)
+
+    assert_nil platform.last_enrollment.fetch(:body)["current_credential"]
+    assert_equal FakePlatform::ISSUED_CREDENTIAL,
+                 secret_store.read(account: "workspace:tiny-demo-workspace")
+  end
+
+  def test_the_preview_carries_no_credential
+    platform = start_platform
+    connect(code: platform.enrollment_code, checkout: git_checkout)
+
+    body = JSON.generate(platform.last_enrollment_preview[:body])
+
+    refute_includes body, FakePlatform::ISSUED_CREDENTIAL
+    refute_includes body, "credential"
+  end
+
   # --- Platform owns the verdict --------------------------------------------
 
   def test_reports_the_state_platform_decided_not_its_own_opinion

@@ -47,12 +47,26 @@ module SpecrelayRunner
       status == 201 ? body : raise_for(status, body)
     end
 
+    # POST /api/runner/enrollment_preview (round 002). The bearer is the one-time enrollment
+    # code, and the call does NOT consume it: it returns only the non-secret assignment, with no
+    # credential. It exists so `connect` can validate the local checkout and provider readiness
+    # BEFORE consuming anything, so a failed attempt costs the operator nothing — not even the
+    # code. Raises Unauthorized (401) for an invalid, expired, or already-used code.
+    def preview_enrollment
+      status, body = post_json("/api/runner/enrollment_preview", {})
+      status == 200 ? body : raise_for(status, body)
+    end
+
     # POST /api/runner/enrollment (MVP-0017). The bearer for THIS call is the one-time
-    # enrollment code. Returns the parsed body, which carries the durable credential
-    # exactly once plus the non-secret project/workspace assignment. Raises Unauthorized
-    # (401) for an invalid, expired, or already-used code.
-    def enroll(runner_params)
-      status, body = post_json("/api/runner/enrollment", runner: runner_params)
+    # enrollment code, and this call DOES consume it. Returns the parsed body, which carries the
+    # non-secret assignment plus the durable credential exactly once — unless
+    # `credential_unchanged` is true, meaning Platform recognised `current_credential` and the
+    # machine should keep using the credential it already holds (round 002, review-001 F3).
+    # Raises Unauthorized (401) for an invalid, expired, or already-used code.
+    def enroll(runner_params, current_credential: nil)
+      payload = { runner: runner_params }
+      payload[:current_credential] = current_credential if current_credential
+      status, body = post_json("/api/runner/enrollment", payload)
       status == 201 ? body : raise_for(status, body)
     end
 

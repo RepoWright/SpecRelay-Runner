@@ -24,6 +24,11 @@ class FakePlatform
   # state PLATFORM decided rather than its own opinion.
   attr_accessor :enrollment_code, :readiness_verdict, :enrollment_status
 
+  # Round 002: the credential the fake believes this machine already holds. When the runner
+  # presents it on the exchange, the fake responds `credential_unchanged` and issues nothing —
+  # mirroring Platform's non-destructive reconnect (review-001 F3).
+  attr_accessor :held_credential
+
   attr_reader :requests
 
   # `token` is the shared development token (fallback mode). `registration_token`
@@ -81,6 +86,7 @@ class FakePlatform
   def last_report = requests_to("/api/runner/reports").last
   def last_registration = requests_to("/api/runner/registration").last
   def last_enrollment = requests_to("/api/runner/enrollment").last
+  def last_enrollment_preview = requests_to("/api/runner/enrollment_preview").last
   def last_readiness_report = requests_to("/api/runner/workspace_connections").last
 
   # MVP-0013: the v1 protocol events the runner sent (the `event` sub-hash of each
@@ -135,7 +141,8 @@ class FakePlatform
     presented = request[:headers]["authorization"].to_s
     case request[:path].to_s.split("?").first
     when "/api/runner/registration" then presented == "Bearer #{@registration_token}"
-    when "/api/runner/enrollment" then presented == "Bearer #{@enrollment_code}"
+    when "/api/runner/enrollment", "/api/runner/enrollment_preview"
+      presented == "Bearer #{@enrollment_code}"
     else presented == "Bearer #{@token}" || presented == "Bearer #{ISSUED_CREDENTIAL}"
     end
   end
@@ -143,7 +150,8 @@ class FakePlatform
   def route(request)
     case request[:path]
     when "/api/runner/registration" then registration
-    when "/api/runner/enrollment" then enrollment
+    when "/api/runner/enrollment" then enrollment(request)
+    when "/api/runner/enrollment_preview" then [ 200, assignment ]
     when "/api/runner/workspace_connections" then workspace_connection(request)
     when "/api/runner/claim" then claim
     when "/api/runner/events" then events(request)
@@ -160,21 +168,30 @@ class FakePlatform
              credential: ISSUED_CREDENTIAL, credential_env: "SPECRELAY_RUNNER_CREDENTIAL" } ]
   end
 
-  # MVP-0017 guided connection: return the durable credential once plus the non-secret
-  # assignment. The workspace block deliberately mirrors the claim payload's, so a
-  # connection and a later claim describe the same workspace.
-  def enrollment
+  # The non-secret assignment, identical for the preview and the exchange. The workspace block
+  # deliberately mirrors the claim payload's, so a connection and a later claim describe the same
+  # workspace.
+  def assignment
     workspace = @claim_payload.fetch("workspace")
+    { contract_version: "mvp-0017",
+      platform: { base_url: base_url },
+      project: { slug: "tiny-demo", name: "Tiny Demo" },
+      workspace: workspace.slice("project_key", "workspace_key", "display_name",
+                                 "repository_url", "default_branch"),
+      executor: @claim_payload.fetch("executor") }
+  end
+
+  # MVP-0017 guided connection: consume the code and return the durable credential once — unless
+  # the runner presented the credential it already holds, in which case nothing is issued.
+  def enrollment(request)
+    unchanged = !@held_credential.nil? && request.dig(:body, "current_credential") == @held_credential
     [ @enrollment_status,
-      { contract_version: "mvp-0017",
-        platform: { base_url: base_url },
-        project: { slug: "tiny-demo", name: "Tiny Demo" },
-        workspace: workspace.slice("project_key", "workspace_key", "display_name",
-                                   "repository_url", "default_branch"),
-        executor: @claim_payload.fetch("executor"),
+      assignment.merge(
         runner: { id: "host-runner", public_id: "rnr_fake", display_name: "host runner",
-                  connection_public_id: "rwc_fake", reconnected: false },
-        credential: ISSUED_CREDENTIAL } ]
+                  connection_public_id: "rwc_fake", reconnected: unchanged },
+        credential: unchanged ? nil : ISSUED_CREDENTIAL,
+        credential_unchanged: unchanged
+      ) ]
   end
 
   # Platform — not the runner — decides the state, so the verdict is scripted here and

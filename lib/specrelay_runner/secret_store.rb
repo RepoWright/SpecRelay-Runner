@@ -18,10 +18,18 @@ module SpecrelayRunner
   # `add-generic-password -U` is an upsert, which is what makes a retried `connect`
   # idempotent instead of raising a duplicate-item error.
   #
-  # The credential is passed as an argv element to a directly-spawned process (never a
-  # shell string), so it cannot be word-split, glob-expanded, or captured by a shell
-  # history file. It is not logged, echoed, or included in any error message: a failure
-  # reports the exit status and the tool's own stderr, which never contains the value.
+  # The credential is delivered on the child's STDIN, never as an argv element (round 002,
+  # review-001 F8). `security` itself documents `-w` as insecure — "Use of the -p or -w
+  # options is insecure. Specify -w as the last option to be prompted." — because an argv
+  # element is visible in the process table to any process running as the same user for the
+  # duration of the call. Passing `-w` last with no value makes the tool prompt, and the value
+  # is written to the pipe instead. The tool asks twice (password, then confirmation), so the
+  # value is written twice; that is the documented interactive contract, not a workaround.
+  #
+  # The process is spawned directly, never through a shell, so the value cannot be
+  # word-split, glob-expanded, or captured by a shell history file either. It is not logged,
+  # echoed, or included in any error message: a failure reports the exit status and the tool's
+  # own stderr, which never contains the value.
   class SecretStore
     Error = Class.new(StandardError)
     UnsupportedPlatform = Class.new(Error)
@@ -52,10 +60,11 @@ module SpecrelayRunner
     end
 
     # Store (or replace) the credential for one workspace. `-U` upserts, so reconnecting
-    # the same workspace overwrites rather than failing.
+    # the same workspace overwrites rather than failing. `-w` is LAST and carries no value, so
+    # the tool prompts and reads the credential from stdin — keeping it out of argv.
     def write(account:, credential:)
-      result = run([ "security", "add-generic-password",
-                     "-a", account, "-s", SERVICE, "-U", "-w", credential ])
+      result = run([ "security", "add-generic-password", "-a", account, "-s", SERVICE, "-U", "-w" ],
+                   stdin_data: prompt_response(credential))
       return true if result&.success?
 
       raise Error, "could not save the runner credential to the macOS Keychain#{failure_suffix(result)}. " \
@@ -80,9 +89,14 @@ module SpecrelayRunner
 
     attr_reader :runner
 
-    def run(argv)
+    # `security add-generic-password -w` prompts for the password and then for a confirmation,
+    # so both lines are the credential. Kept in one place so the doubling is obvious and cannot
+    # be mistaken for an accidental duplicate.
+    def prompt_response(credential) = "#{credential}\n#{credential}\n"
+
+    def run(argv, stdin_data: nil)
       runner.run(argv, chdir: Dir.pwd, env: { "PATH" => ENV["PATH"].to_s },
-                 timeout_seconds: TIMEOUT_SECONDS)
+                 timeout_seconds: TIMEOUT_SECONDS, stdin_data: stdin_data)
     rescue SystemCallError
       # `security` could not be launched at all. Treated as a failure rather than an
       # exception so the caller reports one clear remedy.

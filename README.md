@@ -64,41 +64,55 @@ Platform endpoint (carried inside the code, so no `--platform` flag), the
 project/workspace assignment, the repository identity to validate against, and
 the executor profile to check.
 
-Order of operations, stopping at the first problem so this machine is never left
-half-connected:
+Order of operations. Steps 1 to 4 change **nothing** — no code is consumed, no
+credential is issued, and no binding is touched — so a purely local failure costs
+the operator nothing and the same code still works:
 
 1. confirm this platform supports guided secret storage (**macOS only** in this
    release — see below);
-2. exchange the code for this machine's durable credential and its assignment;
+2. **preview** the code's assignment without consuming it
+   (`POST /api/runner/enrollment_preview`);
 3. validate the checkout: it must be a Git repository whose configured remote and
    default branch match the assigned workspace. Remote comparison is identity-only
    (`host/owner/repo`), so an `https` URL and an scp-like SSH remote for the same
    repository match, while a different repository, owner, or host does not;
 4. run the bounded provider readiness checks **only** when the assigned executor
    is the real Claude profile;
-5. store the durable credential in the **macOS Keychain**;
-6. write non-secret connection facts to `~/.specrelay/runner/connections.json`
+5. **exchange** the code, presenting the credential this machine already holds for
+   the assigned workspace (if any) so Platform can recognise a reconnect;
+6. store the durable credential in the **macOS Keychain** — skipped entirely when
+   Platform replied `credential_unchanged`, because there is nothing new to store;
+7. write non-secret connection facts to `~/.specrelay/runner/connections.json`
    (mode `0600`, and you never need to edit it);
-7. report a bounded readiness result and print the state **Platform** decided.
+8. report a bounded readiness result and print the state **Platform** decided.
 
 Exit `0` when Platform records this machine ready, `1` otherwise, `2` on a
 usage/platform error.
 
 **Secret posture.** The durable credential is never printed, never written to
-YAML, a shell profile, Git, or a log, and never appears in an error message. The
-local checkout path is stored **locally only** and is never sent to Platform,
-along with the Keychain service name, the credential, the provider account
-identity, and raw probe output.
+YAML, a shell profile, Git, or a log, and never appears in an error message. It is
+also never an argv element: it is handed to the `security` tool on **stdin**,
+because `security` documents `-w` as insecure and an argv element is visible in the
+process table to any process running as the same user. The local checkout path is
+stored **locally only** and is never sent to Platform, along with the Keychain
+service name, the credential, the provider account identity, and raw probe output.
 
 **Supported storage.** macOS only in this release. On any other system `connect`
 stops **before** registering with a clear message rather than saving a plaintext
 credential — there is no file-based fallback in the code at all
 ([`lib/specrelay_runner/secret_store.rb`](lib/specrelay_runner/secret_store.rb)).
 
-**Retry is idempotent.** Codes are single-use, so a retry needs a fresh one — but
-presenting the same machine-derived runner id updates that machine instead of
-creating a second one: the credential is re-issued and the single (runner,
-workspace) binding is reused.
+**Retry is safe and idempotent.** A failure in steps 1 to 4 does not consume the
+code, so the operator simply runs the same command again. When a code *is*
+consumed, presenting the same machine-derived runner id updates that machine
+instead of creating a second one, and the single (runner, workspace) binding is
+reused.
+
+**A reconnect does not replace a working credential.** Step 5 sends the credential
+this machine already holds; when Platform recognises it, nothing is rotated and
+step 6 is skipped. That is what stops a reconnect that fails later from taking a
+working machine offline, and it means reconnecting workspace A never invalidates
+the credential stored for workspace B.
 
 ### 2. Claim and execute work
 
@@ -443,7 +457,8 @@ lib/specrelay_runner/
   cli.rb                        # argv -> config/connection -> client -> claim/execute
   connect.rb                    # the guided connection: code -> assignment ->
                                 #   checkout validation -> readiness -> Keychain
-  secret_store.rb               # macOS Keychain adapter; NO plaintext fallback
+  secret_store.rb               # macOS Keychain adapter; NO plaintext fallback,
+                                #   credential delivered on stdin (never argv)
   repository_check.rb           # local checkout identity validation (git, offline)
   connection_store.rb           # non-secret local connection record (0600)
   config.rb                     # local YAML config (secrets from ENV only), or

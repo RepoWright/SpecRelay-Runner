@@ -63,14 +63,18 @@ module SpecrelayRunner
       print_connection(result)
       result.ready? ? SUCCESS : RUN_FAILED
     rescue SecretStore::UnsupportedPlatform => e
-      err.puts "Cannot connect: #{e.message}"
-      USAGE_ERROR
-    rescue Connect::Error, SecretStore::Error, ConnectionStore::Error => e
-      err.puts "Connection failed: #{Redaction.redact(e.message)}"
-      RUN_FAILED
-    rescue PlatformClient::Error => e
-      err.puts "Connection failed: #{Redaction.redact(e.message)}"
-      RUN_FAILED
+      connect_failed("Cannot connect: #{e.message}", USAGE_ERROR)
+    rescue Connect::Error, SecretStore::Error, ConnectionStore::Error, PlatformClient::Error => e
+      connect_failed("Connection failed: #{Redaction.redact(e.message)}", RUN_FAILED)
+    end
+
+    # stdout is block-buffered when redirected while stderr is not, so without this flush the
+    # failure line appears BEFORE the assignment lines it refers to in a merged operator log —
+    # the same ordering problem `executor_ready?` already guards against.
+    def connect_failed(message, status)
+      out.flush if out.respond_to?(:flush)
+      err.puts message
+      status
     end
 
     # Prints the state PLATFORM decided, never the runner's own opinion, and never the
