@@ -20,6 +20,12 @@ require_relative "specrelay_runner/config"
 require_relative "specrelay_runner/platform_client"
 require_relative "specrelay_runner/command_runner"
 require_relative "specrelay_runner/claude_profile"
+# MVP-0017 guided connection: the OS secret store, the local checkout validator, the
+# non-secret local connection record, and the `connect` operation that drives them.
+require_relative "specrelay_runner/secret_store"
+require_relative "specrelay_runner/repository_check"
+require_relative "specrelay_runner/connection_store"
+require_relative "specrelay_runner/connect"
 require_relative "specrelay_runner/workspace"
 require_relative "specrelay_runner/executor"
 require_relative "specrelay_runner/report_bundle"

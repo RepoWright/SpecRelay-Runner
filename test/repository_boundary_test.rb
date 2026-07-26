@@ -137,4 +137,67 @@ class RepositoryBoundaryTest < Minitest::Test
 
     assert_empty offenders, "the runner must reach Platform only over HTTP, never through its files"
   end
+
+  # MVP-0017 — the runner must not acquire Jira integration.
+  #
+  # The scan targets what actually constitutes integration: a Jira client constant or
+  # namespace, a Jira REST path, or an Atlassian host the runner would call. It deliberately
+  # does NOT flag the word "Jira" in operator prose or in the report contract's
+  # `final_jira_update_ready` field name — the runner legitimately tells the operator that
+  # Jira was not advanced, and legitimately names a field Platform reads on ingest. Flagging
+  # those would make this test pass or fail for the wrong reason.
+  JIRA_INTEGRATION = %r{
+    SpecRelay::Integrations::Jira | \bJira:: | \bJiraClient\b |
+    /rest/api/ | atlassian\.net/rest | \.atlassian\.net["'] |
+    search_ready_issues | transition_issue | fetch_issue
+  }xi
+
+  def test_acquires_no_jira_integration
+    refute_empty runner_sources
+
+    offenders = runner_sources.select { |path| code_lines(path).match?(JIRA_INTEGRATION) }
+
+    assert_empty offenders, "the runner must never talk to Jira; Platform owns provider integration"
+  end
+
+  # The same rule for the other two boundaries MVP-0017 names: the runner must not gain
+  # project-routing or direct Platform-persistence behaviour.
+  def test_acquires_no_platform_persistence_or_routing_logic
+    offenders = runner_sources.select do |path|
+      code_lines(path).match?(/\bWorkspaceDefinition\b|\bJiraConnection\b|\bRunnerWorkspaceConnection\b|\bRegisteredRunner\b/)
+    end
+
+    assert_empty offenders,
+                 "the runner must not reference Platform's persisted models; it exchanges JSON over HTTP"
+  end
+
+  # MVP-0017 — the runner and Platform each normalize a repository URL to compare a local
+  # checkout against a workspace definition. If the two normalizations disagreed, a
+  # checkout the runner accepted locally would be rejected server-side (or worse, the
+  # reverse), so the agreement is asserted directly on the cases that differ in the wild.
+  def test_repository_identity_normalization_matches_the_documented_platform_rule
+    expectations = {
+      "https://github.com/SpecRelay/tiny-demo-runs" => "github.com/specrelay/tiny-demo-runs",
+      "https://github.com/SpecRelay/tiny-demo-runs.git" => "github.com/specrelay/tiny-demo-runs",
+      "https://github.com/SpecRelay/tiny-demo-runs/" => "github.com/specrelay/tiny-demo-runs",
+      "git@github.com:SpecRelay/tiny-demo-runs.git" => "github.com/specrelay/tiny-demo-runs",
+      "ssh://git@github.com/SpecRelay/tiny-demo-runs" => "github.com/specrelay/tiny-demo-runs",
+      # Credentials embedded in a remote must not change identity (and must not survive it).
+      "https://user:secret@github.com/SpecRelay/tiny-demo-runs" => "github.com/specrelay/tiny-demo-runs",
+      "https://github.com:443/SpecRelay/tiny-demo-runs" => "github.com/specrelay/tiny-demo-runs"
+    }
+
+    expectations.each do |url, expected|
+      assert_equal expected, SpecrelayRunner::RepositoryCheck.repository_identity(url), url
+    end
+  end
+
+  def test_repository_identity_still_distinguishes_different_repositories
+    tiny = SpecrelayRunner::RepositoryCheck.repository_identity("https://github.com/SpecRelay/tiny-demo-runs")
+    other = SpecrelayRunner::RepositoryCheck.repository_identity("https://github.com/SpecRelay/some-other-repo")
+    forked = SpecrelayRunner::RepositoryCheck.repository_identity("https://github.com/Other/tiny-demo-runs")
+
+    refute_equal tiny, other
+    refute_equal tiny, forked
+  end
 end

@@ -22,6 +22,12 @@ module SpecrelayRunner
     # A claimed run payload, or a not-claimed signal.
     ClaimResult = Struct.new(:claimed, :payload, keyword_init: true) do
       def claimed? = claimed
+
+      # Platform's own explanation for a not-claimed poll. Since MVP-0017 the two cases are
+      # genuinely different problems — "you are not connected to any workspace" needs
+      # `specrelay-runner connect`, while "nothing to do right now" needs nothing — so the
+      # runner prints what Platform said instead of one generic line.
+      def reason = payload.is_a?(Hash) ? payload["reason"].to_s : ""
     end
 
     def initialize(base_url:, token:, open_timeout: 5, read_timeout: 1800, http: Net::HTTP)
@@ -38,6 +44,25 @@ module SpecrelayRunner
     # once. Raises Unauthorized (401) for an invalid/expired/used token.
     def register(runner_params)
       status, body = post_json("/api/runner/registration", runner: runner_params)
+      status == 201 ? body : raise_for(status, body)
+    end
+
+    # POST /api/runner/enrollment (MVP-0017). The bearer for THIS call is the one-time
+    # enrollment code. Returns the parsed body, which carries the durable credential
+    # exactly once plus the non-secret project/workspace assignment. Raises Unauthorized
+    # (401) for an invalid, expired, or already-used code.
+    def enroll(runner_params)
+      status, body = post_json("/api/runner/enrollment", runner: runner_params)
+      status == 201 ? body : raise_for(status, body)
+    end
+
+    # POST /api/runner/workspace_connections (MVP-0017). Reports this runner's bounded
+    # readiness result for one connected workspace. Platform — not the runner — decides
+    # the resulting state, so the response is read for the DECIDED state rather than
+    # assumed.
+    def report_workspace_readiness(workspace_key:, report:)
+      status, body = post_json("/api/runner/workspace_connections",
+                               workspace_key: workspace_key, report: report)
       status == 201 ? body : raise_for(status, body)
     end
 

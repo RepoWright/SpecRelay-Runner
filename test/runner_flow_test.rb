@@ -99,7 +99,10 @@ class RunnerFlowTest < Minitest::Test
                                          out: io2, err: io2,
                                          env: { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN, "PATH" => ENV["PATH"] })
     assert_equal SpecrelayRunner::CLI::SUCCESS, exit_code
-    assert_match(/no eligible work/, io2.string)
+    # MVP-0017: the runner prints the reason PLATFORM returned rather than one generic idle
+    # line, so an unconnected runner is told to run `connect` instead of reading a refusal as a
+    # healthy poll. The fake Platform's reason here is its own "already claimed".
+    assert_match(/no work claimed: already claimed/, io2.string)
   end
 
   def test_invalid_token_fails_without_claiming

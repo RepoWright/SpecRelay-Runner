@@ -51,13 +51,15 @@ module SpecrelayRunner
     CONFIG_PATH_ENV = "SPECRELAY_RUNNER_CONFIG"
     LEGACY_CONFIG_PATH_ENV = "SPECRELAY_RUNNER_SPIKE_CONFIG"
     WORKSPACE_ROOT_ENV = "SPECRELAY_RUNNER_WORKSPACE_ROOT"
+    # The policy value a guided connection uses; see .from_connection.
+    ALL_ELIGIBLE_MODE = "all_eligible"
 
     # The resolved runner API bearer: a per-runner registered credential
     # (mode: :registered) or the shared development token (mode: :development).
     Auth = Struct.new(:mode, :token, keyword_init: true)
 
     attr_reader :base_url, :token_env, :credential_env, :registration_token_env,
-                :runner, :workspace_roots, :source_path
+                :runner, :workspace_roots, :source_path, :connection
 
     def self.load(path, env: ENV)
       resolved = resolve_path(path, env)
@@ -65,6 +67,29 @@ module SpecrelayRunner
       raise Error, "runner config file not found: #{resolved}" unless File.file?(resolved)
 
       new(parse(resolved), source_path: resolved)
+    end
+
+    # Build a config from a guided connection (MVP-0017) instead of a YAML file. This is
+    # what makes the normal path complete: after `specrelay-runner connect`, `claim-once`
+    # needs no file, no exported credential, and no workspace-root environment variable.
+    #
+    # The credential is passed in, having been read from the OS secret store, and never
+    # touches disk or the environment. The workspace root comes from the connection's own
+    # validated local path — the runner's to keep, which Platform never learns.
+    #
+    # `all_eligible` is the honest policy value here: since MVP-0017, workspace access is
+    # an explicit Platform-side grant on this runner's identity, so the routing policy is
+    # no longer what bounds what it may execute.
+    def self.from_connection(connection, credential:)
+      document = {
+        "platform" => { "base_url" => connection.base_url },
+        "runner" => {
+          "id" => connection.runner_id, "display_name" => connection.runner_display_name,
+          "claim_policy" => { "mode" => ALL_ELIGIBLE_MODE }
+        },
+        "workspace_roots" => { connection.workspace_key.to_s => connection.local_path }
+      }
+      new(document, source_path: nil, credential: credential, connection: connection)
     end
 
     # An explicit `--config <path>` always wins; otherwise the canonical env var,
@@ -82,10 +107,14 @@ module SpecrelayRunner
       raise Error, "runner config is not valid YAML: #{e.message.split("\n").first}"
     end
 
-    def initialize(document, source_path: nil)
+    def initialize(document, source_path: nil, credential: nil, connection: nil)
       raise Error, "runner config must be a YAML mapping" unless document.is_a?(Hash)
 
       @source_path = source_path
+      # MVP-0017: a credential resolved from the OS secret store by the guided path. It is
+      # held in memory only — never written to the config file, the environment, or a log.
+      @resolved_credential = presence(credential)
+      @connection = connection
       platform = fetch_hash(document, "platform")
       @base_url = presence(platform["base_url"]) or raise Error, "platform.base_url is required"
       @token_env = presence(platform["token_env"]) || TOKEN_ENV_DEFAULT
@@ -156,6 +185,10 @@ module SpecrelayRunner
     # fall back to the shared development token (explicit local/demo path). Neither
     # value ever comes from the config file.
     def resolve_auth(env: ENV)
+      # A guided connection's credential wins: it came from the OS secret store, which is
+      # the supported storage, and it must not be overridable by a stale exported value.
+      return Auth.new(mode: :registered, token: @resolved_credential) if @resolved_credential
+
       credential = env[credential_env].to_s.strip
       return Auth.new(mode: :registered, token: credential) unless credential.empty?
 
