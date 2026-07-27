@@ -44,9 +44,10 @@ cd SpecRelay-Runner
 bin/specrelay-runner version
 ```
 
-## Usage — the normal path (MVP-0017)
+## Usage — the normal path (MVP-0017, extended by MVP-0018)
 
-Two commands, no files to author, no credential to export.
+Two commands to get going, no files to author, no credential to export: one to
+connect the machine, one to leave running.
 
 ### 1. Connect this machine to one workspace
 
@@ -138,22 +139,89 @@ not rotated out from under itself.
 
 It travels in a **header**, never the request body, so it cannot reach Rails' parameter log.
 
-### 2. Claim and execute work
+### 2. Execute work
+
+Two commands. `loop` is the normal mode for a connected machine; `claim-once` is
+the controlled single shot.
 
 ```bash
-bin/specrelay-runner claim-once                    # uses the connection from step 1
-bin/specrelay-runner claim-once --workspace <key>  # when several are connected here
+bin/specrelay-runner loop                          # poll, claim one at a time, repeat
+bin/specrelay-runner loop --workspace <key>        # when several are connected here
+bin/specrelay-runner loop --poll-interval 300      # 5-3600s (default 60s)
+bin/specrelay-runner loop --on-failure stop        # end the session after a failed run
+
+bin/specrelay-runner claim-once                    # exactly one claim, then exit
+bin/specrelay-runner claim-once --workspace <key>
 ```
 
-No config file, no exported credential, and no workspace-root environment
-variable: the credential is read from the Keychain and the workspace root is the
-checkout you validated. `claim-once` claims at most one eligible run (**Platform**
-decides which), executes it, and uploads the report. Exit `0` on completion or no
-eligible work, `1` on a failed execution, `2` on a config/usage error.
+Neither needs a config file, an exported credential, or a workspace-root
+environment variable: the credential is read from the Keychain and the workspace
+root is the checkout you validated.
 
-When nothing was claimed it prints the reason **Platform** returned, so a machine
-that is not connected (or not ready) is told to run `connect` rather than reading a
-refusal as a healthy idle.
+`claim-once` claims at most one eligible run (**Platform** decides which), executes
+it, and uploads the report. Exit `0` on completion or no eligible work, `1` on a
+failed execution, `2` on a config/usage error.
+
+`loop` (MVP-0018) does the same repeatedly, at a bounded poll interval. Exit `0`
+when every run it executed succeeded, `1` if any failed or the credential was
+rejected, `2` on a config/usage error. It shares `claim-once`'s connection
+resolution, credential read, readiness gate, claim request, and reporting — it adds
+repetition and nothing else, so `claim-once` remains byte-for-byte the command it
+was.
+
+`--poll-interval` is bounded at `5-3600s`. A value outside the range is **clamped
+and the clamp is printed**; a non-numeric value is **refused**, because silently
+substituting a default would hide that the operator's intent was lost.
+
+Only **one run at a time**, structurally: the loop body is synchronous, so
+`Execution#call` must return before the next poll is even attempted. There is no
+code path that starts a second executor.
+
+`SIGINT`/`SIGTERM` stop it cleanly and name the situation it stopped in:
+
+```text
+[loop] stopped by signal while IDLE — no execution was in progress and nothing was claimed
+[loop] stopped by signal DURING an execution — the run finished and reported its result first
+```
+
+Foreground only, deliberately: no LaunchAgent, no daemonization, no supervisor.
+
+When nothing was claimed either command prints the reason **Platform** returned, so
+a machine that is not connected (or not ready) is told to run `connect` rather than
+reading a refusal as a healthy idle.
+
+### Live executor output (MVP-0018)
+
+While the executor runs, safe output is streamed to the terminal between
+`[core.started]` and `[verification.started]` and submitted to Platform as ordered
+live log events, so a working run never looks like a hung one:
+
+```text
+[core.started] Running claude executor for MAPIAI-40
+  [claude:status] claude executor running for 15s on MAPIAI-40 (no new output yet)
+  [claude:stdout] MAPIAI-40 is implemented per approved spec `specs/DEMO-0012-…/spec.md`
+[verification.started] Running project tests for MAPIAI-40
+```
+
+The supported Claude profile runs with `--print` and emits nothing until it
+finishes (`--output-format` is a forbidden flag), so a `core.progress` **heartbeat**
+is emitted every 15s of silence naming the elapsed time. It is a fallback, never a
+substitute: real output, when available, is what you see.
+
+Every line is redacted before the terminal write **and** before upload, clipped at
+2000 bytes, and counted against a 131072-byte per-run budget whose exhaustion emits
+one `log.truncated` event rather than dropping output silently. Output is flushed,
+because Ruby block-buffers a non-terminal stdout and an unflushed live log is just
+a delayed one.
+
+It cannot break the run: a consumer that raises is swallowed, an upload failure is
+counted and reported once, and the buffered capture plus the child's exit status are
+observed independently of any of it.
+
+The report carries the bounded stream as its own artifact,
+`evidence/live-executor-log.txt`, deliberately separate from the full
+`evidence/stdout.log` / `evidence/stderr.log` capture — a reviewer needs to tell
+what the operator saw live from what was collected for review.
 
 Platform authorizes a claim only for a workspace this machine has explicitly
 connected to and been recorded `ready` for — and only while its reported
@@ -479,6 +547,8 @@ config/runner.example.yml       # the one operator-facing config example
 lib/specrelay_runner.rb         # requires
 lib/specrelay_runner/
   cli.rb                        # argv -> config/connection -> client -> claim/execute
+  loop_runner.rb                # the long-running poll/claim/execute loop (MVP-0018)
+  poll_interval.rb              # validated, bounded --poll-interval value object
   connect.rb                    # the guided connection: code -> assignment ->
                                 #   checkout validation -> readiness -> Keychain
   secret_store.rb               # macOS Keychain adapter; NO plaintext fallback, credential
@@ -494,7 +564,10 @@ lib/specrelay_runner/
   workspace.rb                  # worktree create + git diff capture
   executor.rb                   # launch the configured executor with the prompt
   report_bundle.rb              # build manifest + evidence, base64 for upload
-  event_emitter.rb              # per-attempt sequence + v1 event envelope
+  event_emitter.rb              # per-attempt sequence + v1 event envelope (mutex-guarded:
+                                #   the log stream allocates sequences concurrently)
+  executor_log_stream.rb        # live executor output: redact -> clip -> budget -> batch,
+                                #   terminal print + ordered log events + report evidence
   terminal_result.rb            # terminal-result envelope builder
   protocol_controls.rb          # default-off deterministic protocol test controls
   publication.rb                # commit + push + draft PR create/reuse
@@ -529,6 +602,11 @@ ruby -Itest test/publication_flow_test.rb
 ruby -Itest test/redaction_test.rb
 ruby -Itest test/claude_profile_test.rb
 ruby -Itest test/real_executor_flow_test.rb
+ruby -Itest test/live_log_test.rb
+ruby -Itest test/loop_mode_test.rb
+ruby -Itest test/connect_flow_test.rb
+ruby -Itest test/secret_store_test.rb
+ruby -Itest test/keychain_tty_test.rb
 ```
 
 The suite never invokes the operator's real Claude Code, real account, or any

@@ -40,6 +40,7 @@ module SpecrelayRunner
       when "connect" then connect(rest)
       when "register" then register(rest)
       when "claim-once" then claim_once(rest)
+      when "loop" then loop_mode(rest)
       when nil, "help", "-h", "--help" then print_help
       when "version", "--version" then print_version
       else usage("unknown command: #{command}")
@@ -83,7 +84,10 @@ module SpecrelayRunner
       out.puts ""
       if result.ready?
         out.puts "Connected. This machine is ready to execute #{result.workspace_key} work."
-        out.puts "Next: run `specrelay-runner claim-once` here, or leave it to your scheduler."
+        # `loop` is named first because it is the normal mode for a connected machine
+        # (MVP-0018); `claim-once` is the controlled single shot for a manual test.
+        out.puts "Next: leave `specrelay-runner loop` running here to pick up work as it becomes ready,"
+        out.puts "      or run `specrelay-runner claim-once` for a single controlled test."
         return
       end
 
@@ -162,6 +166,54 @@ module SpecrelayRunner
     rescue PlatformClient::Error => e
       err.puts "Runner failed: #{e.message}"
       RUN_FAILED
+    end
+
+    # MVP-0018 — the normal operator mode for a connected personal runner: poll,
+    # claim, execute, repeat, until interrupted.
+    #
+    # It reuses `claim-once`'s resolution and readiness gates verbatim — the same
+    # stored connection, the same Keychain credential, the same executor readiness
+    # check — and adds only repetition. The readiness gate runs ONCE here rather
+    # than per poll: it probes the provider CLI, and doing that every minute would
+    # be a cost with no new information.
+    def loop_mode(args)
+      interval = PollInterval.resolve(option(args, "--poll-interval"))
+      return usage(interval.error) unless interval.valid?
+
+      policy = option(args, "--on-failure").to_s.strip
+      policy = LoopRunner::ON_FAILURE_CONTINUE if policy.empty?
+      return usage("--on-failure must be one of: #{LoopRunner::FAILURE_POLICIES.join(', ')}") unless
+        LoopRunner::FAILURE_POLICIES.include?(policy)
+
+      start_loop(args, interval, policy)
+    end
+
+    def start_loop(args, interval, policy)
+      config = resolve_claim_config(args)
+      return USAGE_ERROR if config.nil?
+
+      auth = config.resolve_auth(env: env)
+      announce(config, auth)
+      out.puts "Poll interval: #{interval.notice || "#{interval.seconds}s"}"
+      return RUN_FAILED unless executor_ready?(config)
+
+      run_loop(config, auth, interval, policy)
+    rescue ClaudeProfile::Error => e
+      err.puts "Invalid executor profile: #{e.message}"
+      USAGE_ERROR
+    rescue Config::Error => e
+      err.puts "Invalid runner config: #{e.message}"
+      USAGE_ERROR
+    end
+
+    def run_loop(config, auth, interval, policy)
+      client = PlatformClient.new(base_url: config.base_url, token: auth.token)
+      result = LoopRunner.call(
+        out: out, err: err, poll_seconds: interval.seconds, on_failure: policy,
+        claim: -> { client.claim(config.claim_runner_params) },
+        execute: ->(payload) { execute(config, client, payload) == SUCCESS }
+      )
+      result == LoopRunner::OK ? SUCCESS : RUN_FAILED
     end
 
     # Print PLATFORM's reason for a not-claimed poll, so an unconnected runner is told to run
@@ -327,6 +379,8 @@ module SpecrelayRunner
       err.puts message if message
       err.puts "Usage: specrelay-runner connect <enrollment-code>"
       err.puts "       specrelay-runner claim-once [--workspace <workspace-key>]"
+      err.puts "       specrelay-runner loop [--workspace <workspace-key>] " \
+               "[--poll-interval <#{PollInterval::MINIMUM}-#{PollInterval::MAXIMUM}>] [--on-failure continue|stop]"
       USAGE_ERROR
     end
 
@@ -340,7 +394,7 @@ module SpecrelayRunner
         specrelay-runner — the SpecRelay execution plane
 
         A developer-installed runner that talks to Platform ONLY over the runner
-        API (HTTP). It claims one approved run, runs the configured executor and
+        API (HTTP). It claims approved runs, runs the configured executor and
         tests locally, and uploads events/heartbeat/report through the API.
 
         This is the one supported way to execute SpecRelay work. Platform's
@@ -373,6 +427,36 @@ module SpecrelayRunner
               --workspace picks one when several are connected. Exits 0 on
               completion or no eligible work, 1 on a failed execution, 2 on a
               config/usage error.
+
+              Use this for a controlled, single-shot manual test. For day-to-day
+              operation, leave `loop` running instead.
+
+          specrelay-runner loop [--workspace <workspace-key>]
+                                [--poll-interval <seconds>]
+                                [--on-failure continue|stop]
+              The normal mode for a connected machine: poll Platform for eligible
+              work, claim ONE run at a time, execute it, and keep going. Uses the
+              same stored connection and Keychain credential as `claim-once`.
+
+              While the executor runs, safe redacted executor output is streamed to
+              this terminal between [core.started] and [verification.started], and
+              submitted to Platform as ordered live log events. When the provider is
+              quiet, a periodic heartbeat line proves forward progress. Output is
+              redacted, per-line clipped, and budget-capped; truncation is printed.
+
+              --poll-interval defaults to #{PollInterval::DEFAULT}s; the supported
+              range is #{PollInterval::MINIMUM}-#{PollInterval::MAXIMUM}s. A value
+              outside it is clamped and the clamp is printed; a non-numeric value is
+              refused.
+              --on-failure continue (default) reports a failed run through the normal
+              terminal-result contract and resumes polling; stop ends the session.
+
+              Ctrl-C (or SIGTERM) stops it cleanly and says whether it was idle or an
+              execution was in progress. Foreground only — installing it as a service
+              is deliberately out of scope.
+
+              Exits 0 when every executed run succeeded, 1 if any failed or the
+              credential was rejected, 2 on a config/usage error.
 
         Advanced / legacy — supported for an existing hand-written setup, and NOT the
         documented way to set a machine up:
