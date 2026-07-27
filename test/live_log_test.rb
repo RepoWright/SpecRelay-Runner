@@ -1,0 +1,375 @@
+# frozen_string_literal: true
+
+require_relative "test_helper"
+
+# MVP-0018 proof for live executor output on the standalone runner.
+#
+# The three claims that matter, each asserted against real behaviour rather than
+# against a mock of it:
+#
+#   1. output is INCREMENTAL. A real child process is spawned that prints, sleeps,
+#      then prints again; the test measures the arrival gap. Under the previous
+#      `IO#read(n)` reader both lines arrived at process exit, so the gap assertion
+#      fails against pre-fix source — which is what makes it a regression test.
+#   2. output is SAFE. Redaction happens before the terminal write and before the
+#      upload, per-line clipping and a whole-run byte budget are enforced, and
+#      reaching the budget is announced instead of silently dropping output.
+#   3. output cannot break the run. A consumer that raises, and a Platform that
+#      refuses the upload, both leave the execution's captured result untouched.
+class LiveLogTest < Minitest::Test
+  Sink = Struct.new(:lines, :times) do
+    def to_proc = ->(source, line) { lines << [ source, line ] and times << Process.clock_gettime(Process::CLOCK_MONOTONIC) }
+  end
+
+  def setup
+    @tmp = Dir.mktmpdir("live-log")
+  end
+
+  def teardown
+    FileUtils.remove_entry(@tmp) if @tmp && File.directory?(@tmp)
+  end
+
+  # ---- CommandRunner: incremental delivery -------------------------------
+
+  def test_output_lines_arrive_while_the_process_is_still_running
+    script = write_script(<<~RUBY)
+      $stdout.sync = true
+      puts "first line"
+      sleep 0.5
+      puts "second line"
+    RUBY
+    seen = []
+    result = SpecrelayRunner::CommandRunner.run(
+      [ RbConfig.ruby, script ], chdir: @tmp, env: { "PATH" => ENV["PATH"] }, timeout_seconds: 20,
+      on_output: ->(source, line) { seen << [ monotonic, source, line ] }
+    )
+
+    assert_equal 0, result.exit_code
+    assert_equal 2, seen.size, "both lines must be delivered, got #{seen.inspect}"
+    gap = seen[1][0] - seen[0][0]
+    assert_operator gap, :>=, 0.3,
+                    "the first line must arrive BEFORE the process exits; a #{gap.round(3)}s gap means " \
+                    "both lines were delivered at exit (buffered, not streamed)"
+    assert_equal [ "stdout", "first line" ], seen[0][1..2]
+    assert_equal [ "stdout", "second line" ], seen[1][1..2]
+  end
+
+  def test_stdout_and_stderr_are_delivered_with_distinct_stream_names
+    script = write_script(<<~RUBY)
+      $stdout.sync = true
+      $stderr.sync = true
+      puts "to stdout"
+      warn "to stderr"
+    RUBY
+    seen = []
+    SpecrelayRunner::CommandRunner.run([ RbConfig.ruby, script ], chdir: @tmp, env: { "PATH" => ENV["PATH"] },
+                                                                 timeout_seconds: 20,
+                                                                 on_output: ->(s, l) { seen << [ s, l ] })
+
+    assert_includes seen, [ "stdout", "to stdout" ]
+    assert_includes seen, [ "stderr", "to stderr" ]
+  end
+
+  def test_a_final_line_without_a_trailing_newline_is_still_delivered
+    script = write_script('$stdout.write("no trailing newline")')
+    seen = []
+    SpecrelayRunner::CommandRunner.run([ RbConfig.ruby, script ], chdir: @tmp, env: { "PATH" => ENV["PATH"] },
+                                                                 timeout_seconds: 20,
+                                                                 on_output: ->(s, l) { seen << [ s, l ] })
+
+    assert_equal [ [ "stdout", "no trailing newline" ] ], seen
+  end
+
+  def test_a_consumer_that_raises_cannot_fail_the_execution
+    script = write_script('puts "still captured"')
+    result = SpecrelayRunner::CommandRunner.run([ RbConfig.ruby, script ], chdir: @tmp,
+                                                                          env: { "PATH" => ENV["PATH"] }, timeout_seconds: 20,
+                                                                          on_output: ->(_s, _l) { raise "consumer exploded" })
+
+    assert_equal 0, result.exit_code
+    assert_includes result.stdout, "still captured", "the buffered capture stays authoritative"
+  end
+
+  def test_multibyte_output_split_across_reads_always_decodes_as_valid_utf8
+    # 120_000 bytes of two-byte characters with a single trailing newline, so a
+    # character necessarily straddles the boundary between two 64KiB reads AND the
+    # pending-line cap forces a partial flush. Both paths must still yield text a
+    # terminal, a JSON body, and a browser can render.
+    script = write_script('$stdout.write(("é" * 60_000) + "\n")')
+    seen = []
+    SpecrelayRunner::CommandRunner.run([ RbConfig.ruby, script ], chdir: @tmp, env: { "PATH" => ENV["PATH"] },
+                                                                 timeout_seconds: 30,
+                                                                 on_output: ->(s, l) { seen << [ s, l ] })
+
+    refute_empty seen
+    seen.each do |_source, line|
+      assert_equal Encoding::UTF_8, line.encoding
+      assert_predicate line, :valid_encoding?, "no delivered line may carry a split multi-byte character"
+    end
+  end
+
+  def test_a_line_that_never_terminates_is_delivered_rather_than_buffered_forever
+    # No newline at all, and more than the pending-line cap: the consumer must see
+    # it while the process is still alive instead of at exit.
+    script = write_script(<<~RUBY)
+      $stdout.sync = true
+      $stdout.write("a" * (#{SpecrelayRunner::CommandRunner::MAX_PENDING_LINE_BYTES} + 1))
+      sleep 0.5
+      $stdout.write("\\n")
+    RUBY
+    seen = []
+    SpecrelayRunner::CommandRunner.run([ RbConfig.ruby, script ], chdir: @tmp, env: { "PATH" => ENV["PATH"] },
+                                                                 timeout_seconds: 20,
+                                                                 on_output: ->(_s, l) { seen << [ monotonic, l ] })
+
+    refute_empty seen
+    assert_operator seen.first[0], :<, monotonic - 0.4,
+                    "an unterminated long line must be flushed before the process exits"
+  end
+
+  # ---- ExecutorLogStream: redaction, bounds, heartbeats -------------------
+
+  def test_a_secret_is_redacted_before_the_terminal_write_and_before_the_upload
+    stream, io, emitter = build_stream
+    stream.accept("stdout", "using token sk-live-DO-NOT-LEAK-0123456789 now")
+    stream.finish
+
+    refute_includes io.string, "sk-live-DO-NOT-LEAK-0123456789", "the terminal must never show the secret"
+    chunks = emitter.chunks
+    assert_equal 1, chunks.size
+    refute_includes chunks.first[:log_chunk], "sk-live-DO-NOT-LEAK-0123456789", "the upload must never carry the secret"
+    assert_includes chunks.first[:log_chunk], "[REDACTED]"
+    refute_includes stream.evidence_text, "sk-live-DO-NOT-LEAK-0123456789", "the report evidence must not carry it either"
+  end
+
+  def test_one_overlong_line_is_clipped_with_a_visible_marker
+    stream, io, emitter = build_stream
+    stream.accept("stdout", "x" * (SpecrelayRunner::ExecutorLogStream::MAX_LINE_BYTES + 5_000))
+    stream.finish
+
+    chunk = emitter.chunks.first[:log_chunk]
+    assert_operator chunk.bytesize, :<=, SpecrelayRunner::ExecutorLogStream::MAX_LINE_BYTES
+    assert_includes chunk, "[line clipped at"
+    assert_includes io.string, "[line clipped at"
+  end
+
+  def test_the_whole_run_budget_is_capped_and_the_truncation_is_announced_once
+    stream, io, emitter = build_stream
+    line = "y" * 1_000
+    200.times { stream.accept("stdout", line) } # far beyond MAX_TOTAL_BYTES
+    stream.finish
+    stream.finish # idempotent: a second stop must not re-announce
+
+    assert_predicate stream, :truncated?
+    truncations = emitter.events_of("log.truncated")
+    assert_equal 1, truncations.size, "the truncation notice is emitted exactly once"
+    assert_equal 1, io.string.scan("reached its").size, "and printed exactly once"
+    total = emitter.chunks.sum { |c| c[:log_chunk].bytesize }
+    assert_operator total, :<=, SpecrelayRunner::ExecutorLogStream::MAX_TOTAL_BYTES
+  end
+
+  def test_every_uploaded_chunk_stays_within_the_platform_per_event_cap
+    stream, _io, emitter = build_stream
+    500.times { |i| stream.accept("stdout", "line #{i} #{'z' * 200}") }
+    stream.finish
+
+    emitter.chunks.each do |chunk|
+      assert_operator chunk[:log_chunk].bytesize, :<=, 65_536,
+                      "a single log.chunk must stay inside the documented 65536-byte contract cap"
+    end
+  end
+
+  def test_a_chunk_event_names_its_stream_and_phase
+    stream, _io, emitter = build_stream
+    stream.accept("stderr", "a diagnostic line")
+    stream.finish
+
+    attributes = emitter.chunks.first[:attributes]
+    assert_equal "stderr", attributes[:log_source]
+    assert_equal "core", attributes[:phase]
+  end
+
+  def test_a_heartbeat_is_emitted_only_while_the_provider_is_quiet
+    clock = FakeClock.new
+    stream, io, emitter = build_stream(clock: clock, heartbeat_interval: 10)
+    clock.advance(11)
+    stream.send(:heartbeat_if_quiet)
+
+    beats = emitter.events_of("core.progress")
+    assert_equal 1, beats.size, "a quiet provider gets a heartbeat"
+    assert_includes beats.first[:summary], "no new output yet"
+    assert_includes io.string, "no new output yet"
+
+    # Output resumes: the provider is no longer quiet, so no further heartbeat.
+    stream.accept("stdout", "talking again")
+    stream.send(:heartbeat_if_quiet)
+    assert_equal 1, emitter.events_of("core.progress").size,
+                 "a heartbeat must never stand in for output that was actually available"
+    stream.finish
+
+    # The quiet period is part of what the operator saw, so it belongs in the report
+    # evidence too — otherwise the file cannot explain why the run took as long as it did.
+    assert_includes stream.evidence_text, "[status] fake executor running for",
+                    "the evidence file must record the heartbeats, not only the chatty moments"
+  end
+
+  def test_an_upload_failure_is_counted_and_reported_but_never_raised
+    stream, io, emitter = build_stream
+    emitter.fail_next!
+    stream.accept("stdout", "a line that cannot be delivered")
+    stream.finish
+
+    assert_includes io.string, "could not be delivered to Platform"
+    assert_includes io.string, "a line that cannot be delivered", "the terminal still showed it"
+    assert_includes stream.evidence_text, "a line that cannot be delivered", "and the report still records it"
+  end
+
+  def test_a_stop_signal_on_a_log_event_response_is_observed
+    stream, _io, emitter = build_stream
+    emitter.lease = { "state" => "cancelled", "cancel_requested" => true }
+    stream.accept("stdout", "a line")
+    stream.finish
+
+    assert_equal "cancelled", stream.stop_reason
+  end
+
+  def test_the_evidence_file_distinguishes_live_output_from_the_full_capture
+    stream, _io, _emitter = build_stream
+    stream.accept("stdout", "hello")
+    stream.finish
+    text = stream.evidence_text
+
+    assert_includes text, "evidence/stdout.log", "it points at where the full capture lives"
+    assert_includes text, "[stdout] hello"
+    assert_includes text, "Redacted before display, before upload"
+  end
+
+  def test_a_run_with_no_executor_output_says_so_rather_than_producing_an_empty_file
+    stream, _io, emitter = build_stream
+    stream.finish
+
+    assert_includes stream.evidence_text, "(the executor emitted no live output)"
+    assert_empty emitter.chunks
+  end
+
+  # ---- end to end over real HTTP -----------------------------------------
+
+  def test_live_log_events_land_between_core_started_and_verification_started
+    with_execution do |platform, output|
+      types = platform.protocol_events.map { |e| e["event_type"] }
+      core = types.index("core.started")
+      verification = types.index("verification.started")
+      chunk = types.index("log.chunk")
+
+      refute_nil chunk, "a live log event must be submitted; got #{types.inspect}"
+      assert_operator core, :<, chunk
+      assert_operator chunk, :<, verification
+      assert_includes output, "[fake:stdout]", "and the same output is shown in the terminal"
+    end
+  end
+
+  def test_the_event_sequence_stays_dense_and_monotonic_with_log_events_interleaved
+    with_execution do |platform, _output|
+      sequences = platform.protocol_events.map { |e| e["sequence"] }
+      assert_equal (1..sequences.size).to_a, sequences,
+                   "adding a concurrently-emitted log stream must not skip or reuse a sequence"
+    end
+  end
+
+  def test_the_uploaded_report_carries_the_bounded_live_log_as_its_own_evidence_file
+    with_execution do |platform, _output|
+      files = platform.last_report.dig(:body, "report", "files").to_h { |f| [ f["relative_path"], f ] }
+      path = SpecrelayRunner::ReportBundle::LIVE_LOG_PATH
+      assert_includes files.keys, path
+      assert_includes files.keys, "evidence/stdout.log", "the full capture is still a separate file"
+
+      body = Base64.decode64(files.fetch(path)["content_base64"])
+      refute_includes body, "sk-live-DO-NOT-LEAK", "the demo executor's planted secret must be redacted"
+      assert_includes body, "[stdout]"
+      assert_includes platform.last_terminal_result.fetch("artifacts"), path
+    end
+  end
+
+  private
+
+  def monotonic = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
+  def write_script(body)
+    path = File.join(@tmp, "script-#{rand(1 << 32)}.rb")
+    File.write(path, body)
+    path
+  end
+
+  # A stream wired to a recording emitter, with the timer thread never started so
+  # the heartbeat/flush schedule is driven explicitly by the test.
+  def build_stream(clock: FakeClock.new, heartbeat_interval: 15)
+    io = StringIO.new
+    emitter = RecordingEmitter.new
+    stream = SpecrelayRunner::ExecutorLogStream.new(
+      emitter: emitter, io: io, provider: "fake", task_id: "DEMO-0018",
+      clock: clock, heartbeat_interval: heartbeat_interval
+    )
+    [ stream, io, emitter ]
+  end
+
+  def with_execution
+    root, executor = DemoWorkspace.build
+    platform = FakePlatform.new(claim_payload: claim_payload_for(task_id: "DEMO-0018", executor_command: executor)).start
+    path = File.join(Dir.mktmpdir("cfg"), "runner.yml")
+    File.write(path, <<~YAML)
+      platform:
+        base_url: #{platform.base_url}
+        token_env: TEST_TOKEN
+      runner:
+        id: live-log-runner
+        display_name: Live Log Runner
+        claim_policy:
+          mode: all_eligible
+      workspace_roots:
+        tiny-demo-workspace: #{root}
+    YAML
+    io = StringIO.new
+    code = SpecrelayRunner::CLI.run(%W[claim-once --config #{path}], out: io, err: io,
+                                                                    env: { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN, "PATH" => ENV["PATH"] })
+    assert_equal SpecrelayRunner::CLI::SUCCESS, code, io.string
+    yield platform, io.string
+  ensure
+    platform&.stop
+    FileUtils.remove_entry(root) if root && File.directory?(root)
+  end
+
+  # A monotonic clock the test advances by hand, so heartbeat timing is exact
+  # rather than slept for.
+  class FakeClock
+    def initialize = @now = 1_000.0
+    def advance(seconds) = @now += seconds
+    def clock_gettime(_id) = @now
+  end
+
+  # Records what the stream tried to send, and can be told to fail or to return a
+  # stop-signalling lease.
+  class RecordingEmitter
+    attr_accessor :lease
+    attr_reader :sent
+
+    def initialize
+      @sent = []
+      @fail_next = false
+      @lease = { "state" => "active", "cancel_requested" => false }
+    end
+
+    def fail_next! = @fail_next = true
+
+    def emit(event_type, summary, log_chunk: nil, **attributes)
+      @sent << { type: event_type, summary: summary, log_chunk: log_chunk, attributes: attributes }
+      if @fail_next
+        @fail_next = false
+        raise SpecrelayRunner::PlatformClient::Error, "simulated transport failure"
+      end
+      { "lease" => lease }
+    end
+
+    def chunks = @sent.select { |e| e[:type] == "log.chunk" }
+    def events_of(type) = @sent.select { |e| e[:type] == type }
+  end
+end

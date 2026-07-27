@@ -47,6 +47,7 @@ module SpecrelayRunner
       @workspace = payload.fetch("workspace")
       @claim = payload.fetch("claim").fetch("runner_execution_id")
       @heartbeater = nil
+      @log_stream = nil
       @lease_stop_reason = nil
       @controls = ProtocolControls.new(env: env)
       @emitter = EventEmitter.new(client: client, run_id: @run.fetch("id"), attempt_id: @claim)
@@ -71,6 +72,9 @@ module SpecrelayRunner
       # secret-safe recovery guidance and exit non-zero cleanly.
       preflight_failure(e)
     ensure
+      # The log stream owns a timer thread, so it is stopped on EVERY exit path —
+      # including the aborted/mismatch/preflight ones — before the heartbeater.
+      @log_stream&.finish
       @heartbeater&.stop
     end
 
@@ -95,7 +99,7 @@ module SpecrelayRunner
     end
 
     def check_stop!
-      reason = @heartbeater&.stop_reason || @lease_stop_reason
+      reason = @heartbeater&.stop_reason || @log_stream&.stop_reason || @lease_stop_reason
       raise Aborted, reason if reason
     end
 
@@ -212,7 +216,8 @@ module SpecrelayRunner
       emit("attempt.completed", "Uploading failed execution report for #{run['task_id']}", phase: "completed")
       bundle = ReportBundle.build(payload: payload, status: ReportBundle::STATUS_FAILED, executor: executor_result,
                                   test: test, changes: changes, base_commit: worktree.base_commit,
-                                  worktree_path: worktree.path, failure_details: reason)
+                                  worktree_path: worktree.path, failure_details: reason,
+                                  live_log: live_log_evidence)
       terminal = terminal_result(status: ReportBundle::STATUS_FAILED, final_sequence: emitter.sequence,
                                  exit_code: executor_result.exit_code, base_commit: worktree.base_commit,
                                  changes: changes, error_classification: "worktree_unmeasurable")
@@ -265,9 +270,35 @@ module SpecrelayRunner
                     create_command: workspace.fetch("worktree_create_command")).create
     end
 
+    # MVP-0018 — the executor runs with a live output sink attached, so safe,
+    # redacted, bounded progress reaches the terminal and Platform BETWEEN
+    # `core.started` and `verification.started` instead of only at process exit.
+    #
+    # The stream is stopped here rather than only in the outer `ensure`, so its
+    # final flush and truncation notice land before `verification.started` — the
+    # live executor log is a record of the CORE phase, not of everything after it.
     def run_executor(worktree, staging)
+      @log_stream = start_log_stream
       Executor.new(config: payload.fetch("executor"), worktree_path: worktree.path, staging_dir: staging, env: env)
-              .run(prompt_text(worktree.path))
+              .run(prompt_text(worktree.path), on_output: @log_stream.sink)
+    ensure
+      @log_stream&.finish
+    end
+
+    def start_log_stream
+      ExecutorLogStream.start(emitter: emitter, io: io, provider: provider, task_id: run["task_id"])
+    end
+
+    # The bounded live-log text for the report, or nil when nothing streamed. Kept
+    # separate from the full stdout/stderr capture on purpose (see ReportBundle).
+    def live_log_evidence = @log_stream&.evidence_text
+
+    # The report-relative artifacts named in the terminal-result envelope. The live
+    # executor log joins the list only when it exists, so a run with no streamed
+    # output never claims an artifact it did not upload.
+    def terminal_artifacts
+      base = %w[README.md manifest.yml evidence/stdout.log evidence/tests.log evidence/diff.txt]
+      live_log_evidence ? base + [ ReportBundle::LIVE_LOG_PATH ] : base
     end
 
     def run_tests(worktree, root)
@@ -291,7 +322,8 @@ module SpecrelayRunner
            phase: "completed", exit_code: test[:exit_code])
       bundle = ReportBundle.build(payload: payload, status: status, executor: executor_result, test: test,
                                   changes: changes, base_commit: worktree.base_commit, worktree_path: worktree.path,
-                                  failure_details: failure_details(status, test, publication_failure))
+                                  failure_details: failure_details(status, test, publication_failure),
+                                  live_log: live_log_evidence)
       terminal = terminal_result(status: status, final_sequence: emitter.sequence, exit_code: test[:exit_code],
                                  base_commit: worktree.base_commit, changes: changes, publication: publication,
                                  error_classification: publication_failure ? "publication_failed" : nil)
@@ -311,7 +343,8 @@ module SpecrelayRunner
       emit("attempt.completed", "Uploading failed execution report for #{run['task_id']}", phase: "completed")
       bundle = ReportBundle.build(payload: payload, status: ReportBundle::STATUS_FAILED, executor: executor_result,
                                   test: test, changes: changes, base_commit: worktree.base_commit,
-                                  worktree_path: worktree.path, failure_details: message)
+                                  worktree_path: worktree.path, failure_details: message,
+                                  live_log: live_log_evidence)
       terminal = terminal_result(status: ReportBundle::STATUS_FAILED, final_sequence: emitter.sequence,
                                  exit_code: executor_result.exit_code, base_commit: worktree.base_commit,
                                  changes: changes, error_classification: classification)
@@ -342,7 +375,7 @@ module SpecrelayRunner
         final_sequence: final_sequence, exit_code: exit_code,
         error_classification: succeeded ? nil : (error_classification || "tests_failed"),
         repositories: publication || unpublished_repositories(base_commit, changes),
-        artifacts: %w[README.md manifest.yml evidence/stdout.log evidence/tests.log evidence/diff.txt]
+        artifacts: terminal_artifacts
       )
     end
 
@@ -437,7 +470,13 @@ module SpecrelayRunner
     def runner_name = payload.dig("claim", "runner_display_name").to_s
     def provider = payload.dig("executor", "provider").to_s
 
-    def log(message) = io.puts(Redaction.redact(message.to_s))
+    # Flushed for the same reason the live log stream is (MVP-0018): a redirected
+    # stdout is block-buffered, so an unflushed phase line only appears at exit and
+    # the operator cannot tell a working run from a stuck one.
+    def log(message)
+      io.puts(Redaction.redact(message.to_s))
+      io.flush if io.respond_to?(:flush)
+    end
 
     def executor_failure(result)
       return Redaction.redact("the #{provider} executor could not be started: #{result.launch_error}") if result.launch_error

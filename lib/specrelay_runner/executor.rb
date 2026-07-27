@@ -47,12 +47,18 @@ module SpecrelayRunner
     # prompt_text is the approved-spec-derived handoff prompt (with a runner-local
     # preamble prepended by Execution). Returns the process Result plus the
     # sanitized argv for report evidence.
-    def run(prompt_text)
+    #
+    # `on_output` (MVP-0018) receives `(stream, line)` for each complete line the
+    # executor writes, while it is still running. It is passed straight through to
+    # CommandRunner, which guarantees it can neither change nor fail the captured
+    # result — this method's contract is unchanged when it is nil.
+    def run(prompt_text, on_output: nil)
       prompt_path = write_prompt(prompt_text)
       result = CommandRunner.run(
         launch_argv(prompt_text, prompt_path),
         chdir: worktree_path, env: process_env,
-        timeout_seconds: timeout_seconds, stdin_data: (prompt_text if stdin_prompt?)
+        timeout_seconds: timeout_seconds, stdin_data: (prompt_text if stdin_prompt?),
+        on_output: on_output
       )
       Result.new(exit_code: result.exit_code, stdout: result.stdout, stderr: result.stderr,
                  duration_seconds: result.duration_seconds, timed_out: result.timed_out,
