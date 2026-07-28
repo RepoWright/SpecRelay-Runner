@@ -11,6 +11,7 @@ $LOAD_PATH.unshift(File.expand_path("../lib", __dir__))
 require "specrelay_runner"
 
 require_relative "support/fake_platform"
+require_relative "support/fake_secret_store"
 require_relative "support/demo_workspace"
 require_relative "support/fake_github"
 require_relative "support/fake_claude_cli"

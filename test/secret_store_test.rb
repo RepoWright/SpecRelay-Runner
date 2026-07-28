@@ -301,4 +301,48 @@ class SecretStoreTest < Minitest::Test
     end
     assert_empty runner.invocations
   end
+
+  # --- deletion (MVP-0021 scope 5) ------------------------------------------
+
+  def test_deleting_a_credential_addresses_exactly_that_account_and_service
+    runner = RecordingRunner.new([ ok ])
+
+    assert SpecrelayRunner::SecretStore.new(runner: runner).delete_credential(account: ACCOUNT)
+    assert_equal [ [ "security", "delete-generic-password", "-a", ACCOUNT, "-s", SERVICE ] ],
+                 runner.invocations
+  end
+
+  # `security` exits non-zero when there is nothing to delete. That is the state the caller asked
+  # for, so it is success — an operator cleaning up a connection whose credential was already
+  # gone must not be shown a failure.
+  def test_deleting_a_credential_that_is_not_there_is_success
+    runner = RecordingRunner.new([ failed(stderr: "SecKeychainSearchCopyNext: The specified item could not be found") ])
+
+    assert SpecrelayRunner::SecretStore.new(runner: runner).delete_credential(account: ACCOUNT)
+  end
+
+  # Only a tool that could not be RUN is a failure: unlike "no such item", it means the operator's
+  # request was not carried out and they need to know.
+  def test_a_keychain_that_cannot_be_reached_raises_and_names_the_account
+    runner = RecordingRunner.new([ nil ])
+
+    error = assert_raises(SpecrelayRunner::SecretStore::Error) do
+      SpecrelayRunner::SecretStore.new(runner: runner).delete_credential(account: ACCOUNT)
+    end
+
+    assert_match(/could not remove the Keychain item #{Regexp.escape(ACCOUNT)}/, error.message)
+    assert_match(/could not be run/, error.message)
+  end
+
+  def test_a_deletion_that_times_out_is_reported_as_a_timeout
+    timed_out = SpecrelayRunner::CommandRunner::Result.new(exit_code: nil, stdout: "", stderr: "", timed_out: true)
+    runner = RecordingRunner.new([ timed_out ])
+
+    error = assert_raises(SpecrelayRunner::SecretStore::Error) do
+      SpecrelayRunner::SecretStore.new(runner: runner).delete_credential(account: ACCOUNT)
+    end
+
+    assert_match(/did not finish within/, error.message)
+    refute_match(/exit \)/, error.message)
+  end
 end

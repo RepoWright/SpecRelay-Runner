@@ -18,6 +18,11 @@ module SpecrelayRunner
     Error = Class.new(StandardError)
     Unauthorized = Class.new(Error)
     RequestFailed = Class.new(Error)
+    # A 404. Distinguished from RequestFailed because for the MVP-0021 connection test it is
+    # not a failure at all — it is the specific, actionable answer "Platform holds no grant
+    # for this runner on that workspace", which names a different remedy (reconnect) than a
+    # rejected credential or an unreachable Platform.
+    NotFound = Class.new(Error)
 
     # The header the non-destructive reconnect uses to present the credential this machine
     # already holds. Deliberately not the request body: see #enroll.
@@ -87,6 +92,26 @@ module SpecrelayRunner
       status == 201 ? body : raise_for(status, body)
     end
 
+    # GET /api/runner/workspace_connections/<workspace_key> (MVP-0021 scope 3). What Platform
+    # currently believes about THIS runner's grant for one workspace: its state, the
+    # repository identity the workspace defines today, and the executor it resolves to. A
+    # pure read — it consumes nothing and cannot demote a working connection, so the
+    # readiness test is safe to run repeatedly. Raises NotFound (404) when this runner holds
+    # no grant for that workspace, which is a diagnosis rather than an error.
+    def describe_workspace_connection(workspace_key:)
+      status, body = request_json(Net::HTTP::Get, connection_path(workspace_key))
+      status == 200 ? body : raise_for(status, body)
+    end
+
+    # DELETE /api/runner/workspace_connections/<workspace_key> (MVP-0021 scope 6). Asks
+    # Platform to remove THIS runner's grant for ONE workspace. Idempotent server-side: a
+    # grant that is already absent returns 200 with `outcome: already_absent`, so a retry
+    # after a dropped response is a success. Never revokes the runner identity.
+    def disconnect_workspace_connection(workspace_key:)
+      status, body = request_json(Net::HTTP::Delete, connection_path(workspace_key))
+      status == 200 ? body : raise_for(status, body)
+    end
+
     # POST /api/runner/claim. Returns a ClaimResult: claimed with the run payload,
     # or not claimed when Platform authorizes no eligible work under the policy.
     def claim(runner_params)
@@ -146,17 +171,30 @@ module SpecrelayRunner
 
     attr_reader :base, :token, :http
 
+    # The workspace key is a path SEGMENT, so it is escaped rather than interpolated: a key
+    # containing a slash or a space would otherwise silently address a different route.
+    def connection_path(workspace_key)
+      "/api/runner/workspace_connections/#{URI.encode_www_form_component(workspace_key.to_s)}"
+    end
+
     # `payload` is always an explicit Hash at every call site: this method takes a keyword
     # argument, so a trailing `key: value` list would be parsed as keywords rather than converted
     # into the positional payload hash.
     def post_json(path, payload, headers: {})
+      request_json(Net::HTTP::Post, path, payload: payload, headers: headers)
+    end
+
+    # One request shape for every verb. The bearer, the JSON headers, the timeouts, and the
+    # transport-failure mapping are identical for a read and a write, so they live here once
+    # rather than being re-derived per method.
+    def request_json(verb, path, payload: nil, headers: {})
       uri = URI.join(base.to_s, path)
-      request = Net::HTTP::Post.new(uri)
+      request = verb.new(uri)
       request["Authorization"] = "Bearer #{token}"
       request["Content-Type"] = "application/json"
       request["Accept"] = "application/json"
       headers.each { |name, value| request[name] = value }
-      request.body = JSON.generate(payload)
+      request.body = JSON.generate(payload) unless payload.nil?
 
       response = http.start(uri.host, uri.port, use_ssl: uri.scheme == "https",
                             open_timeout: @open_timeout, read_timeout: @read_timeout) do |conn|
@@ -176,6 +214,8 @@ module SpecrelayRunner
     def raise_for(status, body)
       message = body.is_a?(Hash) ? body["error"].to_s : ""
       raise Unauthorized, "Platform rejected the runner token (401)#{": #{message}" unless message.empty?}" if status == 401
+      raise NotFound, "Platform found no such resource (404)#{": #{message}" unless message.empty?}" if status == 404
+
       raise RequestFailed, "Platform request failed (#{status})#{": #{message}" unless message.empty?}"
     end
   end

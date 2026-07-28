@@ -158,6 +158,15 @@ Neither needs a config file, an exported credential, or a workspace-root
 environment variable: the credential is read from the Keychain and the workspace
 root is the checkout you validated.
 
+Which connection an argument-free invocation uses, and why, is resolved in this
+order (MVP-0021): `--workspace`, then this machine's **explicit default**, then the
+sole stored connection. Anything else asks. The chosen source is printed, so the
+decision is visible rather than inferred:
+
+```text
+Source:   connected workspace tiny-demo-workspace (your explicit default workspace)
+```
+
 `claim-once` claims at most one eligible run (**Platform** decides which), executes
 it, and uploads the report. Exit `0` on completion or no eligible work, `1` on a
 failed execution, `2` on a config/usage error.
@@ -227,6 +236,103 @@ Platform authorizes a claim only for a workspace this machine has explicitly
 connected to and been recorded `ready` for — and only while its reported
 repository identity still matches that workspace. A historical `all_eligible`
 claim policy grants nothing on its own.
+
+### 3. Manage this machine's connections (MVP-0021)
+
+```bash
+bin/specrelay-runner            # in a terminal: opens the local control center
+bin/specrelay-runner            # with no terminal: prints usage, exits 2
+bin/specrelay-runner help       # always prints help, exits 0
+```
+
+The dashboard lists every workspace this machine is connected to and, for a
+selected one, offers: `Start loop`, `Claim once`, `Test connection/readiness`,
+`Show details`, `Set as default` / `Clear default`, `Disconnect locally`,
+`Disconnect from Platform`, `Back`.
+
+Keys match `./bin/worktree`: single-key shortcuts act immediately, arrows move a
+highlight that Enter runs, `Esc`/`Ctrl-C` backs out. The terminal is restored on
+every exit path — quit, `Ctrl-C`, an error, and after a nested command — which is
+asserted under a real pty in [`test/dashboard_tty_test.rb`](test/dashboard_tty_test.rb),
+by reading the terminal's own attributes after the process exits.
+
+The no-argument split matters in both directions. Opening a menu with no terminal
+would render escape sequences into a log and then block on a keypress that can
+never arrive; exiting `0` with only help text would let a mis-scripted invocation
+pass as a successful run that executed nothing.
+
+**The dashboard is a presentation layer and nothing else.** Every action calls one
+`ConnectionOperations` method — the same one the equivalent direct command calls —
+and `Start loop` / `Claim once` hand `["loop", "--workspace", <key>]` to the CLI's
+own dispatcher. They cannot drift from the direct commands, because they *are*
+them; the command line is echoed before it runs so it can be copied.
+
+Every action is also scriptable, needs no terminal, and never prompts:
+
+```bash
+bin/specrelay-runner connections list
+bin/specrelay-runner connections show <workspace-key>
+bin/specrelay-runner connections test <workspace-key>
+bin/specrelay-runner connections default <workspace-key>
+bin/specrelay-runner connections clear-default
+bin/specrelay-runner connections disconnect-local <workspace-key> [--remove-credential]
+bin/specrelay-runner connections disconnect-platform <workspace-key>
+bin/specrelay-runner connections forget-legacy-credential <workspace-key>
+```
+
+Exit codes: `0` success, `1` an expected operation failure (Platform rejected it, a
+readiness check failed), `2` usage or unusable local state. `1` means "the answer
+is no"; `2` means "the question was wrong".
+
+#### Test connection and readiness
+
+Walks the same preconditions a claim depends on, in the order a claim hits them,
+and stops at the first failure so the remedy names the thing worth fixing:
+`local_state_invalid`, `credential_missing`, `platform_unreachable`,
+`credential_rejected`, `workspace_grant_missing`, `workspace_grant_not_ready`,
+`repository_mismatch`, `executor_unavailable`, `executor_not_authenticated`, or
+`ok`.
+
+It **claims nothing** — no run requested, no lease taken, no readiness report
+submitted, and Platform's half is a pure `GET`. It can be run repeatedly without
+risking the connection it is testing, which is what makes it usable as a first move
+when something looks wrong.
+
+#### The explicit default workspace
+
+Stored in the runner's own non-secret local state as `default_workspace_key`. With
+it set, `loop` and `claim-once` run with no `--workspace` even when several
+workspaces are connected, and they print that the default was used.
+
+There is no implicit default by recency, alphabet, project, or last menu row, and a
+default that no longer resolves **fails closed** — it is checked before the
+sole-connection shortcut, so it cannot fall through even on a machine with exactly
+one remaining connection.
+
+A `connections.json` written by an earlier runner has no such key, loads unchanged,
+and simply has no default; the document is written as version 2 the next time it
+changes.
+
+#### Two disconnects
+
+| | Effect |
+|---|---|
+| `disconnect-local` | Removes THIS machine's stored connection. Platform **still** authorizes this runner for that workspace — local deletion revokes nothing. |
+| `disconnect-platform` | Asks Platform to remove THIS runner's grant for THIS workspace. Never revokes the runner identity, never touches another workspace, and deletes no project, workspace, run, report, or branch. |
+
+The runner credential is scoped to the **runner identity**, so a local disconnect
+keeps it while any other local connection still uses it. When nothing depends on it
+any more you are asked separately (dashboard) or must pass `--remove-credential`
+(script). The pre-round-003 per-workspace Keychain item is removed only by
+`forget-legacy-credential`, which names the exact account it removes — nothing else
+in the runner ever deletes a legacy item, because a machine that connected under the
+old scheme still authenticates from it.
+
+Platform disconnect goes first; local removal is offered only after Platform
+confirms, and a **failed** Platform disconnect changes no local state.
+
+**You never need to edit `~/.specrelay/runner/connections.json`.** These commands
+write it atomically and preserve mode `0600`.
 
 ## ADVANCED / LEGACY: the hand-written config path
 
@@ -554,7 +660,18 @@ lib/specrelay_runner/
   secret_store.rb               # macOS Keychain adapter; NO plaintext fallback, credential
                                 #   delivered on stdin (never argv), account per RUNNER identity
   repository_check.rb           # local checkout identity validation (git, offline)
-  connection_store.rb           # non-secret local connection record (0600)
+  connection_store.rb           # non-secret local connection record (0600), including
+                                #   the operator's EXPLICIT default workspace (v2)
+  connection_operations.rb      # the ONE implementation of list/test/default/disconnect,
+                                #   shared by the dashboard and the direct commands
+  connection_diagnosis.rb       # the non-claiming readiness test: local state -> credential
+                                #   -> Platform -> grant -> repository -> executor
+  connection_view.rb            # the shared non-secret rendering rules (no local path in
+                                #   the top-level list; full detail in the detail view)
+  connections_command.rb        # `connections …`: argv -> one operation -> exit code
+  terminal_menu.rb              # small raw-mode keyboard menu (io/console); pure key decisions
+  dashboard.rb                  # the control center's top level (MVP-0021)
+  workspace_view.rb             # the per-workspace detail view and its actions
   config.rb                     # local YAML config (secrets from ENV only), or
                                 #   built from a stored connection
   platform_client.rb            # the ONLY Platform touchpoint (HTTP/JSON)
@@ -579,6 +696,9 @@ test/                           # minitest: fake Platform HTTP server + real git
   support/fake_platform.rb      # a real HTTP server on an ephemeral loopback port
   support/fake_github.rb        # a real bare remote + scriptable fake `gh`
   support/fake_claude_cli.rb    # an on-disk executable named `claude` (no inference)
+  support/fake_secret_store.rb  # the shared in-memory Keychain stand-in
+  dashboard_tty_test.rb         # the dashboard under a REAL pty, incl. terminal restoration
+  keychain_tty_test.rb          # credential delivery under a REAL controlling terminal
 ```
 
 ## Tests

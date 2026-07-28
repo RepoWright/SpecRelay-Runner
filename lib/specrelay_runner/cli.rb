@@ -26,12 +26,19 @@ module SpecrelayRunner
     RUN_FAILED = 1
     USAGE_ERROR = 2
 
-    def self.run(argv, out: $stdout, err: $stderr, env: ENV) = new(out:, err:, env:).run(argv)
+    def self.run(argv, out: $stdout, err: $stderr, env: ENV, input: $stdin) =
+      new(out:, err:, env:, input:).run(argv)
 
-    def initialize(out: $stdout, err: $stderr, env: ENV)
+    # `secret_store` is the deterministic injection seam the engineering constraints require, and
+    # the same one `Connect` and `ConnectionDiagnosis` already expose: it lets the stored-connection
+    # claim path — including the explicit-default resolution — be exercised as behaviour without
+    # touching the developer's real Keychain or raising an interactive prompt in CI.
+    def initialize(out: $stdout, err: $stderr, env: ENV, input: $stdin, secret_store: nil)
       @out = out
       @err = err
       @env = env
+      @input = input
+      @injected_secret_store = secret_store
     end
 
     def run(argv)
@@ -41,7 +48,9 @@ module SpecrelayRunner
       when "register" then register(rest)
       when "claim-once" then claim_once(rest)
       when "loop" then loop_mode(rest)
-      when nil, "help", "-h", "--help" then print_help
+      when "connections" then connections(rest)
+      when nil then no_arguments
+      when "help", "-h", "--help" then print_help
       when "version", "--version" then print_version
       else usage("unknown command: #{command}")
       end
@@ -49,7 +58,37 @@ module SpecrelayRunner
 
     private
 
-    attr_reader :out, :err, :env
+    attr_reader :out, :err, :env, :input
+
+    # No arguments means two DIFFERENT things, decided by whether a human is actually there
+    # (MVP-0021 scope 1).
+    #
+    # In a real terminal it opens the control center, because a connected machine's normal daily
+    # action is to look at its workspaces and start one.
+    #
+    # Anywhere else — a pipe, a cron job, a CI step, an ssh command with no tty — it prints
+    # usage and exits 2. Both halves matter. Opening a menu with no terminal would render
+    # escape sequences into a log and then block forever on a keypress that can never arrive;
+    # exiting 0 with only help text would let a mis-scripted `specrelay-runner` (a dropped
+    # argument, a typo'd subcommand) pass as a successful run that executed nothing. `help`
+    # still exits 0 — asking for help and getting it is a success.
+    def no_arguments
+      return usage("specrelay-runner needs a command when there is no terminal to open the dashboard in.") unless
+        TerminalMenu.interactive?(input: input, out: out)
+
+      Dashboard.call(operations: connection_operations, out: out, err: err, input: input,
+                     dispatch: ->(argv) { run(argv) })
+    end
+
+    # The scriptable equivalent of every dashboard action. Both surfaces drive the SAME
+    # ConnectionOperations instance type, so they cannot disagree about what an action means.
+    def connections(args)
+      ConnectionsCommand.call(args: args, out: out, err: err, operations: connection_operations)
+    end
+
+    def connection_operations = ConnectionOperations.new(env: env, secret_store: @injected_secret_store)
+
+    def secret_store = @injected_secret_store || SecretStore.for(platform: RUBY_PLATFORM)
 
     # The guided connection (MVP-0017). Every failure mode reports ONE focused, redacted
     # remedy and leaves this runner not-ready rather than half-connected: an unsupported
@@ -279,13 +318,14 @@ module SpecrelayRunner
     # store. Returns nil after printing ONE specific remedy when the connection cannot be
     # used, so a normal user is never shown a config-file error they did not cause.
     def connection_config(store, args)
-      connection = select_connection(store, option(args, "--workspace"))
-      return nil if connection.nil?
+      selection = select_connection(store, option(args, "--workspace"))
+      return nil if selection.nil?
 
-      credential = stored_credential(connection)
-      return missing_credential(connection) if credential.nil?
+      credential = stored_credential(selection.connection)
+      return missing_credential(selection.connection) if credential.nil?
 
-      Config.from_connection(connection, credential: credential)
+      Config.from_connection(selection.connection, credential: credential,
+                             selection_source: selection.source)
     rescue SecretStore::UnsupportedPlatform, SecretStore::Error => e
       err.puts "Cannot read the stored runner credential: #{Redaction.redact(e.message)}"
       nil
@@ -296,7 +336,7 @@ module SpecrelayRunner
     # (review-002, F3 residual). The credential is per runner, so keying it per workspace is what
     # let a second workspace's connection orphan the first's stored copy.
     def stored_credential(connection)
-      store = SecretStore.for(platform: RUBY_PLATFORM)
+      store = secret_store
       runner_public_id = connection.runner_public_id.to_s.strip
       unless runner_public_id.empty?
         value = store.read(account: SecretStore.account_for_runner(runner_public_id))
@@ -305,19 +345,54 @@ module SpecrelayRunner
       store.read(account: SecretStore.legacy_account_for(connection.workspace_key))
     end
 
-    # A named workspace, or the sole stored connection. Several connections with no
-    # `--workspace` is ambiguous, and guessing which workspace to claim for is exactly the
-    # inference this MVP removed — so it asks.
+    # Which connection this invocation is for, and — just as importantly — WHY.
+    #
+    # Resolution order, all of it explicit:
+    #
+    #   1. `--workspace <key>`: the operator said so.
+    #   2. An explicit default (MVP-0021 scope 4): the operator said so earlier, from the
+    #      dashboard or `connections default`. Checked BEFORE the sole-connection shortcut, so
+    #      a default that no longer resolves fails closed even on a machine with exactly one
+    #      connection. Falling through to "well, there is only one" would be precisely the
+    #      silent substitution the fail-closed rule forbids.
+    #   3. The sole stored connection: unambiguous, so no inference is involved.
+    #
+    # Anything else asks. Guessing which workspace to claim for is the inference MVP-0017
+    # removed, and a default the operator did not choose would reintroduce it — so there is no
+    # implicit default by recency, alphabet, project, or last menu row.
+    Selection = Struct.new(:connection, :source, keyword_init: true)
+
     def select_connection(store, workspace_key)
       requested = workspace_key.to_s.strip
       unless requested.empty?
         found = store.connection_for(requested)
-        return found if found
-
-        return unknown_workspace(store, requested)
+        return found ? Selection.new(connection: found, source: :requested) : unknown_workspace(store, requested)
       end
 
-      store.sole_connection || ambiguous_workspace(store)
+      default_selection(store) || sole_selection(store)
+    end
+
+    # nil means "no default is set, carry on"; a set-but-unresolvable default returns nothing
+    # AND has already reported, which `sole_selection` must not then override — so that case
+    # sets a flag rather than relying on nil, which the two states would otherwise share.
+    def default_selection(store)
+      key = store.default_workspace_key
+      return nil if key.nil?
+
+      connection = store.connection_for(key)
+      return Selection.new(connection: connection, source: :default) if connection
+
+      @default_failed = true
+      broken_default(store, key)
+    end
+
+    def sole_selection(store)
+      return nil if @default_failed
+
+      sole = store.sole_connection
+      return Selection.new(connection: sole, source: :sole) if sole
+
+      ambiguous_workspace(store)
     end
 
     def unknown_workspace(store, requested)
@@ -326,10 +401,24 @@ module SpecrelayRunner
       nil
     end
 
+    # A default naming a workspace this machine no longer has is a configuration error with a
+    # one-line fix, and it must never resolve to a different workspace: executing another
+    # project's work because a default went stale is exactly the failure mode MVP-0017 fixed.
+    def broken_default(store, key)
+      err.puts "the default workspace '#{key}' is no longer connected on this machine, so nothing " \
+               "was claimed."
+      err.puts "Connected: #{store.connections.map(&:workspace_key).join(', ')}" if store.connections.any?
+      err.puts "Remedy: choose another default (`specrelay-runner connections default <workspace-key>`), " \
+               "clear it (`specrelay-runner connections clear-default`), or pass --workspace explicitly."
+      nil
+    end
+
     def ambiguous_workspace(store)
       err.puts "several workspaces are connected " \
                "(#{store.connections.map(&:workspace_key).join(', ')}); " \
                "choose one with --workspace <workspace-key>"
+      err.puts "Or set a default once and stop passing it: `specrelay-runner connections default " \
+               "<workspace-key>` — or just run `specrelay-runner` in a terminal for the dashboard."
       nil
     end
 
@@ -357,8 +446,24 @@ module SpecrelayRunner
       out.puts "SpecRelay standalone runner #{VERSION} (contract #{CONTRACT_VERSION})"
       out.puts "Platform: #{config.base_url}"
       out.puts "Runner:   #{config.runner['display_name']} (#{config.runner['id']})"
-      out.puts "Source:   #{config.connection ? "connected workspace #{config.connection.workspace_key}" : "config file #{config.source_path}"}"
+      out.puts "Source:   #{source_line(config)}"
       out.puts "Auth:     #{auth.mode == :registered ? 'registered runner credential' : 'development token (fallback)'}"
+    end
+
+    # Names WHICH workspace and, when it was not stated on the command line, WHY this one. An
+    # operator who set a default weeks ago and now runs a bare `specrelay-runner loop` must be
+    # able to see the decision in the output rather than infer it (MVP-0021 scope 4).
+    def source_line(config)
+      return "config file #{config.source_path}" if config.connection.nil?
+
+      case config.selection_source
+      when :default
+        "connected workspace #{config.connection.workspace_key} (your explicit default workspace)"
+      when :sole
+        "connected workspace #{config.connection.workspace_key} (the only one connected here)"
+      else
+        "connected workspace #{config.connection.workspace_key}"
+      end
     end
 
     def announce_claim(payload)
@@ -377,10 +482,13 @@ module SpecrelayRunner
 
     def usage(message)
       err.puts message if message
-      err.puts "Usage: specrelay-runner connect <enrollment-code>"
+      err.puts "Usage: specrelay-runner                       (in a terminal: opens the dashboard)"
+      err.puts "       specrelay-runner connect <enrollment-code>"
       err.puts "       specrelay-runner claim-once [--workspace <workspace-key>]"
       err.puts "       specrelay-runner loop [--workspace <workspace-key>] " \
                "[--poll-interval <#{PollInterval::MINIMUM}-#{PollInterval::MAXIMUM}>] [--on-failure continue|stop]"
+      err.puts "       specrelay-runner connections <#{ConnectionsCommand::SUBCOMMANDS.join('|')}>"
+      err.puts "       specrelay-runner help"
       USAGE_ERROR
     end
 
@@ -399,6 +507,21 @@ module SpecrelayRunner
 
         This is the one supported way to execute SpecRelay work. Platform's
         `bin/platform runner once|loop` no longer executes anything.
+
+        Day-to-day operation — run it with no arguments:
+
+          specrelay-runner
+              In a terminal, opens the local control center: every workspace this
+              machine is connected to, with actions to start `loop` or `claim-once`
+              for one, test its connection and readiness without claiming work, set
+              or clear an explicit default workspace, and disconnect a workspace
+              locally or from Platform. It is a presentation layer over the
+              `connections` commands below, so anything you can do there you can
+              also script.
+
+              With no terminal (a pipe, cron, CI, `ssh host specrelay-runner`) it
+              prints this usage and exits 2 rather than rendering a menu into a log.
+              `specrelay-runner help` always prints help and exits 0.
 
         Normal setup — two commands, no files to edit:
 
@@ -457,6 +580,58 @@ module SpecrelayRunner
 
               Exits 0 when every executed run succeeded, 1 if any failed or the
               credential was rejected, 2 on a config/usage error.
+
+        Managing this machine's connections — every dashboard action, scriptable, and
+        usable with no terminal. Exit codes: 0 success, 1 the operation failed (Platform
+        rejected it, a readiness check failed), 2 usage or unusable local state.
+
+          specrelay-runner connections list
+              Every workspace this machine is connected to, newest first, with the
+              explicit default marked `*`. Shows no absolute local paths.
+
+          specrelay-runner connections show <workspace-key>
+              Everything stored locally for one workspace, including its local checkout
+              path. No credential is read or shown.
+
+          specrelay-runner connections test <workspace-key>
+              Check that this connection could still execute — WITHOUT claiming any
+              work. Verifies the local entry, the credential in the Keychain, that
+              Platform accepts it, that the workspace grant is still ready, that the
+              repository and branch still match this checkout, and that the executor is
+              ready. Reports one focused remedy for the first thing that is wrong.
+
+          specrelay-runner connections default <workspace-key>
+          specrelay-runner connections clear-default
+              Choose (or clear) this machine's default workspace. With several
+              workspaces connected, `loop` and `claim-once` then run with no
+              --workspace and print that the default was used. Nothing is ever
+              defaulted implicitly, and a default that no longer resolves fails closed
+              instead of falling through to another workspace.
+
+          specrelay-runner connections disconnect-local <workspace-key>
+                                                        [--remove-credential]
+              Remove THIS MACHINE's stored connection for one workspace. Platform still
+              authorizes this runner for it — local deletion revokes nothing. The
+              runner credential is shared by every workspace of the same runner
+              identity, so it is KEPT unless nothing depends on it any more and you
+              pass --remove-credential.
+
+          specrelay-runner connections disconnect-platform <workspace-key>
+              Ask Platform to remove THIS runner's grant for THIS one workspace.
+              Idempotent: a grant that is already gone succeeds. It never revokes the
+              runner identity, never touches another workspace, and deletes no project,
+              run, report, or branch. Local state is left alone — remove it separately
+              with disconnect-local once Platform confirms.
+
+          specrelay-runner connections forget-legacy-credential <workspace-key>
+              Remove the pre-MVP-0017 per-workspace Keychain item
+              `workspace:<workspace-key>`. Nothing else ever deletes a legacy item,
+              because a machine that connected under the old scheme still
+              authenticates from it.
+
+        Never hand-edit ~/.specrelay/runner/connections.json. The commands above (and
+        the dashboard) are the supported way to inspect and clean up local state; they
+        write it atomically and keep its 0600 permissions.
 
         Advanced / legacy — supported for an existing hand-written setup, and NOT the
         documented way to set a machine up:

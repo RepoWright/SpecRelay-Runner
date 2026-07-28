@@ -122,6 +122,22 @@ module SpecrelayRunner
       value.empty? ? nil : value
     end
 
+    # Remove one stored item (MVP-0021 scope 5). A missing item is SUCCESS, not an error:
+    # `security` exits non-zero when there is nothing to delete, and an operator cleaning up
+    # a connection whose credential was already gone has got what they asked for. The account
+    # name is non-secret by construction (`runner:<public-id>` or `workspace:<key>`), so a
+    # caller may name it in the confirmation it shows before calling this.
+    #
+    # The runner NEVER calls this as a side effect of another operation. Removing a credential
+    # is its own explicit, separately confirmed decision, because the credential is scoped to
+    # the runner identity and shared by every workspace that identity is connected to.
+    def delete_credential(account:)
+      result = delete(account)
+      raise Error, delete_failure_message(account, result) if result.nil? || result.timed_out?
+
+      true
+    end
+
     # The non-secret Keychain account name for one RUNNER identity.
     #
     # Keyed by the runner's Platform-issued public id, because that is the credential's actual
@@ -175,6 +191,13 @@ module SpecrelayRunner
 
     def delete(account)
       run([ "security", "delete-generic-password", "-a", account, "-s", SERVICE ])
+    end
+
+    # Only a tool that could not be LAUNCHED (or timed out) is a failure. A non-zero exit from
+    # `security` here means "no such item", which is the state the caller asked for.
+    def delete_failure_message(account, result)
+      "could not remove the Keychain item #{account}#{failure_suffix(result)}. " \
+        "Unlock your login keychain (Keychain Access ▸ login) and try again."
     end
 
     # Refused rather than truncated. The value itself is never named in the message.

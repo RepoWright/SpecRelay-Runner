@@ -59,7 +59,7 @@ module SpecrelayRunner
     Auth = Struct.new(:mode, :token, keyword_init: true)
 
     attr_reader :base_url, :token_env, :credential_env, :registration_token_env,
-                :runner, :workspace_roots, :source_path, :connection
+                :runner, :workspace_roots, :source_path, :connection, :selection_source
 
     def self.load(path, env: ENV)
       resolved = resolve_path(path, env)
@@ -80,7 +80,10 @@ module SpecrelayRunner
     # `all_eligible` is the honest policy value here: since MVP-0017, workspace access is
     # an explicit Platform-side grant on this runner's identity, so the routing policy is
     # no longer what bounds what it may execute.
-    def self.from_connection(connection, credential:)
+    # `selection_source` records HOW this connection was chosen (:requested, :default, :sole)
+    # so the announce line can say so. It is presentation metadata, deliberately not a
+    # decision input: nothing in this class behaves differently because of it (MVP-0021).
+    def self.from_connection(connection, credential:, selection_source: nil)
       document = {
         "platform" => { "base_url" => connection.base_url },
         "runner" => {
@@ -89,7 +92,8 @@ module SpecrelayRunner
         },
         "workspace_roots" => { connection.workspace_key.to_s => connection.local_path }
       }
-      new(document, source_path: nil, credential: credential, connection: connection)
+      new(document, source_path: nil, credential: credential, connection: connection,
+          selection_source: selection_source)
     end
 
     # An explicit `--config <path>` always wins; otherwise the canonical env var,
@@ -107,7 +111,7 @@ module SpecrelayRunner
       raise Error, "runner config is not valid YAML: #{e.message.split("\n").first}"
     end
 
-    def initialize(document, source_path: nil, credential: nil, connection: nil)
+    def initialize(document, source_path: nil, credential: nil, connection: nil, selection_source: nil)
       raise Error, "runner config must be a YAML mapping" unless document.is_a?(Hash)
 
       @source_path = source_path
@@ -115,6 +119,7 @@ module SpecrelayRunner
       # held in memory only — never written to the config file, the environment, or a log.
       @resolved_credential = presence(credential)
       @connection = connection
+      @selection_source = selection_source
       platform = fetch_hash(document, "platform")
       @base_url = presence(platform["base_url"]) or raise Error, "platform.base_url is required"
       @token_env = presence(platform["token_env"]) || TOKEN_ENV_DEFAULT
