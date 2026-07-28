@@ -29,10 +29,27 @@ class FakePlatform
   # mirroring Platform's non-destructive reconnect (review-001 F3).
   attr_accessor :held_credential
 
+  # MVP-0021: what the per-workspace GET reports. Scripted so a test can model a grant an
+  # operator blocked, a workspace that was deactivated, and a healthy one — the runner must
+  # render Platform's verdict rather than deciding for itself.
+  attr_accessor :grant_state, :grant_failure_class, :workspace_active
+
+  # CR-001: make DELETE answer 200 with a body that confirms nothing. Set to a Hash (rendered as
+  # the JSON body) — `{}` for "no disconnected block", or a block with a missing/unrecognised
+  # `outcome`. A non-JSON 200 is modelled by `unconfirmed_disconnect_raw`.
+  attr_accessor :unconfirmed_disconnect, :unconfirmed_disconnect_raw
+
   # Lets a test model a SECOND workspace on the same Platform and the same machine, which is the
   # shape that used to orphan the first workspace's stored credential (review-002, F3 residual).
   def claim_payload_workspace_key=(key)
     @claim_payload["workspace"]["workspace_key"] = key
+  end
+
+  # MVP-0021: the executor the workspace resolves to, as reported by the assignment and the
+  # per-workspace GET. Scripted so a test can model the real Claude profile (which triggers the
+  # bounded provider readiness check) as well as the deterministic fixture (which must not).
+  def claim_payload_executor=(executor)
+    @claim_payload["executor"] = executor
   end
 
   attr_reader :requests
@@ -49,6 +66,9 @@ class FakePlatform
     @registration_token = registration_token
     @enrollment_code = enrollment_code
     @enrollment_status = 201
+    @grant_state = "ready"
+    @grant_failure_class = nil
+    @workspace_active = true
     @readiness_verdict = { "state" => "ready", "failure_class" => nil,
                            "detail" => "Runner validated its local checkout and reported the executor ready." }
     @requests = []
@@ -110,6 +130,17 @@ class FakePlatform
   def last_terminal_result = last_report&.dig(:body, "terminal_result")
   def protocol_attempt_id = @claim_payload.dig("claim", "runner_execution_id")
 
+  # MVP-0021: the workspace grants this fake holds for the calling runner. It starts as the one
+  # workspace the claim payload models; a test clears or inspects it to model a grant an operator
+  # revoked in Platform, and DELETE removes from it, which is what makes the fake's idempotency
+  # real rather than assumed.
+  def grants = @grants ||= [ @claim_payload.dig("workspace", "workspace_key") ]
+
+  # Authorize no work at all, so a test can assert what the runner PRINTS while resolving which
+  # workspace to claim for without also executing a whole run. "Nothing eligible" is a normal,
+  # exit-0 poll, so the resolution is proven on the real code path rather than a stubbed one.
+  def offer_no_work! = @claimed = true
+
   private
 
   def handle(socket)
@@ -167,12 +198,65 @@ class FakePlatform
     when "/api/runner/enrollment" then enrollment(request)
     when "/api/runner/enrollment_preview" then code_spent? ? spent_code : [ 200, assignment ]
     when "/api/runner/workspace_connections" then workspace_connection(request)
+    when %r{\A/api/runner/workspace_connections/(?<key>.+)\z} then member(request, Regexp.last_match[:key])
     when "/api/runner/claim" then claim
     when "/api/runner/events" then events(request)
     when "/api/runner/heartbeat" then [ 200, { acknowledged: true, state: "EXECUTING", lease: lease_signal } ]
     when "/api/runner/reports" then report(request)
     else [ 404, { error: "not found" } ]
     end
+  end
+
+  # MVP-0021: the per-workspace member routes. GET describes this runner's grant; DELETE
+  # removes it and is idempotent, exactly as Platform's own controller is — the runner's
+  # branching depends on that, so a fake that 404'd the second delete would let a broken
+  # idempotency assumption pass.
+  def member(request, key)
+    case request[:method]
+    when "GET" then describe_connection(key)
+    when "DELETE" then disconnect_connection(key)
+    else [ 404, { error: "not found" } ]
+    end
+  end
+
+  def describe_connection(key)
+    return [ 404, { error: "this runner has no connection for workspace '#{key}'" } ] unless grants.include?(key)
+
+    [ 200, { contract_version: "mvp-0021",
+             runner: { public_id: "rnr_fake", runner_id: "host-runner", display_name: "host runner",
+                       revoked: false },
+             connection: connection_state(key),
+             project: { slug: "tiny-demo", name: "Tiny Demo" },
+             workspace: assignment.fetch(:workspace).merge(project_slug: "tiny-demo", active: workspace_active),
+             executor: @claim_payload.fetch("executor") } ]
+  end
+
+  def connection_state(key)
+    { workspace_key: key, public_id: "rwc_fake", state: grant_state,
+      ready: grant_state == "ready", failure_class: grant_failure_class,
+      detail: "Runner validated its local checkout and reported the executor ready.",
+      connected_at: "2026-07-24T00:00:00Z", ready_at: "2026-07-24T00:00:00Z",
+      last_reported_at: "2026-07-24T00:00:00Z",
+      reported_repository_url: @claim_payload.dig("workspace", "repository_url"),
+      reported_default_branch: @claim_payload.dig("workspace", "default_branch") }
+  end
+
+  # CR-001: a 200 that is NOT a confirmation must be expressible, because that is the shape the
+  # runner used to accept (review-001 F2). `unconfirmed_disconnect` replaces the body while
+  # keeping the 200, modelling a proxy, a captive portal, or another service on that port — and,
+  # deliberately, the grant is NOT removed, so a test can assert the runner refused to treat it
+  # as done AND that Platform-side state is untouched.
+  def disconnect_connection(key)
+    return [ 200, { raw: @unconfirmed_disconnect_raw } ] if @unconfirmed_disconnect_raw
+    return [ 200, @unconfirmed_disconnect ] if @unconfirmed_disconnect
+
+    removed = grants.delete(key)
+    [ 200, { contract_version: "mvp-0021",
+             disconnected: { workspace_key: key,
+                             outcome: removed ? "revoked" : "already_absent",
+                             routing_label: removed ? "tiny-demo/#{key}" : nil,
+                             detail: removed ? "Platform removed this runner's grant for tiny-demo/#{key}." :
+                                       "Platform holds no grant for this runner on '#{key}'." } } ]
   end
 
   def registration
@@ -257,13 +341,17 @@ class FakePlatform
                run_state: "COMPLETED" } ]
   end
 
+  # CR-001: `:raw` is an escape hatch for a 200 whose body is NOT JSON — an HTML error page from
+  # a proxy or a captive portal. The runner's client parses that to `{}`, which is exactly the
+  # input that used to reach the operator as "Platform confirmed".
   def respond(socket, status, body)
-    json = JSON.generate(body)
+    raw = body.is_a?(Hash) && body[:raw]
+    payload = raw || JSON.generate(body)
     socket.write("HTTP/1.1 #{status} #{reason(status)}\r\n")
-    socket.write("Content-Type: application/json\r\n")
-    socket.write("Content-Length: #{json.bytesize}\r\n")
+    socket.write("Content-Type: #{raw ? 'text/html' : 'application/json'}\r\n")
+    socket.write("Content-Length: #{payload.bytesize}\r\n")
     socket.write("Connection: close\r\n\r\n")
-    socket.write(json)
+    socket.write(payload)
   end
 
   def reason(status)

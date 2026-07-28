@@ -26,6 +26,16 @@ require_relative "specrelay_runner/secret_store"
 require_relative "specrelay_runner/repository_check"
 require_relative "specrelay_runner/connection_store"
 require_relative "specrelay_runner/connect"
+# MVP-0021 local control center: the readiness test, the one implementation of every
+# connection-management action, its two presentations (a keyboard-driven dashboard and the
+# scriptable `connections` commands), and the shared non-secret rendering rules.
+require_relative "specrelay_runner/connection_view"
+require_relative "specrelay_runner/connection_diagnosis"
+require_relative "specrelay_runner/connection_operations"
+require_relative "specrelay_runner/connections_command"
+require_relative "specrelay_runner/terminal_menu"
+require_relative "specrelay_runner/workspace_view"
+require_relative "specrelay_runner/dashboard"
 require_relative "specrelay_runner/workspace"
 require_relative "specrelay_runner/executor"
 require_relative "specrelay_runner/report_bundle"

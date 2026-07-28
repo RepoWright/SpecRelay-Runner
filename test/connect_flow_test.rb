@@ -28,43 +28,10 @@ class ConnectFlowTest < Minitest::Test
 
   # --- test doubles ---------------------------------------------------------
 
-  # An in-memory stand-in for the macOS Keychain, exercising the same narrow seam the
-  # real SecretStore exposes. It is used INSTEAD of shelling out to `security` so the
-  # suite never touches the developer's real Keychain or prompts for access.
-  class FakeSecretStore
-    attr_reader :writes, :probes
-    attr_writer :fail_probe
-
-    # `fail_probe` defaults to `fail_write` because a Keychain that refuses writes refuses the
-    # writability probe too. They are separable so one example can model a Keychain that passes
-    # the pre-flight and then fails at the real write.
-    def initialize(fail_write: false, fail_probe: fail_write)
-      @entries = {}
-      @writes = []
-      @probes = 0
-      @fail_write = fail_write
-      @fail_probe = fail_probe
-    end
-
-    def write(account:, credential:)
-      raise SpecrelayRunner::SecretStore::Error, "keychain access was denied" if @fail_write
-
-      @writes << account
-      @entries[account] = credential
-      true
-    end
-
-    # The real store writes, reads back, and deletes a throwaway item; the fake only has to
-    # record that the check happened and whether it passed.
-    def verify_writable!
-      @probes += 1
-      raise SpecrelayRunner::SecretStore::Error, "keychain access was denied" if @fail_probe
-
-      true
-    end
-
-    def read(account:) = @entries[account]
-  end
+  # The in-memory Keychain stand-in lives in `support/fake_secret_store.rb` — it is shared with
+  # the MVP-0021 connection-management tests, so "what the Keychain seam does" has exactly one
+  # definition rather than one per test file.
+  FakeSecretStore = ::FakeSecretStore
 
   # --- fixtures -------------------------------------------------------------
 
