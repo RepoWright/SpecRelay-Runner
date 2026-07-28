@@ -85,6 +85,17 @@ class DestructivePathsTest < Minitest::Test
     refute_match(/exit \)/, error.message)
   end
 
+  def test_a_nil_exit_status_without_timeout_is_a_refusal
+    error = assert_raises(SpecrelayRunner::SecretStore::Error) do
+      store_with(R.new(exit_code: nil, stdout: "", stderr: "terminated by signal", timed_out: false))
+        .delete_credential(account: RUNNER_ACCOUNT)
+    end
+
+    assert_match(/refused to remove the item #{Regexp.escape(RUNNER_ACCOUNT)}/, error.message)
+    assert_match(/still stored/, error.message)
+    refute_match(/exit 0/, error.message)
+  end
+
   # Recognised by the tool's own message as well as by its status, so a `security` that
   # renumbered its statuses is still understood rather than reclassified as a refusal.
   def test_item_not_found_is_recognised_by_the_tools_own_message_too

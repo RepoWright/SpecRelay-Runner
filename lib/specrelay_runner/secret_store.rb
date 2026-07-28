@@ -224,6 +224,7 @@ module SpecrelayRunner
     # raising path, not the succeeding one.
     def removed?(result)
       return false if result.nil? || result.timed_out?
+      return false if result.exit_code.nil?
       return true if result.exit_code.to_i.zero?
 
       result.exit_code.to_i == ITEM_NOT_FOUND || result.stderr.to_s.match?(ITEM_NOT_FOUND_HINT)
