@@ -122,6 +122,23 @@ class TerminalMenuTest < Minitest::Test
     assert_equal [ "   1  first", " › 2  second", "   Q  Quit" ], rows
   end
 
+  # CR-001 / review-001 F4. A wrapped title, header, or footer pushes every row below it down, so
+  # the highlighted line and the line the operator is reading stop being the same line. The entry
+  # rows were clipped from the start; these three were not.
+  def test_every_line_in_a_frame_is_clipped_to_the_terminal_width
+    narrow = narrow_terminal(48)
+    menu = SpecrelayRunner::TerminalMenu.new(input: StringIO.new, out: narrow)
+    long = "x" * 200
+
+    menu.send(:render, title: long, entries: entries, index: 0, footer: long, header: [ long, long ])
+
+    frame = narrow.string.sub(SpecrelayRunner::TerminalMenu::CLEAR, "")
+    frame.split("\r\n").reject(&:empty?).each do |line|
+      assert_operator line.gsub(/\e\[[\d;]*m/, "").length, :<=, 48,
+                      "a line wider than the terminal wraps and shifts every row below it"
+    end
+  end
+
   # Raw mode disables ONLCR, so a bare "\n" would render as a right-drifting staircase.
   def test_every_rendered_line_ends_with_an_explicit_carriage_return
     plain = StringIO.new

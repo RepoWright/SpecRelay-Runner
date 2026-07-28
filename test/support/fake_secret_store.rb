@@ -12,7 +12,7 @@
 # It is shared rather than redefined per test file so "what the Keychain seam does" has one
 # definition; a per-file copy is how the fake and the real class drift apart.
 class FakeSecretStore
-  attr_reader :writes, :deletes, :probes
+  attr_reader :writes, :deletes, :refused_deletes, :probes
   attr_writer :fail_probe, :fail_delete
 
   # `fail_probe` defaults to `fail_write` because a Keychain that refuses writes refuses the
@@ -22,6 +22,7 @@ class FakeSecretStore
     @entries = entries.dup
     @writes = []
     @deletes = []
+    @refused_deletes = []
     @probes = 0
     @fail_write = fail_write
     @fail_probe = fail_probe
@@ -48,10 +49,21 @@ class FakeSecretStore
   def read(account:) = @entries[account]
 
   # MVP-0021 scope 5. Mirrors the real store: removing an item that is not there is SUCCESS,
-  # because the caller has got the state it asked for. Only a Keychain that could not be
-  # reached is a failure.
+  # because the caller has got the state it asked for. A Keychain that REFUSED the deletion is a
+  # failure, and — this is the part round 001 could not express — the item is still stored
+  # afterwards.
+  #
+  # `fail_delete` existed before CR-001 but nothing used it, and the fake deleted the entry even
+  # when it was set. That was the coverage gap review-001 named: a double that cannot answer
+  # *wrongly* cannot catch a caller that believes every answer. It now leaves the entry in place,
+  # so a test can assert both the reported failure AND that the credential really survived.
   def delete_credential(account:)
-    raise SpecrelayRunner::SecretStore::Error, "keychain access was denied" if @fail_delete
+    if @fail_delete
+      @refused_deletes << account
+      raise SpecrelayRunner::SecretStore::Error,
+            "the macOS Keychain refused to remove the item #{account} (exit 36: security: " \
+            "SecKeychainItemDelete: User interaction is not allowed.). It is still stored."
+    end
 
     @deletes << account
     @entries.delete(account)

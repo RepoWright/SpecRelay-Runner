@@ -19,6 +19,15 @@ module SpecrelayRunner
   # (`remove_credential:`), so a scripted `connections disconnect-local --remove-credential`
   # and a confirmed menu action travel the same path.
   class ConnectionOperations
+    # The two outcomes Platform's disconnect endpoint is contracted to state
+    # (`Runner::Connections::Disconnect::REVOKED` / `ALREADY_ABSENT`). They are consumed here as
+    # constants because Platform's own comment says "the runner branches on them" — round 001
+    # never looked at the field at all, which made that statement aspirational rather than true
+    # (review-001 F2).
+    PLATFORM_REVOKED = "revoked"
+    PLATFORM_ALREADY_ABSENT = "already_absent"
+    PLATFORM_OUTCOMES = [ PLATFORM_REVOKED, PLATFORM_ALREADY_ABSENT ].freeze
+
     # A finished operator-facing result. `ok` is the exit-code decision: false means the
     # operation was understood and did not succeed (exit 1), and `invalid` means the local
     # state or request was unusable (exit 2). `remedy` is the ONE next action.
@@ -135,7 +144,12 @@ module SpecrelayRunner
       return already_absent_locally(connection) if removed.nil?
 
       credential = credential_disposition(removed, remove_credential: remove_credential)
-      Outcome.new(ok: true, message: local_disconnect_message(removed, credential),
+      # The local entry really was removed, so the message says so — but a Keychain that REFUSED
+      # the credential deletion makes this a failed operation, not a successful one with a note.
+      # An operator who asked for the credential to be gone must not be told it is (review-001 F1),
+      # and a script must be able to see it in the exit code.
+      Outcome.new(ok: credential[:state] != :remove_failed,
+                  message: local_disconnect_message(removed, credential),
                   remedy: credential[:remedy], payload: credential)
     rescue ConnectionStore::Error => e
       write_failed(e)
@@ -179,7 +193,9 @@ module SpecrelayRunner
       when :kept_shared
         "The runner credential was kept: #{credential[:shared_with].join(', ')} still uses it."
       when :removed then "The runner-scoped Keychain credential (#{credential[:account]}) was removed."
-      when :remove_failed then "The runner-scoped Keychain credential could not be removed."
+      when :remove_failed
+        "The runner-scoped Keychain credential (#{credential[:account]}) could NOT be removed and " \
+          "is still stored."
       else "The runner credential was kept."
       end
     end
@@ -232,13 +248,55 @@ module SpecrelayRunner
                   remedy: "unlock your login keychain (Keychain Access ▸ login) and try again")
     end
 
+    # A 200 is not a confirmation. Platform must SAY what it did.
+    #
+    # Round 001 returned `ok: true` for any 200 (review-001 F2). `PlatformClient#parse` yields
+    # `{}` for a body that is not JSON, so an HTML page from a proxy, a captive portal, or a
+    # different service now listening on that port arrived here as a success — and the dashboard
+    # went on to print "Platform confirmed." and offer to delete local state. That is the exact
+    # "worst of both states" this operation exists to prevent: local memory gone, Platform-side
+    # authorization possibly still there, and nothing left on the machine pointing at it.
+    #
+    # So the outcome is validated against the two contract values. Anything else is an operation
+    # failure (exit 1), not invalid local state (exit 2) — the request was well-formed and the
+    # machine's own state is fine; it is the answer that could not be trusted.
     def platform_disconnected(connection, response)
-      disconnected = response.fetch("disconnected", {})
+      disconnected = response.is_a?(Hash) ? response["disconnected"] : nil
+      outcome = disconnected.is_a?(Hash) ? disconnected["outcome"].to_s : ""
+      return platform_unconfirmed(connection, outcome) unless PLATFORM_OUTCOMES.include?(outcome)
+
       Outcome.new(ok: true, payload: disconnected,
-                  message: Redaction.redact(disconnected["detail"].to_s),
+                  message: platform_disconnect_message(connection, disconnected, outcome),
                   remedy: "the local entry for #{connection.workspace_key} is still stored on this " \
                           "machine. Remove it with `specrelay-runner connections disconnect-local " \
                           "#{connection.workspace_key}`.")
+    end
+
+    # Platform's own sentence when it sent one, and the runner's own when it did not. A blank
+    # `detail` used to render as an empty line, so the operator's next screen line was
+    # "Platform confirmed." with nothing behind it (review-001 F2).
+    def platform_disconnect_message(connection, disconnected, outcome)
+      supplied = Redaction.redact(disconnected["detail"].to_s).strip
+      return supplied unless supplied.empty?
+
+      case outcome
+      when PLATFORM_REVOKED
+        "Platform removed this runner's grant for #{connection.workspace_key}. The runner " \
+          "identity and its other workspace connections are unchanged."
+      else
+        "Platform holds no grant for this runner on '#{connection.workspace_key}', so there was " \
+          "nothing to remove."
+      end
+    end
+
+    def platform_unconfirmed(connection, outcome)
+      Outcome.new(ok: false, payload: nil,
+                  message: "Platform answered, but did not confirm the disconnect for " \
+                           "#{connection.workspace_key}#{" (it reported '#{Redaction.redact(outcome)}')" unless outcome.empty?}.",
+                  remedy: "nothing local was changed. Check that #{connection.base_url} is really " \
+                          "Platform and not a proxy or another service, then try again; or remove " \
+                          "only this machine's copy with `specrelay-runner connections " \
+                          "disconnect-local #{connection.workspace_key}`.")
     end
 
     def platform_refused(connection, error)

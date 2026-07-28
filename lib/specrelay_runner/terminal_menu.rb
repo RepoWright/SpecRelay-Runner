@@ -174,13 +174,19 @@ module SpecrelayRunner
 
     # Raw mode disables ONLCR, so lines are joined with an explicit CR+LF and the frame ends
     # with one. Written as ONE `print` so a redraw cannot be seen half-finished.
+    #
+    # EVERY line is clipped, not only the entry rows (review-001 F4). A title, header, or footer
+    # that wraps pushes every row below it down, which in a menu means the highlighted line and
+    # the line the operator is reading are no longer the same line — the failure mode the
+    # specification's "no unreadable overlap, no hidden destructive action" rule is about. The
+    # rows were clipped from the start; these were not.
     def render(title:, entries:, index:, footer:, header:)
-      lines = [ paint(title, :bold), rule ]
-      lines.concat(header)
+      lines = [ paint(clip(title), :bold), rule ]
+      lines.concat(header.map { |line| clip(line) })
       lines << rule unless header.empty?
       entries.each_with_index { |entry, position| lines << row(entry, position == index) }
       lines << rule
-      lines << dim(footer)
+      lines << dim(clip(footer))
       out.print(CLEAR + lines.join("\r\n") + "\r\n")
       out.flush if out.respond_to?(:flush)
     end

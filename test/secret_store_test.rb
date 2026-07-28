@@ -312,17 +312,19 @@ class SecretStoreTest < Minitest::Test
                  runner.invocations
   end
 
-  # `security` exits non-zero when there is nothing to delete. That is the state the caller asked
-  # for, so it is success — an operator cleaning up a connection whose credential was already
-  # gone must not be shown a failure.
+  # `security` exits ITEM_NOT_FOUND (44) when there is nothing to delete. That is the state the
+  # caller asked for, so it is success — an operator cleaning up a connection whose credential was
+  # already gone must not be shown a failure. It is the ONLY non-zero status treated this way; the
+  # full classification matrix lives in `destructive_paths_test.rb` (CR-001).
   def test_deleting_a_credential_that_is_not_there_is_success
     runner = RecordingRunner.new([ failed(stderr: "SecKeychainSearchCopyNext: The specified item could not be found") ])
 
     assert SpecrelayRunner::SecretStore.new(runner: runner).delete_credential(account: ACCOUNT)
   end
 
-  # Only a tool that could not be RUN is a failure: unlike "no such item", it means the operator's
-  # request was not carried out and they need to know.
+  # A tool that could not be RUN means the operator's request was not carried out and the item is
+  # still stored — which the message must say, because the caller may have just deleted the local
+  # entry that would lead back to it (CR-001, review-001 F1).
   def test_a_keychain_that_cannot_be_reached_raises_and_names_the_account
     runner = RecordingRunner.new([ nil ])
 
@@ -330,7 +332,8 @@ class SecretStoreTest < Minitest::Test
       SpecrelayRunner::SecretStore.new(runner: runner).delete_credential(account: ACCOUNT)
     end
 
-    assert_match(/could not remove the Keychain item #{Regexp.escape(ACCOUNT)}/, error.message)
+    assert_match(/refused to remove the item #{Regexp.escape(ACCOUNT)}/, error.message)
+    assert_match(/still stored/, error.message)
     assert_match(/could not be run/, error.message)
   end
 

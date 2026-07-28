@@ -173,6 +173,24 @@ class DashboardTest < Minitest::Test
     assert_includes menu.frames.first[:entries].map(&:first), "C"
   end
 
+  # CR-001 round 002: with one connection there is no ambiguity to resolve, so the "you need
+  # --workspace" advice describes a situation the operator is not in.
+  def test_the_no_default_header_matches_how_many_workspaces_are_actually_connected
+    store_connection("tiny-demo-workspace")
+    sole = ScriptedMenu.new([ :quit ])
+    run_dashboard(sole)
+
+    assert_match(/none set \(not needed — only one workspace is connected\)/,
+                 sole.frames.first[:header].join("\n"))
+
+    store_connection("development-workspace", connected_at: "2026-07-27T10:00:00Z")
+    several = ScriptedMenu.new([ :quit ])
+    run_dashboard(several)
+
+    assert_match(/none set — `loop` needs --workspace while several are connected/,
+                 several.frames.first[:header].join("\n"))
+  end
+
   def test_a_dangling_default_is_flagged_on_the_top_level
     store_connection("tiny-demo-workspace")
     operations.set_default("tiny-demo-workspace")

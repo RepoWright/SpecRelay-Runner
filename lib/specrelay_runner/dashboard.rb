@@ -75,13 +75,24 @@ module SpecrelayRunner
 
     def default_header(listing)
       if listing.default_workspace_key.nil?
-        "Default workspace: none set — `loop` needs --workspace while several are connected"
+        no_default_header(listing)
       elsif listing.default_missing?
         "Default workspace: #{listing.default_workspace_key} — SET BUT NOT CONNECTED; " \
           "`loop` fails closed until you set another or clear it"
       else
         "Default workspace: #{listing.default_workspace_key}"
       end
+    end
+
+    # With ONE connection there is no ambiguity to resolve, so telling the operator that `loop`
+    # "needs --workspace while several are connected" is advice about a situation they are not in.
+    # Round 001 printed that line unconditionally; the real-pty evidence for CR-001 is what made
+    # it visible.
+    def no_default_header(listing)
+      return "Default workspace: none set (not needed — only one workspace is connected)" if
+        listing.connections.one?
+
+      "Default workspace: none set — `loop` needs --workspace while several are connected"
     end
 
     # The empty state names the ONE command that fixes it and where the code comes from. An

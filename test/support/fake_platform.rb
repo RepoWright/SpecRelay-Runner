@@ -34,6 +34,11 @@ class FakePlatform
   # render Platform's verdict rather than deciding for itself.
   attr_accessor :grant_state, :grant_failure_class, :workspace_active
 
+  # CR-001: make DELETE answer 200 with a body that confirms nothing. Set to a Hash (rendered as
+  # the JSON body) — `{}` for "no disconnected block", or a block with a missing/unrecognised
+  # `outcome`. A non-JSON 200 is modelled by `unconfirmed_disconnect_raw`.
+  attr_accessor :unconfirmed_disconnect, :unconfirmed_disconnect_raw
+
   # Lets a test model a SECOND workspace on the same Platform and the same machine, which is the
   # shape that used to orphan the first workspace's stored credential (review-002, F3 residual).
   def claim_payload_workspace_key=(key)
@@ -236,7 +241,15 @@ class FakePlatform
       reported_default_branch: @claim_payload.dig("workspace", "default_branch") }
   end
 
+  # CR-001: a 200 that is NOT a confirmation must be expressible, because that is the shape the
+  # runner used to accept (review-001 F2). `unconfirmed_disconnect` replaces the body while
+  # keeping the 200, modelling a proxy, a captive portal, or another service on that port — and,
+  # deliberately, the grant is NOT removed, so a test can assert the runner refused to treat it
+  # as done AND that Platform-side state is untouched.
   def disconnect_connection(key)
+    return [ 200, { raw: @unconfirmed_disconnect_raw } ] if @unconfirmed_disconnect_raw
+    return [ 200, @unconfirmed_disconnect ] if @unconfirmed_disconnect
+
     removed = grants.delete(key)
     [ 200, { contract_version: "mvp-0021",
              disconnected: { workspace_key: key,
@@ -328,13 +341,17 @@ class FakePlatform
                run_state: "COMPLETED" } ]
   end
 
+  # CR-001: `:raw` is an escape hatch for a 200 whose body is NOT JSON — an HTML error page from
+  # a proxy or a captive portal. The runner's client parses that to `{}`, which is exactly the
+  # input that used to reach the operator as "Platform confirmed".
   def respond(socket, status, body)
-    json = JSON.generate(body)
+    raw = body.is_a?(Hash) && body[:raw]
+    payload = raw || JSON.generate(body)
     socket.write("HTTP/1.1 #{status} #{reason(status)}\r\n")
-    socket.write("Content-Type: application/json\r\n")
-    socket.write("Content-Length: #{json.bytesize}\r\n")
+    socket.write("Content-Type: #{raw ? 'text/html' : 'application/json'}\r\n")
+    socket.write("Content-Length: #{payload.bytesize}\r\n")
     socket.write("Connection: close\r\n\r\n")
-    socket.write(json)
+    socket.write(payload)
   end
 
   def reason(status)

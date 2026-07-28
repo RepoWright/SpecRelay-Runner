@@ -331,6 +331,14 @@ old scheme still authenticates from it.
 Platform disconnect goes first; local removal is offered only after Platform
 confirms, and a **failed** Platform disconnect changes no local state.
 
+A `200` alone is **not** a confirmation: the runner accepts the disconnect only when
+Platform states an `outcome` of `revoked` or `already_absent`, and any other answer
+on that status (an HTML page from a proxy, a missing block, an unrecognised value)
+exits `1` with *"Platform answered, but did not confirm the disconnect"* and writes
+nothing locally. Similarly, if the Keychain **refuses** the credential deletion, the
+local entry is still removed but the command exits `1` and says the credential could
+not be removed and is still stored — it never claims a removal the OS refused.
+
 **You never need to edit `~/.specrelay/runner/connections.json`.** These commands
 write it atomically and preserve mode `0600`.
 

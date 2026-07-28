@@ -73,6 +73,16 @@ module SpecrelayRunner
     # Characters `security -i` would treat as token structure rather than as part of the value.
     UNDELIVERABLE = /[\s"'\\]/
 
+    # `security`'s exit status for "the item is not there", measured against the real tool on
+    # macOS 15: `security delete-generic-password -a <absent> -s <service>` exits 44 with
+    # `SecKeychainSearchCopyNext: The specified item could not be found in the keychain.`
+    #
+    # This is the ONLY non-zero status `delete_credential` treats as success. It exists as a
+    # named constant because round 001 assumed every non-zero status meant this one, and a
+    # refusal (exit 36, keychain locked or access denied) took the same path.
+    ITEM_NOT_FOUND = 44
+    ITEM_NOT_FOUND_HINT = /could not be found in the keychain/i
+
     def self.for(platform: RUBY_PLATFORM, runner: CommandRunner)
       raise UnsupportedPlatform, unsupported_message(platform) unless macos?(platform)
 
@@ -122,20 +132,32 @@ module SpecrelayRunner
       value.empty? ? nil : value
     end
 
-    # Remove one stored item (MVP-0021 scope 5). A missing item is SUCCESS, not an error:
-    # `security` exits non-zero when there is nothing to delete, and an operator cleaning up
-    # a connection whose credential was already gone has got what they asked for. The account
-    # name is non-secret by construction (`runner:<public-id>` or `workspace:<key>`), so a
-    # caller may name it in the confirmation it shows before calling this.
+    # Remove one stored item (MVP-0021 scope 5).
     #
-    # The runner NEVER calls this as a side effect of another operation. Removing a credential
-    # is its own explicit, separately confirmed decision, because the credential is scoped to
-    # the runner identity and shared by every workspace that identity is connected to.
+    # SUCCESS means exactly two things: the item was deleted (exit 0), or it was ALREADY GONE
+    # (exit ITEM_NOT_FOUND). The second is a success because the operator asked for the item not
+    # to be there and it is not there.
+    #
+    # EVERYTHING else is a refusal and raises. Round 001 shipped this as "any non-zero exit means
+    # no such item", which was measured wrong and was the more dangerous direction to be wrong in
+    # (review-001 F1): a locked or access-denied login keychain exits 36
+    # (`SecKeychainItemDelete: User interaction is not allowed.`) with the credential still
+    # stored, and that reported as "the credential was removed" — while the same operation had
+    # just deleted the local entry that would have led the operator back to it. A deletion the OS
+    # refused must reach the operator as a refusal.
+    #
+    # The account name is non-secret by construction (`runner:<public-id>` or `workspace:<key>`),
+    # so a caller may name it in the confirmation it shows before calling this, and this method
+    # may name it in a failure.
+    #
+    # The runner NEVER calls this as a side effect of another operation. Removing a credential is
+    # its own explicit, separately confirmed decision, because the credential is scoped to the
+    # runner identity and shared by every workspace that identity is connected to.
     def delete_credential(account:)
       result = delete(account)
-      raise Error, delete_failure_message(account, result) if result.nil? || result.timed_out?
+      return true if removed?(result)
 
-      true
+      raise Error, delete_failure_message(account, result)
     end
 
     # The non-secret Keychain account name for one RUNNER identity.
@@ -193,11 +215,26 @@ module SpecrelayRunner
       run([ "security", "delete-generic-password", "-a", account, "-s", SERVICE ])
     end
 
-    # Only a tool that could not be LAUNCHED (or timed out) is a failure. A non-zero exit from
-    # `security` here means "no such item", which is the state the caller asked for.
+    # Deleted, or already absent. Nothing else counts.
+    #
+    # `ITEM_NOT_FOUND` is matched by exit status AND by the tool's own not-found message, so a
+    # future `security` that renumbered its statuses would still be understood rather than
+    # silently reclassified as a refusal. The stderr match is the belt to the status's braces —
+    # deliberately not the other way round, because an unrecognised failure must land on the
+    # raising path, not the succeeding one.
+    def removed?(result)
+      return false if result.nil? || result.timed_out?
+      return true if result.exit_code.to_i.zero?
+
+      result.exit_code.to_i == ITEM_NOT_FOUND || result.stderr.to_s.match?(ITEM_NOT_FOUND_HINT)
+    end
+
+    # Names the account (non-secret) and the tool's own diagnostic, which `failure_suffix`
+    # already redacts and reduces to one line. The credential value appears nowhere: `security`
+    # does not echo it, and nothing here reads it.
     def delete_failure_message(account, result)
-      "could not remove the Keychain item #{account}#{failure_suffix(result)}. " \
-        "Unlock your login keychain (Keychain Access ▸ login) and try again."
+      "the macOS Keychain refused to remove the item #{account}#{failure_suffix(result)}. " \
+        "It is still stored. Unlock your login keychain (Keychain Access ▸ login) and try again."
     end
 
     # Refused rather than truncated. The value itself is never named in the message.
