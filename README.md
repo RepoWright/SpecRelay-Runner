@@ -201,8 +201,9 @@ must not be indistinguishable from a failed execution to a script or a `loop`
 iteration. In `loop` mode it counts as a successful iteration and polling continues.
 
 Platform still holds a real leased claim afterwards. Release it with
-`bin/platform runner release <run-id>` on the Platform host, or leave it — an
-unrenewed lease is swept automatically. Either way the run returns to
+`bin/platform runner release <run-id>` — or `<ticket-key>`, since a specification run
+has no task id and the Jira key is what you already have — on the Platform host, or
+leave it: an unrenewed lease is swept automatically. Either way the run returns to
 `AWAITING_SPECIFICATION_CREATION` and is claimable again; nothing was written that
 needs undoing.
 
@@ -421,8 +422,8 @@ workspace grant.
 pointer here. Platform keeps only the commands that operate on **its own state**:
 
 ```bash
-bin/platform runner release <run-id|task-id>   # free a stuck/stale claim
-bin/platform runner cancel  <run-id|task-id>   # terminally stop a run
+bin/platform runner release <run-id|task-id|ticket-key>   # free a stuck/stale claim
+bin/platform runner cancel  <run-id|task-id|ticket-key>   # terminally stop a run
 bin/platform runner sweep-leases               # reclaim lapsed leases
 bin/platform runners issue-registration-token|list|revoke|rotate-credential
 ```
