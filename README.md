@@ -168,8 +168,43 @@ Source:   connected workspace tiny-demo-workspace (your explicit default workspa
 ```
 
 `claim-once` claims at most one eligible run (**Platform** decides which), executes
-it, and uploads the report. Exit `0` on completion or no eligible work, `1` on a
-failed execution, `2` on a config/usage error.
+it, and uploads the report. Exit `0` on completion, no eligible work, or an
+acknowledged specification assignment (below), `1` on a failed execution, `2` on a
+config/usage error.
+
+### Two lanes, and one of them stops here (MVP-0025)
+
+Platform can hand this runner work from either lane, and the runner branches on the
+assignment's own `run.type` — never on which fields are missing:
+
+| `run.type` | What this runner does |
+|---|---|
+| `implementation` | The full flow: worktree, executor, tests, report, publication. |
+| `spec_creation` | Prints the assignment and **stops.** |
+
+A `spec_creation` assignment means "write a specification for this Jira issue", and
+this runner cannot write one yet — MVP-0026 is that capability. So MVP-0025's
+behaviour on this side is deliberately minimal and complete: recognize the
+assignment, print the run, the Jira issue, the recorded input bundle, the
+specification repository target and the lease, state that generation is deferred,
+print the release command, and return.
+
+It is `SpecrelayRunner::SpecificationAssignment`, and its guarantees are structural
+rather than promised: it is handed **no Platform client at all**, so it cannot
+report, publish, or transition anything, and Platform sends no `executor`,
+`repositories`, or `report_contract` block, so there is nothing to execute. It
+creates no worktree and writes no file.
+
+The exit status is `0` with `Runner outcome: assignment_received`. That is not
+"nothing happened" and it is deliberately not `1`: a correct assignment-only stop
+must not be indistinguishable from a failed execution to a script or a `loop`
+iteration. In `loop` mode it counts as a successful iteration and polling continues.
+
+Platform still holds a real leased claim afterwards. Release it with
+`bin/platform runner release <run-id>` on the Platform host, or leave it — an
+unrenewed lease is swept automatically. Either way the run returns to
+`AWAITING_SPECIFICATION_CREATION` and is claimable again; nothing was written that
+needs undoing.
 
 `loop` (MVP-0018) does the same repeatedly, at a bounded poll interval. Exit `0`
 when every run it executed succeeded, `1` if any failed or the credential was
