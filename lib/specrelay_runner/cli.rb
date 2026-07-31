@@ -285,11 +285,31 @@ module SpecrelayRunner
       false
     end
 
+    # MVP-0025: dispatch on the assignment's own LANE before anything is prepared or
+    # launched. The check is first, so the specification path never touches the executor
+    # readiness assumptions, the worktree, or the report contract — and a specification
+    # assignment reaching an older code path is impossible rather than merely unlikely.
     def execute(config, client, payload)
+      return acknowledge_specification_assignment(payload) if SpecificationAssignment.specification?(payload)
+
       announce_claim(payload)
       result = Execution.new(config: config, client: client, payload: payload, env: env, io: out).call
       out.puts result.message
       result.success? ? SUCCESS : RUN_FAILED
+    end
+
+    # The documented MVP-0025 stop. `SUCCESS` is correct and deliberate: the runner did
+    # exactly what this MVP asks of it, and the printed message — not the exit code — is
+    # what distinguishes "assignment acknowledged" from "execution completed". Returning
+    # RUN_FAILED would tell every script and loop that a correct assignment-only stop was
+    # a failed execution, which is the specific confusion scope 5 forbids.
+    #
+    # No client is passed: this path makes no Platform call, so it cannot report, publish,
+    # or transition anything even by mistake.
+    def acknowledge_specification_assignment(payload)
+      result = SpecificationAssignment.call(payload: payload, io: out)
+      out.puts result.message
+      SUCCESS
     end
 
     # Prefer the guided connection (MVP-0017); fall back to the advanced/legacy config

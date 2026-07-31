@@ -46,6 +46,9 @@ require_relative "specrelay_runner/executor_log_stream"
 require_relative "specrelay_runner/publication"
 require_relative "specrelay_runner/terminal_result"
 require_relative "specrelay_runner/execution"
+# MVP-0025: recognizing a specification-creation assignment and stopping at the
+# assignment boundary. A sibling of `execution`, not a mode of it — it launches nothing.
+require_relative "specrelay_runner/specification_assignment"
 require_relative "specrelay_runner/poll_interval"
 require_relative "specrelay_runner/loop_runner"
 require_relative "specrelay_runner/cli"
