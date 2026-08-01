@@ -176,7 +176,10 @@ class SpecificationPreflightTest < Minitest::Test
     assert_equal SpecrelayRunner::CLI::SUCCESS, exit_code, @io.string
     technical = File.read(File.join(@specs, "specs", "SR-700-add-an-export-button", "analysis", "technical.md"))
     assert_includes technical, "read the changed area directly"
-    assert_includes technical, "Result: NOT used"
+    # See the note in specification_generation_test.rb: the verdict vocabulary changed under
+    # CR-001 must-fix 2; the property this line protects — a substituted tool is recorded as
+    # having contributed nothing — did not.
+    assert_includes technical, "Result: did NOT contribute evidence"
   end
 
   def test_a_substituted_external_reference_is_a_warning_rather_than_a_refusal

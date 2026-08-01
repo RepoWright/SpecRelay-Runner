@@ -102,10 +102,61 @@ class SpecificationGenerationTest < Minitest::Test
     technical = read_package("analysis/technical.md")
 
     assert_includes technical, "STALE"
-    assert_includes technical, "Result: NOT used"
+    # CR-001 must-fix 2 renamed this verdict from "used"/"NOT used" to the two-verdict
+    # vocabulary the Tool struct has always carried. The property is unchanged: a tool the run
+    # only continued past must not be described as having produced evidence.
+    assert_includes technical, "Result: did NOT contribute evidence"
     assert_includes technical, "direct source inspection of the changed area"
     # The weaker basis is stated, not papered over.
     assert_includes technical, "No structural graph contributed to this assessment"
+  end
+
+  # CR-001 must-fix 2. Round 001 derived `contributed` for Context+ from the operator's
+  # `available:` flag, so a configuration value became an evidence claim: the analysis said the
+  # tool had been used, and nothing had queried anything. The runner has no MCP client and
+  # cannot verify a semantic pass, so it may never claim one.
+  def test_context_plus_is_never_reported_as_having_contributed_evidence
+    run_cli
+    technical = read_package("analysis/technical.md")
+    tool = @platform.last_specification_generation["tool_evidence"]
+             .find { |entry| entry["name"] == "context_plus" }
+
+    refute tool["contributed"], "the runner cannot verify a semantic query and must not claim one"
+    assert tool["usable"], "usable is unchanged — it is what preflight gates on"
+    section = technical[/^## Context\+ evidence$(.*?)^## /m, 1].to_s
+    assert_includes section, "No semantic evidence was gathered by this process"
+    refute_includes section, "Result: contributed evidence"
+  end
+
+  # The other half of must-fix 2: an operator CAN put real semantic evidence in front of the
+  # runner, and then it is reproduced verbatim under the heading criterion 4 asks for. It is
+  # still not the runner's contribution — a person gathered it — so `contributed` stays false
+  # and the document attributes it.
+  def test_operator_recorded_context_plus_evidence_is_reproduced_verbatim_and_attributed
+    @config = build_config(context_plus_queries: [ "where is the weekly report rendered" ],
+                           context_plus_evidence: "ReportsController#weekly and ExportReport are the hits")
+    run_cli
+    technical = read_package("analysis/technical.md")
+    tool = @platform.last_specification_generation["tool_evidence"]
+             .find { |entry| entry["name"] == "context_plus" }
+
+    section = technical[/^## Context\+ evidence$(.*?)^## /m, 1].to_s
+    assert_includes section, "where is the weekly report rendered"
+    assert_includes section, "ReportsController#weekly and ExportReport are the hits"
+    assert_includes section, "the operator's attestation, not this process's output"
+    refute tool["contributed"], "an operator's attestation is not the runner's own evidence"
+  end
+
+  # The derived sentences elsewhere in the document must agree with that section. They did not:
+  # the analysis asserted "both tool layers reported a usable result" and "no tool reported a
+  # false negative" on the strength of the same conflated flag.
+  def test_the_derived_claims_distinguish_contribution_from_usability
+    run_cli
+    technical = read_package("analysis/technical.md")
+
+    refute_includes technical, "both tool layers reported a usable result"
+    refute_includes technical, "No tool reported a false negative"
+    assert_includes technical, "No Context+ semantic query was performed by this process"
   end
 
   # ------------------------------------------------------------------ criterion 7
@@ -223,6 +274,42 @@ class SpecificationGenerationTest < Minitest::Test
     assert_equal original, read_package("spec.md"), "the existing package must be untouched"
   end
 
+  # CR-001 must-fix 3 AC 1. Deleting the set-aside copy is housekeeping AFTER a completed
+  # replacement. Round 001 ran it inside the rename's rescue window, so a failure there tore
+  # down a generation that had already succeeded and reported it as a failure that wrote
+  # nothing — with the destination fully replaced.
+  def test_a_failure_to_delete_the_replaced_package_is_a_warning_on_a_successful_generation
+    run_cli
+    restart_platform
+
+    exit_code = with_unremovable_replaced_package { run_cli }
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, exit_code, @io.string
+    generation = @platform.last_specification_generation
+    assert_equal "generated", generation["outcome"]
+    assert generation["warnings"].any? { |warning| warning.include?("could not be removed") },
+           generation["warnings"].inspect
+    assert generation.dig("package", "replaced_existing_package")
+    # The new package really is at the final path, which is what makes "generated" the honest
+    # outcome rather than a downgrade of a failure.
+    assert_includes read_package("spec.md"), ISSUE
+    assert Dir.children(File.join(@specs, "specs")).any? { |name| name.start_with?(".specrelay-replaced-") },
+           "the leftover the warning names must actually be there"
+  end
+
+  # AC 3: a failure AFTER the rename reports zero_output_files_written FALSE and names the
+  # package, because the operator's next move is to go and look at it.
+  def test_a_failure_after_the_rename_reports_that_a_package_was_written
+    exit_code = with_unreadable_final_manifest { run_cli }
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, exit_code, @io.string
+    generation = @platform.last_specification_generation
+    assert_equal "failed", generation["outcome"]
+    refute generation["zero_output_files_written"], "the package IS on disk; the report must say so"
+    assert_includes generation["message"], PACKAGE
+    assert File.file?(File.join(@specs, PACKAGE, "spec.md")), "the package landed before the failure"
+  end
+
   # ------------------------------------------------------------------ criterion 10
 
   def test_a_cancelled_claim_stops_without_reporting_success
@@ -253,7 +340,50 @@ class SpecificationGenerationTest < Minitest::Test
     @config = build_config(graphify_substitute: graphify_substitute)
   end
 
-  def build_config(graphify_substitute: nil)
+  # A fresh claim for a second `claim-once` against the same checkouts.
+  def restart_platform
+    @platform.stop
+    @platform = FakePlatform.new(claim_payload: spec_creation_payload_for(issue_key: ISSUE)).start
+    @config = build_config
+    @io = StringIO.new
+  end
+
+  # Fail the post-move deletion of the set-aside package, and ONLY that. Scoped by the
+  # writer's own prefix so the staging cleanup in the same `ensure` still runs — otherwise the
+  # test would prove something about a broken FileUtils rather than about this branch.
+  #
+  # `define_singleton_method` + restore rather than a mocking library: this suite has no gems,
+  # which is the same reason with_broken_redaction in the preflight test is written this way.
+  def with_unremovable_replaced_package
+    original = FileUtils.method(:remove_entry)
+    FileUtils.define_singleton_method(:remove_entry) do |path, *rest|
+      raise Errno::EACCES, path.to_s if
+        File.basename(path.to_s).start_with?(SpecrelayRunner::Specification::PackageWriter::REPLACED_PREFIX)
+
+      original.call(path, *rest)
+    end
+    yield
+  ensure
+    FileUtils.define_singleton_method(:remove_entry, original)
+  end
+
+  # Fail the manifest digest, which is taken from the FINAL location after the rename. The
+  # only production failure that genuinely lands after the atomic move, and the reason `call`
+  # converts a stray Errno into a write error that reports the package as present.
+  def with_unreadable_final_manifest
+    final = File.join(@specs, PACKAGE, "generation-manifest.json")
+    original = File.method(:binread)
+    File.define_singleton_method(:binread) do |path, *rest|
+      raise Errno::EIO, path.to_s if path.to_s == final
+
+      original.call(path, *rest)
+    end
+    yield
+  ensure
+    File.define_singleton_method(:binread, original)
+  end
+
+  def build_config(graphify_substitute: nil, context_plus_queries: [], context_plus_evidence: nil)
     path = File.join(Dir.mktmpdir("cfg"), "runner.yml")
     File.write(path, <<~YAML)
       platform:
@@ -271,6 +401,8 @@ class SpecificationGenerationTest < Minitest::Test
             "SpecRelay/SpecRelay-Specs": #{@specs}
           context_plus:
             available: true
+            queries: #{context_plus_queries.to_json}
+            evidence: #{context_plus_evidence.nil? ? '~' : context_plus_evidence.to_json}
           graphify:
             substitute: #{graphify_substitute.nil? ? '~' : graphify_substitute.to_json}
       workspace_roots:

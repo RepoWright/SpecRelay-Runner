@@ -511,11 +511,14 @@ module SpecrelayRunner
         "\n…and #{entry_points.length - 25} further source files in the sampled tree."
       end
 
+      # "Contributed" / "did not contribute", never "used". A tool that was declared available
+      # and never queried was previously printed as `Result: used`, which is the single
+      # sentence a reader would take as evidence that a semantic pass had happened.
       def tool_section(name)
-        tool = tools.find { |entry| entry["name"] == name } || {}
-        usable = tool["contributed"] ? "used" : "NOT used"
+        tool = tool_entry(name)
+        verdict = tool["contributed"] ? "contributed evidence" : "did NOT contribute evidence"
         [
-          "**Result: #{usable}.** #{tool['summary']}",
+          "**Result: #{verdict}.** #{tool['summary']}",
           "",
           tool_detail(tool)
         ].join("\n")
@@ -545,25 +548,43 @@ module SpecrelayRunner
 
       def blast_radius_basis
         return "Based on the structural evidence above, corroborated against the inspected source." if
-          graphify_usable?
+          graphify_contributed?
 
         "**No structural graph contributed to this assessment.** It rests on direct source " \
           "inspection alone, so it is weaker than it would otherwise be and an implementer should " \
           "re-derive the dependency picture before relying on it."
       end
 
+      # Every gap is named, and each one distinguishes CONTRIBUTED from USABLE. "Usable" only
+      # ever meant the run was allowed to proceed; printing the two as one verdict is what
+      # produced "no tool reported a false negative" next to a layer that had never run.
       def blast_radius_caveat
-        return "- No tool reported a false negative for this package." if graphify_usable? && context_plus_usable?
+        gaps = tool_gaps
+        return "- Every tool layer contributed evidence to this package; no tool reported a false negative." if
+          gaps.empty?
 
-        "- **Tool gap:** #{tool_gap_sentence} The assessment above compensates with direct source " \
+        "- **Tool gap:** #{gaps.join(' ')} The assessment above compensates with direct source " \
           "inspection, which is a narrower instrument."
       end
 
-      def tool_gap_sentence
+      def tool_gaps
         gaps = []
-        gaps << "the structural graph was unusable" unless graphify_usable?
-        gaps << "Context+ semantic discovery did not run" unless context_plus_usable?
-        "#{gaps.join(' and ')}."
+        gaps << "The structural graph contributed nothing#{graphify_substitute_clause}." unless
+          graphify_contributed?
+        # No substitute clause for Context+: the runner cannot probe it at all, so the reason
+        # is never "the tool failed and a substitute was accepted". The Context+ section above
+        # carries the whole story, including any operator attestation.
+        gaps << "No Context+ semantic query was performed by this process." unless context_plus_contributed?
+        gaps
+      end
+
+      # For Graphify, usable-but-not-contributed means exactly one thing: the probe failed and
+      # a substitute was recorded. That is why the run continued. It is NOT the tool's
+      # evidence, and the sentence has to say both things or it launders one into the other.
+      def graphify_substitute_clause
+        return "" unless usable?("graphify")
+
+        " (the run continued on a recorded substitute, which is not the tool's own evidence)"
       end
 
       def implementation_approach
@@ -631,19 +652,23 @@ module SpecrelayRunner
           "  decision usually becomes an arbitrary implementation choice."
         ]
         lines << "- **Blocked evidence:** #{blocked_evidence_sentence}" if blocked_evidence?
-        lines << "- No evidence was blocked for this package; both tool layers reported a usable result." unless
-          blocked_evidence?
+        lines << "- No evidence was blocked for this package: every recorded input was readable and " \
+                 "every tool layer contributed." unless blocked_evidence?
         lines.join("\n")
       end
 
       def blocked_evidence?
-        !graphify_usable? || !context_plus_usable? || unused_inputs.any?
+        !graphify_contributed? || !context_plus_contributed? || unused_inputs.any?
       end
 
+      # Deliberately reports CONTRIBUTION. A capability the runner cannot probe is always a
+      # gap in this document's evidence, even when the operator declared it available — that
+      # declaration is what the runner is allowed to proceed on, not what it may claim to have
+      # gathered.
       def blocked_evidence_sentence
         parts = []
-        parts << "the structural graph was unusable" unless graphify_usable?
-        parts << "Context+ semantic discovery did not run" unless context_plus_usable?
+        parts << "the structural graph contributed nothing" unless graphify_contributed?
+        parts << "no Context+ semantic query was performed by this process" unless context_plus_contributed?
         parts << "#{unused_inputs.length} recorded #{unused_inputs.length == 1 ? 'input' : 'inputs'} could not be read" if
           unused_inputs.any?
         "#{parts.join('; ')}. Conclusions that would have depended on that material are absent rather " \
@@ -670,11 +695,18 @@ module SpecrelayRunner
         raw.empty? ? "the change recorded in its input bundle" : "\"#{raw}\""
       end
 
-      # CONTRIBUTED, not usable. A substituted tool is one the run was allowed to proceed
-      # without; describing its substitute as the tool's own evidence is the false-negative
-      # laundering criterion 4 forbids. See SourceEvidence::Tool for the two verdicts.
-      def graphify_usable? = tools.any? { |tool| tool["name"] == "graphify" && tool["contributed"] }
-      def context_plus_usable? = tools.any? { |tool| tool["name"] == "context_plus" && tool["contributed"] }
+      # CONTRIBUTED, not usable — and named that way now, because the old names said `usable?`
+      # while reading `contributed`, which is how the document ended up asserting "both tool
+      # layers reported a usable result" about a layer that had produced nothing.
+      #
+      # A substituted tool is one the run was allowed to proceed without; describing its
+      # substitute as the tool's own evidence is the false-negative laundering criterion 4
+      # forbids. See SourceEvidence::Tool for the two verdicts.
+      def tool_entry(name) = tools.find { |tool| tool["name"] == name } || {}
+      def contributed?(name) = tool_entry(name)["contributed"] ? true : false
+      def usable?(name) = tool_entry(name)["usable"] ? true : false
+      def graphify_contributed? = contributed?("graphify")
+      def context_plus_contributed? = contributed?("context_plus")
 
       # A crude but honest heuristic, and labelled as one wherever it is used. It reads the
       # ticket's own words rather than guessing from the codebase, so a reviewer can check it.
@@ -749,11 +781,18 @@ module SpecrelayRunner
 
       # The bundle body, fenced. Fenced rather than quoted because it is Markdown itself and
       # would otherwise re-render its own headings into this document's outline.
+      #
+      # The fence LENGTH is chosen from the body, and that is not a detail. The bundle always
+      # carries a fenced block of its own — Platform's renderer puts the reporter's
+      # description in one — so a hardcoded three-backtick fence closed on the bundle's fence
+      # and left the remaining six sections of this document inside a code block that was
+      # never closed. That shipped. See Markdown.fenced, which is now the only sanctioned way
+      # to embed text this process did not author.
       def bundle_block
         body = bundle["content_markdown"].to_s.strip
         return "_The bundle recorded no rendered content._" if body.empty?
 
-        "```markdown\n#{body}\n```"
+        Markdown.fenced(body, info: "markdown")
       end
 
       # What the REPORTER actually wrote, pulled out of the rendered bundle.
@@ -770,10 +809,17 @@ module SpecrelayRunner
       # rendered without one.
       DESCRIPTION_HEADING = "## Jira description"
 
+      # The fence around that section is NOT always three backticks: Platform lengthens it
+      # when the reporter's own text contains a backtick run. Matching a fixed ``` here would
+      # quietly fall through to the paragraph heuristic for exactly the descriptions most
+      # likely to contain code — so the opening run is captured and the closing one matched
+      # against it.
+      DESCRIPTION_BODY = /^(`{3,})[^\n`]*\n(.*?)\n\1`*[ \t]*$/m
+
       def reported_description
         body = bundle["content_markdown"].to_s
         section = body.split(DESCRIPTION_HEADING, 2)[1]
-        fenced = section.to_s[/```(?:text)?\n(.*?)\n```/m, 1]
+        fenced = section.to_s[DESCRIPTION_BODY, 2]
         (fenced || first_prose_paragraph(body)).to_s.strip
       end
 

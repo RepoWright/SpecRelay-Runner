@@ -39,14 +39,19 @@ module SpecrelayRunner
       # very thorough specification.
       MAX_OUTPUT_BYTES = 4_000_000
 
+      # The configured kind and the resolved provider's own `kind` are the SAME vocabulary —
+      # `composed` and `command` — so the diagnostics Platform persists cannot contradict the
+      # manifest. They used to: the default was configured as `fake` and reported itself as
+      # `composed`, and the run page told operators the production default was a fake.
       def self.resolve(settings:, env: ENV)
-        settings.fake_provider? ? Composed.new : Command.build(settings: settings, env: env)
+        settings.composed_provider? ? Composed.new : Command.build(settings: settings, env: env)
       end
 
       # The deterministic, built-in provider. It composes the documents from the packet with
       # no model call, which makes it both the test double the spec asks for and a genuinely
       # usable default: its output is grounded in the real bundle and the real source
-      # evidence, so it is a weak writer rather than a fake one.
+      # evidence, so it is a weak writer rather than a fake one — which is why the
+      # configuration value that selects it is `composed`.
       class Composed
         KIND = "composed"
 

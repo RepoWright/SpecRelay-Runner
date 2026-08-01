@@ -12,6 +12,7 @@ module SpecrelayRunner
   #
   # The pipeline, in the order it runs and in the order these files are required:
   #
+  #   Markdown        fenced-block rules, shared by everything that embeds untrusted text
   #   Assignment      parse and validate the payload Platform sent
   #   Settings        the operator's local, non-secret lane configuration
   #   PackagePath     the deterministic, contained destination
@@ -40,6 +41,7 @@ module SpecrelayRunner
   end
 end
 
+require_relative "specification/markdown"
 require_relative "specification/assignment"
 require_relative "specification/settings"
 require_relative "specification/package_path"

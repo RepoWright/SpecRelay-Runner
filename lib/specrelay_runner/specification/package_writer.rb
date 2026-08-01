@@ -31,8 +31,33 @@ module SpecrelayRunner
     # is renamed aside FIRST, the new one is moved in, and only then is the old one deleted.
     # If the second rename fails the old package is put back, so a failed replacement leaves
     # the previous package intact rather than nothing at all.
+    #
+    # The rename is the boundary between "nothing happened" and "it happened". Before it, a
+    # failure means the destination is untouched. After it, the generation has SUCCEEDED, and
+    # anything that goes wrong afterwards — deleting the set-aside copy, rewriting one
+    # manifest field — is a warning on a good package, never a teardown. Every failure this
+    # class raises carries which side of that boundary it is on, because the caller cannot
+    # know and an operator's next move depends on it.
     class PackageWriter
-      Error = Class.new(StandardError)
+      # The failure carries WHETHER THE RENAME HAPPENED, because that is the one fact an
+      # operator needs before deciding whether to go and look in the specification repository
+      # — and it is a fact only this class knows.
+      #
+      # It used to be a literal `true` in the caller ("both leave the destination untouched"),
+      # which was accurate for every path but one and therefore wrong exactly when it
+      # mattered: a post-rename cleanup failure reported "no output files written" over a
+      # destination that had already been completely replaced.
+      class Error < StandardError
+        attr_reader :package_path
+
+        def initialize(message, package_path: nil, wrote_package: false)
+          super(message)
+          @package_path = package_path
+          @wrote_package = wrote_package
+        end
+
+        def wrote_package? = @wrote_package ? true : false
+      end
 
       MANIFEST_CONTRACT_VERSION = "mvp-0026"
       STAGING_PREFIX = ".specrelay-generating-"
@@ -64,6 +89,7 @@ module SpecrelayRunner
         @settings = settings
         @clock = clock
         @warnings = []
+        @moved = false
       end
 
       def call
@@ -84,6 +110,14 @@ module SpecrelayRunner
           Result.new(relative_package_path: package_path.relative_package_path,
                      files: files + [ manifest_digest ], manifest: manifest,
                      replaced_existing: replaced, warnings: warnings)
+        rescue Error
+          raise
+        rescue StandardError => e
+          # Anything unexpected — most plausibly an I/O error while digesting the manifest at
+          # its final location — becomes an Error that still reports whether the package
+          # landed. Letting a bare Errno escape would crash past Generation's rescue list and
+          # leave the claim held with no recorded reason.
+          raise write_error("the generated package could not be completed: #{e.class}")
         ensure
           FileUtils.remove_entry(staging) if ::File.directory?(staging)
         end
@@ -235,7 +269,7 @@ module SpecrelayRunner
       def move_into_place(staging)
         destination = package_path.absolute_package_path
         return finish_move(staging, destination, nil) unless ::File.exist?(destination)
-        raise Error, "a package already exists at #{package_path.relative_package_path}" unless
+        raise write_error("a package already exists at #{package_path.relative_package_path}") unless
           settings.replace_existing?
 
         aside = "#{::File.dirname(destination)}/#{REPLACED_PREFIX}#{SecureRandom.hex(8)}"
@@ -246,15 +280,42 @@ module SpecrelayRunner
       # The rename, with the previous package restored if it fails. `aside` is nil for a
       # first generation, in which case there is nothing to restore and a failure simply
       # propagates with the destination still absent.
+      #
+      # ONLY the rename is inside the rescue window, and that is the fix for a real defect.
+      # The window used to extend over the post-move bookkeeping too, so a failure to delete
+      # the set-aside copy — pure housekeeping, after a completed replacement — tore down a
+      # good generation and reported it as a failure that wrote nothing. Everything after the
+      # rename is now treated the way `rewrite_manifest_replacement` on the line below always
+      # was: a warning on a generation that succeeded.
       def finish_move(staging, destination, aside)
-        ::File.rename(staging, destination)
+        begin
+          ::File.rename(staging, destination)
+        rescue SystemCallError => e
+          ::File.rename(aside, destination) if aside && !::File.exist?(destination)
+          raise write_error("could not move the generated package into place: #{e.class}")
+        end
+        @moved = true
         @replaced_existing = !aside.nil?
-        rewrite_manifest_replacement(destination) if aside
-        FileUtils.remove_entry(aside) if aside && ::File.directory?(aside)
-        !aside.nil?
-      rescue SystemCallError => e
-        ::File.rename(aside, destination) if aside && !::File.exist?(destination)
-        raise Error, "could not move the generated package into place: #{e.class}"
+        return false if aside.nil?
+
+        rewrite_manifest_replacement(destination)
+        discard_replaced(aside)
+        true
+      end
+
+      # The set-aside previous package, removed only after the new one is safely in place. Its
+      # removal cannot fail the generation; the operator is told where it is instead, by
+      # BASENAME — the containing directory is the operator's own checkout path and has no
+      # business in a message Platform stores and renders.
+      def discard_replaced(aside)
+        FileUtils.remove_entry(aside) if ::File.directory?(aside)
+      rescue StandardError
+        warnings << "the package this generation replaced could not be removed; it is still beside the " \
+                    "new package as `#{::File.basename(aside)}` and can be deleted by hand."
+      end
+
+      def write_error(message)
+        Error.new(message, package_path: package_path.relative_package_path, wrote_package: @moved)
       end
 
       # `replaced_existing_package` is only knowable after the move, and scope 10 requires the

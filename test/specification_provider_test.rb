@@ -24,6 +24,41 @@ class SpecificationProviderTest < Minitest::Test
     FileUtils.remove_entry(@temp) if @temp && File.directory?(@temp)
   end
 
+  # ------------------------------------------------------- the operator-facing vocabulary
+
+  # CR-001 should-fix 6. The default provider was CONFIGURED as `fake` and REPORTED itself as
+  # `composed`, so the diagnostics Platform persists told an operator that the intended
+  # production path was a fake. One vocabulary, and this asserts the two halves agree rather
+  # than trusting that they happen to.
+  def test_the_configured_provider_kind_and_the_resolved_provider_agree
+    { "composed" => "composed", "fake" => "composed", "command" => "command" }.each do |configured, resolved|
+      settings = settings_for(configured)
+
+      assert_equal resolved, settings.provider_kind, "configured #{configured.inspect}"
+      next if configured == "command"
+
+      assert_equal settings.provider_kind,
+                   SpecrelayRunner::Specification::Provider.resolve(settings: settings).kind
+    end
+  end
+
+  # `fake` stays accepted so an operator's existing config keeps working; it normalizes on the
+  # way in, so nothing downstream ever sees the old word.
+  def test_the_legacy_fake_alias_is_accepted_and_normalized
+    assert_equal "composed", settings_for("fake").provider_kind
+    assert settings_for("fake").composed_provider?
+  end
+
+  def test_an_unknown_provider_kind_is_refused_by_name
+    error = assert_raises(SpecrelayRunner::Specification::Settings::Error) { settings_for("magic") }
+
+    assert_includes error.message, "composed, command"
+  end
+
+  def settings_for(kind)
+    SpecrelayRunner::Specification::Settings.new({ "provider" => { "kind" => kind } }, env: {})
+  end
+
   # ------------------------------------------------------------------ what goes in
 
   def test_the_packet_carries_sanitized_bundle_and_source_evidence
@@ -145,7 +180,12 @@ class SpecificationProviderTest < Minitest::Test
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_with(provider), @io.string
     assert_empty Dir.children(File.join(@specs, "specs"))
-    assert_equal "package_write_failed", @platform.last_specification_generation["failure_class"]
+    generation = @platform.last_specification_generation
+    assert_equal "package_write_failed", generation["failure_class"]
+    # CR-001 must-fix 3 AC 2: a failure BEFORE the rename still reports zero output files, and
+    # this is now the computed answer rather than a hardcoded one. Keeping the assertion is the
+    # point — the fix must not turn every write failure into "something might be on disk".
+    assert generation["zero_output_files_written"], generation.inspect
     assert_includes @io.string, "private host filesystem path"
   end
 

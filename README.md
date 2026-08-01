@@ -233,9 +233,17 @@ a property of the control flow rather than of a cleanup routine that might fail.
 
 After preflight passes, three more classes can occur, and they are distinguished
 because the operator's next move differs: `generation_provider_failed`,
-`generated_output_invalid`, and `package_write_failed`. All three leave the
+`generated_output_invalid`, and `package_write_failed`. Almost always they leave the
 destination unchanged — the runner stages the whole package and moves it into place
 with a single rename.
+
+**Almost always is not always, so the runner reports which.** Every failure result
+carries `zero_output_files_written`, and it is computed from whether that rename
+completed rather than asserted. If a rare failure lands *after* the move — the
+package is already in place and something in the bookkeeping went wrong — the result
+says `false`, the message names the package path, and the run page tells you to go
+and look at the checkout. Deleting the package a lease or an I/O error interrupted
+would be a worse surprise than leaving it, so it is left.
 
 Recovery from any of these is on the **Platform** host, and it is not `release`
 (the refusing attempt already closed its own claim):
@@ -253,7 +261,7 @@ belongs here — the provider is a local executable path.
 runner:
   specification:
     provider:
-      kind: fake            # fake (built-in deterministic composer) | command
+      kind: composed        # composed (built-in deterministic composer) | command
       command: /abs/path/to/spec-writer   # required for kind: command
       timeout_seconds: 900
     repository_roots:
@@ -261,11 +269,21 @@ runner:
     on_existing_package: replace          # replace (default) | refuse
     context_plus:
       available: true
+      # Optional. Semantic evidence YOU gathered — the runner cannot query Context+.
+      queries:
+        - "where is the weekly report rendered"
+      evidence: "ReportsController#weekly and ExportReport are the material hits"
     graphify:
       substitute: "why, when the wrappers are absent"
     external_references:
       substitute: "why, when the bundle defers a reference to this runner"
 ```
+
+`provider.kind: fake` is still accepted as an alias for `composed` and normalizes on
+the way in, so an existing config keeps working. The value was renamed because the
+built-in composer is not a fake: it composes from the real bundle and the real source
+evidence, and an operator reading `provider: fake` in a run page's diagnostics was
+being told the intended default was a stub.
 
 Environment overrides: `SPECRELAY_RUNNER_SPEC_REPOSITORY_ROOT_<OWNER>_<REPO>` (or the
 unsuffixed `SPECRELAY_RUNNER_SPEC_REPOSITORY_ROOT`), `SPECRELAY_RUNNER_SPEC_PROVIDER`,
@@ -278,23 +296,44 @@ is what makes preflight refuse. A substituted tool is reported as having contrib
 **nothing** — "we were allowed to continue without Graphify" and "Graphify produced
 evidence" are different facts and are never collapsed.
 
+**Context+ is always reported as having contributed nothing.** The runner is a
+separate OS process with no MCP client, so it can neither run a semantic query nor
+verify that one ran; `context_plus.available: true` lets generation proceed and
+changes nothing about what the runner may claim. If you have gathered semantic
+evidence yourself, put it in `context_plus.queries` and `context_plus.evidence` —
+the runner reproduces both verbatim under `## Context+ evidence` and attributes them
+to you. It still does not mark the tool as having contributed, because the
+contributor was a person, not this process.
+
 #### The generation provider boundary
 
 Everything that turns evidence into prose goes through one interface with two
 methods — `describe` and `generate(packet)` — and the entire input a provider
 receives is one reviewable, redacted packet. Two implementations ship:
 
-- **`fake`** (the default) is the built-in deterministic composer: same packet, same
-  bytes, no model, no network. It is both the test double and a genuinely usable
+- **`composed`** (the default) is the built-in deterministic composer: same packet,
+  same bytes, no model, no network. It is both the test double and a genuinely usable
   default, because it composes from the real bundle and the real source evidence.
 - **`command`** runs an operator-configured local executable with the packet as JSON
   on stdin, expecting the file map as JSON on stdout. No shell, no inherited
   environment beyond `PATH`, and a throwaway working directory — the provider is
   never handed either checkout, because writing is not its job.
 
-Whatever a provider returns is validated for required sections before anything is
-written, so a plausible-looking document that silently omits acceptance criteria is
-rejected rather than committed.
+Whatever a provider returns is validated before anything is written, so a
+plausible-looking document that silently omits acceptance criteria is rejected rather
+than committed. **The document contract a provider must satisfy:**
+
+- every required section present as a `##` heading with a substantive body;
+- that heading **outside** every fenced code block — a heading that exists only
+  inside a fence is not a heading, and counts as absent;
+- **balanced fences**: a code block opened and never closed fails validation, because
+  everything after it renders as code.
+
+The last two are not pedantry. Round 001 shipped a `spec.md` in which six of the nine
+required sections rendered inside an unterminated code block, and a validator that
+matched headings on raw lines certified it. If your provider embeds text it did not
+author — a ticket body, tool output — choose the fence length from that text, longer
+than the longest backtick run inside it.
 
 Exit status is `0` only for a generated package. A refusal or a post-preflight
 failure exits `1`: the correct behaviour is now a package, so a `loop` session that

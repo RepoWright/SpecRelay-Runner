@@ -160,19 +160,40 @@ module SpecrelayRunner
 
       # A failure AFTER preflight passed. The distinction from a refusal is real and is
       # carried through to Platform: a refusal means a precondition was missing, a failure
-      # means generation was attempted and did not produce a usable package. Both leave the
-      # destination untouched — the writer's staging guarantees that — so both report
-      # zero output files at the final path.
+      # means generation was attempted and did not produce a usable package.
+      #
+      # Whether the destination is untouched is ASKED, not asserted. Almost every path here
+      # leaves it unchanged — the writer stages and renames once — but "almost every" is not a
+      # guarantee, and this line used to state the guarantee as a literal `true`. A failure in
+      # the bookkeeping after a completed rename then told the operator nothing had been
+      # written while the package sat fully replaced on their disk. Only PackageWriter knows
+      # which side of the rename a failure fell on, so only PackageWriter answers.
       def fail_generation(assignment, error)
         message = Redaction.redact(error.message.to_s)
+        wrote = wrote_package?(error)
         log("")
         log("Specification generation failed: #{message}")
-        log("No partial package was left at #{package_hint}; the destination is unchanged.")
+        log(wrote ? "The generated package IS in place at #{error.package_path} — it was not removed. " \
+                    "Inspect it before re-running." :
+                    "No partial package was left at #{package_hint}; the destination is unchanged.")
         log("Re-run after fixing the cause, or release the claim:")
         log("  #{assignment.release_command}")
-        submit(refusal_payload(Preflight::Refusal.new(failure_class: failure_class_for(error), message: message),
-                               outcome: "failed", zero_files: true))
+        refusal = Preflight::Refusal.new(failure_class: failure_class_for(error),
+                                         message: failure_message(error, message, wrote))
+        submit(refusal_payload(refusal, outcome: "failed", zero_files: !wrote))
         Result.new(outcome: FAILED, message: "Runner outcome: generation_failed (#{failure_class_for(error)}).")
+      end
+
+      def wrote_package?(error) = error.is_a?(PackageWriter::Error) && error.wrote_package?
+
+      # When a package IS on disk, the message names its path. The failure class alone sends
+      # an operator to the runner's configuration; the path is what sends them to the one
+      # place that now holds unreviewed generated files.
+      def failure_message(error, message, wrote)
+        return message unless wrote
+
+        "#{message}. The generated package IS in place at #{error.package_path} and was not removed; " \
+          "inspect it before re-running."
       end
 
       # Stable failure classes for the post-preflight failures, distinct from the preflight

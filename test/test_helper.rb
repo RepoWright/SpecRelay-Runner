@@ -59,45 +59,39 @@ def spec_creation_payload_for(issue_key:, title: "Add an export button", inputs:
   }
 end
 
-# The bundle body as Jira::SpecCreation::Markdown really renders it: a completeness verdict
-# and several tables BEFORE the reporter's own words, which arrive last under
-# `## Jira description` in a fenced block.
+# The bundle body, CAPTURED from the real renderer rather than written to resemble it.
 #
-# The original fixture put the reporter's prose first, and that politeness hid a real defect —
-# the composer quoted the first paragraph as the problem statement, which against a real
-# bundle is SpecRelay's own "Every expected input was readable." bookkeeping. A fixture that
-# is tidier than the document it stands in for tests nothing.
-def spec_bundle_markdown(issue_key)
-  <<~MD
-    # Specification-creation input bundle — #{issue_key}
+# `test/fixtures/input_bundle_rendered*.md` are verbatim output of Platform's
+# `Jira::SpecCreation::Markdown.render`, produced by running the real bundle engine over a
+# real `IssueDetail` in the Platform container. The runner is Rails-free and cannot call that
+# renderer, so the capture is committed; the command that produces it is in the fixture
+# README beside it, and a reviewer can re-run it and diff.
+#
+# Two rounds of defects came from a hand-written approximation of this document, and both
+# were invisible to the suite until a live pass:
+#
+#   - The first fixture put the reporter's prose FIRST, so the composer's "first paragraph"
+#     heuristic looked right. Against a real bundle it quotes SpecRelay's own "Every expected
+#     input was readable." bookkeeping as the problem statement.
+#   - The second was structurally right but hand-shaped, and it fenced the description with
+#     exactly three backticks. The real renderer LENGTHENS that fence when the description
+#     contains one — so the case that broke every generated `spec.md` was never generated.
+#
+# A fixture that is tidier than the document it stands in for tests nothing. Both variants are
+# real: `:plain` for the ordinary case, `:backticked` for a description carrying its own fenced
+# block, which the renderer wraps in a four-backtick fence.
+BUNDLE_FIXTURES = {
+  plain: "input_bundle_rendered.md",
+  backticked: "input_bundle_rendered_backticked.md"
+}.freeze
 
-    ## Input completeness
+# The issue key baked into the captured fixture. Substituted so one capture serves every test
+# without re-rendering per key.
+BUNDLE_FIXTURE_ISSUE_KEY = "SR-700"
 
-    Every expected input was readable.
-
-    ## Issue
-
-    - Issue: [#{issue_key}](https://example.atlassian.net/browse/#{issue_key}) — Add an export button
-    - Reporter: Dana Reporter
-    - Bundle trace id: `bundle_abc123`
-
-    ## Classified inputs
-
-    | Kind | Name | Read status | Reason |
-    | --- | --- | --- | --- |
-    | description | Jira description | available | read from the Jira issue |
-
-    ## Jira description
-
-    ```text
-    Reporting analysts need to take the weekly report out of the app and into a
-    spreadsheet. Today they retype it by hand, which takes about an hour a week and
-    introduces transcription mistakes that are only caught at month end.
-
-    Add a way to export the report the analysts already look at, in a format a
-    spreadsheet can open.
-    ```
-  MD
+def spec_bundle_markdown(issue_key, variant: :plain)
+  path = File.expand_path("fixtures/#{BUNDLE_FIXTURES.fetch(variant)}", __dir__)
+  File.read(path).gsub(BUNDLE_FIXTURE_ISSUE_KEY, issue_key)
 end
 
 

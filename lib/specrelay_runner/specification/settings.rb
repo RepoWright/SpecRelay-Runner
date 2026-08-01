@@ -16,7 +16,7 @@ module SpecrelayRunner
     #   runner:
     #     specification:
     #       provider:
-    #         kind: fake                 # fake | command
+    #         kind: composed             # composed | command  (`fake` is an accepted alias)
     #         command: /abs/path/to/spec-writer
     #         args: []
     #         timeout_seconds: 900
@@ -28,6 +28,9 @@ module SpecrelayRunner
     #       context_plus:
     #         available: false
     #         substitute: "<why, and what was used instead>"
+    #         queries:                   # optional: the semantic themes the operator searched
+    #           - "<query theme>"
+    #         evidence: "<the material hits, in the operator's own words>"
     #       external_references:
     #         available: false
     #         substitute: "<why, when the bundle defers a reference to the runner>"
@@ -44,9 +47,21 @@ module SpecrelayRunner
     class Settings
       Error = Class.new(StandardError)
 
+      # The built-in provider is `composed`, and it is named that everywhere an operator can
+      # see it: in the configuration, in the log, in the manifest, and in the diagnostics
+      # Platform persists.
+      #
+      # It used to be configured as `fake` while reporting itself as `composed`, so the run
+      # page told an operator the DEFAULT production path was a fake. It is not a fake — it
+      # composes real documents from the real bundle and the real source evidence, and it is a
+      # weak writer rather than a pretend one. `fake` stays accepted as an alias so no
+      # operator's existing config or env var breaks; it normalizes to `composed` on the way
+      # in, so there is exactly one value downstream.
+      PROVIDER_COMPOSED = "composed"
       PROVIDER_FAKE = "fake"
       PROVIDER_COMMAND = "command"
-      PROVIDER_KINDS = [ PROVIDER_FAKE, PROVIDER_COMMAND ].freeze
+      PROVIDER_KINDS = [ PROVIDER_COMPOSED, PROVIDER_COMMAND ].freeze
+      PROVIDER_ALIASES = { PROVIDER_FAKE => PROVIDER_COMPOSED }.freeze
 
       # What to do when a package for this issue already exists locally. MVP-0026 scope 10
       # requires ONE documented behaviour; `replace` is it, and `refuse` exists for an
@@ -75,10 +90,18 @@ module SpecrelayRunner
       # A capability's local availability, plus the operator's recorded reason when it is
       # not available. `usable?` is deliberately "available OR substituted": both let
       # generation proceed, and the difference is what gets written into the evidence.
-      Capability = Struct.new(:name, :available, :substitute, keyword_init: true) do
+      #
+      # `queries` and `notes` carry evidence the OPERATOR gathered by hand. They are populated
+      # for Context+ only — see #capability — because Context+ is the one required capability
+      # this process cannot probe, so it is the one place where a human's attestation is the
+      # only semantic evidence there can be. Recording it does not make the capability
+      # "contributed"; a person contributed, and SourceEvidence attributes it to them.
+      Capability = Struct.new(:name, :available, :substitute, :queries, :notes, keyword_init: true) do
         def available? = available ? true : false
         def substitute? = !substitute.to_s.strip.empty?
         def usable? = available? || substitute?
+        def queries = self[:queries] || []
+        def recorded_evidence? = !queries.empty? || !notes.to_s.strip.empty?
 
         def evidence
           return "available" if available?
@@ -104,7 +127,7 @@ module SpecrelayRunner
         @repository_roots = string_map(@document["repository_roots"])
         @on_existing_package = resolve_existing_policy
         @graphify = capability("graphify", default_available: true)
-        @context_plus = capability("context_plus", default_available: false)
+        @context_plus = capability("context_plus", default_available: false, operator_evidence: true)
         @external_references = capability("external_references", default_available: false)
       end
 
@@ -127,14 +150,15 @@ module SpecrelayRunner
       end
 
       def replace_existing? = on_existing_package == REPLACE
-      def fake_provider? = provider_kind == PROVIDER_FAKE
+      def composed_provider? = provider_kind == PROVIDER_COMPOSED
 
       private
 
       attr_reader :document, :env
 
       def resolve_provider_kind(provider)
-        kind = presence(env[PROVIDER_KIND_ENV]) || presence(provider["kind"]) || PROVIDER_FAKE
+        configured = presence(env[PROVIDER_KIND_ENV]) || presence(provider["kind"]) || PROVIDER_COMPOSED
+        kind = PROVIDER_ALIASES.fetch(configured, configured)
         raise Error, "runner.specification.provider.kind must be one of: #{PROVIDER_KINDS.join(', ')}" unless
           PROVIDER_KINDS.include?(kind)
 
@@ -155,11 +179,19 @@ module SpecrelayRunner
       # UNAVAILABLE because they are MCP capabilities this process cannot probe from the
       # outside, so assuming them present would let a runner claim evidence it never
       # gathered.
-      def capability(name, default_available:)
+      # `operator_evidence` is opt-in per capability rather than read for all three, so
+      # `graphify.queries` is not silently accepted-and-ignored. Graphify is probed; its
+      # evidence comes from the tool, and a config key that looked like it would be reproduced
+      # but never was is the kind of dead vocabulary the spec forbids adding.
+      def capability(name, default_available:, operator_evidence: false)
         section = subsection(name)
         available = section.key?("available") ? truthy(section["available"]) : default_available
-        Capability.new(name: name, available: available, substitute: presence(section["substitute"]))
+        Capability.new(name: name, available: available, substitute: presence(section["substitute"]),
+                       queries: operator_evidence ? string_list(section["queries"]) : [],
+                       notes: operator_evidence ? presence(section["evidence"]) : nil)
       end
+
+      def string_list(value) = Array(value).map { |entry| entry.to_s.strip }.reject(&:empty?)
 
       def subsection(key)
         value = document[key]

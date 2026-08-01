@@ -16,9 +16,15 @@ module SpecrelayRunner
     # the criteria are good. Claiming otherwise would be the more dangerous failure, so the
     # validation states exactly what it establishes and the review step remains human.
     #
-    # Section titles are matched as `##` headings. That is a contract with the composer and
-    # with any operator writing an external provider, and it is documented in the runner
-    # README rather than left to be reverse-engineered from a rejection message.
+    # Section titles are matched as `##` headings, OUTSIDE any fenced code block, and every
+    # document must have balanced fences. That is a contract with the composer and with any
+    # operator writing an external provider, and it is documented in the runner README rather
+    # than left to be reverse-engineered from a rejection message.
+    #
+    # The fence rules are here because their absence was a shipped defect rather than a
+    # theoretical gap: a raw-line heading scan certified a `spec.md` whose last six required
+    # sections rendered inside an unterminated code block. Structural completeness that a
+    # renderer disagrees with is not completeness.
     class DocumentSet
       Invalid = Class.new(StandardError)
 
@@ -105,11 +111,7 @@ module SpecrelayRunner
       # The lines under one `###` subheading, up to the next heading of any level. Separate
       # from #section_body because that one deliberately treats `###` as part of the body.
       def subsection_body(content, heading)
-        lines = content.lines
-        start = lines.index { |line| line.chomp == heading }
-        return nil if start.nil?
-
-        lines[(start + 1)..].to_a.take_while { |line| !/\A\#{1,3}[ \t]+\S/.match?(line) }.join
+        bounded_body(content, /\A#{Regexp.escape(heading)}\z/, /\A\#{1,3}[ \t]+\S/)
       end
 
       def validate_document(name)
@@ -117,7 +119,26 @@ module SpecrelayRunner
         raise Invalid, "#{name} is too short to be a generated document (#{content.length} characters)" if
           content.strip.length < MIN_DOCUMENT_CHARS
 
+        validate_fences!(name, content)
         REQUIRED_SECTIONS.fetch(name).each { |section| validate_section(name, content, section) }
+      end
+
+      # A document with an unterminated fenced code block is not a valid document, whatever
+      # its text contains: everything after the stray fence renders as code, including the
+      # acceptance criteria.
+      #
+      # This check exists because its absence let a broken package through. The section scan
+      # below matched `##` on raw lines, so it could not tell a heading from a line of
+      # code-block content, and it certified a `spec.md` in which six of the nine required
+      # sections were inside an unterminated block. Both halves are fixed together on
+      # purpose — a renderability gate without a fence-aware section scan would still accept
+      # a document whose headings exist only inside a code block.
+      def validate_fences!(name, content)
+        line = Markdown.unterminated_fence(content)
+        return if line.nil?
+
+        raise Invalid, "#{name} has a fenced code block opened at line #{line} that is never closed; " \
+                       "everything after it would render as code"
       end
 
       def validate_section(name, content, section)
@@ -135,13 +156,28 @@ module SpecrelayRunner
       # terminate the body). Returns nil when the heading is absent, which is a different
       # answer from an empty body and is reported differently.
       def section_body(content, section)
-        heading = /\A##[ \t]+#{Regexp.escape(section)}[ \t]*\z/
-        lines = content.lines
-        start = lines.index { |line| heading.match?(line.chomp) }
+        bounded_body(content, /\A##[ \t]+#{Regexp.escape(section)}[ \t]*\z/, /\A\#{1,2}[ \t]+\S/)
+      end
+
+      # The body between a heading and its terminator, where BOTH are looked for only among
+      # lines a renderer would treat as document structure.
+      #
+      # Scanning raw lines is the bug that let a broken `spec.md` through: the generated
+      # document embeds the input bundle in a fenced block, the bundle carries `##` headings
+      # of its own, and a raw scan happily reported those as this document's sections. A
+      # heading that exists only inside a code block is not a heading, and this returns nil
+      # for it — which is the same answer as "absent", because to a reader it is.
+      #
+      # The BODY is still taken from the raw lines: everything between the two structural
+      # headings belongs to the section, fenced content included.
+      def bounded_body(content, heading, terminator)
+        structural = Markdown.structural_lines(content)
+        start = structural.find { |line, _number| heading.match?(line.chomp) }
         return nil if start.nil?
 
-        body = lines[(start + 1)..].to_a.take_while { |line| !/\A\#{1,2}[ \t]+\S/.match?(line) }
-        body.join
+        finish = structural.find { |line, number| number > start.last && terminator.match?(line) }
+        lines = content.lines
+        lines[start.last..(finish ? finish.last - 2 : lines.length - 1)].to_a.join
       end
     end
   end

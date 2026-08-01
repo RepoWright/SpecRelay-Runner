@@ -152,7 +152,18 @@ module SpecrelayRunner
 
         Tool.new(name: "graphify", usable: true, contributed: true,
                  summary: "graph FRESH for this checkout, verified with `#{GRAPH_CHECK}`",
-                 detail: [ clip(result.stdout), graph_query(query) ].reject(&:empty?).join("\n\n"))
+                 detail: [ graph_check_block(result), graph_query(query) ].reject(&:empty?).join("\n\n"))
+      end
+
+      # Tool stdout is FENCED, both here and below. `graph-check` prints one fact per line —
+      # version, graph path, source commits, freshness — and emitting them bare collapsed the
+      # whole verdict into a single run-together paragraph in the generated analysis. It is
+      # program output; it renders as program output.
+      def graph_check_block(result)
+        text = clip(result.stdout)
+        return "" if text.empty?
+
+        "`#{GRAPH_CHECK}`:\n\n#{Markdown.fenced(text, info: 'text')}"
       end
 
       # One scoped traversal, not a tour of the codebase. The question is derived from the
@@ -162,7 +173,7 @@ module SpecrelayRunner
         result = run([ query, question ])
         return "`#{GRAPH_QUERY} \"#{question}\"` returned no output." unless result.success?
 
-        "`#{GRAPH_QUERY} \"#{question}\"`:\n\n```text\n#{clip(result.stdout)}\n```"
+        "`#{GRAPH_QUERY} \"#{question}\"`:\n\n#{Markdown.fenced(clip(result.stdout), info: 'text')}"
       end
 
       # `contributed: false` unconditionally. A substitute lets the run proceed; it does not
@@ -175,17 +186,63 @@ module SpecrelayRunner
                  detail: substitute.to_s.strip.empty? ? reason : "#{reason}. Approved substitute: #{substitute}")
       end
 
-      # Semantic evidence. The runner is a separate OS process with no MCP client of its
-      # own, so it cannot probe Context+ the way it probes Graphify — it reports what the
-      # operator declared and nothing more. Claiming a semantic pass this process did not
-      # perform would be exactly the dishonest evidence criterion 4 is written against.
+      # Semantic evidence — and the honest verdict about it.
+      #
+      # `contributed: false`, UNCONDITIONALLY. The runner is a separate OS process with no MCP
+      # client, so it cannot run a Context+ query and cannot verify that one ran. Deriving
+      # `contributed` from the operator's `available:` flag was the exact conflation the
+      # two-verdict Tool struct exists to prevent, and it shipped: the generated analysis said
+      # "Result: used", Platform's run page said "contributed evidence", and nothing had
+      # queried anything.
+      #
+      # `usable` keeps its meaning and still gates preflight, so no refusal behaviour changes.
+      # What changes is that the document and the durable record now say who gathered what.
+      #
+      # An operator CAN put real semantic evidence into the package — `queries:` and
+      # `evidence:` under `runner.specification.context_plus` are reproduced verbatim below.
+      # That is an operator attestation, and it is labelled as one; it still does not make
+      # `contributed` true, because the contributor was a person, not this process.
+      NO_SEMANTIC_QUERY = "No semantic evidence was gathered by this process. The runner is a separate OS " \
+                          "process with no MCP client, so it can neither run a Context+ query nor verify " \
+                          "that one ran."
+
       def context_plus_evidence
         capability = settings.context_plus
-        Tool.new(name: "context_plus", usable: capability.usable?, contributed: capability.available?,
-                 summary: capability.evidence,
-                 detail: capability.available? ?
-                   "Context+ was declared available for this runner; semantic discovery supplements the " \
-                   "structural evidence above." : capability.evidence)
+        Tool.new(name: "context_plus", usable: capability.usable?, contributed: false,
+                 summary: context_plus_summary(capability), detail: context_plus_detail(capability))
+      end
+
+      def context_plus_summary(capability)
+        return "not queried by this process; operator-recorded semantic evidence is reproduced in the " \
+               "technical analysis" if capability.recorded_evidence?
+        return "not queried by this process; #{capability.evidence}" unless capability.available?
+
+        "declared available, but this process performed no semantic query and no themes or hits were recorded"
+      end
+
+      def context_plus_detail(capability)
+        parts = [ NO_SEMANTIC_QUERY ]
+        parts << "Declared available in this runner's configuration. A declaration is not a query result." if
+          capability.available?
+        parts << "Approved substitute: #{Redaction.redact(capability.substitute.to_s)}" if capability.substitute?
+        parts << operator_recorded_semantics(capability) if capability.recorded_evidence?
+        parts.join("\n\n")
+      end
+
+      # Reproduced verbatim, and attributed. Criterion 4 asks the technical analysis to carry
+      # query themes and material hits; when a human has them, the honest thing is to print
+      # them under the heading they belong to and name whose they are.
+      def operator_recorded_semantics(capability)
+        lines = [ "**Operator-recorded Context+ evidence.** Reproduced verbatim from this runner's " \
+                  "configuration. It is the operator's attestation, not this process's output." ]
+        unless capability.queries.empty?
+          lines << "" << "Query themes:"
+          lines.concat(capability.queries.map { |query| "- #{clip(query)}" })
+        end
+        unless capability.notes.to_s.strip.empty?
+          lines << "" << "Material hits:" << clip(capability.notes)
+        end
+        lines.join("\n")
       end
 
       # What direct source inspection found that the tools did not. Recorded unconditionally,
@@ -198,10 +255,19 @@ module SpecrelayRunner
                   "#{entry_points.length == 1 ? 'file' : 'files'} across the sampled tree." ]
         notes << "Graphify contributed no structural evidence for this package, so the source files " \
                  "named below come from direct inspection alone." unless graphify_evidence.contributed?
-        notes << "Context+ contributed no semantic evidence for this package; the technical analysis " \
-                 "is grounded in direct inspection and the structural graph only." unless
-          settings.context_plus.available?
+        # Always recorded, because it is always true: this process never queries Context+.
+        # The two wordings differ only in whether a human put semantic evidence in front of it.
+        notes << context_plus_fallback
         notes
+      end
+
+      def context_plus_fallback
+        return "Context+ was not queried by this process; the operator's recorded semantic evidence is " \
+               "reproduced in the technical analysis and attributed to them." if
+          settings.context_plus.recorded_evidence?
+
+        "Context+ contributed no semantic evidence for this package; the technical analysis is " \
+          "grounded in direct inspection and the structural graph only."
       end
 
       # The wrapper's absolute path when it exists and is executable, else nil. Executability
