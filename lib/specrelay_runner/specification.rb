@@ -55,3 +55,19 @@ require_relative "specification/provider"
 require_relative "specification/package_writer"
 require_relative "specification/preflight"
 require_relative "specification/generation"
+# MVP-0027 — the lane's third phase: publish the generated package as a draft pull request.
+#
+#   PackageVerification   prove the local files ARE the package Platform recorded
+#   GitCommands           the one place a git/gh process is launched
+#   GitPublisher          commit the verified files with plumbing and push, never touching
+#                         the operator's working tree or HEAD
+#   PullRequestPublisher  create or reuse exactly one draft pull request
+#   Publication           the orchestrator that runs the above against a live claim
+#
+# The same two properties hold as for generation: nothing mutates a repository before
+# PackageVerification succeeds, and nothing in this namespace requires Rails or reaches Jira.
+require_relative "specification/package_verification"
+require_relative "specification/git_commands"
+require_relative "specification/git_publisher"
+require_relative "specification/pull_request_publisher"
+require_relative "specification/publication"

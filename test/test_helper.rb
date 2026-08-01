@@ -59,6 +59,33 @@ def spec_creation_payload_for(issue_key:, title: "Add an export button", inputs:
   }
 end
 
+# A specification-PUBLICATION assignment exactly as Runner::Api::SpecCreationPayload builds one
+# for a run in AWAITING_SPECIFICATION_PUBLICATION (MVP-0027).
+#
+# It is the generation payload plus the two blocks that make publication possible and a
+# different `expected_runner_action` — the same document with a different authorization, which
+# is precisely what the runner branches on. `files` carries REAL digests supplied by the caller,
+# because every interesting case here is about whether the bytes on disk match them.
+def spec_publication_payload_for(issue_key:, files:, package_path:, branch:,
+                                 repository_url: "https://github.com/SpecRelay/SpecRelay-Specs",
+                                 slug: "SpecRelay/SpecRelay-Specs", base_branch: "main",
+                                 draft: true, title: "Add an export button")
+  spec_creation_payload_for(issue_key: issue_key, title: title).merge(
+    "run" => { "id" => "run_spec123", "type" => "spec_creation",
+               "state" => "AWAITING_SPECIFICATION_PUBLICATION" },
+    "assignment_boundary" => { "generation" => "generate_package_only",
+                               "publication" => "publish_draft_pull_request_only",
+                               "expected_runner_action" => "publish_specification_package",
+                               "release_command" => "bin/platform runner release run_spec123" },
+    "generated_package" => { "path" => package_path, "generated_at" => "2026-08-01T09:00:00Z",
+                             "files" => files },
+    "publication" => { "repository_url" => repository_url, "slug" => slug,
+                       "specification_root" => "specs", "branch" => branch,
+                       "base_branch" => base_branch, "create_pull_request" => true,
+                       "pull_request_draft" => draft }
+  )
+end
+
 # The bundle body, CAPTURED from the real renderer rather than written to resemble it.
 #
 # `test/fixtures/input_bundle_rendered*.md` are verbatim output of Platform's

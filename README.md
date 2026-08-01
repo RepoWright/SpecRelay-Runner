@@ -172,7 +172,7 @@ it, and uploads the report. Exit `0` on completion, no eligible work, or a gener
 specification package (below), `1` on a failed execution or a refused generation,
 `2` on a config/usage error.
 
-### Two lanes, and one of them writes files (MVP-0026)
+### Two lanes, and one of them writes files (MVP-0026, MVP-0027)
 
 Platform can hand this runner work from either lane, and the runner branches on the
 assignment's own `run.type` — never on which fields are missing:
@@ -180,14 +180,20 @@ assignment's own `run.type` — never on which fields are missing:
 | `run.type` | What this runner does |
 |---|---|
 | `implementation` | The full flow: worktree, executor, tests, report, publication. |
-| `spec_creation` | Generates a specification package locally, then **stops before publication.** |
+| `spec_creation` | Two phases, each its own claim: **generate** a specification package locally, then — when Platform offers the same run again — **publish** it as a draft pull request. |
 
-A `spec_creation` assignment means "write a specification for this Jira issue". The
-runner generates it into the operator's own checkout of the configured specification
-repository and reports what it wrote. It does **not** create a branch, commit, push,
-open a pull request, write a Jira field, or transition an issue — those are MVP-0027
-and MVP-0028, and the assignment says so as data
-(`assignment_boundary.generation = "generate_package_only"`).
+Within the specification lane the runner branches a second time, on
+`assignment_boundary.expected_runner_action` rather than on the run's state:
+
+| `expected_runner_action` | Phase |
+|---|---|
+| `generate_specification_package` | Write the package into the operator's specification checkout. Nothing is committed. |
+| `publish_specification_package` | Verify the recorded digests, commit, push, and open or reuse one draft pull request. |
+| anything else | **Stop.** A build that meets an action it does not implement refuses rather than guessing, and prints the release command. |
+
+Neither phase writes a Jira field, transitions an issue, or adds a comment — that is
+MVP-0028, and the assignment says so as data
+(`assignment_boundary.publication = "publish_draft_pull_request_only"`).
 
 #### What it writes
 
@@ -211,6 +217,62 @@ never reach a generated file — including in quoted `bin/graph-check` and
 `bin/graph-query` output, which the runner relativizes before quoting. The input
 bundle is identified by its **trace id**, never by a Platform URL: that address is
 machine-local, and this package is destined for a shared repository.
+
+#### Publishing the package (MVP-0027)
+
+When Platform offers the run again with `expected_runner_action:
+publish_specification_package`, the assignment adds two blocks: `generated_package`, the
+SHA-256 of every file Platform recorded, and `publication`, Platform's branch decision. The
+runner executes that decision; it never invents a branch name, a base, or a pull-request
+kind.
+
+The order is the contract, and everything before the first git command is reversible by
+doing nothing:
+
+```text
+parse -> resolve the checkout -> VERIFY EVERY DIGEST -> check `gh auth` -> commit+push -> draft PR -> report
+```
+
+- **Digest verification first.** A file that differs, is missing, or cannot be read is a
+  refusal with no git command run at all. The package was written by an earlier run into a
+  checkout the operator owns and can edit; publishing whatever is there now would mean
+  Platform's evidence described a different document set from the one a developer reviews.
+- **`gh auth` before the commit, not after the push.** A host that cannot open a pull
+  request must not first push a branch nobody will be asked to review.
+- **The commit never touches the working tree or HEAD.** It is built with plumbing into a
+  TEMPORARY index — `read-tree` the base, `hash-object` each verified file,
+  `update-index`, `write-tree`, `commit-tree` — and the commit object is pushed directly.
+  Run this against a checkout you are working in; that is the intent. It also makes
+  "the commit contains only the package files" structural: nothing else was ever added.
+- **A retry reuses.** The base is the existing remote branch tip, so a republish writes the
+  same tree; an unchanged tree means no commit is created and the existing tip is reused,
+  and the push is a no-op. The pull request is looked up before it is created, and a lookup
+  that cannot answer FAILS CLOSED rather than guessing "none". The reuse decision itself is
+  `SpecrelayRunner::PullRequestReuse`, shared with the implementation lane.
+- **Never a force push, never a delete.** A diverged publication branch is refused with the
+  branch named and the remedy stated.
+
+A pushed branch without the required draft pull request is a **failure**, not a partial
+success: the run does not reach approval, and the branch is reported as evidence of how far
+the attempt got. Failure classes are a closed set — `publication_assignment_malformed`,
+`specification_repository_unresolved`, `specification_checkout_mismatch`,
+`generated_package_missing`, `generated_package_digest_mismatch`, `github_cli_unavailable`,
+`git_push_failed`, `pull_request_creation_failed`, `publication_verification_failed` — and
+Platform enforces the same list.
+
+**A publication is `published` only once Platform has accepted the result.** If Platform
+answers `4xx`, it has read the payload and REFUSED it — the run will not reach approval and no
+retry of the same body will change that, so the runner reports a failure, names what Platform
+refused, still prints the branch and pull request (they exist, and Platform holds no record of
+where), and exits non-zero. A `5xx` or an unreachable Platform is different: the outcome on
+GitHub still stands, the runner says so, and the claim is left to expire so a later attempt can
+reuse the same branch and pull request.
+
+The checkout is checked against the assigned repository, but only when its `origin`
+resolves to a GitHub `owner/repo`. A remote that does not resolve (an ssh alias, an internal
+mirror, a local path) is not evidence of a mismatch, and refusing every one would refuse
+legitimate setups on a guess; the wrong-clone case those could hide still fails closed at
+the pull-request step, which addresses GitHub by the ASSIGNED slug.
 
 #### What happens when the source checkout yields nothing
 

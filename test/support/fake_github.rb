@@ -124,8 +124,13 @@ module FakeGithub
           head = flag("--head")
           # A second create for the same branch would be a duplicate; the runner is
           # expected to reuse instead, so record it and let the test assert on it.
+          # `isDraft` mirrors what real `gh pr list --json isDraft` returns, and it is a FACT
+          # about the invocation rather than a constant: MVP-0027 refuses to report a pull
+          # request as this run's specification unless GitHub says it is a draft, so a fake that
+          # always answered `true` would make that check untestable.
           File.write(STATE, JSON.generate(prs + [ { "url" => URL, "state" => "OPEN",
                                                     "headRefName" => head,
+                                                    "isDraft" => ARGV.include?("--draft"),
                                                     "headRefOid" => head_oid(head) } ]))
           # "create_silent": creation succeeds but prints no URL, so the runner has to
           # fall back to a lookup. Real gh can be quiet under some output settings.

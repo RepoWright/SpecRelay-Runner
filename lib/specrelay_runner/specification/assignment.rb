@@ -114,6 +114,75 @@ module SpecrelayRunner
       def lease_expires_at = section("execution_policy")["lease_expires_at"].to_s
       def lease_renewal_seconds = section("execution_policy")["lease_renewal_seconds"].to_i
 
+      # ------------------------------------------------------------------ MVP-0027
+
+      # What this claim authorizes, read from the field Platform writes for exactly that
+      # purpose. The runner branches on THIS rather than on `run.state`, so "what am I allowed
+      # to do?" has one answer written by the control plane — and a runner build that does not
+      # recognise the token stops instead of guessing.
+      PUBLISH_ACTION = "publish_specification_package"
+      GENERATE_ACTION = "generate_specification_package"
+
+      def expected_runner_action = section("assignment_boundary")["expected_runner_action"].to_s
+      def publication? = expected_runner_action == PUBLISH_ACTION
+
+      # Generation is the DEFAULT for an empty action as well as for the explicit token: a
+      # Platform old enough not to send the field at all can only be asking for generation, and
+      # refusing it would break a runner against a Platform it used to work with. An action that
+      # is present but unrecognised is a different case entirely — that is a newer Platform
+      # asking for something this build does not implement, and guessing would be worse than
+      # stopping.
+      def generation? = expected_runner_action.empty? || expected_runner_action == GENERATE_ACTION
+
+      # The publication decisions Platform made. The runner executes them; it never invents a
+      # branch name, never chooses a base, and never decides whether a pull request is a draft.
+      def publication_branch = publication["branch"].to_s
+      def publication_base_branch = publication["base_branch"].to_s
+      def publication_repository_url = publication["repository_url"].to_s
+      def publication_slug = publication["slug"].to_s
+      def create_pull_request? = publication["create_pull_request"] == true
+      def draft_pull_request? = publication["pull_request_draft"] == true
+
+      # The package Platform RECORDED at generation, with a digest per file. This is the
+      # evidence the runner verifies its local checkout against before it is allowed to touch
+      # git — the whole point of publishing from Platform's record rather than from whatever
+      # happens to be on the disk now.
+      def generated_package_path = generated_package["path"].to_s
+
+      def generated_files
+        Array(generated_package["files"]).map do |file|
+          entry = file.to_h
+          { "path" => entry["path"].to_s, "sha256" => entry["sha256"].to_s }
+        end
+      end
+
+      # Everything a publication needs, validated as a set BEFORE any git command runs. A
+      # publication assignment missing one of these is a contract violation, and discovering it
+      # halfway through — after a branch exists on a shared repository — is exactly what this
+      # ordering prevents.
+      PUBLICATION_REQUIRED = [
+        [ %w[publication repository_url], "publication.repository_url" ],
+        [ %w[publication branch], "publication.branch" ],
+        [ %w[publication base_branch], "publication.base_branch" ],
+        [ %w[generated_package path], "generated_package.path" ]
+      ].freeze
+
+      SHA256 = /\A[0-9a-f]{64}\z/
+
+      def validate_publication!
+        missing = PUBLICATION_REQUIRED.reject { |path, _| present?(payload.dig(*path)) }.map(&:last)
+        raise Malformed, "publication assignment is missing required data: #{missing.join(', ')}" if missing.any?
+
+        files = generated_files
+        raise Malformed, "publication assignment names no generated file to publish" if files.empty?
+
+        undigested = files.reject { |file| SHA256.match?(file["sha256"]) }.map { |file| file["path"] }
+        raise Malformed, "publication assignment carries no usable digest for: #{undigested.join(', ')}" if
+          undigested.any?
+
+        self
+      end
+
       # Prefer the command Platform sent, so the runner never invents an identifier — the
       # same rule the implementation lane follows for branch names.
       def release_command
@@ -126,6 +195,8 @@ module SpecrelayRunner
       attr_reader :payload
 
       def target = section("specification_target")
+      def publication = section("publication")
+      def generated_package = section("generated_package")
       def section(name) = payload[name].to_h
       def present?(value) = !value.to_s.strip.empty?
     end

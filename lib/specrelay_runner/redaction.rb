@@ -33,7 +33,12 @@ module SpecrelayRunner
       # CI_JOB_TOKEN= and GITHUB_TOKEN= match: a \b before "token" does not, because the
       # underscore is a word character (review-003 finding 3).
       /\b[A-Za-z0-9_]*(?:secret|token|password|passwd|api[_-]?key|access[_-]?key)\s*[:=]\s*\S+/i,
-      /\bbearer\s+[A-Za-z0-9._\-]{8,}\b/i
+      /\bbearer\s+[A-Za-z0-9._\-]{8,}\b/i,
+      # The other Authorization scheme, where the base64 blob IS the credential. `git` and
+      # `gh` both echo request headers under GIT_CURL_VERBOSE / GH_DEBUG=api, and no pattern
+      # above matches a base64 blob (MVP-0027 review-001 P2-1). Anchored on the header name
+      # rather than on a bare `basic ` so ordinary prose is not redacted.
+      /\bauthorization\s*:\s*basic\s+\S+/i
     ].freeze
 
     # Credential userinfo in a URL: `https://user:token@host/…`. A raw git error can

@@ -290,7 +290,7 @@ module SpecrelayRunner
     # readiness assumptions, the worktree, or the report contract — and a specification
     # assignment reaching an older code path is impossible rather than merely unlikely.
     def execute(config, client, payload)
-      return generate_specification(config, client, payload) if
+      return specification(config, client, payload) if
         Specification::Assignment.specification?(payload)
 
       announce_claim(payload)
@@ -311,9 +311,40 @@ module SpecrelayRunner
     # An ABORTED attempt (Platform cancelled the claim or the lease lapsed) also exits
     # non-zero: the run did not produce what it was claimed for, and Platform — not this
     # process — owns what happens next.
+    # MVP-0027 — the specification lane now has two phases, and which one a claim authorizes is
+    # read from the ASSIGNMENT rather than inferred. Platform writes `expected_runner_action` for
+    # exactly this purpose, so a runner build that meets a token it does not recognise refuses
+    # instead of guessing — which is what stops a future phase from being executed by an older
+    # runner that only knows how to generate.
+    def specification(config, client, payload)
+      assignment = Specification::Assignment.new(payload)
+      return publish_specification(config, client, payload) if assignment.publication?
+      return generate_specification(config, client, payload) if assignment.generation?
+
+      unknown_specification_action(assignment)
+    end
+
+    def unknown_specification_action(assignment)
+      err.puts "This Platform asked for a specification action this runner does not implement " \
+               "(#{assignment.expected_runner_action.inspect})."
+      err.puts "Upgrade the runner, or release the claim so a newer one can take it:"
+      err.puts "  #{assignment.release_command}"
+      RUN_FAILED
+    end
+
     def generate_specification(config, client, payload)
       result = Specification::Generation.call(config: config, client: client, payload: payload,
                                               env: env, io: out)
+      out.puts result.message
+      result.success? ? SUCCESS : RUN_FAILED
+    end
+
+    # A FAILED publication exits non-zero for the same reason a refused generation does: the run
+    # did not produce what it was claimed for, and a `loop` session or a CI step that treated it
+    # as success would poll forever against a runner that cannot reach GitHub, reporting health.
+    def publish_specification(config, client, payload)
+      result = Specification::Publication.call(config: config, client: client, payload: payload,
+                                               env: env, io: out)
       out.puts result.message
       result.success? ? SUCCESS : RUN_FAILED
     end

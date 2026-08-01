@@ -95,6 +95,27 @@ class RedactionTest < Minitest::Test
     assert_match(/\[REDACTED\]/, redacted)
   end
 
+  # --- MVP-0027 review-001 P2-1: the other Authorization scheme ---------------
+
+  # `bearer` was covered; `Basic` was not, and the base64 blob IS the credential. It can
+  # reach the runner's console through GIT_CURL_VERBOSE / GH_DEBUG=api output.
+  def test_basic_authorization_header_is_redacted
+    raw = "> Authorization: Basic ZGVwbG95Ym90Okh1bnRlcjJIdW50ZXIy"
+
+    redacted = R.redact(raw)
+
+    refute_match(/ZGVwbG95Ym90/, redacted, "the base64 credential must not survive")
+    assert_match(/\[REDACTED\]/, redacted)
+  end
+
+  # Anchored on the header name, so ordinary prose that happens to contain "basic"
+  # followed by a long word is left alone.
+  def test_basic_pattern_does_not_eat_ordinary_prose
+    text = "mobile acceptance means basic readability at narrow widths"
+
+    assert_equal text, R.redact(text)
+  end
+
   # The prefixed-label pattern must not swallow ordinary prose or evidence.
   def test_labelled_pattern_does_not_eat_evidence
     assert_equal "pushed to specrelay/MAPIAI-25 at 8819084d8c18",
