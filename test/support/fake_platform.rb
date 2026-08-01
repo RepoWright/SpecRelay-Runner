@@ -126,6 +126,10 @@ class FakePlatform
   # as load-bearing for criterion 15 — the fact that nothing was sent to /reports.
   def specification_generations = requests_to("/api/runner/specification_generations")
   def last_specification_generation = specification_generations.last&.dig(:body, "generation")
+  # MVP-0027: what the runner reported about a publication attempt, and the fact that a
+  # publication claim sent nothing to the generation endpoint.
+  def specification_publications = requests_to("/api/runner/specification_publications")
+  def last_specification_publication = specification_publications.last&.dig(:body, "publication")
 
   # MVP-0013: the v1 protocol events the runner sent (the `event` sub-hash of each
   # /events request), in receipt order, and the terminal-result envelope uploaded
@@ -144,6 +148,12 @@ class FakePlatform
   # workspace to claim for without also executing a whole run. "Nothing eligible" is a normal,
   # exit-0 poll, so the resolution is proven on the real code path rather than a stubbed one.
   def offer_no_work! = @claimed = true
+
+  # MVP-0027: offer the SAME assignment again, which is what real Platform does after
+  # `bin/platform runner retry-publication` returns a blocked run to the publishable state. It
+  # is how a retry is exercised end to end through the CLI rather than by calling a publisher
+  # twice in-process — and the retry-idempotency rule is about what a second CLAIM does.
+  def offer_again! = @claimed = false
 
   private
 
@@ -208,6 +218,7 @@ class FakePlatform
     when "/api/runner/heartbeat" then [ 200, { acknowledged: true, state: "EXECUTING", lease: lease_signal } ]
     when "/api/runner/reports" then report(request)
     when "/api/runner/specification_generations" then specification_generation(request)
+    when "/api/runner/specification_publications" then specification_publication(request)
     else [ 404, { error: "not found" } ]
     end
   end
@@ -224,6 +235,20 @@ class FakePlatform
              execution_state: outcome == "generated" ? "COMPLETED" : "GENERATION_REFUSED",
              run_state: outcome == "generated" ? "AWAITING_SPECIFICATION_PUBLICATION" :
                           "BLOCKED_SPECIFICATION_GENERATION" } ]
+  end
+
+  # MVP-0027: the specification-publication result endpoint. Dumb about domain rules for the
+  # same reason its sibling is — Platform's own specs cover the real validation — but honest
+  # about the run state it reports back, because the runner prints it and a fake that always
+  # said "published" would let a fail-closed path look identical to a success in the output.
+  def specification_publication(request)
+    outcome = request.dig(:body, "publication", "outcome").to_s
+    return [ 422, { error: "publication outcome is required" } ] if outcome.empty?
+
+    published = outcome == "published"
+    [ 201, { outcome: outcome,
+             execution_state: published ? "COMPLETED" : "PUBLICATION_FAILED",
+             run_state: published ? "AWAITING_SPECIFICATION_APPROVAL" : "BLOCKED_SPECIFICATION_PUBLICATION" } ]
   end
 
   # MVP-0021: the per-workspace member routes. GET describes this runner's grant; DELETE

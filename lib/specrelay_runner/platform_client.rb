@@ -176,6 +176,23 @@ module SpecrelayRunner
       status == 201 ? body : raise_for(status, body)
     end
 
+    # POST /api/runner/specification_publications (MVP-0027). Reports the outcome of ONE
+    # specification-publication attempt: the branch, commit and draft pull request that reached
+    # GitHub, or the failure that stopped it.
+    #
+    # A separate endpoint from #submit_specification_generation for the same reason that one is
+    # separate from #submit_report: Platform moves the run to a different state for each, and a
+    # shared endpoint would let a runner reach the approval transition by posting the wrong body.
+    #
+    # Platform decides the resulting run state; the response is read for what it DECIDED rather
+    # than assumed. A rejected payload returns non-201 and is raised, so the runner fails closed
+    # instead of printing a success it cannot substantiate.
+    def submit_specification_publication(claim:, publication:)
+      status, body = post_json("/api/runner/specification_publications",
+                               { claim: claim, publication: publication })
+      status == 201 ? body : raise_for(status, body)
+    end
+
     # POST /api/runner/reports. bundle is { round_label:, files: [...] }.
     # terminal_result, when given, is the MVP-0013 terminal-result envelope
     # validated by Platform BEFORE import; a rejected envelope returns non-201 and

@@ -310,7 +310,11 @@ module SpecrelayRunner
     # truth — `reusable` derives its behaviour from it and the table-driven test pins
     # it, so a decision cannot join the reusable set in one place only (review-005
     # R5-F2, which found the set duplicated as a hardcoded expression here).
-    REUSABLE_DECISIONS = %i[head_matches reported_is_ancestor].freeze
+    #
+    # MVP-0027 moved the set and the predicate it belongs to into {PullRequestReuse} so the
+    # specification lane holds the same copy rather than a second implementation. This alias
+    # keeps the constant readable at its original name; the authority is the module.
+    REUSABLE_DECISIONS = PullRequestReuse::REUSABLE_DECISIONS
 
     # Belt and braces on top of `--state open`: the pull request must name this branch,
     # and its head must be shown to contain the commit THIS RUN PUSHED — `pushed`, taken
@@ -363,14 +367,16 @@ module SpecrelayRunner
     # `--json`; a requested field that comes back missing means we could not determine the
     # head, and whose fault that is has no bearing on whether linking an unverified pull
     # request as this run's output is safe.
+    #
+    # MVP-0027 moved the table itself into {PullRequestReuse} so the specification lane's
+    # publication path decides reuse by the same rows rather than by a second implementation of
+    # them. The comment above stays here because this is where the four rounds happened; the
+    # module carries it too, and the module is the authority. `ancestor?` — the one part that
+    # touches a repository — remains this class's, which is exactly the boundary that made the
+    # rest shareable.
     def reuse_decision(reported, pushed)
-      return :pushed_head_unknown if pushed.empty?
-      return :reported_head_unknown if reported.empty?
-      return :head_matches if reported == pushed
-      return :reported_is_ancestor if ancestor?(reported, pushed)
-      return :reported_head_ahead if ancestor?(pushed, reported)
-
-      :heads_diverged
+      PullRequestReuse.decide(reported: reported, pushed: pushed,
+                              ancestor: ->(candidate, descendant) { ancestor?(candidate, descendant) })
     end
 
     def refusal_for(decision, pull_request, branch, pushed)
