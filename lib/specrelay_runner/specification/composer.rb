@@ -141,25 +141,46 @@ module SpecrelayRunner
         text.lines.map { |line| line.strip.empty? ? ">" : "> #{line.chomp}" }.join("\n")
       end
 
+      # CR-003 must-fix 1 part 2. This section used to be three generic bullets with one
+      # interpolation, and it read **identically** for two differently-shaped real tickets — a
+      # crash-on-failed-read bug and a homepage version display. That is the template prose
+      # scope 3 forbids.
+      #
+      # The choice, stated because the CR asked for it to be stated: **derive it from the
+      # ticket's own outcome material** where the ticket has any, and where it does not, emit
+      # ONE honest sentence that does not pretend to be ticket-specific. Not a better template.
       def outcome_statement
+        return derived_outcome unless ticket.outcome?
+
         [
-          "When this is delivered, the behaviour #{issue_key} describes exists in `#{repository}`",
-          "and can be exercised by the people the ticket names. Concretely:",
+          "**From the ticket's own \"#{ticket.heading_for(TicketSections::OUTCOME)}\" section, verbatim:**",
           "",
-          "- the request recorded in the input bundle is satisfied rather than partially approximated;",
-          "- the change is visible from the surfaces the ticket refers to, not only in internal state;",
-          "- #{outcome_evidence_clause}",
+          blockquote(ticket.outcome),
           "",
           "The business reading of who benefits and what it is worth is in",
           "[`#{PackagePath::BUSINESS_MD}`](#{PackagePath::BUSINESS_MD})."
         ].join("\n")
       end
 
-      def outcome_evidence_clause
-        return "the open questions listed below are answered before the work is considered done." if
-          open_questions.any?
+      # No bullets, no "concretely", and nothing that implies this generation knows what
+      # delivery looks like. The ticket did not say, so this says only what is true.
+      def derived_outcome
+        [
+          "The ticket states no outcome section of its own, so this one does not invent one. The",
+          "change lands in `#{repository}`, and what counts as delivered is #{outcome_authority}.",
+          "Restating that here in different words would create a second requirement to disagree",
+          "with the first.",
+          "",
+          "The business reading of who benefits and what it is worth is in",
+          "[`#{PackagePath::BUSINESS_MD}`](#{PackagePath::BUSINESS_MD})."
+        ].join("\n")
+      end
 
-        "the acceptance criteria below can each be demonstrated on a running system."
+      def outcome_authority
+        return "exactly what the acceptance criteria below require — and those are the reporter's own" if
+          ticket.acceptance_criteria?
+
+        "what the recorded inputs quoted under \"Input summary\" describe"
       end
 
       def input_summary
@@ -178,29 +199,38 @@ module SpecrelayRunner
         ].join("\n")
       end
 
-      # The ticket's own account of the wanted behaviour comes FIRST and verbatim, followed by
-      # the derived numbered statements — and only those the ticket actually supports.
+      # CR-003 must-fix 1. Where the ticket supplies its own acceptance criteria, the DERIVED
+      # numbered behaviour list is not emitted at all.
       #
-      # The derived list used to assert idempotency and a failure path unconditionally, which
-      # against a real ticket for a stateless read-only endpoint produced two invented
-      # requirements. Worse, the OPEN QUESTIONS about the same two topics were conditional, so
-      # one document could assert idempotency as a requirement and, four sections later, ask
-      # who was going to decide it. Both now read the same predicate.
+      # Round 003 emitted it alongside the reproduced material, and its second entry was
+      # "Repeating the same request produces no second effect — the ticket calls for idempotent
+      # behaviour", conditioned on a keyword match. On the real Bug `MAPIAI-49` the only match
+      # in the whole description was the word "again", in "a following request to / succeeds
+      # once the file is readable again" — a sentence about a file becoming readable. Four
+      # statements across two documents then instructed an implementer to build and test
+      # idempotency for a stateless GET handler, attributed to the reporter.
+      #
+      # Emitting less is the fix. A ticket that has written six testable criteria does not need
+      # this generation to add four more from a word list.
       def proposed_behavior
         lines = [ behaviour_preamble ]
         lines += [ "", reproduced_sections ] if reproduced_sections
-        lines += [ "", *derived_behaviour_lines ]
+        lines += [ "", *derived_behaviour_lines ] unless ticket.acceptance_criteria?
         lines += unresolved_behaviour_lines
         lines.join("\n")
       end
 
       def behaviour_preamble
+        return "The behaviour this ticket asks for is the ticket's own, reproduced below and under " \
+               "\"Acceptance criteria\". This generation adds nothing to it — where a specification " \
+               "needs a decision the ticket did not make, it is an open question rather than a " \
+               "requirement." if ticket.acceptance_criteria?
         return "The ticket's own description of the wanted behaviour is reproduced first, verbatim. " \
-               "The numbered statements after it are derived from the recorded inputs; where the " \
-               "ticket is silent, they say so instead of choosing for the product." if reproduced_sections
+               "The numbered statements after it are DERIVED by this generation; where the ticket is " \
+               "silent, they say so instead of choosing for the product." if reproduced_sections
 
-        "The behaviour below is derived from the recorded inputs. Where the ticket is silent, this " \
-          "section says so instead of choosing for the product."
+        "The behaviour below is DERIVED by this generation from the recorded inputs. Where the ticket " \
+          "is silent, this section says so instead of choosing for the product."
       end
 
       # Every section of the ticket that is not Problem, Acceptance criteria or Non-goals —
@@ -216,15 +246,16 @@ module SpecrelayRunner
         @reproduced_sections = blocks.empty? ? nil : blocks.join("\n\n")
       end
 
+      # Reached only when the ticket states NO acceptance criteria. Every line says outright
+      # that it is this generation's, and none of them claims the ticket asked for it — the
+      # clauses "the ticket calls for idempotent behaviour" and "which the ticket asks for" are
+      # gone unconditionally, because a keyword is not a requirement and the ticket's own words
+      # are reproduced verbatim elsewhere anyway.
       def derived_behaviour_lines
-        lines = [ "Derived from the recorded inputs:", "" ]
+        lines = [ "DERIVED by this generation, and to be confirmed:", "" ]
         numbered = [ "The system accepts the interaction #{issue_key} describes, from the surface the " \
-                     "ticket names, and applies the change the input bundle records." ]
-        numbered << "Repeating the same request produces no second effect — the ticket calls for " \
-                    "idempotent behaviour." if ticket_mentions_repeat?
-        numbered << "The failure case reports a specific, actionable reason rather than silently " \
-                    "doing nothing." if ticket_mentions_failure?
-        numbered << "Existing behaviour outside the ticket's scope is unchanged; see \"Non-goals\"."
+                     "ticket names, and applies the change the input bundle records.",
+                     "Existing behaviour outside the ticket's scope is unchanged; see \"Non-goals\"." ]
         lines + numbered.each_with_index.map { |text, index| "#{index + 1}. #{text}" }
       end
 
@@ -285,7 +316,8 @@ module SpecrelayRunner
           "",
           ticket.acceptance_criteria,
           "",
-          "Derived additions, which are this generation's and must be confirmed:",
+          "This generation adds no numbered criteria of its own. Two conditions hold for any",
+          "generated specification and are stated rather than numbered:",
           "",
           standing_criteria.join("\n")
         ].join("\n")
@@ -302,17 +334,15 @@ module SpecrelayRunner
         ].join("\n")
       end
 
-      # Only the criteria the ticket's own text supports. `bundle_mentions_repeat?` and
-      # `bundle_mentions_failure?` drive both these and the matching open questions, so the
-      # document can no longer require a behaviour and simultaneously ask who will decide it.
+      # Reached only when the ticket states no criteria. One bullet, and it asserts nothing the
+      # ticket did not: no idempotency, no failure path, nothing conditioned on a word list.
+      #
+      # The keyword-conditioned bullets that used to be here are gone. A keyword is not a
+      # product decision, and where a specification needs one the ticket did not make, the
+      # honest output is an open question — which is what #open_questions now always raises.
       def derived_criteria_list
-        lines = [ "- The interaction #{issue_key} describes can be performed end to end, and its effect",
-                  "  is observable afterwards." ]
-        lines << "- Repeating the same request produces no second effect (idempotency), which the " \
-                 "ticket asks for." if ticket_mentions_repeat?
-        lines << "- The failure path reports a specific, actionable reason and leaves no partial " \
-                 "state, which the ticket asks for." if ticket_mentions_failure?
-        lines
+        [ "- The interaction #{issue_key} describes can be performed end to end, and its effect",
+          "  is observable afterwards." ]
       end
 
       # True of any specification this runner generates, whatever the ticket says, and labelled
@@ -328,22 +358,29 @@ module SpecrelayRunner
         lines
       end
 
+      # CR-003 must-fix 1 part 2 item 3: every bullet here must be **universally true** — true
+      # of validating any change to any repository — or conditional on something the ticket
+      # actually says. Nothing may require evidence for a criterion the document does not state.
+      #
+      # The idempotency bullet is gone. It was conditioned on a keyword, so `MAPIAI-49` was told
+      # to prove idempotency "by performing the operation twice" for a stateless GET handler.
+      # The choice this section makes, stated because the CR asked which was chosen:
+      # **universally true bullets**, with the one ticket-conditional bullet added when — and
+      # only when — the ticket has criteria of its own to be held to.
       def validation_expectations
         lines = [
-          "- Automated tests in `#{repository}` covering the happy path and each behaviour named",
-          "  under \"Proposed behavior\". The specific suites and likely test seams are enumerated in",
+          "- Automated tests in `#{repository}` covering the happy path and each behaviour this",
+          "  specification states. The likely test seams are enumerated in",
           "  [`#{PackagePath::TECHNICAL_MD}`](#{PackagePath::TECHNICAL_MD}).",
           "- The repository's existing full validation (test suite and lint) passing unchanged, so",
           "  the change is shown not to regress anything.",
           "- A demonstration of the behaviour on a running system for anything user-visible;",
           "  a passing unit test is not evidence that a user-facing flow works."
         ]
-        # Conditional for the same reason the criterion is: a ticket that never mentions repeat
-        # behaviour should not be told to prove idempotency.
-        lines << "- Evidence that the idempotency criterion holds, by performing the operation twice." if
-          ticket_mentions_repeat?
-        lines << "- Evidence for each acceptance criterion the ticket itself states, in the ticket's " \
-                 "own terms." if ticket.acceptance_criteria?
+        lines << "- Evidence for each criterion the ticket itself states, in the ticket's own terms " \
+                 "and against its own labels." if ticket.acceptance_criteria?
+        lines << "- An answer to each open question below, recorded before implementation starts." if
+          open_questions.any?
         lines.join("\n")
       end
 
@@ -475,20 +512,46 @@ module SpecrelayRunner
           *open_questions.map { |question| "- #{question}" } ]
       end
 
+      # CR-003. This section had the same two defects as the specification, and the review found
+      # them only in `spec.md` — so fixing it there and not here would have left the business
+      # analysis asserting "Criterion 2 (idempotency) is not in the ticket. It is included
+      # because…" for a ticket whose criteria are lettered `a)`–`f)` and which asks for no such
+      # thing. Six invented criterion numbers, and one of them justifying the exact
+      # fabrication must-fix 1 removes.
+      #
+      # Where the ticket states its criteria, the rationale is the reporter's and this section
+      # says so instead of explaining a numbering nobody wrote.
       def criteria_rationale
+        return stated_criteria_rationale if ticket.acceptance_criteria?
+
         [
-          "The specification's criteria are written against what a reviewer can observe, because the",
+          "The ticket states no criteria of its own, so the ones in the specification are DERIVED",
+          "and unconfirmed. They are written against what a reviewer can observe, because the",
           "recorded inputs describe an outcome rather than a mechanism:",
           "",
-          "- Criterion 1 is the ticket's actual request, stated as something demonstrable.",
-          "- Criterion 2 (idempotency) is not in the ticket. It is included because the workflow",
-          "  described is one a user can repeat, and a double effect would be a defect the reporter",
-          "  would attribute to this change.",
-          "- Criterion 3 (failure path) is included for the same reason: the ticket describes the",
-          "  success case only, and an unspecified failure mode is decided by whoever implements it.",
-          "- Criterion 4 exists so \"it works\" cannot be satisfied by breaking something adjacent.",
-          "- Criterion 5 ties the delivered behaviour back to the recorded inputs, so an input that",
-          "  was captured but quietly ignored shows up as an unmet criterion rather than as nothing.",
+          "- The first is the ticket's actual request, stated as something demonstrable.",
+          "- The rest tie the delivered behaviour back to the recorded inputs and to the existing",
+          "  suites, so \"it works\" cannot be satisfied by breaking something adjacent, and an",
+          "  input that was captured but quietly ignored shows up as an unmet criterion rather",
+          "  than as nothing.",
+          criteria_rationale_tail
+        ].join("\n")
+      end
+
+      def stated_criteria_rationale
+        [
+          "**The criteria are the reporter's own**, reproduced verbatim in",
+          "[`#{PackagePath::SPEC_MD}`](../#{PackagePath::SPEC_MD}) from the ticket's",
+          "\"#{ticket.heading_for(TicketSections::ACCEPTANCE)}\" section. This generation added none",
+          "of its own and does not restate their rationale — the reporter wrote them, and a",
+          "paraphrase here would be a second, competing account of what \"done\" means.",
+          "",
+          "What this analysis can say about them:",
+          "",
+          "- They are the authority for acceptance. Anything an implementer cannot demonstrate",
+          "  against one of them is out of scope by the ticket's own reckoning.",
+          "- Two conditions hold beyond them for any generated specification: the existing suites",
+          "  still pass, and every input marked *used* is reflected in the delivered behaviour.",
           criteria_rationale_tail
         ].join("\n")
       end
@@ -496,7 +559,7 @@ module SpecrelayRunner
       def criteria_rationale_tail
         return "" if open_questions.empty?
 
-        "- Criterion 6 blocks implementation on the open questions, so a guess cannot enter the\n" \
+        "- The open questions block implementation, so a guess cannot enter the\n" \
           "  codebase as though it were an approved decision."
       end
 
@@ -705,19 +768,37 @@ module SpecrelayRunner
         " (the run continued on a recorded substitute, which is not the tool's own evidence)"
       end
 
+      # CR-003 should-fix 2. This list used to cite "criterion 1", "criterion 2" and
+      # "criterion 3" — numbers that exist only in the DERIVED criteria list, which is no longer
+      # emitted when the ticket supplies its own. `MAPIAI-49`'s criteria are lettered `a)`–`f)`
+      # and `MAPIAI-48`'s are bullets; neither document ever had a criterion 2. Seven
+      # cross-references in this file pointed at nothing on exactly the tickets the reproduction
+      # work was written to serve.
+      #
+      # The fix is to describe the behaviour and point at the criteria as a body, by whatever
+      # labels they carry. Inventing a numbering the specification does not use is what caused
+      # this.
       def implementation_approach
         [
-          "1. Reproduce the current behaviour first, from the surface the ticket names. The",
-          "   specification's criterion 1 is not implementable until the present behaviour is understood.",
+          "1. Reproduce the current behaviour first, from the surface the ticket names. Nothing here",
+          "   is implementable until the present behaviour is understood.",
           "2. Locate the owning code among the entry points above, and confirm ownership by reading it —",
           "   the file list is evidence that inspection happened, not a design.",
           "3. Make the change additively, following the conventions already present in `#{repository}`.",
-          "4. Build the failure path deliberately (criterion 3) rather than letting it fall out of the",
-          "   happy path.",
-          "5. Make the operation idempotent (criterion 2); this is usually a guard at the entry point",
-          "   rather than a change to the effect itself.",
-          "6. Add the tests below, then run the repository's full validation."
+          "4. Work through #{criteria_reference} one at a time, building each deliberately rather than",
+          "   letting it fall out of the happy path.",
+          "5. Add the tests below, then run the repository's full validation."
         ].join("\n")
+      end
+
+      # How to refer to the criteria a reader will actually find in `spec.md`, without inventing
+      # a numbering for them.
+      def criteria_reference
+        return "the acceptance criteria the ticket states, under \"Acceptance criteria\" in " \
+               "[`#{PackagePath::SPEC_MD}`](../#{PackagePath::SPEC_MD})" if ticket.acceptance_criteria?
+
+        "the derived acceptance criteria in [`#{PackagePath::SPEC_MD}`](../#{PackagePath::SPEC_MD}), " \
+          "confirming each with the product owner first"
       end
 
       def implementation_surface
@@ -750,16 +831,27 @@ module SpecrelayRunner
         "No credential, permission, or trust-boundary change is described in the recorded inputs."
       end
 
+      # No invented criterion numbers here either (CR-003 should-fix 2). Every bullet is a test
+      # any change of this shape needs, or is anchored to the criteria as a body.
       def tests_needed
         [
-          "- A happy-path test for the interaction in criterion 1, at the level the behaviour lives at.",
-          "- An idempotency test that performs the operation twice and asserts one effect (criterion 2).",
-          "- A failure-path test asserting the specific reason and the absence of partial state (criterion 3).",
-          "- Regression coverage for the adjacent behaviour criterion 4 protects.",
+          "- **One test per criterion.** #{criteria_test_sentence}",
+          "- A happy-path test at the level the behaviour lives at, not one level below it.",
+          "- Regression coverage for the adjacent behaviour the ticket's exclusions protect —",
+          "  see \"Non-goals\" in [`#{PackagePath::SPEC_MD}`](../#{PackagePath::SPEC_MD}).",
           "- If the change turns out to be user-facing, a test at that surface — a passing unit test",
           "  does not establish that a user flow works.",
           "- The repository's existing suites, run unchanged, as the baseline the change must not move."
         ].join("\n")
+      end
+
+      def criteria_test_sentence
+        return "The ticket states its criteria under " \
+               "\"#{ticket.heading_for(TicketSections::ACCEPTANCE)}\"; each one should be demonstrable " \
+               "by a named test, referred to by the ticket's own label." if ticket.acceptance_criteria?
+
+        "The criteria in [`#{PackagePath::SPEC_MD}`](../#{PackagePath::SPEC_MD}) are DERIVED and " \
+          "unconfirmed; confirm them before writing tests against them."
       end
 
       def technical_risks
@@ -877,12 +969,16 @@ module SpecrelayRunner
       # A crude but honest heuristic, and labelled as one wherever it is used. It reads the
       # ticket's own words rather than guessing from the codebase, so a reviewer can check it.
       #
-      # WORD BOUNDARIES, not `include?`. Substring matching read `page` inside "homepage", `ui`
-      # inside "distinguishable" and `view` inside "REVIEW", so a JSON endpoint with no user
-      # interface was reported as `UI | Likely` — a wrong assessment produced by three
-      # coincidences in one real ticket.
+      # Two corrections, in two rounds, and the second is the one that mattered:
+      #
+      #   - WORD BOUNDARIES, not `include?`. Substring matching read `page` inside "homepage",
+      #     `ui` inside "distinguishable" and `view` inside "REVIEW".
+      #   - The ticket's INCLUSIVE material only. Word boundaries did not fix `MAPIAI-49`,
+      #     because the matching mode was never the problem: its only `\bpage\b` is in "not
+      #     about the page content", inside `Out of scope`. Reading an exclusion as an inclusion
+      #     is a category error, and no amount of tuning the word list corrects it.
       def user_facing?
-        matches_any?("#{issue['title']} #{reported_description}",
+        matches_any?("#{issue['title']} #{ticket.inclusive_material}",
                      %w[button page screen ui click form field display show view])
       end
 
@@ -893,13 +989,23 @@ module SpecrelayRunner
 
       # The open questions this generation is willing to state. Each is derived from a real
       # gap rather than from a list of questions that could be asked about anything.
+      # CR-003 must-fix 1 part 2. An open question is now suppressed only by the ticket's own
+      # CRITERIA saying something about the topic — never by a keyword appearing anywhere in the
+      # prose.
+      #
+      # Round 003 suppressed the repeat question `unless ticket_mentions_repeat?`, so the word
+      # "again" in "once the file is readable again" removed the counterweight and left
+      # `spec.md` reading "None arising from the recorded inputs." next to a fabricated
+      # idempotency requirement. Round 002's version was contradictory but LOUD; round 003 made
+      # it quiet, which is worse. A keyword match is not a product decision, and it must never
+      # be able to silence a question.
       def open_questions
         @open_questions ||= begin
           questions = []
-          questions << "What should happen when the operation is attempted a second time? The recorded " \
-                       "inputs describe the first attempt only." unless ticket_mentions_repeat?
-          questions << "What should the user see when the operation cannot complete? The recorded inputs " \
-                       "describe the success case only." unless ticket_mentions_failure?
+          questions << "What should happen when the operation is attempted a second time? No stated " \
+                       "criterion covers repeat behaviour." unless criteria_mention_repeat?
+          questions << "What should the user see when the operation cannot complete? No stated " \
+                       "criterion covers the failure path." unless criteria_mention_failure?
           unused_inputs.each do |input|
             questions << "What did **#{input['kind']}#{input_name_suffix(input)}** contain? It was recorded " \
                          "as an input but could not be read here (#{input['note']})."
@@ -913,21 +1019,22 @@ module SpecrelayRunner
       # of read statuses and reasons — and matching a keyword there would answer "did
       # SpecRelay mention failure?" instead of "did the ticket specify one?", which is the
       # question that decides whether an open question is real.
-      # These two now decide THREE things each — whether the derived behaviour statement is
-      # emitted, whether the derived acceptance criterion is emitted, and whether the open
-      # question is raised — so that the document can never both require a behaviour and ask
-      # who is going to decide it. That contradiction shipped.
+      # These decide ONE thing each, and only one: whether to raise an open question. They no
+      # longer gate any normative statement, because CR-003 established that a keyword cannot
+      # carry a requirement — "again" in "readable again" is not a request for idempotency.
       #
-      # `idempot` stays a prefix rather than a whole word: "idempotent", "idempotency" and
-      # "idempotently" are all the same signal, and `\b` on a prefix is exactly right for it.
-      def ticket_mentions_repeat?
-        matches_any?(reported_description, %w[idempotent idempotency idempotently again twice repeat
-                                              re-run rerun duplicate duplicating second])
+      # They read the ticket's own CRITERIA rather than its whole description, which is the
+      # narrowest text where a stated requirement can actually live. Prose discussing a failure
+      # mode is not a criterion about it, and the cost of a false negative here is one extra
+      # open question — the safe direction.
+      def criteria_mention_repeat?
+        matches_any?(ticket.acceptance_criteria, %w[idempotent idempotency idempotently twice repeat
+                                                    re-run rerun duplicate duplicating])
       end
 
-      def ticket_mentions_failure?
-        matches_any?(reported_description, %w[error errors fail fails failure invalid reject rejects
-                                              unable cannot unreadable missing absent])
+      def criteria_mention_failure?
+        matches_any?(ticket.acceptance_criteria, %w[error errors fail fails failing failure invalid
+                                                    reject rejects unable cannot unreadable 500])
       end
 
       def input_name_suffix(input)

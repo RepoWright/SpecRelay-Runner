@@ -88,6 +88,154 @@ class SpecificationTicketMaterialTest < Minitest::Test
     refute_includes problem, "Reviewer-created verification fixture"
   end
 
+  # ------------------------------------------------- CR-003 must-fix 1: no derived requirements
+
+  # THE regression. On the real Bug MAPIAI-49 the only match for any repeat keyword in the whole
+  # description is the word "again", in "a following request to / succeeds once the file is
+  # readable again" — a sentence about a file becoming readable. Round 003 turned that into four
+  # statements across two documents instructing an implementer to build and test idempotency for
+  # a stateless GET handler, attributed to the reporter.
+  def test_the_word_again_in_readable_again_does_not_produce_an_idempotency_requirement
+    package = compose(:failed_read)
+    spec = package["spec.md"]
+    technical = package["analysis/technical.md"]
+
+    assert_includes spec, "readable again", "the fixture must still contain the phrase that misfired"
+    refute_includes spec, "the ticket calls for idempotent behaviour"
+    refute_includes spec, "Evidence that the idempotency criterion holds"
+    refute_includes spec, "idempotency"
+    refute_includes technical, "Make the operation idempotent"
+    refute_includes technical, "An idempotency test"
+    refute_includes technical, "idempotent"
+  end
+
+  # …and the counterweight must be there. Round 003 suppressed the open question `unless
+  # ticket_mentions_repeat?`, so the same word that produced the false requirement also removed
+  # the question that would have exposed it, leaving "None arising from the recorded inputs."
+  def test_a_ticket_whose_criteria_are_silent_on_repeats_still_raises_the_open_question
+    spec = compose(:failed_read)["spec.md"]
+    questions = section(spec, "Dependencies, assumptions, and open questions")
+
+    assert_includes questions, "attempted a second time"
+    refute_includes questions, "None arising from the recorded inputs"
+  end
+
+  # CR-003 must-fix 1 criterion 3: the POSITIVE branch of each predicate, which nothing pinned.
+  # Without this the tests pass identically whether the predicate is word-boundaried, naive, or
+  # absent altogether.
+  def test_the_content_predicates_fire_when_a_criterion_really_states_the_requirement
+    # MAPIAI-49's lettered criteria do describe the failure path — 500, "read fails", the log.
+    questions = section(compose(:failed_read)["spec.md"],
+                        "Dependencies, assumptions, and open questions")
+    refute_includes questions, "cannot complete", "the failure question must be suppressed by a real criterion"
+
+    # MAPIAI-48's criteria mention neither repeats nor failures, so both questions stand.
+    version_questions = section(compose(:version)["spec.md"],
+                                "Dependencies, assumptions, and open questions")
+    assert_includes version_questions, "attempted a second time"
+    assert_includes version_questions, "cannot complete"
+  end
+
+  # CR-003 must-fix 1 criterion 5: refute over the WHOLE document, not one section.
+  def test_no_real_ticket_produces_a_fabricated_repeat_requirement_anywhere
+    %i[healthz version failed_read].each do |ticket|
+      package = compose(ticket)
+      %w[spec.md analysis/technical.md analysis/business.md].each do |name|
+        refute_includes package[name], "Repeating the same request produces no second effect",
+                        "#{ticket} #{name}"
+        refute_includes package[name], "the ticket calls for", "#{ticket} #{name}"
+        refute_includes package[name], "which the ticket asks for", "#{ticket} #{name}"
+      end
+    end
+  end
+
+  # ------------------------------------- CR-003 must-fix 1 part 2: three sections stop being literal
+
+  def test_outcome_differs_between_two_real_tickets
+    a = section(compose(:version)["spec.md"], "Outcome").gsub("MAPIAI-48", "KEY")
+    b = section(compose(:failed_read)["spec.md"], "Outcome").gsub("MAPIAI-49", "KEY")
+
+    refute_equal a, b, "## Outcome is identical for two differently-shaped real tickets"
+  end
+
+  # The ticket's own goal material where it has some — MAPIAI-48's "What we want".
+  def test_outcome_reproduces_the_tickets_own_goal_section_when_it_has_one
+    outcome = section(compose(:version)["spec.md"], "Outcome")
+
+    assert_includes outcome, "From the ticket's own \"What we want\" section, verbatim"
+    assert_includes outcome, "> Serve a version string in two places"
+  end
+
+  # And says so, briefly and without inventing bullets, where it has none — MAPIAI-49.
+  def test_outcome_says_the_ticket_states_none_rather_than_inventing_one
+    outcome = section(compose(:failed_read)["spec.md"], "Outcome")
+
+    assert_includes outcome, "states no outcome section of its own"
+    refute_includes outcome, "Concretely:"
+    refute_includes outcome, "partially approximated"
+  end
+
+  # The choice CR-003 must-fix 1 part 2 criterion 2 asks to be stated: this section's bullets are
+  # UNIVERSALLY TRUE of validating any change, rather than ticket-specific. Naming the choice in
+  # the test is the requirement.
+  def test_validation_expectations_are_universally_true_rather_than_ticket_specific
+    %i[healthz version failed_read].each do |ticket|
+      expectations = section(compose(ticket)["spec.md"], "Validation expectations")
+
+      refute_includes expectations, "idempotency", ticket.to_s
+      assert_includes expectations, "existing full validation", ticket.to_s
+      assert_includes expectations, "Evidence for each criterion the ticket itself states", ticket.to_s
+    end
+  end
+
+  def test_a_ticket_with_its_own_criteria_gets_no_derived_numbered_lists
+    spec = compose(:failed_read)["spec.md"]
+
+    refute_includes section(spec, "Acceptance criteria"), "DERIVED by this generation"
+    refute_includes section(spec, "Proposed behavior"), "DERIVED by this generation, and to be confirmed"
+    assert_includes section(spec, "Acceptance criteria"), "adds no numbered criteria of its own"
+  end
+
+  # ------------------------------------------- CR-003 should-fix 2: cross-references must resolve
+
+  # BOTH analyses, not just the technical one. The review found the dangling references in
+  # `analysis/technical.md`; `analysis/business.md` had six of its own, one of them justifying
+  # the very fabrication must-fix 1 removes ("Criterion 2 (idempotency) is not in the ticket. It
+  # is included because…"). Fixing only the file the review named would have left that standing.
+  def test_neither_analysis_cites_a_criterion_number_the_specification_lacks
+    %i[healthz version failed_read].each do |ticket|
+      package = compose(ticket)
+      present = package["spec.md"].scan(/^\s*(\d+)\.\s/).flatten.uniq
+
+      %w[analysis/technical.md analysis/business.md].each do |name|
+        cited = package[name].scan(/criterion (\d+)/i).flatten.uniq
+        dangling = cited - present
+
+        assert_empty dangling, "#{ticket}: #{name} cites criterion #{dangling.join(', ')}, " \
+                               "which spec.md does not number"
+      end
+    end
+  end
+
+  def test_the_business_analysis_does_not_justify_an_invented_idempotency_criterion
+    business = compose(:failed_read)["analysis/business.md"]
+
+    refute_includes business, "idempotency"
+    assert_includes business, "The criteria are the reporter's own"
+  end
+
+  # ------------------------------------------------ CR-003 should-fix 3: exclusions are not inclusions
+
+  # MAPIAI-49's only `\bpage\b` is inside its own "Out of scope": "not about the page content".
+  # Word boundaries did not fix this, because the matching mode was never the problem.
+  def test_a_ui_keyword_inside_out_of_scope_does_not_make_a_ticket_user_facing
+    surface = section(compose(:failed_read)["analysis/technical.md"], "Implementation surface")
+
+    assert_includes compose(:failed_read)["spec.md"], "not about the page content",
+                    "the fixture must still contain the excluded keyword"
+    refute_includes surface, "| UI | Likely"
+  end
+
   # ------------------------------------------------------------------ no fabrication
 
   # The CR's criterion 5: a ticket silent on repeat behaviour must get the open QUESTION and
@@ -192,6 +340,12 @@ class SpecificationTicketMaterialTest < Minitest::Test
     version: { key: "MAPIAI-48", url: "https://finlink.atlassian.net/browse/MAPIAI-48",
                title: "Show the running app version on the Tiny Demo homepage and at /version",
                fixture: "jira_ticket_version.md" },
+    # The real Bug from review round 003. Lettered `a)`–`f)` criteria under a
+    # "Definition of done" heading, four paragraph-shaped exclusions, a "Notes" section, no
+    # outcome section — and the word "again" appearing exactly once, in "readable again".
+    failed_read: { key: "MAPIAI-49", url: "https://finlink.atlassian.net/browse/MAPIAI-49",
+                   title: "Tiny Demo app dies when index.html cannot be read",
+                   fixture: "jira_ticket_failed_read.md" },
     # A ticket with no headings and no lists at all — the shape the derived path exists for.
     silent: { key: "MAPIAI-49", url: "https://finlink.atlassian.net/browse/MAPIAI-49",
               title: "Sort the run list newest first", fixture: nil }

@@ -159,18 +159,50 @@ class SpecificationGenerationTest < Minitest::Test
     assert_includes technical, "No Context+ semantic query was performed by this process"
   end
 
-  # CR-002 must-fix 2, end to end. The warning has to reach Platform and the manifest, not
-  # just exist inside the runner — round 002's manifest recorded `warnings: []` on exactly
-  # this path and the run page showed nothing at all.
+  # CR-003 should-fix 4. This test used to be named for the warn path and assert only that the
+  # run refused on Graphify — its own comment conceded it never reached the code it was named
+  # for. It now does what its name says: a checkout with no readable source AND a recorded
+  # Graphify substitute reaches the warn-and-generate path, and the warning is asserted where it
+  # has to arrive.
+  #
+  # After CR-002 must-fix 2 this warning is the only thing standing between a source-less
+  # generation and a document that otherwise reads as fully grounded, so it is worth pinning at
+  # both ends rather than only at the producer.
   def test_a_zero_file_inspection_warns_platform_and_the_manifest
-    FileUtils.rm_rf(Dir.glob(File.join(@source, "*")))
-    FileUtils.rm_rf(Dir.glob(File.join(@source, ".*")).reject { |p| p.end_with?(".", "..") })
-    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
+    empty_the_source_checkout
+    @config = build_config(graphify_substitute: "no source in this checkout to build a graph from")
 
-    # Graphify goes with the checkout, so this refuses on the graph before it can generate.
-    # The inspection warning is asserted at the unit level in
-    # specification_source_inspection_test.rb; what this proves is that an empty checkout is
-    # never quietly successful.
+    assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
+
+    warnings = @platform.last_specification_generation["warnings"]
+    assert warnings.any? { |warning| warning.include?("No source file could be read") },
+           "the source warning must reach Platform: #{warnings.inspect}"
+
+    manifest = JSON.parse(read_package("generation-manifest.json"))
+    assert manifest["warnings"].any? { |warning| warning.include?("No source file could be read") },
+           "the source warning must reach the on-disk manifest: #{manifest['warnings'].inspect}"
+    assert_equal 0, manifest.dig("source_evidence", "entry_points_inspected")
+  end
+
+  # The other half of the same claim: with nothing read, the generated documents must not read
+  # as grounded in code.
+  def test_a_zero_file_generation_does_not_claim_source_grounding
+    empty_the_source_checkout
+    @config = build_config(graphify_substitute: "no source in this checkout to build a graph from")
+    assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
+
+    spec = read_package("spec.md")
+    assert_includes spec, "No source was inspected"
+    refute_includes spec, "read-only inspection of the source checkout"
+    assert_includes read_package("analysis/technical.md"), "NO SOURCE WAS INSPECTED"
+  end
+
+  # An empty checkout without a recorded substitute still refuses on the graph, which is the
+  # ordinary case and must not change.
+  def test_an_empty_checkout_without_a_substitute_still_refuses_on_the_graph
+    empty_the_source_checkout
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
     assert_equal "graphify_unavailable", @platform.last_specification_generation["failure_class"]
   end
 
@@ -349,6 +381,16 @@ class SpecificationGenerationTest < Minitest::Test
   # ------------------------------------------------------------------ helpers
 
   def read_package(name) = File.read(File.join(@specs, PACKAGE, name))
+
+  # Leaves the directory itself in place — the point is a checkout that RESOLVES and contains
+  # nothing readable, which is a different condition from a missing workspace root.
+  def empty_the_source_checkout
+    Dir.glob(File.join(@source, "*"), File::FNM_DOTMATCH).each do |path|
+      next if path.end_with?("/.", "/..")
+
+      FileUtils.remove_entry(path)
+    end
+  end
 
   # Every file under a checkout with its digest, so "nothing was modified" is asserted over
   # content rather than over mtimes, which a copy would also preserve.

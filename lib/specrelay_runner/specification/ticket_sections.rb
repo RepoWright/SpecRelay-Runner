@@ -58,10 +58,17 @@ module SpecrelayRunner
       MARKDOWN_HEADING = /\A\s{0,3}\#{2,6}\s+(.+?)\s*\z/
       BOLD_HEADING = /\A\s*\*\*(.+?)\*\*\s*\z/
 
-      # The three things a ticket reliably carries and a specification must not paraphrase.
+      # The four things a ticket reliably carries and a specification must not paraphrase.
+      #
+      # `definition of done` is deliberately in ACCEPTANCE rather than OUTCOME: on the real Bug
+      # `MAPIAI-49` it introduces six lettered testable criteria, which is what it usually
+      # means. OUTCOME is for a ticket's statement of the *goal* — "What we want" on
+      # `MAPIAI-47` and `MAPIAI-48` — and a ticket may legitimately have none, in which case
+      # the generated Outcome section says one short honest thing instead of pretending.
       PROBLEM = /\A(problem|context|background|why)\b/i
       ACCEPTANCE = /\A(acceptance criteria|acceptance|criteria|definition of done)\b/i
       NON_GOALS = /\A(out of scope|out-of-scope|non-?goals?|not in scope|exclusions)\b/i
+      OUTCOME = /\A(outcome|desired outcome|what we want|goal|goals|expected behaviou?r|expected result)\b/i
 
       Section = Struct.new(:heading, :body, keyword_init: true) do
         def empty? = body.to_s.strip.empty?
@@ -83,10 +90,25 @@ module SpecrelayRunner
       def problem = find(PROBLEM)
       def acceptance_criteria = find(ACCEPTANCE)
       def non_goals = find(NON_GOALS)
+      def outcome = find(OUTCOME)
 
       def problem? = !problem.nil?
       def acceptance_criteria? = !acceptance_criteria.nil?
       def non_goals? = !non_goals.nil?
+      def outcome? = !outcome.nil?
+
+      # Everything the ticket says about what it WANTS, excluding what it says it does not want.
+      #
+      # The distinction is not academic. A `user_facing?`-style keyword heuristic run over the
+      # whole description reads an exclusion as an inclusion: on `MAPIAI-49` the only
+      # occurrence of "page" is in "This is about surviving a failed read, not about the page
+      # content" — inside `Out of scope` — and the generated analysis reported `UI | Likely`
+      # for a process that dies on a failed file read. Word boundaries did not help, because
+      # the matching mode was never the problem.
+      def inclusive_material
+        sections.reject { |section| NON_GOALS.match?(section.heading) }
+                .map { |section| "#{section.heading}\n#{section.body}" }.join("\n\n")
+      end
 
       # The heading the reporter actually wrote, so the generated document can attribute the
       # quote to it ("the ticket's own \"Out of scope\" section") rather than to a label this
@@ -97,7 +119,7 @@ module SpecrelayRunner
       # that matter" is a real heading on both real tickets and belongs in the specification
       # even though nothing here looks for it by name.
       def other_sections
-        named = [ PROBLEM, ACCEPTANCE, NON_GOALS ]
+        named = [ PROBLEM, ACCEPTANCE, NON_GOALS, OUTCOME ]
         sections.reject { |section| named.any? { |matcher| matcher.match?(section.heading) } }
       end
 

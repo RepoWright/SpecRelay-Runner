@@ -347,6 +347,7 @@ than paraphrasing it. Three sections are read out of the reporter's own descript
 | Ticket heading (case-insensitive) | Where it lands |
 |---|---|
 | `Problem`, `Context`, `Background`, `Why` | `## Problem`, as a blockquote |
+| `Outcome`, `What we want`, `Goal`, `Expected behaviour` | `## Outcome`, verbatim and attributed |
 | `Acceptance criteria`, `Acceptance`, `Criteria`, `Definition of done` | `## Acceptance criteria`, verbatim and attributed |
 | `Out of scope`, `Non-goals`, `Not in scope`, `Exclusions` | `## Non-goals`, verbatim and attributed |
 
@@ -359,12 +360,25 @@ text loses heading formatting, so a heading arrives as a short line alone betwee
 lines. Ordered list items arrive as `#`, which is renumbered to `1.` on the way out —
 left alone, a bare `#` is a level-1 heading and would destroy the document's outline.
 
-**Where the ticket says nothing, the document says so.** A ticket with no acceptance
-criteria produces a section that opens "The ticket states no acceptance criteria" and
-labels what follows as derived and needing confirmation. Criteria the ticket does not
-support are not emitted at all: a ticket that never mentions repeat behaviour gets the
-open question about idempotency and no criterion requiring it. A fabricated acceptance
-criterion is worse than a missing one, because a reviewer cannot tell it from a real one.
+**Where the ticket says nothing, the document says so** — and where it says something, the
+composer does not add to it.
+
+- A ticket that states its own acceptance criteria gets **no derived numbered criteria and no
+  derived numbered behaviour list**. The reproduced material plus two stated conditions is the
+  section. A ticket that has written six testable criteria does not need a machine to add four
+  more.
+- **Nothing normative is derived from a keyword.** An earlier version treated the word "again"
+  as a request for idempotency, and on a real bug about a file becoming "readable again" it
+  produced four statements telling an implementer to build and test idempotency for a stateless
+  read handler. No generated sentence claims the ticket asked for something it did not.
+- Where a specification needs a decision the ticket never made, the output is an **open
+  question**, never a requirement — and a keyword can never suppress one. Only the ticket's own
+  criteria can.
+- A ticket with no criteria at all produces a section that opens "The ticket states no
+  acceptance criteria" and labels what follows as derived and needing confirmation.
+
+A fabricated acceptance criterion is worse than a missing one, because a reviewer cannot tell it
+from a real one.
 
 Whatever a provider returns is validated before anything is written, so a
 plausible-looking document that silently omits acceptance criteria is rejected rather
