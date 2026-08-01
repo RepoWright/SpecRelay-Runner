@@ -15,6 +15,91 @@ require_relative "support/fake_secret_store"
 require_relative "support/demo_workspace"
 require_relative "support/fake_github"
 require_relative "support/fake_claude_cli"
+require_relative "support/specification_workspace"
+
+# A specification-creation assignment exactly as Runner::Api::SpecCreationPayload builds it
+# (MVP-0025 scope 3, consumed by MVP-0026). It deliberately carries NO `executor`,
+# `repositories`, or `report_contract` block, because Platform sends none for this lane — a
+# fixture that included them would be testing a payload this product does not produce.
+def spec_creation_payload_for(issue_key:, title: "Add an export button", inputs: nil,
+                              specification_root: "specs", complete: true, content: nil)
+  {
+    "contract_version" => "mvp-0025",
+    "claim" => { "runner_execution_id" => "rex_spec123", "runner_id" => "test-runner",
+                 "runner_display_name" => "Test Runner", "claim_policy_mode" => "all_eligible",
+                 "assignee_match_field" => nil, "claimed_at" => "2026-07-31T12:00:00Z" },
+    "run" => { "id" => "run_spec123", "type" => "spec_creation",
+               "state" => "AWAITING_SPECIFICATION_CREATION" },
+    "work_item" => { "provider" => "jira", "issue_key" => issue_key,
+                     "issue_url" => "https://example.atlassian.net/browse/#{issue_key}",
+                     "title" => title },
+    "input_bundle" => {
+      "artifact_id" => "art_spec123", "url" => "http://127.0.0.1:3200/artifacts/art_spec123",
+      "complete" => complete, "trace_id" => "bundle_abc123", "captured_at" => "2026-07-31T12:00:00Z",
+      "blocking_inputs" => complete ? [] : [ { "kind" => "description", "read_status" => "unavailable",
+                                               "reason" => "the issue has no description" } ],
+      "inputs" => inputs || [ { "kind" => "description", "name" => "Jira description",
+                                "read_status" => "available", "reason" => "read from the Jira issue" } ],
+      "content_markdown" => content || spec_bundle_markdown(issue_key)
+    },
+    "specification_target" => {
+      "repository_url" => "https://github.com/SpecRelay/SpecRelay-Specs", "default_branch" => "main",
+      "specification_root" => specification_root, "host" => "github.com", "owner" => "SpecRelay",
+      "repository" => "SpecRelay-Specs"
+    },
+    "workspace" => { "project_key" => "tiny-demo", "workspace_key" => "tiny-demo-workspace",
+                     "display_name" => "Tiny Demo Workspace" },
+    "links" => { "run_url" => "http://127.0.0.1:3200/runs/run_spec123",
+                 "work_item_url" => "https://example.atlassian.net/browse/#{issue_key}" },
+    "execution_policy" => { "timeout_seconds" => 120, "lease_renewal_seconds" => 30,
+                            "lease_expires_at" => "2026-07-31T12:05:00Z" },
+    "assignment_boundary" => { "generation" => "runner_generates_package",
+                               "expected_runner_action" => "generate_specification_package",
+                               "release_command" => "bin/platform runner release run_spec123" }
+  }
+end
+
+# The bundle body as Jira::SpecCreation::Markdown really renders it: a completeness verdict
+# and several tables BEFORE the reporter's own words, which arrive last under
+# `## Jira description` in a fenced block.
+#
+# The original fixture put the reporter's prose first, and that politeness hid a real defect —
+# the composer quoted the first paragraph as the problem statement, which against a real
+# bundle is SpecRelay's own "Every expected input was readable." bookkeeping. A fixture that
+# is tidier than the document it stands in for tests nothing.
+def spec_bundle_markdown(issue_key)
+  <<~MD
+    # Specification-creation input bundle — #{issue_key}
+
+    ## Input completeness
+
+    Every expected input was readable.
+
+    ## Issue
+
+    - Issue: [#{issue_key}](https://example.atlassian.net/browse/#{issue_key}) — Add an export button
+    - Reporter: Dana Reporter
+    - Bundle trace id: `bundle_abc123`
+
+    ## Classified inputs
+
+    | Kind | Name | Read status | Reason |
+    | --- | --- | --- | --- |
+    | description | Jira description | available | read from the Jira issue |
+
+    ## Jira description
+
+    ```text
+    Reporting analysts need to take the weekly report out of the app and into a
+    spreadsheet. Today they retype it by hand, which takes about an hour a week and
+    introduces transcription mistakes that are only caught at month end.
+
+    Add a way to export the report the analysts already look at, in a format a
+    spreadsheet can open.
+    ```
+  MD
+end
+
 
 # Build a claim payload shaped like the Platform RunPayload for a task, pointing
 # the executor at the given fake-executor command.

@@ -290,7 +290,8 @@ module SpecrelayRunner
     # readiness assumptions, the worktree, or the report contract — and a specification
     # assignment reaching an older code path is impossible rather than merely unlikely.
     def execute(config, client, payload)
-      return acknowledge_specification_assignment(payload) if SpecificationAssignment.specification?(payload)
+      return generate_specification(config, client, payload) if
+        Specification::Assignment.specification?(payload)
 
       announce_claim(payload)
       result = Execution.new(config: config, client: client, payload: payload, env: env, io: out).call
@@ -298,18 +299,23 @@ module SpecrelayRunner
       result.success? ? SUCCESS : RUN_FAILED
     end
 
-    # The documented MVP-0025 stop. `SUCCESS` is correct and deliberate: the runner did
-    # exactly what this MVP asks of it, and the printed message — not the exit code — is
-    # what distinguishes "assignment acknowledged" from "execution completed". Returning
-    # RUN_FAILED would tell every script and loop that a correct assignment-only stop was
-    # a failed execution, which is the specific confusion scope 5 forbids.
+    # MVP-0026 — the specification lane now generates rather than acknowledging and stopping.
     #
-    # No client is passed: this path makes no Platform call, so it cannot report, publish,
-    # or transition anything even by mistake.
-    def acknowledge_specification_assignment(payload)
-      result = SpecificationAssignment.call(payload: payload, io: out)
+    # A REFUSAL exits non-zero, unlike the MVP-0025 acknowledgement it replaces. That is the
+    # right change of meaning: acknowledging an assignment was the whole of the correct
+    # behaviour then, so exiting 0 was honest. Now the correct behaviour is a generated
+    # package, and a refusal means the operator has something to fix — a `loop` session or a
+    # CI step that treated it as success would poll forever against a misconfigured runner,
+    # reporting health.
+    #
+    # An ABORTED attempt (Platform cancelled the claim or the lease lapsed) also exits
+    # non-zero: the run did not produce what it was claimed for, and Platform — not this
+    # process — owns what happens next.
+    def generate_specification(config, client, payload)
+      result = Specification::Generation.call(config: config, client: client, payload: payload,
+                                              env: env, io: out)
       out.puts result.message
-      SUCCESS
+      result.success? ? SUCCESS : RUN_FAILED
     end
 
     # Prefer the guided connection (MVP-0017); fall back to the advanced/legacy config

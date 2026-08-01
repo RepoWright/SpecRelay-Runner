@@ -168,11 +168,11 @@ Source:   connected workspace tiny-demo-workspace (your explicit default workspa
 ```
 
 `claim-once` claims at most one eligible run (**Platform** decides which), executes
-it, and uploads the report. Exit `0` on completion, no eligible work, or an
-acknowledged specification assignment (below), `1` on a failed execution, `2` on a
-config/usage error.
+it, and uploads the report. Exit `0` on completion, no eligible work, or a generated
+specification package (below), `1` on a failed execution or a refused generation,
+`2` on a config/usage error.
 
-### Two lanes, and one of them stops here (MVP-0025)
+### Two lanes, and one of them writes files (MVP-0026)
 
 Platform can hand this runner work from either lane, and the runner branches on the
 assignment's own `run.type` — never on which fields are missing:
@@ -180,32 +180,126 @@ assignment's own `run.type` — never on which fields are missing:
 | `run.type` | What this runner does |
 |---|---|
 | `implementation` | The full flow: worktree, executor, tests, report, publication. |
-| `spec_creation` | Prints the assignment and **stops.** |
+| `spec_creation` | Generates a specification package locally, then **stops before publication.** |
 
-A `spec_creation` assignment means "write a specification for this Jira issue", and
-this runner cannot write one yet — MVP-0026 is that capability. So MVP-0025's
-behaviour on this side is deliberately minimal and complete: recognize the
-assignment, print the run, the Jira issue, the recorded input bundle, the
-specification repository target and the lease, state that generation is deferred,
-print the release command, and return.
+A `spec_creation` assignment means "write a specification for this Jira issue". The
+runner generates it into the operator's own checkout of the configured specification
+repository and reports what it wrote. It does **not** create a branch, commit, push,
+open a pull request, write a Jira field, or transition an issue — those are MVP-0027
+and MVP-0028, and the assignment says so as data
+(`assignment_boundary.generation = "generate_package_only"`).
 
-It is `SpecrelayRunner::SpecificationAssignment`, and its guarantees are structural
-rather than promised: it is handed **no Platform client at all**, so it cannot
-report, publish, or transition anything, and Platform sends no `executor`,
-`repositories`, or `report_contract` block, so there is nothing to execute. It
-creates no worktree and writes no file.
+#### What it writes
 
-The exit status is `0` with `Runner outcome: assignment_received`. That is not
-"nothing happened" and it is deliberately not `1`: a correct assignment-only stop
-must not be indistinguishable from a failed execution to a script or a `loop`
-iteration. In `loop` mode it counts as a successful iteration and polling continues.
+```text
+<specification-root>/<ISSUE-KEY>-<sanitized-summary-slug>/
+  spec.md
+  analysis/business.md
+  analysis/technical.md
+  generation-manifest.json
+```
 
-Platform still holds a real leased claim afterwards. Release it with
-`bin/platform runner release <run-id>` — or `<ticket-key>`, since a specification run
-has no task id and the Jira key is what you already have — on the Platform host, or
-leave it: an unrenewed lease is swept automatically. Either way the run returns to
-`AWAITING_SPECIFICATION_CREATION` and is claimable again; nothing was written that
-needs undoing.
+The folder name is deterministic — the same issue always produces the same
+directory, so a re-run replaces its own package instead of accumulating
+near-duplicates. The issue key is validated against a closed shape and the
+configured specification root is REFUSED (not sanitized) if it is absolute,
+traverses, carries URL userinfo, or contains a shell metacharacter or control
+character: a silently rewritten destination is one the operator cannot predict.
+
+Every path in the generated Markdown is repository-relative. Absolute host paths
+never reach a generated file — including in quoted `bin/graph-check` and
+`bin/graph-query` output, which the runner relativizes before quoting.
+
+#### Preflight, and why a refusal is the good outcome
+
+Every capability is checked **before any output file is opened**. If one is
+missing, the runner refuses, reports a stable failure class to Platform, and leaves
+zero output files. There is no code path from a refusal to a file handle, so that is
+a property of the control flow rather than of a cleanup routine that might fail.
+
+| Failure class | What to fix |
+|---|---|
+| `assignment_malformed` | Platform sent an assignment without required generation data, or with an incomplete bundle. |
+| `specification_repository_unresolved` | Point this machine at its checkout of the specification repository (below). |
+| `specification_folder_unsafe` / `specification_folder_unwritable` | The configured specification root is not a safe, writable repository-relative folder. |
+| `existing_package_present` | Only with `on_existing_package: refuse`. Move the existing package, or switch back to `replace`. |
+| `source_workspace_unresolved` | Map the workspace to its local source checkout (`SPECRELAY_RUNNER_WORKSPACE_ROOT_<KEY>`). |
+| `input_content_unreadable` | The bundle offers an input Platform classified as unusable. Re-read the ticket. |
+| `external_reference_analysis_unavailable` | A Confluence page or screenshot was deferred to this runner. Enable the capability or record a substitute. |
+| `graphify_unavailable` | Run `bin/graph-build` in the source checkout, or record a substitute. A **stale** graph counts as unavailable — a stale graph is not evidence. |
+| `context_plus_unavailable` | Declare Context+ available, or record what was used instead. |
+| `generation_provider_unavailable` | The configured provider command is missing or not executable. |
+| `redaction_validation_unavailable` | The redaction guard failed its own self-check; generated output cannot be proven safe. |
+
+After preflight passes, three more classes can occur, and they are distinguished
+because the operator's next move differs: `generation_provider_failed`,
+`generated_output_invalid`, and `package_write_failed`. All three leave the
+destination unchanged — the runner stages the whole package and moves it into place
+with a single rename.
+
+Recovery from any of these is on the **Platform** host, and it is not `release`
+(the refusing attempt already closed its own claim):
+
+```bash
+bin/platform runner requeue-specification <run-id|ticket-key>
+```
+
+#### Configuration
+
+Under `runner.specification:` in the config file, or from the environment. No secret
+belongs here — the provider is a local executable path.
+
+```yaml
+runner:
+  specification:
+    provider:
+      kind: fake            # fake (built-in deterministic composer) | command
+      command: /abs/path/to/spec-writer   # required for kind: command
+      timeout_seconds: 900
+    repository_roots:
+      "SpecRelay/SpecRelay-Specs": /abs/path/to/your/specs-checkout
+    on_existing_package: replace          # replace (default) | refuse
+    context_plus:
+      available: true
+    graphify:
+      substitute: "why, when the wrappers are absent"
+    external_references:
+      substitute: "why, when the bundle defers a reference to this runner"
+```
+
+Environment overrides: `SPECRELAY_RUNNER_SPEC_REPOSITORY_ROOT_<OWNER>_<REPO>` (or the
+unsuffixed `SPECRELAY_RUNNER_SPEC_REPOSITORY_ROOT`), `SPECRELAY_RUNNER_SPEC_PROVIDER`,
+`SPECRELAY_RUNNER_SPEC_PROVIDER_COMMAND`, `SPECRELAY_RUNNER_SPEC_ON_EXISTING_PACKAGE`.
+
+**The `substitute:` keys are not off switches.** Each is a sentence you write, and
+the runner copies it verbatim into `analysis/technical.md` and into the evidence
+Platform stores. Recording the gap is what makes proceeding honest; omitting the key
+is what makes preflight refuse. A substituted tool is reported as having contributed
+**nothing** — "we were allowed to continue without Graphify" and "Graphify produced
+evidence" are different facts and are never collapsed.
+
+#### The generation provider boundary
+
+Everything that turns evidence into prose goes through one interface with two
+methods — `describe` and `generate(packet)` — and the entire input a provider
+receives is one reviewable, redacted packet. Two implementations ship:
+
+- **`fake`** (the default) is the built-in deterministic composer: same packet, same
+  bytes, no model, no network. It is both the test double and a genuinely usable
+  default, because it composes from the real bundle and the real source evidence.
+- **`command`** runs an operator-configured local executable with the packet as JSON
+  on stdin, expecting the file map as JSON on stdout. No shell, no inherited
+  environment beyond `PATH`, and a throwaway working directory — the provider is
+  never handed either checkout, because writing is not its job.
+
+Whatever a provider returns is validated for required sections before anything is
+written, so a plausible-looking document that silently omits acceptance criteria is
+rejected rather than committed.
+
+Exit status is `0` only for a generated package. A refusal or a post-preflight
+failure exits `1`: the correct behaviour is now a package, so a `loop` session that
+treated a refusal as success would poll forever against a misconfigured runner while
+reporting health.
 
 `loop` (MVP-0018) does the same repeatedly, at a bounded poll interval. Exit `0`
 when every run it executed succeeded, `1` if any failed or the credential was
