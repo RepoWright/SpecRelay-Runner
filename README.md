@@ -260,6 +260,14 @@ the attempt got. Failure classes are a closed set — `publication_assignment_ma
 `git_push_failed`, `pull_request_creation_failed`, `publication_verification_failed` — and
 Platform enforces the same list.
 
+**A publication is `published` only once Platform has accepted the result.** If Platform
+answers `4xx`, it has read the payload and REFUSED it — the run will not reach approval and no
+retry of the same body will change that, so the runner reports a failure, names what Platform
+refused, still prints the branch and pull request (they exist, and Platform holds no record of
+where), and exits non-zero. A `5xx` or an unreachable Platform is different: the outcome on
+GitHub still stands, the runner says so, and the claim is left to expire so a later attempt can
+reuse the same branch and pull request.
+
 The checkout is checked against the assigned repository, but only when its `origin`
 resolves to a GitHub `owner/repo`. A remote that does not resolve (an ssh alias, an internal
 mirror, a local path) is not evidence of a mismatch, and refusing every one would refuse

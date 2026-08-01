@@ -45,6 +45,9 @@ module SpecrelayRunner
 
       ASSIGNMENT_MALFORMED = "publication_assignment_malformed"
       REPOSITORY_UNRESOLVED = "specification_repository_unresolved"
+      # Local outcome only. Platform refused the result, so by definition Platform stored no
+      # failure class of its own; this one names the condition in the runner's exit and log.
+      REPORT_REFUSED = "publication_report_refused"
 
       Result = Struct.new(:outcome, :message, :pull_request_url, :branch, :head_commit, keyword_init: true) do
         def success? = outcome == PUBLISHED
@@ -159,8 +162,13 @@ module SpecrelayRunner
 
       # ------------------------------------------------------------------ outcomes
 
+      # `published` is claimed only once Platform has ACCEPTED the result. The pull request
+      # existing is not the same fact as the run having advanced, and only Platform can say the
+      # second one happened.
       def succeed(verified, pushed, opened)
-        submit(success_payload(verified, pushed, opened))
+        refusal = submit(success_payload(verified, pushed, opened))
+        return report_refused(refusal, pushed, opened) if refusal
+
         log("")
         log("Published #{verified.length} files on #{assignment.publication_branch} as a draft pull request:")
         log("  #{opened.url}")
@@ -168,6 +176,28 @@ module SpecrelayRunner
         Result.new(outcome: PUBLISHED, pull_request_url: opened.url, branch: assignment.publication_branch,
                    head_commit: pushed.head_commit,
                    message: "Runner outcome: published (draft pull request #{opened.url}).")
+      end
+
+      # Platform READ the result and refused it. The draft pull request genuinely exists, but
+      # Platform holds no record of it, the run did not move to awaiting approval, and no retry
+      # of the same body can change that — so this is a FAILURE, not a success with a footnote.
+      # Printing "Published" here and exiting 0 is precisely the false success the fail-closed
+      # rule exists to prevent (review-001 P2-2).
+      #
+      # Nothing further is posted. A failure payload would be a SECOND write claiming the
+      # publication failed, which is false about GitHub; Platform's record is left untouched and
+      # the claim is left to expire, after which a later attempt reuses this branch and PR.
+      def report_refused(message, pushed, opened)
+        log("")
+        log("Platform REFUSED this publication result: #{message}")
+        log("The draft pull request exists on GitHub, but Platform holds no record of it and the " \
+            "run was NOT moved to awaiting approval.")
+        log("  Branch:       #{assignment.publication_branch}")
+        log("  Pull request: #{opened.url}")
+        log("Fix what Platform refused; the next attempt on this run reuses both.")
+        Result.new(outcome: FAILED, pull_request_url: opened.url, branch: assignment.publication_branch,
+                   head_commit: pushed.head_commit,
+                   message: "Runner outcome: publication_failed (#{REPORT_REFUSED}).")
       end
 
       # A failure at ANY step, including one after the branch reached the remote. `pushed` is
@@ -179,7 +209,10 @@ module SpecrelayRunner
         log("")
         log("Specification publication failed: #{text}")
         log("The run was NOT moved to awaiting approval and Jira was not touched.")
-        submit(failure_payload(failure_class, text, pushed))
+        refusal = submit(failure_payload(failure_class, text, pushed))
+        # Already a failure, so the outcome does not change — but the operator must not be left
+        # believing Platform recorded a failure it in fact refused.
+        log("Platform REFUSED this failure report: #{refusal}") if refusal
         Result.new(outcome: FAILED, branch: pushed ? assignment.publication_branch : nil,
                    head_commit: pushed&.head_commit,
                    message: "Runner outcome: publication_failed (#{failure_class}).")
@@ -239,18 +272,30 @@ module SpecrelayRunner
 
       def claim_token = payload.dig("claim", "runner_execution_id").to_s
 
+      # Returns nil when Platform recorded the result, and the redacted refusal message when
+      # Platform read it and REFUSED it. The two are not interchangeable: one leaves the local
+      # outcome standing, the other invalidates it as something to report.
       def submit(publication)
         claim = publication["runner_execution_id"].to_s
-        return log("(no claim identity in the assignment — nothing was reported to Platform)") if claim.empty?
+        if claim.empty?
+          log("(no claim identity in the assignment — nothing was reported to Platform)")
+          return nil
+        end
 
         response = client.submit_specification_publication(claim: claim, publication: publication)
         log("Platform recorded the result: run #{response['run_state']} (#{response['outcome']}).")
+        nil
       rescue PlatformClient::Error => e
-        # The remote outcome is already true — the branch and the pull request exist or they do
-        # not. Failing to REPORT it is a separate problem with its own remedy, and it must not be
-        # reported as a publication failure, which would send the operator to look at GitHub.
-        log("Could not report the result to Platform: #{Redaction.redact(e.message)}")
+        text = Redaction.redact(e.message)
+        return text if e.refused?
+
+        # A TRANSPORT failure only. The remote outcome is already true — the branch and the pull
+        # request exist or they do not. Failing to REACH Platform is a separate problem with its
+        # own remedy, and it must not be reported as a publication failure, which would send the
+        # operator to look at GitHub for something that is not wrong there.
+        log("Could not report the result to Platform: #{text}")
         log("The outcome above still stands. Platform will reclaim this run when the lease expires.")
+        nil
       end
 
       # ------------------------------------------------------------------- lifecycle

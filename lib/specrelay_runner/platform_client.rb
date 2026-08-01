@@ -15,7 +15,25 @@ module SpecrelayRunner
   # sanitized message and exit non-zero without leaking the token (which is never
   # logged and only ever set in the Authorization header).
   class PlatformClient
-    Error = Class.new(StandardError)
+    # Every failure carries the HTTP status Platform answered with, or nil when Platform never
+    # answered at all. The distinction is the whole point: a transport failure leaves the
+    # request's fate unknown and a retry may still succeed, while a 4xx is Platform having
+    # READ the payload and REFUSED it — no retry of the same body can change that, so a caller
+    # holding a local success must fail closed rather than report it (MVP-0027 review-001 P2-2).
+    class Error < StandardError
+      attr_reader :status
+
+      def initialize(message = nil, status: nil)
+        super(message)
+        @status = status
+      end
+
+      # Platform answered and rejected the payload. Deliberately NOT true for 5xx: Platform
+      # failing to process a request it accepted is closer to a transport fault than to a
+      # refusal, and the same body may well be accepted on the next attempt.
+      def refused? = (400..499).cover?(status.to_i)
+    end
+
     Unauthorized = Class.new(Error)
     RequestFailed = Class.new(Error)
     # A 404. Distinguished from RequestFailed because for the MVP-0021 connection test it is
@@ -250,10 +268,11 @@ module SpecrelayRunner
 
     def raise_for(status, body)
       message = body.is_a?(Hash) ? body["error"].to_s : ""
-      raise Unauthorized, "Platform rejected the runner token (401)#{": #{message}" unless message.empty?}" if status == 401
-      raise NotFound, "Platform found no such resource (404)#{": #{message}" unless message.empty?}" if status == 404
+      detail = message.empty? ? "" : ": #{message}"
+      raise Unauthorized.new("Platform rejected the runner token (401)#{detail}", status: status) if status == 401
+      raise NotFound.new("Platform found no such resource (404)#{detail}", status: status) if status == 404
 
-      raise RequestFailed, "Platform request failed (#{status})#{": #{message}" unless message.empty?}"
+      raise RequestFailed.new("Platform request failed (#{status})#{detail}", status: status)
     end
   end
 end

@@ -344,6 +344,57 @@ class SpecificationPublicationTest < Minitest::Test
     refute_match(/ghp_[A-Za-z0-9]{10,}|github_pat_|-----BEGIN [A-Z ]*PRIVATE KEY-----/, @io.string)
   end
 
+  # ------------------------------------------------- reporting (review-001 P2-2)
+
+  # The case that actually fired during this MVP's live pass: the publication succeeded on
+  # GitHub and Platform REFUSED the result with a 422. A refusal is Platform having read the
+  # payload and rejected it — the run will never reach approval from this attempt, so a zero
+  # exit and a "Published" line are a false success, not a footnote.
+  def test_a_platform_refusal_of_a_successful_publication_is_not_reported_as_success
+    start_platform
+    @platform.publication_response = [ 422, { error: "run run_x is AWAITING_SPECIFICATION_APPROVAL" } ]
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
+
+    refute_match(/^Published /, @io.string, "a refused result must not be announced as published")
+    assert_includes @io.string, "Platform REFUSED this publication result"
+    assert_includes @io.string, "was NOT moved to awaiting approval"
+  end
+
+  # The pull request is real and the operator has to be told where it is, precisely BECAUSE
+  # Platform holds no record of it — hiding it would leave an unreferenced branch nobody knows
+  # to look for.
+  def test_a_refused_publication_still_names_the_branch_and_pull_request
+    start_platform
+    @platform.publication_response = [ 422, { error: "committed files do not match the recorded package" } ]
+    run_cli
+
+    assert_includes @io.string, BRANCH
+    assert_includes @io.string, PR_URL
+  end
+
+  # 401 is a refusal too: Platform answered, and no retry of the same body changes the answer.
+  def test_a_rejected_credential_is_also_a_refusal_rather_than_a_success
+    start_platform
+    @platform.publication_response = [ 401, { error: "runner credential is not valid" } ]
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
+    refute_match(/^Published /, @io.string)
+  end
+
+  # The opposite direction, and the reason the distinction is drawn at 4xx rather than at "not
+  # 201": Platform failing to PROCESS a request leaves the local outcome true and the same body
+  # may be accepted on the next attempt, so the runner keeps its existing behaviour.
+  def test_a_platform_server_error_leaves_the_published_outcome_standing
+    start_platform
+    @platform.publication_response = [ 500, { error: "internal server error" } ]
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
+
+    assert_includes @io.string, "Could not report the result to Platform"
+    assert_includes @io.string, "The outcome above still stands"
+  end
+
   # ---------------------------------------------------------------- the dispatch
 
   # An assignment naming an action this build does not implement must STOP rather than fall

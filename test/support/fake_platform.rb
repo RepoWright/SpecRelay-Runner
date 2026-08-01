@@ -39,6 +39,13 @@ class FakePlatform
   # `outcome`. A non-JSON 200 is modelled by `unconfirmed_disconnect_raw`.
   attr_accessor :unconfirmed_disconnect, :unconfirmed_disconnect_raw
 
+  # MVP-0027 review-001 P2-2: script the publication endpoint's answer so a test can model
+  # Platform READING a locally successful publication and REFUSING it. Set to a
+  # `[status, body]` pair; the live case this models is the 422 that fired during the round's
+  # live pass. Distinct from `unconfirmed_disconnect` because it must also cover 5xx, which
+  # the runner treats as a transport fault rather than a refusal.
+  attr_accessor :publication_response
+
   # Lets a test model a SECOND workspace on the same Platform and the same machine, which is the
   # shape that used to orphan the first workspace's stored credential (review-002, F3 residual).
   def claim_payload_workspace_key=(key)
@@ -242,6 +249,8 @@ class FakePlatform
   # about the run state it reports back, because the runner prints it and a fake that always
   # said "published" would let a fail-closed path look identical to a success in the output.
   def specification_publication(request)
+    return @publication_response if @publication_response
+
     outcome = request.dig(:body, "publication", "outcome").to_s
     return [ 422, { error: "publication outcome is required" } ] if outcome.empty?
 
