@@ -122,6 +122,10 @@ class FakePlatform
   def last_enrollment = requests_to("/api/runner/enrollment").last
   def last_enrollment_preview = requests_to("/api/runner/enrollment_preview").last
   def last_readiness_report = requests_to("/api/runner/workspace_connections").last
+  # MVP-0026: what the runner reported about a specification-generation attempt, and — just
+  # as load-bearing for criterion 15 — the fact that nothing was sent to /reports.
+  def specification_generations = requests_to("/api/runner/specification_generations")
+  def last_specification_generation = specification_generations.last&.dig(:body, "generation")
 
   # MVP-0013: the v1 protocol events the runner sent (the `event` sub-hash of each
   # /events request), in receipt order, and the terminal-result envelope uploaded
@@ -203,8 +207,23 @@ class FakePlatform
     when "/api/runner/events" then events(request)
     when "/api/runner/heartbeat" then [ 200, { acknowledged: true, state: "EXECUTING", lease: lease_signal } ]
     when "/api/runner/reports" then report(request)
+    when "/api/runner/specification_generations" then specification_generation(request)
     else [ 404, { error: "not found" } ]
     end
+  end
+
+  # MVP-0026: the specification-generation result endpoint. Deliberately dumb about domain
+  # rules (Platform's own request specs cover the real state transitions) but NOT dumb about
+  # the run state it reports back: the runner prints it, and a fake that always said the same
+  # thing would let a generated run and a refused one look identical in the runner's output.
+  def specification_generation(request)
+    outcome = request.dig(:body, "generation", "outcome").to_s
+    return [ 422, { error: "generation outcome is required" } ] if outcome.empty?
+
+    [ 201, { outcome: outcome,
+             execution_state: outcome == "generated" ? "COMPLETED" : "GENERATION_REFUSED",
+             run_state: outcome == "generated" ? "AWAITING_SPECIFICATION_PUBLICATION" :
+                          "BLOCKED_SPECIFICATION_GENERATION" } ]
   end
 
   # MVP-0021: the per-workspace member routes. GET describes this runner's grant; DELETE

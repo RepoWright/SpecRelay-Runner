@@ -135,6 +135,20 @@ module SpecrelayRunner
     # Platform Runner::Config expects it. The runner does not interpret policy.
     def claim_runner_params = runner
 
+    # The operator's optional, NON-SECRET `runner.specification:` block (MVP-0026): where
+    # this machine keeps its specification-repository checkouts, which generation provider it
+    # may run, and which lane capabilities are available or explicitly substituted. Parsed by
+    # {Specification::Settings}, which also applies the environment overrides — so a guided
+    # connection, which writes no YAML at all, still resolves a complete configuration.
+    #
+    # Returns {} when absent. That is a usable configuration, not a broken one: it selects
+    # the deterministic built-in provider and no repository roots, and Preflight then refuses
+    # with the exact variable to set rather than raising from here.
+    def specification_settings
+      value = runner["specification"]
+      value.is_a?(Hash) ? value.transform_keys(&:to_s) : {}
+    end
+
     # The operator's optional, NON-SECRET `runner.executor:` override block. It is
     # logical config only (provider/command/args/prompt delivery/timeout/env) and
     # is sent to Platform, which merges it over the workspace's stored executor

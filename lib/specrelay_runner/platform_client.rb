@@ -156,6 +156,26 @@ module SpecrelayRunner
       status == 200 ? body : raise_for(status, body)
     end
 
+    # POST /api/runner/specification_generations (MVP-0026). Reports the outcome of ONE
+    # specification-generation attempt: a generated package with its repository-relative
+    # paths and digests, or a refusal/failure with its stable failure class.
+    #
+    # A separate endpoint from #submit_report rather than another report shape. The two
+    # describe different things — an execution report is a directory of evidence about code
+    # that ran, a generation result is a manifest of documents that were written — and
+    # Platform imports them through different services with different state transitions.
+    # Overloading one endpoint would mean a runner could accidentally finalize an
+    # implementation run by submitting the wrong body.
+    #
+    # Platform decides the resulting run state; the response is read for what it DECIDED
+    # rather than assumed. A rejected payload returns non-201 and is raised, so the runner
+    # fails closed instead of printing a success it cannot substantiate.
+    def submit_specification_generation(claim:, generation:)
+      status, body = post_json("/api/runner/specification_generations",
+                               { claim: claim, generation: generation })
+      status == 201 ? body : raise_for(status, body)
+    end
+
     # POST /api/runner/reports. bundle is { round_label:, files: [...] }.
     # terminal_result, when given, is the MVP-0013 terminal-result envelope
     # validated by Platform BEFORE import; a rejected envelope returns non-201 and
