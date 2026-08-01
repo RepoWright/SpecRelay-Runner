@@ -97,6 +97,47 @@ module SpecrelayRunner
       def non_goals? = !non_goals.nil?
       def outcome? = !outcome.nil?
 
+      # CR-005 must-fix 1. `acceptance_criteria?` answers "is there a section?"; this answers
+      # "did the reporter state criteria in it?". They are not the same question, and round 005
+      # used the first one to decide the second.
+      #
+      # The consequence was review-004's Finding 1 with the sign reversed. A ticket whose
+      # `Acceptance criteria` body is `TBD.` got a document calling that placeholder
+      # "authoritative", asserting that it decides anything the specification does not, and
+      # telling Platform — through `DocumentSet#open_questions` — that nothing was undecided.
+      # Four realistic placeholder bodies, four times the same claim. A keyword no longer
+      # decides whether the reporter made a decision, but the presence of a HEADING did.
+      #
+      # The test is structural, never lexical. CR-005 forbids a placeholder word list, and it is
+      # right to: `TBD`, `to be agreed`, `see the linked page` is the same keyword mistake in a
+      # fourth place, and a word list that can SILENCE a question is the exact failure mode of
+      # rounds 003 and 004.
+      #
+      # Measured over the three real fixtures and the four placeholder bodies CR-005 executed:
+      #
+      #   real         6 non-empty lines, 6 list items, 112-230 words   (MAPIAI-47/48/49)
+      #   placeholder  1 non-empty line,  0-1 items,      1-7 words
+      #
+      # Two or more lines is the primary rule: "criteria" is plural in the heading and in every
+      # real ticket, and a section that collapses to one line is a note to self. The word floor
+      # is the escape hatch for a genuine single criterion written as one sentence — 12 sits
+      # above the largest placeholder measured (7) and below a realistic lone criterion (~15+).
+      #
+      # Both parts fail SAFE. When this returns false the document raises both standing
+      # questions and drops the "authoritative" framing, so a misjudged real criterion costs two
+      # extra open questions a human dismisses — while a misjudged placeholder costs a false
+      # claim about the reporter's work, which is the defect being fixed.
+      SUBSTANTIVE_MIN_LINES = 2
+      SUBSTANTIVE_MIN_WORDS = 12
+
+      def states_acceptance_criteria?
+        return false unless acceptance_criteria?
+
+        lines = acceptance_criteria.lines.map(&:strip).reject(&:empty?)
+        lines.length >= SUBSTANTIVE_MIN_LINES ||
+          lines.sum { |line| line.split.length } >= SUBSTANTIVE_MIN_WORDS
+      end
+
       # Everything the ticket says about what it WANTS, excluding what it says it does not want.
       #
       # The distinction is not academic. A `user_facing?`-style keyword heuristic run over the

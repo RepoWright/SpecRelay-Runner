@@ -311,8 +311,7 @@ module SpecrelayRunner
         return derived_acceptance_criteria unless ticket.acceptance_criteria?
 
         [
-          "**From the ticket's own \"#{ticket.heading_for(TicketSections::ACCEPTANCE)}\" section, " \
-          "verbatim. These are the reporter's criteria and are authoritative:**",
+          criteria_attribution,
           "",
           ticket.acceptance_criteria,
           "",
@@ -325,6 +324,24 @@ module SpecrelayRunner
           "",
           standing_criteria.join("\n")
         ].join("\n")
+      end
+
+      # CR-005 must-fix 1. The reporter's words are reproduced either way — that part of round
+      # 005 was right and must not regress — but only a section that actually states criteria
+      # gets called authoritative.
+      #
+      # "Authoritative" is a claim about the content, and a heading reading `Acceptance criteria`
+      # above the single line `TBD.` does not support it. Naming the section and attributing it
+      # does not overstate anything, so the placeholder branch still tells a reader exactly where
+      # the text came from and leaves the judgement to them.
+      def criteria_attribution
+        heading = ticket.heading_for(TicketSections::ACCEPTANCE)
+        return "**From the ticket's own \"#{heading}\" section, verbatim. These are the " \
+               "reporter's criteria and are authoritative:**" if ticket.states_acceptance_criteria?
+
+        "**From the ticket's own \"#{heading}\" section, verbatim.** This generation could not " \
+          "identify a checkable criterion in it, so it is reproduced without being treated as a " \
+          "decided specification — the open questions below stand until it is filled in."
       end
 
       def derived_acceptance_criteria
@@ -431,8 +448,15 @@ module SpecrelayRunner
         # bullet here, however true, arrives on the run page under the heading "Open questions
         # raised by the specification". The first draft of this fix did exactly that. The parser
         # is right and the document was wrong: the contract is one bullet per question.
+        #
+        # CR-005 must-fix 1: gated on `states_acceptance_criteria?`. Reached with a placeholder
+        # criteria section, round 005's wording told the reader that a body of `TBD.` decided
+        # everything this specification does not — and because the bullet starts with "None",
+        # `DocumentSet` reported nothing undecided to Platform at the same time. That branch is
+        # now unreachable: a placeholder raises both standing questions, so `open_questions` is
+        # non-empty and this method returns above.
         empty = "- None arising from the recorded inputs. Every input the bundle offered was usable"
-        return "#{empty}." unless ticket.acceptance_criteria?
+        return "#{empty}." unless ticket.states_acceptance_criteria?
 
         "#{empty}, and anything this specification does not decide is decided by the ticket's own " \
           "acceptance criteria, reproduced verbatim above."
@@ -1027,7 +1051,9 @@ module SpecrelayRunner
       def open_questions
         @open_questions ||= begin
           questions = []
-          questions.concat(standing_decision_questions) unless ticket.acceptance_criteria?
+          # CR-005 must-fix 1: `states_acceptance_criteria?`, not `acceptance_criteria?`. A
+          # heading is not a decision, and round 005 let one silence both questions.
+          questions.concat(standing_decision_questions) unless ticket.states_acceptance_criteria?
           unused_inputs.each do |input|
             questions << "What did **#{input['kind']}#{input_name_suffix(input)}** contain? It was recorded " \
                          "as an input but could not be read here (#{input['note']})."

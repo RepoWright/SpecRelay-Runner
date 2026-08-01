@@ -342,7 +342,7 @@ receives is one reviewable, redacted packet. Two implementations ship:
 #### What the built-in composer takes from the ticket
 
 Where the Jira ticket states something, the generated specification **quotes it** rather
-than paraphrasing it. Four sections are read out of the reporter's own description:
+than paraphrasing it. These sections are read out of the reporter's own description:
 
 | Ticket heading (case-insensitive) | Where it lands |
 |---|---|
@@ -371,9 +371,9 @@ composer does not add to it.
   as a request for idempotency, and on a real bug about a file becoming "readable again" it
   produced four statements telling an implementer to build and test idempotency for a stateless
   read handler. No generated sentence claims the ticket asked for something it did not.
-  One keyword heuristic survives: `user_facing?` matches nine UI words over the title and the
-  ticket's included sections, and it decides one row of `analysis/technical.md`. It states what
-  the recorded inputs do or do not imply, never what the ticket requires.
+  One keyword heuristic survives: `user_facing?` matches a list of UI words over the title and
+  the ticket's included sections, and it decides one row of `analysis/technical.md`. It states
+  what the recorded inputs do or do not imply, never what the ticket requires.
 - Where a specification needs a decision the ticket never made, the output is an **open
   question**, never a requirement. **A ticket that supplies its own acceptance criteria raises
   neither standing question** — not the repeat one, not the failure-path one. Where it supplies

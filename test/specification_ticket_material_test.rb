@@ -385,6 +385,126 @@ class SpecificationTicketMaterialTest < Minitest::Test
     assert_includes surface, "| UI | Likely"
   end
 
+  # ------------------- CR-005 must-fix 1: a heading is not a decision either
+  #
+  # Round 005 stopped the document asserting what the reporter's criteria FAIL to cover. It then
+  # asserted that whatever they do cover is sufficient — gated on `acceptance_criteria?`, which is
+  # true for any non-empty body under the heading. Review-004's Finding 1 with the sign reversed,
+  # and the same mechanism one level out: a keyword no longer decides whether the reporter made a
+  # decision, but the presence of a heading did.
+
+  # Criterion 1. Scoped to the CLAIM, not the bare word: "The authoritative bundle record is
+  # trace …" is a different and correct use of it, about the Platform record rather than about
+  # the reporter's criteria. `are authoritative` is the criteria claim, and criterion 5 below
+  # asserts the same string is still present for a real ticket.
+  def test_a_placeholder_criteria_section_is_never_called_authoritative
+    PLACEHOLDER_CRITERIA.each do |body, shape|
+      package = placeholder_package(body)
+      %w[spec.md analysis/technical.md analysis/business.md].each do |name|
+        refute_includes package[name], "are authoritative", "#{shape}: #{name}"
+        refute_includes package[name], "the reporter's criteria and", "#{shape}: #{name}"
+      end
+    end
+  end
+
+  # Criterion 2 — refute over all three documents, not one section, because round 005's claim
+  # appeared in two places.
+  def test_a_placeholder_criteria_section_is_never_said_to_decide_the_rest
+    PLACEHOLDER_CRITERIA.each do |body, shape|
+      package = placeholder_package(body)
+      %w[spec.md analysis/technical.md analysis/business.md].each do |name|
+        refute_includes package[name], "is decided by the ticket's own", "#{shape}: #{name}"
+        refute_includes package[name], "anything this specification does not decide", "#{shape}: #{name}"
+      end
+    end
+  end
+
+  # Criterion 3. The fix must not start hiding the reporter's text — that half of round 005 was
+  # right, and losing it would be a worse defect than the one being fixed.
+  def test_a_placeholder_criteria_section_is_still_reproduced_verbatim
+    PLACEHOLDER_CRITERIA.each_key do |body|
+      criteria = section(placeholder_package(body)["spec.md"], "Acceptance criteria")
+
+      assert_includes criteria, body.sub(/\A\* /, ""), "the reporter's own words must survive"
+      assert_includes criteria, "From the ticket's own", "and must still be attributed"
+    end
+  end
+
+  # Criterion 4, through the reader Platform actually uses. This is the one that decides whether
+  # the run page shows an operator that something is undecided.
+  def test_a_placeholder_criteria_section_reports_open_questions_to_platform
+    PLACEHOLDER_CRITERIA.each do |body, shape|
+      documents = SpecrelayRunner::Specification::DocumentSet.new(placeholder_package(body))
+
+      refute_empty documents.open_questions, "#{shape}: Platform must be told something is undecided"
+    end
+  end
+
+  # Criterion 5 — the counterweight, and the one that matters. Round 005's behaviour on the two
+  # REAL tickets must be exactly unchanged. If this fails, the predicate is too strict and the
+  # fix has re-broken what rounds 004 and 005 established.
+  def test_real_criteria_are_unaffected_by_the_placeholder_gate
+    %i[healthz version failed_read].each do |ticket|
+      package = compose(ticket)
+      documents = SpecrelayRunner::Specification::DocumentSet.new(package)
+      questions = section(package["spec.md"], "Dependencies, assumptions, and open questions")
+
+      assert_empty documents.open_questions, "#{ticket}: a real ticket raises no standing question"
+      assert_includes package["spec.md"], "are authoritative", "#{ticket}: real criteria stay authoritative"
+      refute_includes questions, "attempted a second time", "#{ticket}"
+      refute_includes questions, "cannot complete", "#{ticket}"
+      %w[spec.md analysis/technical.md analysis/business.md].each do |name|
+        refute_includes package[name], "No stated criterion covers", "#{ticket} #{name}"
+      end
+    end
+  end
+
+  # Criterion 6 — the negative direction. Without this, a predicate returning false for
+  # everything passes criteria 1-4, and a real ticket that writes one prose criterion instead of
+  # a list would be told its own criteria are not criteria.
+  def test_a_real_criterion_written_as_one_sentence_still_counts_as_stated
+    package = placeholder_package(UNUSUAL_REAL_CRITERION)
+    documents = SpecrelayRunner::Specification::DocumentSet.new(package)
+
+    assert_includes package["spec.md"], "are authoritative"
+    assert_empty documents.open_questions
+  end
+
+  # -------------------------------- CR-005 should-fix 9: the same miscount, a fifth time
+  #
+  # Four instances in two rounds, all the same defect — prose stating a count of something a list
+  # or a conditional generates:
+  #
+  #   review-004 F6   "Two conditions" above three bullets            (generated document)
+  #   review-004 F7   "Three sections" above a four-row table         (README)
+  #   CR-004 SF5      the same "Two conditions", at the root          (generated document)
+  #   review-005 F9   "nine UI words" above a list of ten             (README)
+  #
+  # Round 005 pinned the generated-document half with
+  # `test_the_acceptance_criteria_preamble_never_promises_a_count_the_bullets_contradict`. The
+  # README had no equivalent guard, so the fourth instance arrived in the very edit that closed
+  # the third. CR-005 asks how a fifth gets caught; this is the answer, and it is a test rather
+  # than a convention because "we were careful" is what produced instances two and four.
+  #
+  # The rule enforced is the conclusion CR-004 should-fix 5 already reached for generated prose:
+  # do not write a count that something else generates. Applied to the README's own sentences.
+  COUNTABLE_NOUNS = %w[sections conditions words criteria bullets rows items keywords predicates
+                       questions documents fixtures].freeze
+
+  def test_the_runner_readme_states_no_count_of_a_generated_list
+    readme = File.read(File.expand_path("../README.md", __dir__))
+    offenders = readme.lines.each_with_index.filter_map do |line, index|
+      next if line.start_with?("|")  # tables enumerate their own rows; the reader can count them
+
+      match = line.match(/\b(#{NUMBER_WORDS.join('|')})\s+(#{COUNTABLE_NOUNS.join('|')})\b/i)
+      "README.md:#{index + 1}: \"#{match[0]}\"" if match
+    end
+
+    assert_empty offenders,
+                 "a count in prose drifts the moment the thing it counts changes — say " \
+                 "\"a list of\" instead:\n#{offenders.join("\n")}"
+  end
+
   # ------------------------------------------------------------------------ helpers
 
   # A packet carrying the REAL rendered bundle for one of the two real tickets.
@@ -436,6 +556,34 @@ class SpecificationTicketMaterialTest < Minitest::Test
     return rendered_bundle(TICKETS.fetch(ticket)[:key], SILENT_DESCRIPTION) if fixture.nil?
 
     File.read(File.expand_path("fixtures/#{fixture}", __dir__))
+  end
+
+  # CR-005 must-fix 1, and the test-double gap the CR named: every fixture here was either a
+  # ticket with well-formed criteria or a ticket with no criteria section at all. The third
+  # shape — a section that EXISTS and says nothing checkable — was never exercised, which is why
+  # round 005's heading-presence gate shipped.
+  #
+  # The four bodies are the ones CR-005 executed against the round-005 build, where 4 of 4
+  # asserted the criteria were authoritative and 4 of 4 raised zero open questions.
+  PLACEHOLDER_CRITERIA = {
+    "TBD." => "a bare marker",
+    "See the linked Confluence page." => "a pointer somewhere else",
+    "To be agreed with the product owner." => "an explicit deferral",
+    "* It works." => "a list item carrying no checkable statement"
+  }.freeze
+
+  # A real single criterion, written as one prose sentence rather than a list — CR-005 must-fix 1
+  # criterion 6. The predicate must not simply return false for everything that is not a
+  # six-item list, or criteria 1-4 pass for the wrong reason.
+  UNUSUAL_REAL_CRITERION =
+    "A GET of /version returns 200 with the JSON body {\"version\": \"0.1.0\"} and the homepage " \
+    "shows that same string inside the element with id app-version."
+
+  def placeholder_package(body)
+    packet = packet(:silent, ENTRY_POINTS)
+    packet["input_bundle"]["content_markdown"] =
+      rendered_bundle("MAPIAI-50", "#{SILENT_DESCRIPTION}\n\nAcceptance criteria\n\n#{body}")
+    SpecrelayRunner::Specification::Composer.call(packet)
   end
 
   # The bundle wrapper around a description, in the shape the real renderer produces.
