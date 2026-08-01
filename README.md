@@ -342,7 +342,7 @@ receives is one reviewable, redacted packet. Two implementations ship:
 #### What the built-in composer takes from the ticket
 
 Where the Jira ticket states something, the generated specification **quotes it** rather
-than paraphrasing it. Three sections are read out of the reporter's own description:
+than paraphrasing it. Four sections are read out of the reporter's own description:
 
 | Ticket heading (case-insensitive) | Where it lands |
 |---|---|
@@ -364,16 +364,23 @@ left alone, a bare `#` is a level-1 heading and would destroy the document's out
 composer does not add to it.
 
 - A ticket that states its own acceptance criteria gets **no derived numbered criteria and no
-  derived numbered behaviour list**. The reproduced material plus two stated conditions is the
+  derived numbered behaviour list**. The reproduced material plus the standing conditions is the
   section. A ticket that has written six testable criteria does not need a machine to add four
   more.
-- **Nothing normative is derived from a keyword.** An earlier version treated the word "again"
+- **No requirement is derived from a keyword.** An earlier version treated the word "again"
   as a request for idempotency, and on a real bug about a file becoming "readable again" it
   produced four statements telling an implementer to build and test idempotency for a stateless
   read handler. No generated sentence claims the ticket asked for something it did not.
+  One keyword heuristic survives: `user_facing?` matches nine UI words over the title and the
+  ticket's included sections, and it decides one row of `analysis/technical.md`. It states what
+  the recorded inputs do or do not imply, never what the ticket requires.
 - Where a specification needs a decision the ticket never made, the output is an **open
-  question**, never a requirement — and a keyword can never suppress one. Only the ticket's own
-  criteria can.
+  question**, never a requirement. **A ticket that supplies its own acceptance criteria raises
+  neither standing question** — not the repeat one, not the failure-path one. Where it supplies
+  none, both are raised, worded as what this generation found rather than as a finding about the
+  ticket. Nothing reads the criteria text for keywords to decide this; a generator cannot tell
+  whether a reporter made a decision, and both directions of that guess have now shipped a
+  defect — a false requirement in round 003, a false absence in round 004.
 - A ticket with no criteria at all produces a section that opens "The ticket states no
   acceptance criteria" and labels what follows as derived and needing confirmation.
 

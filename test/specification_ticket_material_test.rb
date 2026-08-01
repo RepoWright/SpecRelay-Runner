@@ -109,31 +109,108 @@ class SpecificationTicketMaterialTest < Minitest::Test
     refute_includes technical, "idempotent"
   end
 
-  # …and the counterweight must be there. Round 003 suppressed the open question `unless
-  # ticket_mentions_repeat?`, so the same word that produced the false requirement also removed
-  # the question that would have exposed it, leaving "None arising from the recorded inputs."
-  def test_a_ticket_whose_criteria_are_silent_on_repeats_still_raises_the_open_question
+  # ------------------------------- CR-004 must-fix 1: an open question stops characterising the ticket
+  #
+  # These three replace the round-003 pair that pinned the keyword predicates. That pair could
+  # not fail on the defect that shipped, because both of its "positive branch" assertions were
+  # `assert_includes` over text the predicates produced either way.
+  #
+  # The chosen correction, of the two CR-004 offered: a ticket that supplies its own acceptance
+  # criteria raises NEITHER standing question, and the predicates are deleted rather than
+  # reworded. So the property under test is no longer "does the word list fire" — it is "does
+  # the document ever tell the reader what the reporter's criteria do not cover".
+
+  # CR-004 must-fix 1 criterion 1. The exact string round 004 shipped, over every document of
+  # every real fixture — not just the section it appeared in, because it appeared in two.
+  def test_no_document_asserts_that_the_tickets_criteria_omit_something
+    %i[healthz version failed_read silent].each do |ticket|
+      package = compose(ticket)
+      %w[spec.md analysis/technical.md analysis/business.md].each do |name|
+        refute_includes package[name], "No stated criterion covers", "#{ticket} #{name}"
+      end
+    end
+  end
+
+  # CR-004 must-fix 1 criterion 2 — the regression that shipped it. `MAPIAI-49` criterion c)
+  # states repeat behaviour outright ("a following request to /nope still returns 404"), and it
+  # does so without using any of the nine words the deleted predicate matched: not "repeat", not
+  # "twice", not "idempotent". Round 004 therefore asserted on the same page as the reproduced
+  # criterion that no criterion covered it.
+  #
+  # The assertion is `refute`, deliberately. The old test asserted the question was PRESENT for
+  # this fixture, which is why the word list could have been empty without any test noticing.
+  def test_a_ticket_whose_criteria_state_repeat_behaviour_in_their_own_words_raises_no_repeat_question
     spec = compose(:failed_read)["spec.md"]
     questions = section(spec, "Dependencies, assumptions, and open questions")
 
-    assert_includes questions, "attempted a second time"
-    refute_includes questions, "None arising from the recorded inputs"
+    assert_includes spec, "a following request to /nope still returns 404",
+                    "fixture drift: this test is meaningless unless the criterion is reproduced"
+    refute_includes questions, "attempted a second time"
+    refute_includes questions, "repeat behaviour"
   end
 
-  # CR-003 must-fix 1 criterion 3: the POSITIVE branch of each predicate, which nothing pinned.
-  # Without this the tests pass identically whether the predicate is word-boundaried, naive, or
-  # absent altogether.
-  def test_the_content_predicates_fire_when_a_criterion_really_states_the_requirement
-    # MAPIAI-49's lettered criteria do describe the failure path — 500, "read fails", the log.
-    questions = section(compose(:failed_read)["spec.md"],
-                        "Dependencies, assumptions, and open questions")
-    refute_includes questions, "cannot complete", "the failure question must be suppressed by a real criterion"
+  # CR-004 must-fix 1 criterion 3. `MAPIAI-48`'s criterion decides the failure path in full —
+  # missing file, missing key, 200, `"version": "unknown"`, the homepage — using none of the
+  # twelve words the deleted failure predicate matched. Round 004 called it unspecified twice.
+  def test_a_ticket_whose_criteria_decide_the_failure_path_is_not_told_the_failure_path_is_unspecified
+    spec = compose(:version)["spec.md"]
+    questions = section(spec, "Dependencies, assumptions, and open questions")
 
-    # MAPIAI-48's criteria mention neither repeats nor failures, so both questions stand.
-    version_questions = section(compose(:version)["spec.md"],
-                                "Dependencies, assumptions, and open questions")
-    assert_includes version_questions, "attempted a second time"
-    assert_includes version_questions, "cannot complete"
+    assert_includes spec, "still starts", "fixture drift: the failure-path criterion must be reproduced"
+    refute_includes questions, "cannot complete"
+    refute_includes questions, "the failure path"
+  end
+
+  # The other half of the choice: where the ticket really is silent, both questions stand. Without
+  # this, deleting `standing_decision_questions` altogether would pass everything above.
+  def test_a_ticket_with_no_criteria_still_raises_both_standing_questions
+    questions = section(compose(:silent)["spec.md"], "Dependencies, assumptions, and open questions")
+
+    assert_includes questions, "attempted a second time"
+    assert_includes questions, "cannot complete"
+    assert_includes questions, "This generation found no stated decision for it"
+  end
+
+  # The empty state must not read as "there is nothing to decide" for a ticket that decided it.
+  def test_the_empty_open_questions_state_points_at_the_tickets_own_criteria
+    questions = section(compose(:failed_read)["spec.md"], "Dependencies, assumptions, and open questions")
+
+    assert_includes questions, "None arising from the recorded inputs"
+    assert_includes questions, "decided by the ticket's own acceptance criteria, reproduced verbatim above"
+  end
+
+  # …and it must be ONE bullet. `DocumentSet#open_questions` parses this section back out for
+  # Platform and treats each bullet as a question, skipping only a leading "none" — so the first
+  # draft of the fix above put a second, perfectly true bullet on the run page under the heading
+  # "Open questions raised by the specification". Caught in the live browser pass, not by a test,
+  # which is why this one exists: it asserts through the same reader Platform uses.
+  def test_an_empty_open_questions_section_reports_no_questions_to_platform
+    %i[healthz version failed_read].each do |ticket|
+      documents = SpecrelayRunner::Specification::DocumentSet.new(compose(ticket))
+
+      assert_empty documents.open_questions,
+                   "#{ticket}: the empty state must not reach Platform as a question"
+    end
+  end
+
+  # CR-004 should-fix 5 criterion 1. `standing_criteria` appends a third bullet whenever an open
+  # question survives, so the hardcoded "Two conditions" in the preamble was wrong in both
+  # committed packages — three bullets under a sentence promising two. Asserted for every
+  # fixture, in both the stated-criteria and derived-criteria shapes, so neither branch can
+  # reintroduce a count.
+  NUMBER_WORDS = %w[One Two Three Four Five one two three four five].freeze
+
+  def test_the_acceptance_criteria_preamble_never_promises_a_count_the_bullets_contradict
+    %i[healthz version failed_read silent].each do |ticket|
+      criteria = section(compose(ticket)["spec.md"], "Acceptance criteria")
+      preamble = criteria.split(/^- /).first.to_s
+      bullets = criteria.scan(/^- /).length
+
+      NUMBER_WORDS.each do |word|
+        refute_match(/\b#{word} conditions?\b/, preamble,
+                     "#{ticket}: preamble promises \"#{word}\" above #{bullets} bullets")
+      end
+    end
   end
 
   # CR-003 must-fix 1 criterion 5: refute over the WHOLE document, not one section.

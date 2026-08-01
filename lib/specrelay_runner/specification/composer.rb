@@ -316,7 +316,11 @@ module SpecrelayRunner
           "",
           ticket.acceptance_criteria,
           "",
-          "This generation adds no numbered criteria of its own. Two conditions hold for any",
+          # CR-004 should-fix 5: no count word here. `standing_criteria` appends a third bullet
+          # whenever an open question survives, so a hardcoded "Two" was wrong in both committed
+          # packages. A number in prose that a conditional generates has to be computed or
+          # dropped; dropped is smaller and cannot drift again.
+          "This generation adds no numbered criteria of its own. The conditions below hold for any",
           "generated specification and are stated rather than numbered:",
           "",
           standing_criteria.join("\n")
@@ -414,10 +418,24 @@ module SpecrelayRunner
       end
 
       def open_question_lines
-        return "- None arising from the recorded inputs. Every input the bundle offered was usable." if
-          open_questions.empty?
+        return open_questions.map { |question| "- #{question}" }.join("\n") if open_questions.any?
 
-        open_questions.map { |question| "- #{question}" }.join("\n")
+        # CR-004 must-fix 1. The empty state has to say why it is empty. A reader who sees only
+        # "None arising" cannot tell a ticket that made its own decisions from a generation that
+        # declined to look for them — and after must-fix 1 the first case is the common one.
+        # Where the ticket states criteria, they are the answer, so this points at them instead
+        # of characterising what they do or do not cover.
+        #
+        # ONE bullet, not two. `DocumentSet#open_questions` reads this section back for Platform
+        # and treats every bullet as a question, skipping only a leading "none" — so a second
+        # bullet here, however true, arrives on the run page under the heading "Open questions
+        # raised by the specification". The first draft of this fix did exactly that. The parser
+        # is right and the document was wrong: the contract is one bullet per question.
+        empty = "- None arising from the recorded inputs. Every input the bundle offered was usable"
+        return "#{empty}." unless ticket.acceptance_criteria?
+
+        "#{empty}, and anything this specification does not decide is decided by the ticket's own " \
+          "acceptance criteria, reproduced verbatim above."
       end
 
       # ------------------------------------------------------- analysis/business.md
@@ -989,23 +1007,27 @@ module SpecrelayRunner
 
       # The open questions this generation is willing to state. Each is derived from a real
       # gap rather than from a list of questions that could be asked about anything.
-      # CR-003 must-fix 1 part 2. An open question is now suppressed only by the ticket's own
-      # CRITERIA saying something about the topic — never by a keyword appearing anywhere in the
-      # prose.
       #
-      # Round 003 suppressed the repeat question `unless ticket_mentions_repeat?`, so the word
-      # "again" in "once the file is readable again" removed the counterweight and left
-      # `spec.md` reading "None arising from the recorded inputs." next to a fabricated
-      # idempotency requirement. Round 002's version was contradictory but LOUD; round 003 made
-      # it quiet, which is worse. A keyword match is not a product decision, and it must never
-      # be able to silence a question.
+      # CR-004 must-fix 1, of the two corrections the CR offered: **when the ticket supplies its
+      # own acceptance criteria, neither standing question is raised at all.** The keyword
+      # predicates that used to gate them are deleted rather than reworded.
+      #
+      # The history is worth keeping, because each round moved the same defect rather than
+      # removing it. Round 003 suppressed the repeat question on a keyword, so "readable again"
+      # silenced it next to a fabricated idempotency requirement. Round 004 stopped suppressing
+      # and instead asserted "No stated criterion covers repeat behaviour" — which `MAPIAI-49`
+      # criterion c) and two of `MAPIAI-48`'s six criteria refute on the same page. A vague
+      # claim had been replaced by a checkable one, and the checkable one was false.
+      #
+      # The mechanism at fault was never the length of the word list. It was asking a keyword
+      # to decide whether the reporter had made a decision. A ticket that wrote testable
+      # criteria has already made its decisions; where they are silent, they are reproduced
+      # verbatim three sections earlier and a reader can see the silence directly. This
+      # generation is not entitled to characterise them.
       def open_questions
         @open_questions ||= begin
           questions = []
-          questions << "What should happen when the operation is attempted a second time? No stated " \
-                       "criterion covers repeat behaviour." unless criteria_mention_repeat?
-          questions << "What should the user see when the operation cannot complete? No stated " \
-                       "criterion covers the failure path." unless criteria_mention_failure?
+          questions.concat(standing_decision_questions) unless ticket.acceptance_criteria?
           unused_inputs.each do |input|
             questions << "What did **#{input['kind']}#{input_name_suffix(input)}** contain? It was recorded " \
                          "as an input but could not be read here (#{input['note']})."
@@ -1014,27 +1036,20 @@ module SpecrelayRunner
         end
       end
 
-      # Both heuristics read the REPORTER's description rather than the whole bundle. The
-      # bundle wraps that text in SpecRelay's own scaffolding — a completeness verdict, tables
-      # of read statuses and reasons — and matching a keyword there would answer "did
-      # SpecRelay mention failure?" instead of "did the ticket specify one?", which is the
-      # question that decides whether an open question is real.
-      # These decide ONE thing each, and only one: whether to raise an open question. They no
-      # longer gate any normative statement, because CR-003 established that a keyword cannot
-      # carry a requirement — "again" in "readable again" is not a request for idempotency.
+      # Reached only when the ticket states no acceptance criteria — the one case where the
+      # absence of a decision is a fact about the document rather than a guess about the ticket.
       #
-      # They read the ticket's own CRITERIA rather than its whole description, which is the
-      # narrowest text where a stated requirement can actually live. Prose discussing a failure
-      # mode is not a criterion about it, and the cost of a false negative here is one extra
-      # open question — the safe direction.
-      def criteria_mention_repeat?
-        matches_any?(ticket.acceptance_criteria, %w[idempotent idempotency idempotently twice repeat
-                                                    re-run rerun duplicate duplicating])
-      end
-
-      def criteria_mention_failure?
-        matches_any?(ticket.acceptance_criteria, %w[error errors fail fails failing failure invalid
-                                                    reject rejects unable cannot unreadable 500])
+      # The wording is scoped to this generation, not to the ticket. "No stated criterion
+      # covers repeat behaviour" is a finding about the reporter's work that a text generator
+      # cannot substantiate; "this generation found no stated decision" is a report of what it
+      # did. `spec.md` turns each of these into a blocking product-owner decision, which is
+      # affordable when the ticket really is silent and is not when it merely used different
+      # words.
+      def standing_decision_questions
+        [ "What should happen when the operation is attempted a second time? This generation found " \
+          "no stated decision for it.",
+          "What should the user see when the operation cannot complete? This generation found no " \
+          "stated decision for it." ]
       end
 
       def input_name_suffix(input)
