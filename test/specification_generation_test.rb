@@ -159,6 +159,30 @@ class SpecificationGenerationTest < Minitest::Test
     assert_includes technical, "No Context+ semantic query was performed by this process"
   end
 
+  # CR-002 must-fix 2, end to end. The warning has to reach Platform and the manifest, not
+  # just exist inside the runner — round 002's manifest recorded `warnings: []` on exactly
+  # this path and the run page showed nothing at all.
+  def test_a_zero_file_inspection_warns_platform_and_the_manifest
+    FileUtils.rm_rf(Dir.glob(File.join(@source, "*")))
+    FileUtils.rm_rf(Dir.glob(File.join(@source, ".*")).reject { |p| p.end_with?(".", "..") })
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
+
+    # Graphify goes with the checkout, so this refuses on the graph before it can generate.
+    # The inspection warning is asserted at the unit level in
+    # specification_source_inspection_test.rb; what this proves is that an empty checkout is
+    # never quietly successful.
+    assert_equal "graphify_unavailable", @platform.last_specification_generation["failure_class"]
+  end
+
+  def test_the_generated_documents_and_manifest_name_the_real_source_files
+    run_cli
+    manifest = JSON.parse(read_package("generation-manifest.json"))
+
+    assert_operator manifest.dig("source_evidence", "entry_points_inspected"), :>, 0
+    assert_includes read_package("analysis/technical.md"), "`app/services/export_report.rb`"
+    assert_empty manifest["warnings"], "a checkout with source must carry no inspection warning"
+  end
+
   # ------------------------------------------------------------------ criterion 7
 
   def test_success_is_reported_to_platform_with_repository_relative_paths_and_digests

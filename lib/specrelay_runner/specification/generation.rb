@@ -237,7 +237,11 @@ module SpecrelayRunner
             "replaced_existing_package" => written.replaced_existing?
           },
           "tool_evidence" => tool_evidence(ready),
-          "warnings" => (ready.inputs.warnings + written.warnings).map { |text| Redaction.redact(text) },
+          # Source-inspection warnings travel with the rest. A zero-file inspection is the one
+          # this exists for: it is the difference between a specification grounded in code and
+          # one grounded in a ticket, and Platform has to be able to show it.
+          "warnings" => (ready.inputs.warnings + ready.source.warnings + written.warnings)
+            .map { |text| Redaction.redact(text) },
           "open_questions" => documents.open_questions.map { |text| Redaction.redact(text) }
         )
       end

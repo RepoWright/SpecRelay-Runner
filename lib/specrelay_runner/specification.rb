@@ -42,6 +42,7 @@ module SpecrelayRunner
 end
 
 require_relative "specification/markdown"
+require_relative "specification/ticket_sections"
 require_relative "specification/assignment"
 require_relative "specification/settings"
 require_relative "specification/package_path"

@@ -30,15 +30,20 @@ class SpecificationProviderTest < Minitest::Test
   # `composed`, so the diagnostics Platform persists told an operator that the intended
   # production path was a fake. One vocabulary, and this asserts the two halves agree rather
   # than trusting that they happen to.
+  # EVERY kind, including `command`. CR-002 should-fix 6.2: this test used to `next` past
+  # `command`, so "asserts it for every kind" was true of two kinds out of three — and
+  # `command` is the one whose resolution can actually fail, because it builds an executable.
   def test_the_configured_provider_kind_and_the_resolved_provider_agree
+    command = SpecificationWorkspace.write_provider(File.join(@temp, "agreement-provider"),
+                                                    files: valid_documents)
+
     { "composed" => "composed", "fake" => "composed", "command" => "command" }.each do |configured, resolved|
-      settings = settings_for(configured)
+      settings = settings_for(configured, command: command)
 
       assert_equal resolved, settings.provider_kind, "configured #{configured.inspect}"
-      next if configured == "command"
-
       assert_equal settings.provider_kind,
-                   SpecrelayRunner::Specification::Provider.resolve(settings: settings).kind
+                   SpecrelayRunner::Specification::Provider.resolve(settings: settings).kind,
+                   "resolved provider disagrees with the configured kind for #{configured.inspect}"
     end
   end
 
@@ -49,14 +54,43 @@ class SpecificationProviderTest < Minitest::Test
     assert settings_for("fake").composed_provider?
   end
 
+  # The ENVIRONMENT path had no coverage at all, and it is the one a guided connection uses —
+  # a guided connection writes no YAML, so `SPECRELAY_RUNNER_SPEC_PROVIDER` is the only way it
+  # can name a provider.
+  def test_the_provider_kind_environment_override_is_read_and_normalized
+    env = { SpecrelayRunner::Specification::Settings::PROVIDER_KIND_ENV => "fake" }
+    settings = SpecrelayRunner::Specification::Settings.new({}, env: env)
+
+    assert_equal "composed", settings.provider_kind
+    assert_equal "composed", SpecrelayRunner::Specification::Provider.resolve(settings: settings).kind
+  end
+
+  def test_the_environment_override_wins_over_the_config_file
+    env = { SpecrelayRunner::Specification::Settings::PROVIDER_KIND_ENV => "composed" }
+    settings = SpecrelayRunner::Specification::Settings.new({ "provider" => { "kind" => "command" } }, env: env)
+
+    assert_equal "composed", settings.provider_kind
+  end
+
+  def test_an_unknown_provider_kind_in_the_environment_is_refused_by_name
+    env = { SpecrelayRunner::Specification::Settings::PROVIDER_KIND_ENV => "magic" }
+    error = assert_raises(SpecrelayRunner::Specification::Settings::Error) do
+      SpecrelayRunner::Specification::Settings.new({}, env: env)
+    end
+
+    assert_includes error.message, "composed, command"
+  end
+
   def test_an_unknown_provider_kind_is_refused_by_name
     error = assert_raises(SpecrelayRunner::Specification::Settings::Error) { settings_for("magic") }
 
     assert_includes error.message, "composed, command"
   end
 
-  def settings_for(kind)
-    SpecrelayRunner::Specification::Settings.new({ "provider" => { "kind" => kind } }, env: {})
+  def settings_for(kind, command: nil)
+    provider = { "kind" => kind }
+    provider["command"] = command if command
+    SpecrelayRunner::Specification::Settings.new({ "provider" => provider }, env: {})
   end
 
   # ------------------------------------------------------------------ what goes in

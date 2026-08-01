@@ -43,11 +43,29 @@ module SpecrelayRunner
       MAX_QUERY_CHARS = 4_000
       GRAPH_TIMEOUT_SECONDS = 300
 
-      # Source files worth naming as entry points. Deliberately a small, language-agnostic
-      # set: this is evidence that the runner looked at the real checkout, not an attempt to
-      # index it.
-      INTERESTING = %w[.rb .py .js .ts .tsx .jsx .go .java .kt .rs .ex .php].freeze
+      # What counts as a file worth naming, expressed as an EXCLUSION rather than an allowlist.
+      #
+      # It used to be a twelve-extension allowlist, and that produced the worst possible
+      # outcome against the first non-Ruby checkout it met: the real Tiny Demo app — a Node ESM
+      # app of `server.mjs`, `index.html`, `homepage.test.mjs` and `package.json` — matched
+      # none of them, the walk returned ZERO entry points, and the run still reported
+      # `generated` while the specification claimed to have been written against the checkout.
+      # An allowlist fails closed for every language the product has not met yet, which is
+      # exactly the set that matters.
+      #
+      # So the rule is inverted: sample anything that is not obviously not source. Binary
+      # formats, lockfiles and archives are named here and everything else is fair game, so
+      # meeting a new language produces a slightly noisier sample rather than an empty one.
+      UNINTERESTING = %w[
+        .png .jpg .jpeg .gif .svg .ico .webp .pdf .zip .gz .tar .tgz .bz2 .7z .rar
+        .woff .woff2 .ttf .eot .otf .mp3 .mp4 .mov .avi .wav .bin .exe .dll .so .dylib
+        .class .jar .pyc .pyo .o .a .lib .db .sqlite .sqlite3 .lock .map .min.js .min.css
+      ].freeze
       SKIP_DIRS = %w[.git node_modules tmp log vendor coverage graphify-out .bundle dist build].freeze
+
+      # A file larger than this is a data blob or a generated artifact, not something an
+      # implementer reads to understand the change.
+      MAX_ENTRY_POINT_BYTES = 512_000
 
       # One tool's outcome, with TWO verdicts that are deliberately not the same question.
       #
@@ -68,10 +86,12 @@ module SpecrelayRunner
       end
 
       Result = Struct.new(:root, :repository_name, :entry_points, :graphify, :context_plus,
-                          :fallbacks, keyword_init: true) do
+                          :fallbacks, :warnings, keyword_init: true) do
         # Repository-relative paths only. Criterion 11 forbids private host filesystem paths
         # in generated output, and this is the accessor every generated document reads.
         def entry_point_paths = entry_points
+        def inspected? = !entry_points.empty?
+        def warnings = self[:warnings] || []
       end
 
       def self.gather(**kwargs) = new(**kwargs).gather
@@ -86,8 +106,33 @@ module SpecrelayRunner
       def gather
         Result.new(
           root: root, repository_name: File.basename(root), entry_points: entry_points,
-          graphify: graphify_evidence, context_plus: context_plus_evidence, fallbacks: fallbacks
+          graphify: graphify_evidence, context_plus: context_plus_evidence, fallbacks: fallbacks,
+          warnings: inspection_warnings
         )
+      end
+
+      # A zero-file inspection is a FIRST-CLASS OUTCOME, not silence.
+      #
+      # The generation still proceeds — see the refuse-or-warn decision below — but the operator
+      # must be told, because the resulting specification is grounded in the ticket alone and is
+      # weaker than every other package the lane produces. Round 002 recorded
+      # `entry_points_inspected: 0` and `warnings: []` on the same run, and the run page showed
+      # nothing at all.
+      #
+      # WARN, DO NOT REFUSE. Scope §8 makes an *unresolvable* source workspace a refusal, and
+      # this is a different condition: the checkout resolved, it is simply empty of anything
+      # this runner can read. A specification written from a complete Jira ticket is still
+      # useful to the person who has to implement it, provided it says what it is missing —
+      # which the generated document now does, in its header, its Problem section, its
+      # dependencies and its risks. Refusing would also make the lane unusable for any
+      # repository whose sources this runner cannot classify, and failing closed on a
+      # classification gap is how the allowlist above caused this in the first place.
+      def inspection_warnings
+        return [] unless entry_points.empty?
+
+        [ "No source file could be read in the `#{File.basename(root)}` checkout, so this " \
+          "specification is grounded in the Jira ticket alone. Check that the workspace root " \
+          "points at the right directory; the generated documents say they are ungrounded." ]
       end
 
       private
@@ -102,9 +147,16 @@ module SpecrelayRunner
         @entry_points ||= begin
           found = []
           walk(root, "", found, 0)
-          found.sort.first(MAX_ENTRY_POINTS)
+          found.sort_by { |path| [ documentation?(path) ? 1 : 0, path ] }.first(MAX_ENTRY_POINTS)
         end
       end
+
+      # Prose is sampled, but ranked last. A repository with forty specification documents and
+      # four source files must show the four; the inverted rule that lets a new language be
+      # sampled at all would otherwise let a wall of Markdown crowd the code out of the list.
+      DOCUMENTATION = %w[.md .markdown .rst .txt .adoc].freeze
+
+      def documentation?(path) = DOCUMENTATION.include?(::File.extname(path).downcase)
 
       def walk(dir, prefix, found, depth)
         return if depth > 4 || found.length >= MAX_ENTRY_POINTS * 4
@@ -117,7 +169,7 @@ module SpecrelayRunner
           relative = prefix.empty? ? name : "#{prefix}/#{name}"
           if File.directory?(path)
             walk(path, relative, found, depth + 1)
-          elsif INTERESTING.include?(File.extname(name))
+          elsif source_file?(path, name)
             found << relative
           end
         end
@@ -125,6 +177,25 @@ module SpecrelayRunner
         # An unreadable directory is a gap in the sample, not a failure of the run. It is
         # surfaced through `fallbacks` rather than aborting evidence gathering.
         nil
+      end
+
+      # Anything that is not a known non-source format, is not enormous, and is not binary.
+      # The NUL-byte check is the cheap, reliable test for "a human does not read this": it
+      # catches formats the extension list has never heard of, which is the whole point.
+      def source_file?(path, name)
+        return false if UNINTERESTING.include?(File.extname(name).downcase)
+        return false if File.size(path) > MAX_ENTRY_POINT_BYTES
+
+        !binary?(path)
+      rescue SystemCallError
+        false
+      end
+
+      def binary?(path)
+        sample = ::File.binread(path, 1024).to_s
+        sample.include?("\x00")
+      rescue SystemCallError
+        true
       end
 
       # Structural evidence, through the wrappers. The freshness check runs FIRST and its

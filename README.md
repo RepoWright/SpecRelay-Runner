@@ -208,7 +208,27 @@ character: a silently rewritten destination is one the operator cannot predict.
 
 Every path in the generated Markdown is repository-relative. Absolute host paths
 never reach a generated file — including in quoted `bin/graph-check` and
-`bin/graph-query` output, which the runner relativizes before quoting.
+`bin/graph-query` output, which the runner relativizes before quoting. The input
+bundle is identified by its **trace id**, never by a Platform URL: that address is
+machine-local, and this package is destined for a shared repository.
+
+#### What happens when the source checkout yields nothing
+
+The runner samples any file in the source checkout that is not binary, not oversized,
+and not a known non-source format — an exclusion rule, not a list of blessed
+extensions, so a language this runner has never met is still inspected.
+
+If it still finds **nothing readable**, the runner **generates anyway and warns**. It
+does not refuse. A resolved-but-empty checkout is not scope 8's *unresolvable* workspace,
+and a specification written from a complete Jira ticket is still worth having — provided
+it admits what it is missing, which it does: the header, the Problem section, the
+dependencies, and the technical risks all state that no source was inspected, and the
+run carries a warning that Platform stores and the run page shows.
+
+If you would rather it refused, the fix is on your side: point the workspace root at a
+checkout that has source in it. A refusal here would make the lane unusable for any
+repository this runner cannot classify, which is how an extension allowlist silently
+produced an empty inspection of a real Node app in the first place.
 
 #### Preflight, and why a refusal is the good outcome
 
@@ -318,6 +338,33 @@ receives is one reviewable, redacted packet. Two implementations ship:
   on stdin, expecting the file map as JSON on stdout. No shell, no inherited
   environment beyond `PATH`, and a throwaway working directory — the provider is
   never handed either checkout, because writing is not its job.
+
+#### What the built-in composer takes from the ticket
+
+Where the Jira ticket states something, the generated specification **quotes it** rather
+than paraphrasing it. Three sections are read out of the reporter's own description:
+
+| Ticket heading (case-insensitive) | Where it lands |
+|---|---|
+| `Problem`, `Context`, `Background`, `Why` | `## Problem`, as a blockquote |
+| `Acceptance criteria`, `Acceptance`, `Criteria`, `Definition of done` | `## Acceptance criteria`, verbatim and attributed |
+| `Out of scope`, `Non-goals`, `Not in scope`, `Exclusions` | `## Non-goals`, verbatim and attributed |
+
+Every other heading the ticket carries — `Edge cases that matter`, say — is reproduced
+under `## Proposed behavior`, because it is material an implementer needs and dropping
+it for want of a name for it would be the same mistake in a smaller form.
+
+Headings are recognised by shape, not by markup: Jira stores ADF and the conversion to
+text loses heading formatting, so a heading arrives as a short line alone between blank
+lines. Ordered list items arrive as `#`, which is renumbered to `1.` on the way out —
+left alone, a bare `#` is a level-1 heading and would destroy the document's outline.
+
+**Where the ticket says nothing, the document says so.** A ticket with no acceptance
+criteria produces a section that opens "The ticket states no acceptance criteria" and
+labels what follows as derived and needing confirmation. Criteria the ticket does not
+support are not emitted at all: a ticket that never mentions repeat behaviour gets the
+open question about idempotency and no criterion requiring it. A fabricated acceptance
+criterion is worse than a missing one, because a reviewer cannot tell it from a real one.
 
 Whatever a provider returns is validated before anything is written, so a
 plausible-looking document that silently omits acceptance criteria is rejected rather

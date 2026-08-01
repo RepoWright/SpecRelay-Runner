@@ -229,7 +229,9 @@ module SpecrelayRunner
           "input_bundle" => input_bundle_block,
           "on_existing_package" => settings.on_existing_package,
           "replaced_existing_package" => @replaced_existing ? true : false,
-          "warnings" => warnings.dup,
+          # Source-inspection warnings belong in the package on disk too. A reader who opens
+          # only the manifest must be able to see that nothing was read from the checkout.
+          "warnings" => (warnings + Array(source.warnings)).uniq,
           "publication" => publication_block
         }
       end
@@ -245,10 +247,13 @@ module SpecrelayRunner
         }
       end
 
+      # No `url`. Platform's artifact address is machine-local — `http://127.0.0.1:3200/…` for
+      # every local operator — and this manifest is committed to a shared specification
+      # repository, where it would point at a different machine for every reader. The trace id
+      # identifies the bundle unambiguously to whoever holds the Platform instance.
       def input_bundle_block
         {
           "trace_id" => assignment.bundle_trace_id,
-          "url" => Redaction.redact(assignment.bundle_url),
           "recorded" => inputs.inputs.length,
           "used" => inputs.readable_inputs.length,
           "warnings" => inputs.warnings.map { |warning| Redaction.redact(warning) }

@@ -42,3 +42,29 @@ puts Jira::SpecCreation::Markdown.render(bundle)
 
 `DESCRIPTION` is the plain reporter text for the first fixture; for the second it is the same
 text with a ```` ```ruby ```` block in the middle.
+
+## `jira_ticket_healthz.md`, `jira_ticket_version.md`
+
+The rendered input bundles for two **real Jira tickets**, captured from the real Platform
+after a real intake pass:
+
+| Fixture | Ticket | Shape |
+|---|---|---|
+| `jira_ticket_healthz.md` | [`MAPIAI-47`](https://finlink.atlassian.net/browse/MAPIAI-47) | numbered acceptance criteria (ADF `#` markers), `Out of scope` as one paragraph |
+| `jira_ticket_version.md` | [`MAPIAI-48`](https://finlink.atlassian.net/browse/MAPIAI-48) | bulleted acceptance criteria (ADF `*` markers), `Non-goals` as four paragraphs |
+
+Two rather than one, deliberately. The property that matters most for the composer — that two
+different tickets produce two different documents — cannot be asserted with a single fixture,
+and its absence is why a round shipped in which six of nine sections were fixed strings.
+
+They are real Jira text because the two defects CR-002 raised were both invisible against
+synthetic tickets: an invented description has the shape you imagined, and both real ones
+turned out to open with an administrative preamble, mark lists in ways Markdown does not, and
+name their exclusions under two different headings.
+
+To re-capture, after a real intake pass:
+
+```ruby
+run = Run.joins(:work_item).find_by(work_items: { external_id: "MAPIAI-48" })
+print run.spec_creation_input_bundle.content
+```
