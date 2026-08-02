@@ -70,16 +70,19 @@ class SpecificationSourceInspectionTest < Minitest::Test
 
     assert_empty result.entry_points
     refute result.inspected?
-    assert_equal 1, result.warnings.length
-    assert_includes result.warnings.first, "No source file could be read"
-    assert_includes result.warnings.first, "grounded in the Jira ticket alone"
+    assert_equal 2, result.warnings.length
+    assert result.warnings.any? { |warning| warning.include?("Graphify is not installed") }
+    source_warning = result.warnings.find { |warning| warning.include?("No source file could be read") }
+    assert_includes source_warning, "grounded in the Jira ticket alone"
   end
 
-  def test_a_checkout_with_source_carries_no_inspection_warning
+  def test_a_checkout_with_source_carries_only_the_missing_graphify_warning
     write("app/real.rb", "class Real; end\n")
 
-    assert_empty gather.warnings
-    assert gather.inspected?
+    result = gather
+    assert_equal [ "Graphify is not installed for this checkout; direct source inspection was used instead." ],
+                 result.warnings
+    assert result.inspected?
   end
 
   # The refuse-or-warn decision, named so a reviewer can see it was made rather than

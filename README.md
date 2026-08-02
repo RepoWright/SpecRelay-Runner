@@ -308,7 +308,7 @@ a property of the control flow rather than of a cleanup routine that might fail.
 | `source_workspace_unresolved` | Map the workspace to its local source checkout (`SPECRELAY_RUNNER_WORKSPACE_ROOT_<KEY>`). |
 | `input_content_unreadable` | The bundle offers an input Platform classified as unusable. Re-read the ticket. |
 | `external_reference_analysis_unavailable` | A Confluence page or screenshot was deferred to this runner. Enable the capability or record a substitute. |
-| `graphify_unavailable` | Run `bin/graph-build` in the source checkout, or record a substitute. A **stale** graph counts as unavailable — a stale graph is not evidence. |
+| `graphify_unavailable` | Graphify is present but incomplete, not executable, stale, or unhealthy. Repair it with `bin/graph-build`, or record a substitute. A repository with neither wrapper installed continues with direct source inspection and records that Graphify contributed nothing. |
 | `context_plus_unavailable` | Declare Context+ available, or record what was used instead. |
 | `generation_provider_unavailable` | The configured provider command is missing or not executable. |
 | `redaction_validation_unavailable` | The redaction guard failed its own self-check; generated output cannot be proven safe. |

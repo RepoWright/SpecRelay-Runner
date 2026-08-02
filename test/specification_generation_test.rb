@@ -197,13 +197,17 @@ class SpecificationGenerationTest < Minitest::Test
     assert_includes read_package("analysis/technical.md"), "NO SOURCE WAS INSPECTED"
   end
 
-  # An empty checkout without a recorded substitute still refuses on the graph, which is the
-  # ordinary case and must not change.
-  def test_an_empty_checkout_without_a_substitute_still_refuses_on_the_graph
+  # A repository that does not install Graphify remains usable. The package must disclose both
+  # the missing structural evidence and the absence of readable source instead of silently
+  # presenting ticket-only generation as code-grounded.
+  def test_an_empty_checkout_without_graphify_uses_the_direct_inspection_fallback
     empty_the_source_checkout
 
-    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
-    assert_equal "graphify_unavailable", @platform.last_specification_generation["failure_class"]
+    assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
+    manifest = JSON.parse(read_package("generation-manifest.json"))
+    assert_includes manifest["warnings"],
+                    "Graphify is not installed for this checkout; direct source inspection was used instead."
+    assert manifest["warnings"].any? { |warning| warning.include?("No source file could be read") }
   end
 
   def test_the_generated_documents_and_manifest_name_the_real_source_files
