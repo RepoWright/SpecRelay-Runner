@@ -219,7 +219,6 @@ module SpecrelayRunner
 
       def check_tools(source)
         return graphify_refusal(source) unless source.graphify.usable?
-        return context_plus_refusal unless settings.context_plus.usable?
 
         nil
       end
@@ -229,13 +228,6 @@ module SpecrelayRunner
                "#{source.graphify.summary}. Rebuild it with `#{SourceEvidence::GRAPH_CHECK}` / " \
                "`bin/graph-build` in the source checkout, or record an approved source-based substitute " \
                "under runner.specification.graphify.substitute.")
-      end
-
-      def context_plus_refusal
-        refuse(CONTEXT_PLUS_UNAVAILABLE,
-               "Context+ is required for this lane and is neither available nor substituted on this runner. " \
-               "Set runner.specification.context_plus.available, or record what was used instead under " \
-               "runner.specification.context_plus.substitute.")
       end
 
       def resolve_provider

@@ -70,18 +70,22 @@ class SpecificationSourceInspectionTest < Minitest::Test
 
     assert_empty result.entry_points
     refute result.inspected?
-    assert_equal 2, result.warnings.length
+    assert_equal 3, result.warnings.length
     assert result.warnings.any? { |warning| warning.include?("Graphify is not installed") }
+    assert result.warnings.any? { |warning| warning.include?("Context+ is not available") }
     source_warning = result.warnings.find { |warning| warning.include?("No source file could be read") }
     assert_includes source_warning, "grounded in the Jira ticket alone"
   end
 
-  def test_a_checkout_with_source_carries_only_the_missing_graphify_warning
+  def test_a_checkout_with_source_carries_only_the_missing_tool_warnings
     write("app/real.rb", "class Real; end\n")
 
     result = gather
-    assert_equal [ "Graphify is not installed for this checkout; direct source inspection was used instead." ],
-                 result.warnings
+    assert_equal [
+      "Graphify is not installed for this checkout; direct source inspection was used instead.",
+      "Context+ is not available on this runner; direct source inspection was used without semantic " \
+      "Context+ evidence."
+    ], result.warnings
     assert result.inspected?
   end
 

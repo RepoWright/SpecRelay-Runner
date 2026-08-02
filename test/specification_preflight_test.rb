@@ -143,9 +143,18 @@ class SpecificationPreflightTest < Minitest::Test
     assert_includes @io.string, "incomplete or not executable"
   end
 
-  def test_context_plus_neither_available_nor_substituted_refuses
-    assert_refusal "context_plus_unavailable", context_plus: false
-    assert_includes @io.string, "context_plus.substitute"
+  def test_context_plus_neither_available_nor_substituted_continues_with_an_explicit_warning
+    start_platform(spec_creation_payload_for(issue_key: ISSUE))
+    config = build_config(context_plus: false)
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli(config: config), @io.string
+    warning = "Context+ is not available on this runner; direct source inspection was used without " \
+              "semantic Context+ evidence."
+    assert_includes @platform.last_specification_generation["warnings"], warning
+    tool = @platform.last_specification_generation["tool_evidence"]
+             .find { |entry| entry["name"] == "context_plus" }
+    refute tool["usable"]
+    refute tool["contributed"]
   end
 
   def test_a_configured_provider_command_that_is_missing_refuses

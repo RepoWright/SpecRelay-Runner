@@ -309,7 +309,7 @@ a property of the control flow rather than of a cleanup routine that might fail.
 | `input_content_unreadable` | The bundle offers an input Platform classified as unusable. Re-read the ticket. |
 | `external_reference_analysis_unavailable` | A Confluence page or screenshot was deferred to this runner. Enable the capability or record a substitute. |
 | `graphify_unavailable` | Graphify is present but incomplete, not executable, stale, or unhealthy. Repair it with `bin/graph-build`, or record a substitute. A repository with neither wrapper installed continues with direct source inspection and records that Graphify contributed nothing. |
-| `context_plus_unavailable` | Declare Context+ available, or record what was used instead. |
+| `context_plus_unavailable` | Legacy result from older runners. Current runners continue with an explicit warning when Context+ is unavailable. |
 | `generation_provider_unavailable` | The configured provider command is missing or not executable. |
 | `redaction_validation_unavailable` | The redaction guard failed its own self-check; generated output cannot be proven safe. |
 
@@ -350,8 +350,8 @@ runner:
       "SpecRelay/SpecRelay-Specs": /abs/path/to/your/specs-checkout
     on_existing_package: replace          # replace (default) | refuse
     context_plus:
-      available: true
-      # Optional. Semantic evidence YOU gathered — the runner cannot query Context+.
+      available: true       # optional declaration; never treated as proof of use
+      # Optional semantic evidence YOU gathered — the runner cannot query Context+.
       queries:
         - "where is the weekly report rendered"
       evidence: "ReportsController#weekly and ExportReport are the material hits"
@@ -374,18 +374,19 @@ unsuffixed `SPECRELAY_RUNNER_SPEC_REPOSITORY_ROOT`), `SPECRELAY_RUNNER_SPEC_PROV
 **The `substitute:` keys are not off switches.** Each is a sentence you write, and
 the runner copies it verbatim into `analysis/technical.md` and into the evidence
 Platform stores. Recording the gap is what makes proceeding honest; omitting the key
-is what makes preflight refuse. A substituted tool is reported as having contributed
-**nothing** — "we were allowed to continue without Graphify" and "Graphify produced
-evidence" are different facts and are never collapsed.
+can make preflight refuse for capabilities that must handle deferred input. A substituted
+tool is reported as having contributed **nothing** — "we were allowed to continue without
+Graphify" and "Graphify produced evidence" are different facts and are never collapsed.
 
 **Context+ is always reported as having contributed nothing.** The runner is a
 separate OS process with no MCP client, so it can neither run a semantic query nor
-verify that one ran; `context_plus.available: true` lets generation proceed and
-changes nothing about what the runner may claim. If you have gathered semantic
-evidence yourself, put it in `context_plus.queries` and `context_plus.evidence` —
-the runner reproduces both verbatim under `## Context+ evidence` and attributes them
-to you. It still does not mark the tool as having contributed, because the
-contributor was a person, not this process.
+verify that one ran. Its absence does not refuse generation: the runner records a warning
+and grounds the package in direct source inspection without semantic Context+ evidence.
+`context_plus.available: true` changes nothing about what the runner may claim. If you
+have gathered semantic evidence yourself, put it in `context_plus.queries` and
+`context_plus.evidence` — the runner reproduces both verbatim under
+`## Context+ evidence` and attributes them to you. It still does not mark the tool as
+having contributed, because the contributor was a person, not this process.
 
 #### The generation provider boundary
 

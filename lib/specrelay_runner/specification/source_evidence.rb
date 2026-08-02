@@ -131,6 +131,10 @@ module SpecrelayRunner
         warnings = []
         warnings << "Graphify is not installed for this checkout; direct source inspection was used instead." if
           graphify_absent?
+        unless settings.context_plus.usable?
+          warnings << "Context+ is not available on this runner; direct source inspection was used without " \
+                      "semantic Context+ evidence."
+        end
         if entry_points.empty?
           warnings << "No source file could be read in the `#{File.basename(root)}` checkout, so this " \
                       "specification is grounded in the Jira ticket alone. Check that the workspace root " \
@@ -289,8 +293,9 @@ module SpecrelayRunner
       # "Result: used", Platform's run page said "contributed evidence", and nothing had
       # queried anything.
       #
-      # `usable` keeps its meaning and still gates preflight, so no refusal behaviour changes.
-      # What changes is that the document and the durable record now say who gathered what.
+      # `usable` records whether the operator supplied a declaration or substitute. It does not
+      # gate preflight: this process cannot query Context+, so requiring that declaration would
+      # make the guided runner flow depend on an unverifiable configuration claim.
       #
       # An operator CAN put real semantic evidence into the package — `queries:` and
       # `evidence:` under `runner.specification.context_plus` are reproduced verbatim below.
