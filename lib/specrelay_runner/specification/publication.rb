@@ -209,7 +209,15 @@ module SpecrelayRunner
         log("")
         log("Published #{verified.length} files on #{publication_branch} as a draft pull request:")
         log("  #{opened.url}")
-        log("No Jira field was written, no status was transitioned, and no comment was added.")
+        # MVP-0028 remediation, defect 8. This line used to read "No Jira field was written, no
+        # status was transitioned, and no comment was added" — true of the RUNNER, and printed
+        # microseconds before Platform wrote all three. An operator reading the last line of a
+        # successful run was told the ticket was untouched when it was about to be updated.
+        #
+        # The fix is to state the BOUNDARY rather than a moment: the runner never writes Jira, and
+        # Platform finalizes after accepting this result. That stays true whenever it is read.
+        log("This runner does not write Jira. Platform finalizes the ticket — Spec PR field, " \
+            "comment and status — after accepting this publication.")
         Result.new(outcome: PUBLISHED, pull_request_url: opened.url, branch: publication_branch,
                    head_commit: pushed.head_commit,
                    message: "Runner outcome: published (draft pull request #{opened.url}).")

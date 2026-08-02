@@ -40,12 +40,38 @@ module SpecrelayRunner
       MAX_OUTPUT_BYTES = 4_000_000
 
       # The configured kind and the resolved provider's own `kind` are the SAME vocabulary —
-      # `composed` and `command` — so the diagnostics Platform persists cannot contradict the
-      # manifest. They used to: the default was configured as `fake` and reported itself as
-      # `composed`, and the run page told operators the production default was a fake.
-      def self.resolve(settings:, env: ENV)
-        settings.composed_provider? ? Composed.new : Command.build(settings: settings, env: env)
+      # `composed`, `command` and `claude` — so the diagnostics Platform persists cannot
+      # contradict the manifest. They used to: the default was configured as `fake` and reported
+      # itself as `composed`, and the run page told operators the production default was a fake.
+      #
+      # **An unset kind is a question, not a default** (MVP-0028 remediation, defect 1). It used
+      # to resolve to `Composed`, so an operator whose guided setup wrote no runner YAML — the
+      # ordinary case — got the deterministic composer while believing they had selected the real
+      # provider. The live MAPIAI-52 run proved it: `runner.executor` named the real Claude
+      # profile and the specification lane never looked at it.
+      #
+      # So the precedence is: an EXPLICIT kind always wins, because an operator who names one has
+      # decided; otherwise the operator's real Claude profile is used if they configured one; and
+      # if neither exists this REFUSES. Falling back to the composer is what this method must
+      # never do again, because the composer's output is plausible enough that nobody notices.
+      def self.resolve(settings:, claude_profile: nil, env: ENV)
+        return Composed.new if settings.composed_provider?
+        return Command.build(settings: settings, env: env) if settings.provider_kind == Settings::PROVIDER_COMMAND
+        return Claude.build(profile: claude_profile, settings: settings) if settings.claude_provider?
+        return Claude.new(profile: claude_profile, settings: settings) if claude_profile
+
+        raise Unavailable, UNCONFIGURED
       end
+
+      # Named here rather than inlined because it is the sentence an operator reads when the lane
+      # cannot proceed, and it has to name every way out — including the fixture, so that choosing
+      # the composer stays a real option rather than something only the source reveals.
+      UNCONFIGURED =
+        "no specification generation provider is configured. Set runner.specification.provider.kind " \
+        "to `claude` to use this runner's configured Claude profile, to `command` with " \
+        "runner.specification.provider.command for another executable, or to `composed` to use the " \
+        "built-in deterministic composer as an explicit fixture. Configuring a runner.executor " \
+        "Claude profile also selects `claude` for specifications."
 
       # The deterministic, built-in provider. It composes the documents from the packet with
       # no model call, which makes it both the test double the spec asks for and a genuinely
@@ -64,6 +90,129 @@ module SpecrelayRunner
           # A composer bug must surface as a generation failure the run records, not as an
           # unhandled crash that leaves the claim held and the operator with a backtrace.
           raise Failed, "the built-in composer could not produce a package: #{e.class}"
+        end
+      end
+
+      # The operator's REAL Claude profile, writing the specification.
+      #
+      # It is a distinct kind from {Command} even though both spawn a process, because the two
+      # answer to different configuration and different failure advice: `command` is "an
+      # executable I chose for this lane", while this is "the Claude profile this runner already
+      # validated for execution". Collapsing them would make the refusal messages wrong for one of
+      # them, and would hide the fact that no separate configuration is needed at all.
+      #
+      # The profile owns the argv, the timeout, the prompt delivery and the child environment —
+      # this class adds none of them. That is what makes the provider that writes a specification
+      # verifiably the same one an operator configured and the readiness check probed.
+      class Claude
+        KIND = "claude"
+
+        MISSING_PROFILE =
+          "runner.specification.provider.kind is `claude` but this runner has no Claude profile: " \
+          "configure runner.executor with provider `claude`, or select another specification " \
+          "provider kind."
+
+        def self.build(profile:, settings:)
+          raise Unavailable, MISSING_PROFILE if profile.nil?
+
+          new(profile: profile, settings: settings)
+        end
+
+        def initialize(profile:, settings:, env: ENV, command_runner: CommandRunner)
+          @profile = profile
+          @settings = settings
+          @env = env
+          @command_runner = command_runner
+        end
+
+        def kind = KIND
+
+        # Already redacted by the profile, and it names the executable and how the prompt is
+        # delivered — enough for an operator to recognise which provider ran, with nothing that
+        # could carry a credential.
+        def describe = "Claude profile — #{profile.describe}"
+
+        # The packet reaches the model as ONE argv element, exactly as the implementation lane
+        # delivers its prompt, and the model must answer with the same JSON file map every
+        # provider answers with. Both halves are deliberate: the instruction lives here in
+        # reviewable source rather than "deep inside command glue" (MVP-0026 scope 9), and the
+        # output contract is the provider boundary's, not this class's, so {DocumentSet} validates
+        # a Claude package exactly as it validates any other.
+        def generate(packet)
+          result = run(prompt_for(packet))
+          raise Failed, "the Claude specification provider timed out" if result.timed_out?
+          raise Failed, "the Claude specification provider exited #{result.exit_code}" unless result.success?
+
+          parse(result.stdout)
+        end
+
+        private
+
+        attr_reader :profile, :settings, :env, :command_runner
+
+        # PATH to find the executable and HOME to find the operator's own Claude credentials —
+        # the same two the implementation lane forwards, and nothing else. The profile's own
+        # `extra_env` is merged last because it is the operator's explicit choice, and it is part
+        # of the profile identity the readiness check already validated.
+        FORWARDED_ENV = %w[PATH HOME].freeze
+
+        def run(prompt)
+          Dir.mktmpdir("specrelay-spec-claude-") do |workdir|
+            command_runner.run([ profile.command, *profile.args, prompt ], chdir: workdir,
+                                                                          env: child_env,
+                                                                          timeout_seconds: profile.timeout_seconds)
+          end
+        end
+
+        def child_env
+          FORWARDED_ENV.each_with_object({}) { |name, acc| acc[name] = env[name].to_s unless env[name].nil? }
+                       .merge(profile.extra_env)
+        end
+
+        # The whole instruction, in one place a reviewer can read. It says what to produce and in
+        # what shape, and nothing about WHAT to write — that is the packet's job, and a prompt
+        # that restated the content requirements would be a second, diverging specification of
+        # them.
+        def prompt_for(packet)
+          <<~PROMPT
+            You are writing a software specification package for SpecRelay.
+
+            Return ONLY a JSON object mapping file paths to file contents, with no prose before or
+            after it and no code fence. The keys must be exactly:
+            "spec.md", "analysis/business.md", "analysis/technical.md".
+
+            Base every statement on the evidence below. Do not invent requirements, and where the
+            evidence is insufficient say so in the document rather than guessing.
+
+            EVIDENCE (JSON):
+            #{JSON.generate(packet)}
+          PROMPT
+        end
+
+        # A model may wrap JSON in a fence or add a sentence despite being asked not to, so the
+        # first balanced object is extracted rather than the whole stdout parsed. Anything else is
+        # a failure the run records — never a partial package.
+        def parse(stdout)
+          text = stdout.to_s
+          raise Failed, "the Claude specification provider produced more output than the runner will accept" if
+            text.bytesize > MAX_OUTPUT_BYTES
+
+          document = JSON.parse(json_object(text))
+          raise Failed, "the Claude specification provider did not return a JSON object of file paths" unless
+            document.is_a?(Hash)
+
+          document.to_h { |name, content| [ name.to_s, content.to_s ] }
+        rescue JSON::ParserError
+          raise Failed, "the Claude specification provider did not return valid JSON"
+        end
+
+        def json_object(text)
+          start = text.index("{")
+          finish = text.rindex("}")
+          raise Failed, "the Claude specification provider returned no JSON object" if start.nil? || finish.nil? ||
+                                                                                       finish < start
+
+          text[start..finish]
         end
       end
 

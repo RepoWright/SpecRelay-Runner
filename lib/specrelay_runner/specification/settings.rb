@@ -60,7 +60,14 @@ module SpecrelayRunner
       PROVIDER_COMPOSED = "composed"
       PROVIDER_FAKE = "fake"
       PROVIDER_COMMAND = "command"
-      PROVIDER_KINDS = [ PROVIDER_COMPOSED, PROVIDER_COMMAND ].freeze
+      # MVP-0028 remediation — the operator's real Claude profile, the one already configured
+      # under `runner.executor` for the implementation lane, used to WRITE the specification.
+      # Before this existed the specification lane had no way to name the real provider at all,
+      # which is why an operator who selected "Claude Code (real provider)" in guided setup still
+      # got the deterministic composer: they had configured the only provider the product offered
+      # them, and the specification lane was not looking at it.
+      PROVIDER_CLAUDE = "claude"
+      PROVIDER_KINDS = [ PROVIDER_COMPOSED, PROVIDER_COMMAND, PROVIDER_CLAUDE ].freeze
       PROVIDER_ALIASES = { PROVIDER_FAKE => PROVIDER_COMPOSED }.freeze
 
       # What to do when a package for this issue already exists locally. MVP-0026 scope 10
@@ -150,14 +157,30 @@ module SpecrelayRunner
       end
 
       def replace_existing? = on_existing_package == REPLACE
+
+      # NOT "is the kind unset or composed". An unset kind is a question for {Provider.resolve},
+      # which knows what else the operator configured; answering it here as `composed` is exactly
+      # the silent substitution this remediation removes.
       def composed_provider? = provider_kind == PROVIDER_COMPOSED
+      def claude_provider? = provider_kind == PROVIDER_CLAUDE
+      def provider_kind_configured? = !provider_kind.nil?
 
       private
 
       attr_reader :document, :env
 
+      # nil when nothing selects a provider, and that is the whole point of this method.
+      #
+      # It used to default to `composed`. An absent `runner.specification` section is the ordinary
+      # state of a guided setup — which writes no runner YAML at all — so the default silently
+      # decided the most important question in the lane, and decided it wrongly for every operator
+      # who had configured a real provider elsewhere. Returning nil moves the decision to
+      # {Provider.resolve}, which can see the operator's executor profile; nothing downstream may
+      # read nil as "composed".
       def resolve_provider_kind(provider)
-        configured = presence(env[PROVIDER_KIND_ENV]) || presence(provider["kind"]) || PROVIDER_COMPOSED
+        configured = presence(env[PROVIDER_KIND_ENV]) || presence(provider["kind"])
+        return nil if configured.nil?
+
         kind = PROVIDER_ALIASES.fetch(configured, configured)
         raise Error, "runner.specification.provider.kind must be one of: #{PROVIDER_KINDS.join(', ')}" unless
           PROVIDER_KINDS.include?(kind)

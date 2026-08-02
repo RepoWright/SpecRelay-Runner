@@ -231,7 +231,12 @@ module SpecrelayRunner
       end
 
       def resolve_provider
-        @injected_provider || Provider.resolve(settings: settings, env: env)
+        # The operator's Claude profile is passed in, because "which provider writes the
+        # specification" now depends on what they configured for EXECUTION too — see
+        # Provider.resolve. `config.selected_claude_profile` is nil when they selected no real
+        # provider, and Provider.resolve turns that into a refusal rather than a quiet fixture.
+        @injected_provider || Provider.resolve(settings: settings, claude_profile: config.selected_claude_profile,
+                                               env: env)
       rescue Provider::Unavailable, Settings::Error => e
         refuse(GENERATION_PROVIDER_UNAVAILABLE, e.message)
       end
