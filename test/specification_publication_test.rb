@@ -130,6 +130,128 @@ class SpecificationPublicationTest < Minitest::Test
     assert_equal before, FakeGithub.remote_branches(@bare)[BRANCH]
   end
 
+  # ------------------------------------------------- MVP-0028 criteria 3 and 4: the ticket's PR
+  #
+  # A ticket that already has a `Spec PR` gets its specification added to THAT pull request. The
+  # branch comes from GitHub rather than from Platform, and the case that proves why is a RENAMED
+  # ticket: the open pull request's head still carries the old title's slug, so re-deriving the
+  # branch from the current title would open a second pull request for one ticket.
+  EXISTING_PR_URL = "https://github.com/SpecRelay/SpecRelay-Specs/pull/3"
+  OLD_TITLE_BRANCH = "specrelay/spec/SR-700-the-title-it-had-before"
+
+  def existing_pr(state: "OPEN", base: "main", fork: false, branch: OLD_TITLE_BRANCH)
+    { "url" => EXISTING_PR_URL, "state" => state, "headRefName" => branch, "baseRefName" => base,
+      "isDraft" => true, "isCrossRepository" => fork, "headRefOid" => "live" }
+  end
+
+  # Neither the derived branch nor the linked pull request's branch reached the remote. Asserted
+  # against BOTH names rather than "the remote is empty": the bare remote legitimately carries
+  # `main`, which this lane never touches.
+  def refute_publication_branches
+    branches = FakeGithub.remote_branches(@bare).keys
+    refute_includes branches, BRANCH
+    refute_includes branches, OLD_TITLE_BRANCH
+  end
+
+  def start_with_existing_pr(gh_mode: "ok", **overrides)
+    start_platform(gh_mode: gh_mode, gh_seed: [ existing_pr(**overrides) ],
+                   payload: spec_publication_payload_for(
+                     issue_key: ISSUE, files: @package_files, package_path: PACKAGE, branch: BRANCH,
+                     existing_pull_request_url: EXISTING_PR_URL
+                   ))
+  end
+
+  def test_a_ticket_with_an_existing_spec_pr_pushes_to_that_pull_requests_branch
+    start_with_existing_pr
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
+
+    result = @platform.last_specification_publication
+    assert_equal "published", result["outcome"], @io.string
+    assert_equal OLD_TITLE_BRANCH, result["branch"], "the branch must come from the pull request, not the title"
+    assert_equal EXISTING_PR_URL, result["pull_request_url"]
+    assert_equal true, result["reused_pull_request"]
+  end
+
+  # The duplicate this MVP exists to prevent, asserted as a fact about invocations.
+  def test_it_opens_no_second_pull_request_for_a_ticket_that_already_has_one
+    start_with_existing_pr
+    run_cli
+
+    assert_equal 0, FakeGithub.pr_creates(@gh_log), "the ticket's pull request must be updated, not duplicated"
+  end
+
+  def test_the_derived_branch_is_never_pushed_when_a_pull_request_already_owns_one
+    start_with_existing_pr
+    run_cli
+
+    branches = FakeGithub.remote_branches(@bare).keys
+    assert_includes branches, OLD_TITLE_BRANCH
+    refute_includes branches, BRANCH, "a second branch for one ticket is the duplicate, one step earlier"
+  end
+
+  # Criterion 4, one row per way a linked pull request can be unusable. Every one of them must
+  # refuse BEFORE any git mutation, so each asserts that the remote is untouched.
+  def test_a_closed_spec_pr_refuses_before_any_git_mutation
+    start_with_existing_pr(state: "CLOSED")
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
+
+    result = @platform.last_specification_publication
+    assert_equal "specification_pull_request_unusable", result["failure_class"]
+    assert_includes result["message"], "Clear the Jira Spec PR field"
+    refute_publication_branches
+    assert_equal 0, FakeGithub.pr_creates(@gh_log)
+  end
+
+  def test_a_merged_spec_pr_refuses
+    start_with_existing_pr(state: "MERGED")
+    run_cli
+
+    assert_equal "specification_pull_request_unusable", @platform.last_specification_publication["failure_class"]
+    refute_publication_branches
+  end
+
+  def test_a_spec_pr_against_the_wrong_base_refuses_and_names_both_branches
+    start_with_existing_pr(base: "release-2.0")
+    run_cli
+
+    message = @platform.last_specification_publication["message"]
+    assert_includes message, "release-2.0"
+    assert_includes message, "main"
+    refute_publication_branches
+  end
+
+  def test_a_spec_pr_from_a_fork_refuses
+    start_with_existing_pr(fork: true)
+    run_cli
+
+    assert_includes @platform.last_specification_publication["message"], "opened from a fork"
+    refute_publication_branches
+  end
+
+  # "Cannot be inspected safely". A `gh pr view` failure is NOT "there is no pull request" —
+  # guessing that would open the duplicate.
+  def test_an_unreadable_spec_pr_refuses_rather_than_creating_a_new_one
+    start_with_existing_pr(gh_mode: "view_fails")
+    run_cli
+
+    result = @platform.last_specification_publication
+    assert_equal "specification_pull_request_unusable", result["failure_class"]
+    assert_includes result["message"], "retry publication"
+    assert_equal 0, FakeGithub.pr_creates(@gh_log)
+    refute_publication_branches
+  end
+
+  # A first publication is unchanged: no `pr view` at all, and the branch Platform derived.
+  def test_a_first_publication_asks_github_about_no_existing_pull_request
+    start_platform
+    run_cli
+
+    assert_equal 0, FakeGithub.pr_views(@gh_log)
+    assert_equal BRANCH, @platform.last_specification_publication["branch"]
+  end
+
   # ---------------------------------------------------------------- criterion 2
 
   def test_a_digest_mismatch_refuses_before_any_git_mutation
@@ -448,8 +570,9 @@ class SpecificationPublicationTest < Minitest::Test
                                  branch: BRANCH)
   end
 
-  def start_platform(gh_mode: "ok", payload: nil)
-    @gh_dir, @gh_log, = FakeGithub.gh_bin(mode: gh_mode, pull_request_url: PR_URL, bare: @bare)
+  def start_platform(gh_mode: "ok", payload: nil, gh_seed: [])
+    @gh_dir, @gh_log, = FakeGithub.gh_bin(mode: gh_mode, pull_request_url: PR_URL, bare: @bare,
+                                          seed: gh_seed)
     @platform = FakePlatform.new(claim_payload: payload || publication_payload).start
     @config = build_config
   end

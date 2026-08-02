@@ -45,9 +45,14 @@ module SpecrelayRunner
 
       def self.call(**kwargs) = new(**kwargs).call
 
-      def initialize(commands:, assignment:, files:, io: $stdout)
+      # +branch+ is passed explicitly rather than read off the assignment, because MVP-0028 gave
+      # it two possible sources: the branch Platform derived for a first publication, or the head
+      # branch of the pull request this ticket already has. The caller resolves which; this class
+      # commits and pushes to whatever it is handed, and never chooses.
+      def initialize(commands:, assignment:, branch:, files:, io: $stdout)
         @commands = commands
         @assignment = assignment
+        @branch = branch
         @files = files
         @io = io
       end
@@ -71,7 +76,7 @@ module SpecrelayRunner
 
       private
 
-      attr_reader :commands, :assignment, :files, :io
+      attr_reader :commands, :assignment, :branch, :files, :io
 
       Base = Struct.new(:commit, :reused, keyword_init: true)
 
@@ -127,8 +132,8 @@ module SpecrelayRunner
       # branch Platform named. Both are fetched fresh, so a stale local clone cannot publish
       # against a base that no longer exists.
       def resolve_base
-        existing = remote_head(assignment.publication_branch)
-        return fetch_base(assignment.publication_branch, reused: true) if existing
+        existing = remote_head(branch)
+        return fetch_base(branch, reused: true) if existing
 
         fetch_base(assignment.publication_base_branch, reused: false)
       end
@@ -224,7 +229,7 @@ module SpecrelayRunner
       # explicit refspec from the commit object rather than from HEAD, because HEAD is the
       # operator's and this class never moves it.
       def push(commit, reused)
-        result = commands.git([ "push", REMOTE, "#{commit.head_commit}:refs/heads/#{assignment.publication_branch}" ])
+        result = commands.git([ "push", REMOTE, "#{commit.head_commit}:refs/heads/#{branch}" ])
         return Result.new(head_commit: commit.head_commit, reused_branch: reused) if result.success?
 
         failure(PUSH_FAILED, push_error(result))
@@ -243,7 +248,7 @@ module SpecrelayRunner
 
       def diverged_refusal
         "git push rejected: the publication branch has diverged on the remote and SpecRelay never " \
-          "force-pushes. Inspect #{assignment.publication_branch}; if it is a stale SpecRelay attempt, " \
+          "force-pushes. Inspect #{branch}; if it is a stale SpecRelay attempt, " \
           "delete it and retry publication. If it holds work you need, merge or rename it first"
       end
 

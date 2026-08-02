@@ -69,7 +69,8 @@ end
 def spec_publication_payload_for(issue_key:, files:, package_path:, branch:,
                                  repository_url: "https://github.com/SpecRelay/SpecRelay-Specs",
                                  slug: "SpecRelay/SpecRelay-Specs", base_branch: "main",
-                                 draft: true, title: "Add an export button")
+                                 draft: true, title: "Add an export button",
+                                 existing_pull_request_url: nil)
   spec_creation_payload_for(issue_key: issue_key, title: title).merge(
     "run" => { "id" => "run_spec123", "type" => "spec_creation",
                "state" => "AWAITING_SPECIFICATION_PUBLICATION" },
@@ -82,7 +83,10 @@ def spec_publication_payload_for(issue_key:, files:, package_path:, branch:,
     "publication" => { "repository_url" => repository_url, "slug" => slug,
                        "specification_root" => "specs", "branch" => branch,
                        "base_branch" => base_branch, "create_pull_request" => true,
-                       "pull_request_draft" => draft }
+                       "pull_request_draft" => draft,
+                       # MVP-0028: nil for a first publication, which is what tells the runner to
+                       # use `branch`. Present for a later run on the same ticket.
+                       "existing_pull_request_url" => existing_pull_request_url }
   )
 end
 

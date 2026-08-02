@@ -143,6 +143,14 @@ module SpecrelayRunner
       def create_pull_request? = publication["create_pull_request"] == true
       def draft_pull_request? = publication["pull_request_draft"] == true
 
+      # MVP-0028 criterion 3 — the pull request Jira's `Spec PR` field already names for this
+      # TICKET, or "" for a first publication. Platform checked it is a pull request on the
+      # configured specification repository and stopped there, because it holds no GitHub
+      # credentials; {ExistingPullRequest} is what asks GitHub whether it is usable and takes its
+      # head branch. Absent for a first publication, which is what tells the runner to use
+      # `publication_branch` instead.
+      def existing_pull_request_url = publication["existing_pull_request_url"].to_s
+
       # The package Platform RECORDED at generation, with a digest per file. This is the
       # evidence the runner verifies its local checkout against before it is allowed to touch
       # git — the whole point of publishing from Platform's record rather than from whatever

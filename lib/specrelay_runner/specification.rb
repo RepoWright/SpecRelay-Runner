@@ -66,8 +66,14 @@ require_relative "specification/generation"
 #
 # The same two properties hold as for generation: nothing mutates a repository before
 # PackageVerification succeeds, and nothing in this namespace requires Rails or reaches Jira.
+#
+# MVP-0028 adds ONE class to that list and no new capability: ExistingPullRequest, which reads
+# and validates the specification pull request a ticket already has, so a second run for one
+# ticket updates that pull request instead of opening another. It still reaches no Jira — the
+# URL arrives in the assignment, Platform having read it from the ticket.
 require_relative "specification/package_verification"
 require_relative "specification/git_commands"
+require_relative "specification/existing_pull_request"
 require_relative "specification/git_publisher"
 require_relative "specification/pull_request_publisher"
 require_relative "specification/publication"
