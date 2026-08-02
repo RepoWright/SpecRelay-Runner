@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require "json"
+
 module SpecrelayRunner
   module Specification
     # What the assignment's input bundle actually offers, and which of it this runner can
@@ -49,9 +51,11 @@ module SpecrelayRunner
 
       def self.gather(**kwargs) = new(**kwargs).gather
 
-      def initialize(assignment:, settings:)
+      def initialize(assignment:, settings:, env: ENV, command_runner: CommandRunner)
         @assignment = assignment
         @settings = settings
+        @env = env
+        @command_runner = command_runner
       end
 
       def gather
@@ -62,7 +66,7 @@ module SpecrelayRunner
 
       private
 
-      attr_reader :assignment, :settings
+      attr_reader :assignment, :settings, :env, :command_runner
 
       def classify(entry)
         status = entry["read_status"].to_s
@@ -104,13 +108,24 @@ module SpecrelayRunner
       # both. That is deliberate: they are the same MCP surface in practice, and splitting
       # the switch would let a runner claim it analysed a screenshot because it could reach
       # Confluence.
+      #
+      # MVP-0028 remediation, defect 2 — this used to read `capability.available?` and mark the
+      # input `readable` on that flag ALONE, with nothing ever fetched or analysed. A Jam link
+      # copied verbatim into the generated business analysis is not evidence that it was read,
+      # and an operator who had set `available: true` believing it meant something got a
+      # specification that quietly claimed it. Readability is now a FACT this process proves by
+      # actually running the configured analyzer against THIS reference — never a flag taken on
+      # trust — and a substitute remains the only way to proceed without one.
       def apply_deferred_verdict(input)
-        capability = settings.external_references
         analysis = input.image? ? "image analysis" : "external-reference fetching"
-        if capability.available?
-          input.readable = true
-          input.note = "#{analysis} is available on this runner"
-        elsif capability.substitute?
+        return unavailable_deferred_verdict(input, analysis) if settings.external_reference_command.nil?
+
+        apply_analysis_outcome(input, analysis, analyze_reference(input))
+      end
+
+      def unavailable_deferred_verdict(input, analysis)
+        capability = settings.external_references
+        if capability.substitute?
           input.readable = false
           input.note = "#{analysis} is unavailable — approved substitute: #{capability.substitute}"
         else
@@ -118,6 +133,71 @@ module SpecrelayRunner
           input.note = "#{analysis} is unavailable on this runner and no substitute was recorded"
         end
       end
+
+      def apply_analysis_outcome(input, analysis, outcome)
+        input.readable = outcome.contributed?
+        input.note =
+          if outcome.contributed?
+            "#{analysis}: #{outcome.summary}"
+          elsif outcome.verdict == :failed
+            "#{analysis} failed: #{outcome.summary}"
+          else
+            "#{analysis} ran but did not contribute: #{outcome.summary}"
+          end
+      end
+
+      # One reference, one process launch: an argv array (never a shell) naming the input's kind
+      # and its reference, under the same bounded-output, bounded-timeout discipline every other
+      # command this runner launches uses. The contract is deliberately the smallest one that can
+      # answer "did this contribute, and what did it find": a JSON object with `contributed`
+      # (boolean) and `summary` (a string this runner then redacts and clips before it can reach
+      # any generated document, a Platform payload, or a log line). Nothing else the command
+      # prints — no raw fetched page, no transcript, no other field — is ever read.
+      MAX_REFERENCE_OUTPUT_BYTES = 200_000
+      MAX_REFERENCE_SUMMARY_CHARS = 2_000
+
+      Outcome = Struct.new(:verdict, :summary, keyword_init: true) do
+        def contributed? = verdict == :contributed
+      end
+
+      def analyze_reference(input)
+        result = command_runner.run([ settings.external_reference_command, input.kind, input.reference ],
+                                     chdir: Dir.pwd, env: { "PATH" => env["PATH"].to_s },
+                                     timeout_seconds: settings.external_reference_timeout_seconds)
+        return Outcome.new(verdict: :failed, summary: "the analyzer timed out") if result.timed_out?
+        return Outcome.new(verdict: :failed, summary: "the analyzer exited #{result.exit_code}") unless
+          result.success?
+
+        parse_reference_output(result.stdout)
+      rescue SystemCallError => e
+        Outcome.new(verdict: :failed, summary: "the analyzer could not be launched: #{e.message}")
+      end
+
+      def parse_reference_output(stdout)
+        text = stdout.to_s
+        return Outcome.new(verdict: :failed, summary: "the analyzer produced more output than this runner " \
+                                                       "will accept") if text.bytesize > MAX_REFERENCE_OUTPUT_BYTES
+
+        document = JSON.parse(text)
+        raise JSON::ParserError, "not a JSON object" unless document.is_a?(Hash)
+
+        reference_outcome(document)
+      rescue JSON::ParserError
+        Outcome.new(verdict: :failed, summary: "the analyzer did not return valid JSON")
+      end
+
+      def reference_outcome(document)
+        summary = clip(Redaction.redact(document["summary"].to_s))
+        contributed = document["contributed"] == true
+        Outcome.new(verdict: contributed ? :contributed : :not_contributed,
+                   summary: summary.empty? ? default_summary(contributed) : summary)
+      end
+
+      def default_summary(contributed)
+        contributed ? "the analyzer reported success but recorded no summary" : "found no usable evidence"
+      end
+
+      def clip(text) = text.to_s[0, MAX_REFERENCE_SUMMARY_CHARS].to_s
 
       # A blocker is an input the bundle offers as usable that this runner cannot actually
       # use, with no recorded substitute. Note what is NOT a blocker: a deferred input the

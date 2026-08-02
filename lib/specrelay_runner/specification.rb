@@ -44,6 +44,7 @@ end
 require_relative "specification/markdown"
 require_relative "specification/ticket_sections"
 require_relative "specification/assignment"
+require_relative "specification/repository_slug"
 require_relative "specification/settings"
 require_relative "specification/package_path"
 require_relative "specification/input_evidence"

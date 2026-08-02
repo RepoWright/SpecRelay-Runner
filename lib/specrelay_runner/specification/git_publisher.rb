@@ -97,7 +97,7 @@ module SpecrelayRunner
         url = commands.git_value([ "remote", "get-url", REMOTE ])
         return failure(CHECKOUT_MISMATCH, no_remote_message) if url.nil? || url.empty?
 
-        actual = slug_for(url)
+        actual = RepositorySlug.for(url)
         expected = assignment.publication_slug
         return nil if expected.empty? || actual.nil? || actual == expected
 
@@ -113,19 +113,6 @@ module SpecrelayRunner
       end
 
       def repository_root_hint = "the runner's specification repository root"
-
-      # Accepts the https and scp-like ssh remote forms, dropping any credential userinfo rather
-      # than carrying it into a comparison, a message, or a log.
-      def slug_for(url)
-        slug =
-          if url.start_with?("git@github.com:")
-            url.delete_prefix("git@github.com:")
-          else
-            url.sub(%r{\Ahttps?://(?:[^@/]+@)?github\.com/}, "")
-          end
-        slug = slug.delete_suffix(".git")
-        slug.match?(%r{\A[A-Za-z0-9._-]+/[A-Za-z0-9._-]+\z}) ? slug : nil
-      end
 
       # The commit this publication builds on: the existing remote publication branch when there
       # is one — which is what makes a retry additive rather than a fork — otherwise the base

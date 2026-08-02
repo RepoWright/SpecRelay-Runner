@@ -32,7 +32,8 @@ module SpecrelayRunner
     #           - "<query theme>"
     #         evidence: "<the material hits, in the operator's own words>"
     #       external_references:
-    #         available: false
+    #         command: /abs/path/to/reference-analyzer   # the REAL tool/MCP boundary (MVP-0028 remediation)
+    #         timeout_seconds: 60
     #         substitute: "<why, when the bundle defers a reference to the runner>"
     #
     # THE SUBSTITUTE KEYS ARE NOT AN OFF SWITCH. Each one is a sentence the operator writes
@@ -41,6 +42,12 @@ module SpecrelayRunner
     # the key is what makes preflight refuse. That asymmetry is the design — the spec's
     # "silent omission blocks acceptance" rule expressed as behaviour rather than as a
     # documentation promise.
+    #
+    # `external_references` has no `available:` DECLARATION to trust (MVP-0028 remediation,
+    # defect 2). It used to: an operator-set `available: true` alone made a deferred reference
+    # `readable`, with nothing ever fetched or analysed, and a specification generated as if it
+    # had been. Availability is now a FACT this runner can prove — a `command` is configured, and
+    # {InputEvidence} actually ran it against the reference — never a flag taken on trust.
     #
     # No secret is read here or stored here. The provider command is a local executable
     # path, and the credential the runner uses to reach Platform is resolved elsewhere.
@@ -93,6 +100,13 @@ module SpecrelayRunner
       PROVIDER_KIND_ENV = "SPECRELAY_RUNNER_SPEC_PROVIDER"
       PROVIDER_COMMAND_ENV = "SPECRELAY_RUNNER_SPEC_PROVIDER_COMMAND"
       EXISTING_POLICY_ENV = "SPECRELAY_RUNNER_SPEC_ON_EXISTING_PACKAGE"
+      # MVP-0028 remediation, defect 2 — the REAL tool/MCP boundary that fetches and analyses an
+      # external reference (a Jam smart link, a Confluence page, a screenshot) a bundle defers to
+      # the runner. Named the same way `provider.command` is, because it is the same shape of
+      # boundary: an operator-configured local executable this runner launches through
+      # {CommandRunner}, never a live call this Ruby process makes itself.
+      EXTERNAL_REFERENCE_COMMAND_ENV = "SPECRELAY_RUNNER_SPEC_EXTERNAL_REFERENCE_COMMAND"
+      DEFAULT_EXTERNAL_REFERENCE_TIMEOUT_SECONDS = 60
 
       # A capability's local availability, plus the operator's recorded reason when it is
       # not available. `usable?` is deliberately "available OR substituted": both let
@@ -119,7 +133,8 @@ module SpecrelayRunner
       end
 
       attr_reader :provider_kind, :provider_command, :provider_args, :provider_timeout_seconds,
-                  :repository_roots, :on_existing_package, :graphify, :context_plus, :external_references
+                  :repository_roots, :on_existing_package, :graphify, :context_plus, :external_references,
+                  :external_reference_command, :external_reference_timeout_seconds
 
       def self.from(config, env: ENV) = new(config.specification_settings, env: env)
 
@@ -136,6 +151,10 @@ module SpecrelayRunner
         @graphify = capability("graphify", default_available: true)
         @context_plus = capability("context_plus", default_available: false, operator_evidence: true)
         @external_references = capability("external_references", default_available: false)
+        references = subsection("external_references")
+        @external_reference_command = presence(env[EXTERNAL_REFERENCE_COMMAND_ENV]) || presence(references["command"])
+        @external_reference_timeout_seconds = positive_int(references["timeout_seconds"]) ||
+          DEFAULT_EXTERNAL_REFERENCE_TIMEOUT_SECONDS
       end
 
       # This machine's local clone of the specification repository, resolved by the same

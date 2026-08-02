@@ -99,7 +99,7 @@ module SpecrelayRunner
       end
 
       def gather_and_verify(checkout, package, source_root)
-        inputs = InputEvidence.gather(assignment: assignment, settings: settings)
+        inputs = InputEvidence.gather(assignment: assignment, settings: settings, env: env)
         blocked = check_inputs(inputs)
         return blocked if blocked
 
@@ -121,11 +121,24 @@ module SpecrelayRunner
       # repository URL; only this machine knows where it is checked out, and it is never
       # cloned automatically — a runner that silently cloned a repository would be doing
       # network work nobody asked for, into a directory nobody chose.
+      #
+      # An EXPLICIT mapping always wins when one is configured — the same "an operator who
+      # named one has decided" precedence {Provider.resolve} uses for the generation provider.
+      # Only when none exists is reuse of the source workspace checkout even considered
+      # (MVP-0028 remediation, defect 5), and only when it can be VERIFIED, never assumed from
+      # workspace naming alone.
       def resolve_specification_checkout
         slug = assignment.target_slug || assignment.repository_url
-        root = settings.repository_root(slug, repository_url: assignment.repository_url)
-        return missing_checkout(slug) if root.nil?
+        configured = settings.repository_root(slug, repository_url: assignment.repository_url)
+        return resolve_configured_checkout(configured) unless configured.nil?
 
+        reused = reuse_source_workspace_checkout
+        return reused unless reused.nil?
+
+        missing_checkout(slug)
+      end
+
+      def resolve_configured_checkout(root)
         expanded = File.expand_path(root)
         return refuse(SPECIFICATION_REPOSITORY_UNRESOLVED,
                       "the configured specification repository checkout does not exist: #{expanded}") unless
@@ -134,11 +147,42 @@ module SpecrelayRunner
         expanded
       end
 
+      # Reuse the SOURCE workspace checkout Platform already assigned and this runner already
+      # validated (`config.workspace_root`) when it is verifiably a clone of the SAME repository
+      # the specification is destined for. Before this, an operator whose specification
+      # repository IS their source workspace repository had to configure a second, duplicate
+      # mapping under `runner.specification.repository_roots` for the identical clone — a step
+      # a guided connection, which writes no runner YAML at all, could never satisfy.
+      #
+      # Reuse is offered, never assumed. "Same workspace" is not evidence of "same repository":
+      # the destination could genuinely be a separate specification repository, and Platform's
+      # assignment carries no repository URL for the source workspace to compare against (by
+      # design — this lane creates no worktree and runs no test, so it was never given one). So
+      # the ONLY safe signal is the workspace checkout's own ACTUAL git remote, verified exactly
+      # the way {GitPublisher} verifies a publication checkout: resolved to a GitHub `owner/repo`
+      # and compared to the one Platform assigned. Anything inconclusive — no workspace mapping,
+      # no remote, a remote that does not resolve, or one that resolves to something else —
+      # is treated as "cannot be matched unambiguously" and falls through to the ordinary
+      # missing-checkout refusal, which correctly tells the operator to add the explicit mapping
+      # instead.
+      def reuse_source_workspace_checkout
+        expected = assignment.target_slug
+        return nil if expected.to_s.empty?
+
+        root = config.workspace_root(assignment.workspace_key, env: env)
+        remote = GitCommands.new(checkout_root: root, env: env).git_value(%w[remote get-url origin])
+        RepositorySlug.for(remote) == expected ? File.expand_path(root) : nil
+      rescue Config::Error
+        nil
+      end
+
       def missing_checkout(slug)
         refuse(SPECIFICATION_REPOSITORY_UNRESOLVED,
                "no local checkout is configured for the specification repository " \
                "#{assignment.repository_url}. Set #{settings.repository_root_env(slug)} to its absolute path, " \
-               "or add it under runner.specification.repository_roots.")
+               "or add it under runner.specification.repository_roots. If this repository is also this run's " \
+               "source workspace, this runner will reuse that checkout automatically once its `origin` remote " \
+               "matches — no separate mapping is needed in that case.")
       end
 
       def resolve_package_path(checkout)
