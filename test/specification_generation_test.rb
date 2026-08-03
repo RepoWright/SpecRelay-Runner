@@ -58,10 +58,11 @@ class SpecificationGenerationTest < Minitest::Test
     # Every section criterion 2 names.
     [ "## Problem", "## Outcome", "## Input summary", "## Proposed behavior", "## Non-goals",
       "## Acceptance criteria", "## Validation expectations",
-      "## Dependencies, assumptions, and open questions", "## Analysis" ].each do |heading|
+      "## Dependencies and assumptions", "## Analysis" ].each do |heading|
       assert_includes spec, heading
     end
-    # And references to both analysis files.
+    # And references to the evidence file and both analysis files.
+    assert_includes spec, "analysis/input-evidence.md"
     assert_includes spec, "analysis/business.md"
     assert_includes spec, "analysis/technical.md"
   end
@@ -229,7 +230,8 @@ class SpecificationGenerationTest < Minitest::Test
     assert_equal "rex_spec123", generation["runner_execution_id"]
     assert_equal PACKAGE, generation.dig("package", "path")
     reported = generation.dig("package", "files")
-    assert_equal %w[spec.md analysis/business.md analysis/technical.md generation-manifest.json].sort,
+    assert_equal %w[spec.md analysis/input-evidence.md analysis/open-questions.md analysis/business.md
+                    analysis/technical.md generation-manifest.json].sort,
                  reported.map { |file| file["path"] }.sort
     # The digests describe the bytes that are actually on disk.
     reported.each do |file|
@@ -284,11 +286,12 @@ class SpecificationGenerationTest < Minitest::Test
     # repository was initialized, no branch created, no commit made.
     refute File.exist?(File.join(@specs, ".git")), "the runner must not create a git repository"
     assert_equal %w[README.md specs].sort, Dir.children(@specs).sort
-    # And the manifest says so in the package itself.
+    # MVP-0028 remediation, defect 4 — the manifest carries no publication claim at all. It is a
+    # durable package file, committed into the specification repository by a later publication
+    # run, so a snapshot claim written here ("no branch, commit, pull request...") would read as
+    # false the moment that happens. Publication state lives in Platform's run record instead.
     manifest = JSON.parse(read_package("generation-manifest.json"))
-    assert_nil manifest.dig("publication", "branch")
-    assert_nil manifest.dig("publication", "pull_request_url")
-    assert_includes manifest.dig("publication", "note"), "no branch, commit, push, pull request"
+    refute manifest.key?("publication"), manifest.inspect
   end
 
   def test_the_source_checkout_is_not_modified

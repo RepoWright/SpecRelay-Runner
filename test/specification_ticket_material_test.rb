@@ -140,43 +140,46 @@ class SpecificationTicketMaterialTest < Minitest::Test
   # The assertion is `refute`, deliberately. The old test asserted the question was PRESENT for
   # this fixture, which is why the word list could have been empty without any test noticing.
   def test_a_ticket_whose_criteria_state_repeat_behaviour_in_their_own_words_raises_no_repeat_question
-    spec = compose(:failed_read)["spec.md"]
-    questions = section(spec, "Dependencies, assumptions, and open questions")
+    package = compose(:failed_read)
 
-    assert_includes spec, "a following request to /nope still returns 404",
+    assert_includes package["spec.md"], "a following request to /nope still returns 404",
                     "fixture drift: this test is meaningless unless the criterion is reproduced"
-    refute_includes questions, "attempted a second time"
-    refute_includes questions, "repeat behaviour"
+    refute package.key?("analysis/open-questions.md"),
+          "a ticket whose criteria decide repeat behaviour must raise no open question at all"
   end
 
   # CR-004 must-fix 1 criterion 3. `MAPIAI-48`'s criterion decides the failure path in full —
   # missing file, missing key, 200, `"version": "unknown"`, the homepage — using none of the
   # twelve words the deleted failure predicate matched. Round 004 called it unspecified twice.
   def test_a_ticket_whose_criteria_decide_the_failure_path_is_not_told_the_failure_path_is_unspecified
-    spec = compose(:version)["spec.md"]
-    questions = section(spec, "Dependencies, assumptions, and open questions")
+    package = compose(:version)
 
-    assert_includes spec, "still starts", "fixture drift: the failure-path criterion must be reproduced"
-    refute_includes questions, "cannot complete"
-    refute_includes questions, "the failure path"
+    assert_includes package["spec.md"], "still starts",
+                    "fixture drift: the failure-path criterion must be reproduced"
+    # A ticket whose criteria decide everything raises no standing question at all — MVP-0028
+    # remediation, defect 3 moved open questions into their own file, omitted entirely when empty.
+    refute package.key?("analysis/open-questions.md")
   end
 
   # The other half of the choice: where the ticket really is silent, both questions stand. Without
   # this, deleting `standing_decision_questions` altogether would pass everything above.
   def test_a_ticket_with_no_criteria_still_raises_both_standing_questions
-    questions = section(compose(:silent)["spec.md"], "Dependencies, assumptions, and open questions")
+    questions = compose(:silent)["analysis/open-questions.md"]
 
     assert_includes questions, "attempted a second time"
     assert_includes questions, "cannot complete"
     assert_includes questions, "This generation found no stated decision for it"
   end
 
-  # The empty state must not read as "there is nothing to decide" for a ticket that decided it.
+  # The empty state (no file at all) must be reached only by a ticket that decided its own
+  # criteria — not by a generation that simply declined to look for what is undecided.
   def test_the_empty_open_questions_state_points_at_the_tickets_own_criteria
-    questions = section(compose(:failed_read)["spec.md"], "Dependencies, assumptions, and open questions")
+    package = compose(:failed_read)
 
-    assert_includes questions, "None arising from the recorded inputs"
-    assert_includes questions, "decided by the ticket's own acceptance criteria, reproduced verbatim above"
+    refute package.key?("analysis/open-questions.md"),
+          "a ticket with its own stated criteria must not get standing open questions"
+    assert_includes section(package["spec.md"], "Acceptance criteria"), "are authoritative",
+                    "the fixture must actually state its own criteria for the omission to mean anything"
   end
 
   # …and it must be ONE bullet. `DocumentSet#open_questions` parses this section back out for
@@ -319,12 +322,14 @@ class SpecificationTicketMaterialTest < Minitest::Test
   # not the criterion. The two used to be driven by different predicates, so one document
   # could require idempotency and then ask who would decide it.
   def test_a_silent_ticket_gets_the_open_question_and_no_invented_criterion
-    spec = compose(:silent)["spec.md"]
+    package = compose(:silent)
 
-    assert_includes spec, "What should happen when the operation is attempted a second time?"
-    assert_includes spec, "What should the user see when the operation cannot complete?"
-    refute_includes section(spec, "Acceptance criteria"), "idempotency"
-    refute_includes section(spec, "Proposed behavior"), "idempotent"
+    assert_includes package["analysis/open-questions.md"],
+                    "What should happen when the operation is attempted a second time?"
+    assert_includes package["analysis/open-questions.md"],
+                    "What should the user see when the operation cannot complete?"
+    refute_includes section(package["spec.md"], "Acceptance criteria"), "idempotency"
+    refute_includes section(package["spec.md"], "Proposed behavior"), "idempotent"
   end
 
   def test_a_ticket_with_no_criteria_says_its_criteria_are_derived
@@ -447,12 +452,10 @@ class SpecificationTicketMaterialTest < Minitest::Test
     %i[healthz version failed_read].each do |ticket|
       package = compose(ticket)
       documents = SpecrelayRunner::Specification::DocumentSet.new(package)
-      questions = section(package["spec.md"], "Dependencies, assumptions, and open questions")
 
       assert_empty documents.open_questions, "#{ticket}: a real ticket raises no standing question"
       assert_includes package["spec.md"], "are authoritative", "#{ticket}: real criteria stay authoritative"
-      refute_includes questions, "attempted a second time", "#{ticket}"
-      refute_includes questions, "cannot complete", "#{ticket}"
+      refute package.key?("analysis/open-questions.md"), "#{ticket}: no standing question means no file at all"
       %w[spec.md analysis/technical.md analysis/business.md].each do |name|
         refute_includes package[name], "No stated criterion covers", "#{ticket} #{name}"
       end

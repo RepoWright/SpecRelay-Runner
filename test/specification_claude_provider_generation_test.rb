@@ -111,6 +111,23 @@ class SpecificationClaudeProviderGenerationTest < Minitest::Test
                 "only PATH, HOME and the profile's own extra_env travel — never an unrelated variable")
   end
 
+  # MVP-0028 remediation, defect 3 — the prompt must actually name the new required key and the
+  # D3 synthesis rules the live MAPIAI-52 package violated, or a real model has no way to know
+  # this runner's document contract changed.
+  def test_the_prompt_names_the_new_required_key_and_the_synthesis_rules
+    provider, runner = provider_for(result: success(stdout: JSON.generate(VALID_DOCUMENTS)))
+
+    provider.generate({ "issue_key" => "SR-700" })
+
+    prompt = runner.calls.fetch(0).argv.last
+    assert_includes prompt, "analysis/input-evidence.md"
+    assert_includes prompt, "analysis/open-questions.md"
+    assert_includes prompt, "PRODUCT BEHAVIOR"
+    assert_includes prompt, "Resolve a vague reference"
+    assert_includes prompt, "DURABLE TRUTH"
+    assert_includes prompt, "not yet published"
+  end
+
   # ------------------------------------------------------------------ the provider misbehaves
 
   def test_a_non_zero_provider_exit_is_a_generation_failure

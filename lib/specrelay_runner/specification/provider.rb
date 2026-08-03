@@ -173,16 +173,90 @@ module SpecrelayRunner
         # what shape, and nothing about WHAT to write — that is the packet's job, and a prompt
         # that restated the content requirements would be a second, diverging specification of
         # them.
+        #
+        # MVP-0028 remediation, defect 3: the live MAPIAI-52 run this prompt used to produce quoted
+        # a Jira SECTION HEADING ("Acceptance criteria") as though it were the reporter's problem
+        # statement, embedded the raw input bundle verbatim inside `spec.md`, and never resolved
+        # the ticket's own vague "the text" to the element its Jam evidence actually named. Every
+        # rule below traces to one of those failures; none is a style preference.
         def prompt_for(packet)
           <<~PROMPT
-            You are writing a software specification package for SpecRelay.
+            You are writing a software specification package for SpecRelay, for a human reviewer
+            with limited attention and no prior context on this ticket.
 
             Return ONLY a JSON object mapping file paths to file contents, with no prose before or
-            after it and no code fence. The keys must be exactly:
-            "spec.md", "analysis/business.md", "analysis/technical.md".
+            after it and no code fence. The keys must be exactly "spec.md", "#{PackagePath::INPUT_EVIDENCE_MD}",
+            "#{PackagePath::BUSINESS_MD}", "#{PackagePath::TECHNICAL_MD}" — plus
+            "#{PackagePath::OPEN_QUESTIONS_MD}" ONLY when at least one open question below is
+            genuinely material (a decision that changes scope, behavior, or acceptance). Omit that
+            key entirely otherwise; never include it as an empty string.
+
+            SOURCE OF TRUTH
+            - The Jira summary, description, acceptance criteria, and any reproduced ticket
+              sections in the evidence below are the reporter's own words. Treat them as
+              READ-ONLY: quote or paraphrase faithfully, never rewrite them, and never silently add
+              a criterion the reporter did not state.
+            - Describe the requested PRODUCT BEHAVIOR, not Jira labels, field names, or SpecRelay's
+              own pipeline concepts (bundle, packet, tool evidence) — those are inputs to your
+              writing, never its subject. A section heading the reporter typed (e.g. "Acceptance
+              criteria") is structure, not prose describing the problem — never quote a heading as
+              though it were the reporter's description of the problem.
+            - Resolve a vague reference in the ticket (e.g. "the text", "this button") to the
+              concrete element it names, using the ticket title and the supporting-input evidence
+              below. State what you resolved it to and why, in one sentence — do not leave it vague
+              when the evidence settles it.
+            - When material ambiguity remains after using all the evidence, record ONE concise open
+              question rather than guessing. A gap that does not change scope, behavior, or
+              acceptance is not material and is not a question.
+
+            SPEC.MD — required `##` sections, in this order: Problem, Outcome, Input summary,
+            Proposed behavior, Non-goals, Acceptance criteria, Validation expectations,
+            "Dependencies and assumptions", Analysis. Each needs real content under it — a heading
+            with nothing under it is rejected.
+
+            #{PackagePath::INPUT_EVIDENCE_MD} — one compact `##` entry per SUPPORTING input (a Jam
+            recording, screenshot, Confluence page, log, attachment, or external link) named in the
+            evidence below — never the core Jira fields (description, comments, linked issues)
+            already reflected in spec.md's own "Input summary". For each: its kind and name, whether
+            it was actually read/analyzed (not just referenced), factual observations, what those
+            observations imply for the requirement, limitations, and any conflict with the ticket or
+            another input. Never copy raw transcript or tool output. Never include a credential or a
+            local filesystem path. Label an inference as an inference, not an observation. A URL
+            that was never analyzed is not evidence, however confidently it reads. If there is no
+            supporting input beyond the core Jira fields, say so in one sentence.
+
+            #{PackagePath::BUSINESS_MD} — required `##` sections: "User problem and affected
+            workflow", "Stakeholder impact", "Risks, edge cases, and missing product decisions",
+            "Acceptance-criteria rationale", "Input conflicts and gaps", Recommendation.
+
+            #{PackagePath::TECHNICAL_MD} — required `##` sections: "Source entry points inspected",
+            "Graphify evidence", "Context+ evidence", "Dependency and blast-radius assessment",
+            "Likely implementation approach", "Implementation surface", "Tests a future
+            implementation ticket needs", "Technical risks, unknowns, and blocked evidence". Ground
+            every claim in the actual source entry points and tool evidence below — naming a file
+            without reading what it contains is a listing, not an analysis.
+
+            #{PackagePath::OPEN_QUESTIONS_MD} (only if included) — one `##` entry per question, id
+            "OQ-001", "OQ-002", ... Each entry is exactly three bullets: "- Why it blocks: ...",
+            "- Decision required: ...", "- Consequence: ...". Never invent a question the evidence
+            already answers, and never treat a tool failure or unreadable input as a product
+            question — that is an operational limitation and belongs in the technical analysis.
+
+            BREVITY — this is an acceptance rule, not a style preference. Include a sentence,
+            bullet, or row only when it changes a requirement, observation, decision, risk,
+            dependency, validation action, blocker, or open question. Delete process narration,
+            generic advice, and repeated conclusions. State each fact once across the whole
+            package. Never dump the raw input bundle, a tool transcript, or a source listing —
+            summarize only what is needed to support a decision.
+
+            DURABLE TRUTH — these documents are committed to the specification repository and read
+            after publication, not only before it. Never state or imply current publication,
+            commit, branch, or Jira status ("not yet published", "no pull request exists",
+            "generated locally"): that state is transient and lives in SpecRelay's own run records,
+            not in a document a reviewer may read after it is already false.
 
             Base every statement on the evidence below. Do not invent requirements, and where the
-            evidence is insufficient say so in the document rather than guessing.
+            evidence is insufficient say so rather than guessing.
 
             EVIDENCE (JSON):
             #{JSON.generate(packet)}

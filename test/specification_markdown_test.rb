@@ -21,7 +21,7 @@ class SpecificationMarkdownTest < Minitest::Test
   REQUIRED_SPEC_SECTIONS = [
     "Problem", "Outcome", "Input summary", "Proposed behavior", "Non-goals",
     "Acceptance criteria", "Validation expectations",
-    "Dependencies, assumptions, and open questions", "Analysis"
+    "Dependencies and assumptions", "Analysis"
   ].freeze
 
   def teardown
@@ -199,6 +199,8 @@ class SpecificationMarkdownTest < Minitest::Test
   def document_set(spec:)
     {
       "spec.md" => spec,
+      "analysis/input-evidence.md" => "# Input evidence\n\nNo supporting input beyond the Jira ticket " \
+                                       "was recorded.\n",
       "analysis/business.md" => document(required_sections("analysis/business.md")),
       "analysis/technical.md" => document(required_sections("analysis/technical.md"))
     }

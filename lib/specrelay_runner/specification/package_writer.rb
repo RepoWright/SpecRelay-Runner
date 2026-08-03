@@ -206,6 +206,15 @@ module SpecrelayRunner
       # The manifest's own digest is deliberately absent from the file list: a file cannot
       # contain its own hash, and pretending otherwise would produce a digest that never
       # verifies.
+      #
+      # It also carries no `publication` block (MVP-0028 remediation, defect 4 — durable
+      # document truth). A prior version wrote `{branch: nil, commit: nil, note: "...no branch,
+      # commit, push, pull request, or Jira write-back was performed"}` here — a claim that is
+      # true at the instant this file is staged and false the moment MVP-0027 commits this exact
+      # file into a pushed branch and opens a pull request with it. Publication state belongs to
+      # Platform's run record and the runner's own console log, which are read AT the time they
+      # describe; this manifest is read for as long as the package exists, including long after
+      # publication.
       def write_manifest(staging, files)
         manifest = manifest_document(files)
         ::File.write(::File.join(staging, PackagePath::MANIFEST_JSON), "#{JSON.pretty_generate(manifest)}\n")
@@ -231,8 +240,7 @@ module SpecrelayRunner
           "replaced_existing_package" => @replaced_existing ? true : false,
           # Source-inspection warnings belong in the package on disk too. A reader who opens
           # only the manifest must be able to see that nothing was read from the checkout.
-          "warnings" => (warnings + Array(source.warnings)).uniq,
-          "publication" => publication_block
+          "warnings" => (warnings + Array(source.warnings)).uniq
         }
       end
 
@@ -258,15 +266,6 @@ module SpecrelayRunner
           "used" => inputs.readable_inputs.length,
           "warnings" => inputs.warnings.map { |warning| Redaction.redact(warning) }
         }
-      end
-
-      # Stated in the manifest rather than only in documentation, so a later tool reading a
-      # package on disk can tell — without consulting a spec — that nothing was published for
-      # it. MVP-0027 is what changes these values.
-      def publication_block
-        { "branch" => nil, "commit" => nil, "pull_request_url" => nil,
-          "note" => "generated locally by MVP-0026; no branch, commit, push, pull request, or Jira " \
-                    "write-back was performed" }
       end
 
       # The single operation that touches the destination. Returns whether an existing
