@@ -128,6 +128,19 @@ class SpecificationClaudeProviderGenerationTest < Minitest::Test
     assert_includes prompt, "not yet published"
   end
 
+  # Review 006, F2 second pass — a linked issue that reaches the evidence has already had its
+  # content READ by Platform; the prompt must ask for genuine analysis of it, not permission to
+  # disclose that it was skipped.
+  def test_the_prompt_requires_genuine_analysis_of_a_linked_issues_own_content
+    provider, runner = provider_for(result: success(stdout: JSON.generate(VALID_DOCUMENTS)))
+
+    provider.generate({ "issue_key" => "SR-700" })
+
+    prompt = runner.calls.fetch(0).argv.last
+    assert_includes prompt, "already had its OWN key, title, and description read"
+    assert_includes prompt, "its own stated acceptance criteria"
+  end
+
   # ------------------------------------------------------------------ the provider misbehaves
 
   def test_a_non_zero_provider_exit_is_a_generation_failure

@@ -223,16 +223,20 @@ module SpecrelayRunner
             #{PackagePath::INPUT_EVIDENCE_MD} — one compact `##` entry per SUPPORTING input (a Jam
             recording, screenshot, Confluence page, log, attachment, external link, or linked Jira
             issue) named in the evidence below — never the ticket's own description or comments,
-            already reflected in spec.md's own "Input summary". Include a linked issue if the
-            evidence shows one exists, even if you cannot read its content: say plainly that its
-            content was not captured (an operational limitation, never a guess at what it might
-            say) rather than omitting it, which would make this package look more complete than it
-            is. For each entry: its kind and name, whether it was actually read/analyzed (not just
-            referenced), factual observations, what those observations imply for the requirement,
-            limitations, and any conflict with the ticket or another input. Never copy raw
-            transcript or tool output. Never include a credential or a local filesystem path. Label
-            an inference as an inference, not an observation. A URL that was never analyzed is not
-            evidence, however confidently it reads. If there is no supporting input beyond the
+            already reflected in spec.md's own "Input summary". A linked issue that reached this
+            evidence has already had its OWN key, title, and description read by Platform before
+            generation — analyze that content exactly as you would a Jam recording or an
+            attachment: quote or summarize what it actually says, and state what it implies for
+            this ticket's requirement (including its own stated acceptance criteria, if any, and
+            any constraint it places on this ticket's scope). Only if a linked issue's content is
+            explicitly marked not read (an operational limitation this generation did not cause) do
+            you say plainly that its content was not captured, rather than guessing at it. For each
+            entry: its kind and name, whether it was actually read/analyzed (not just referenced),
+            factual observations, what those observations imply for the requirement, limitations,
+            and any conflict with the ticket or another input. Never copy raw transcript or tool
+            output. Never include a credential or a local filesystem path. Label an inference as an
+            inference, not an observation. A URL that was never analyzed is not evidence, however
+            confidently it reads. If there is no supporting input beyond the
             ticket's own description and comments, say so in one sentence.
 
             #{PackagePath::BUSINESS_MD} — required `##` sections: "User problem and affected

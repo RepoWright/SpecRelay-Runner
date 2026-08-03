@@ -222,12 +222,17 @@ entry per SUPPORTING input a bundle recorded — a Jam recording, screenshot, Co
 attachment, or linked Jira issue — never the ticket's own description or comments, already
 reflected in `spec.md`'s own "Input summary" table. Each entry states whether the input was
 actually analysed (not merely referenced), what was observed, what that implies for the
-requirement, and any limitation — never the raw transcript or tool output behind it. A linked Jira
-issue is reported honestly rather than either omitted or claimed as analysed (review 006 finding
-F2): Platform classifies the whole linked-issues collection as one entry, and its "available"
-verdict means only that Jira exposed the collection, never that this runner read any linked
-issue's own title, description, or acceptance criteria — so a present, nonempty collection gets an
-entry stating that operational limitation, and an empty one produces no entry at all.
+requirement, and any limitation — never the raw transcript or tool output behind it.
+
+A linked Jira issue is analysed from its OWN content, not disclosed as a gap (review 006 finding
+F2, second pass): Platform now reads each linked issue's key, title, and description one level
+deep (`Jira::SpecCreation::EnrichLinkedIssues`) before classifying the bundle, and an issue whose
+content could not be read BLOCKS intake through the same terminally-blocked, marked-comment path
+as any other unreadable required input — it never reaches generation looking complete. A linked
+issue that does reach generation therefore always carries real content, which the built-in
+composer excerpts (its first paragraph) and a real provider is asked to genuinely analyse,
+including its own stated acceptance criteria. A ticket with no linked issues produces no entry at
+all, the same as any other absent supporting input.
 
 The folder name is deterministic — the same issue always produces the same
 directory, so a re-run replaces its own package instead of accumulating

@@ -459,35 +459,18 @@ module SpecrelayRunner
       # real, sanitized analyzer verdict {ReferenceAnalyzer} produced (MVP-0028 remediation,
       # defect 2); this file is where that evidence gets its own reviewable entry instead of only
       # a table cell.
-      CORE_INPUT_KINDS = %w[description comments].freeze
+      #
+      # `linked_issues` (plural) is included here deliberately, unlike `linked_issue` (singular).
+      # By the time a bundle reaches generation at all, a plural `linked_issues` entry can only
+      # mean "Jira reports zero linked issues" — Platform now blocks intake on ANY linked issue
+      # whose own content could not be read (review 006, F2 second pass; see
+      # `Jira::SpecCreation::EnrichLinkedIssues`/`ClassifyInputs`), so a bundle with a real, named
+      # linked issue always carries it as its OWN `linked_issue` entry instead.
+      CORE_INPUT_KINDS = %w[description comments linked_issues].freeze
 
-      # Review 006 finding F2: linked issues used to be excluded from this file on the same
-      # footing as description/comments, but they are not core in the same sense — Platform
-      # classifies the ENTIRE linked-issues collection as one entry, and its "available" verdict
-      # means only that Jira exposed the collection to the classifier, never that this runner
-      # received any linked issue's title, description, or acceptance criteria. The controlled
-      # MAPIAI-52 package showed the failure this produced: `spec.md` called a linked issue
-      # "readable" while the evidence file said nothing linked existed at all.
-      LINKED_ISSUES_KIND = "linked_issues"
+      LINKED_ISSUE_KIND = "linked_issue"
 
-      # `Jira::SpecCreation::ClassifyInputs#collection_entry` writes exactly this reason string
-      # for a readable collection. Parsing it is reading that contract, not guessing at prose —
-      # it is what tells "0 linked issues" (the ordinary case; nothing to report) apart from
-      # "N linked issues, content not captured" (a real, reportable gap) without this runner ever
-      # needing an individual issue's content, which the input bundle does not carry.
-      LINKED_ISSUES_READABLE_COUNT = /\A(\d+) readable\z/
-
-      def linked_issues_present?(input)
-        match = LINKED_ISSUES_READABLE_COUNT.match(input["reason"].to_s)
-        match ? match[1].to_i.positive? : false
-      end
-
-      def supporting_inputs
-        bundle_inputs.reject do |input|
-          CORE_INPUT_KINDS.include?(input["kind"]) ||
-            (input["kind"] == LINKED_ISSUES_KIND && input["used"] && !linked_issues_present?(input))
-        end
-      end
+      def supporting_inputs = bundle_inputs.reject { |input| CORE_INPUT_KINDS.include?(input["kind"]) }
 
       def input_evidence
         <<~MD
@@ -508,7 +491,7 @@ module SpecrelayRunner
       end
 
       def input_evidence_entry(input)
-        return linked_issues_entry(input) if input["kind"] == LINKED_ISSUES_KIND && input["used"]
+        return linked_issue_entry(input) if input["kind"] == LINKED_ISSUE_KIND
 
         lines = [ "## #{input['kind']}#{input_name_suffix(input)}", "",
                   "- Status: #{input['used'] ? 'analyzed' : 'not analyzed'}",
@@ -518,6 +501,87 @@ module SpecrelayRunner
         lines << "- Limitation: this runner could not analyse it; treat anything it might show as " \
                  "unverified." unless input["used"]
         lines.join("\n")
+      end
+
+      # Review 006, F2 second pass: a linked issue's content — its own title and description,
+      # which is where its acceptance criteria would live, the same as the ticket's — now
+      # genuinely reaches this runner (see `#linked_issue_body`), so it is genuinely reported: an
+      # excerpt of what it actually says, not a boilerplate "content unavailable" sentence. By the
+      # time generation runs at all, Platform has already refused an unreadable one (see the class
+      # comment on `CORE_INPUT_KINDS`), so the "could not read" branch below is a defensive
+      # fallback rather than the expected path.
+      def linked_issue_entry(input)
+        key = input["name"].to_s.split(" — ", 2).first
+        body = linked_issue_body(key)
+        return unread_linked_issue_entry(input) if body.nil?
+
+        lines = [ "## #{input['kind']}#{input_name_suffix(input)}", "",
+                  "- Status: analyzed",
+                  "- Observation: #{linked_issue_excerpt(body)}",
+                  "- Requirement implication: see the observation above against this specification's " \
+                  "acceptance criteria." ]
+        lines.join("\n")
+      end
+
+      def unread_linked_issue_entry(input)
+        [
+          "## #{input['kind']}#{input_name_suffix(input)}", "",
+          "- Status: not analyzed",
+          "- Observation: #{input['note']}",
+          "- Limitation: this runner could not read its content; treat anything it might imply as " \
+          "unverified."
+        ].join("\n")
+      end
+
+      # A bounded excerpt, not the whole ticket — the brevity rule this package is held to
+      # applies to a linked issue's content exactly as it does to the ticket's own. The first
+      # paragraph is almost always the request itself; a fuller reading is the real provider's job
+      # (see `Provider::Claude`'s prompt), not this deterministic composer's.
+      LINKED_ISSUE_EXCERPT_CHARS = 400
+
+      def linked_issue_excerpt(body)
+        excerpt = body.split(/\n{2,}/).first.to_s.strip
+        return "(recorded with no description)" if excerpt.empty?
+
+        excerpt.length > LINKED_ISSUE_EXCERPT_CHARS ? "#{excerpt[0, LINKED_ISSUE_EXCERPT_CHARS]}…" : excerpt
+      end
+
+      # The bundle's rendered "## Linked Jira issues" section, one `### KEY — TITLE (...)`
+      # sub-block per issue (`Jira::SpecCreation::Markdown#linked_issues`, the same class that
+      # renders the ticket's own "## Jira description"). Read the same way that section already
+      # must be read — headings scanned OUTSIDE fenced content, never on raw lines — so a linked
+      # issue whose own description happens to contain a line starting with "### " cannot be
+      # misread as a second heading.
+      LINKED_ISSUES_SECTION_HEADING = "## Linked Jira issues"
+      LINKED_ISSUE_ITEM_HEADING = /\A###[ \t]+(\S+)[ \t]—/
+      LINKED_ISSUE_FENCED_BODY = /^(`{3,})text\n(.*?)\n\1`*[ \t]*$/m
+
+      def linked_issue_sections
+        return @linked_issue_sections if defined?(@linked_issue_sections)
+
+        content = bundle["content_markdown"].to_s
+        section = content.split(LINKED_ISSUES_SECTION_HEADING, 2)[1]
+        @linked_issue_sections = section.nil? ? {} : parsed_linked_issue_sections(section)
+      end
+
+      def parsed_linked_issue_sections(section)
+        headings = Markdown.structural_lines(section).select { |line, _n| LINKED_ISSUE_ITEM_HEADING.match?(line.chomp) }
+        lines = section.lines
+        headings.each_with_index.to_h do |(line, number), index|
+          key = line.chomp[LINKED_ISSUE_ITEM_HEADING, 1]
+          finish = headings[index + 1]&.last
+          [ key, lines[number..(finish ? finish - 2 : lines.length - 1)].to_a.join ]
+        end
+      end
+
+      # nil when the section is absent, the key is not in it, or its content was reported
+      # unreadable — every one of those is "nothing to quote", handled the same way by the caller.
+      def linked_issue_body(key)
+        body = linked_issue_sections[key]
+        return nil if body.nil?
+
+        fenced = body[LINKED_ISSUE_FENCED_BODY, 2]
+        fenced&.strip
       end
 
       # Reached only when Platform reports the linked-issues collection as genuinely PRESENT —
