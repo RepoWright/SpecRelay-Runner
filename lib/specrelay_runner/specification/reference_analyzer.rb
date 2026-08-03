@@ -24,6 +24,23 @@ module SpecrelayRunner
       MAX_OUTPUT_BYTES = 200_000
       MAX_SUMMARY_CHARS = 2_000
 
+      # review-005 finding F3 — the real MAPIAI-52 probe returned a summary that named the
+      # analyst's OWN host filesystem path (`file:///Users/hrmohsen/...`), because the analyzer
+      # is Claude Code running on the operator's own machine and can see it while reading a
+      # local demo page. `Redaction.redact` only recognizes credential shapes; a local path is
+      # not a secret, but it is private host information that must never reach a generated
+      # document, a Platform payload, or a log. Matched only OUTSIDE an http(s) URL, so a safe
+      # reference URL that happens to contain one of these segments in its own path is never
+      # touched — only a real local filesystem reference is.
+      PRIVATE_PATH_REDACTION = "[PRIVATE_PATH_REDACTED]"
+      PRIVATE_PATH_PATTERN = %r{file://\S+|/(?:Users|home|tmp)/\S+}
+
+      # An internal marker used only while sanitizing one summary string, never persisted or
+      # returned. Tagged and improbable enough that it cannot collide with genuine analyzer
+      # prose, unlike a bare delimiter such as a digit between spaces.
+      URL_PLACEHOLDER_TAG = "SPECRELAY_URL_PLACEHOLDER"
+      URL_PLACEHOLDER_PATTERN = /#{URL_PLACEHOLDER_TAG}_(\d+)_/
+
       Outcome = Struct.new(:verdict, :summary, keyword_init: true) do
         def contributed? = verdict == :contributed
       end
@@ -51,21 +68,60 @@ module SpecrelayRunner
       # different flag. A contributed result now REQUIRES a nonblank string summary, or it is
       # `:failed` — an analyzer that claims success and hands back nothing is a malfunction to
       # report, not a fact to accept.
+      #
+      # review-005 finding F3 adds a second requirement on the SAME contract: even a nonblank
+      # string summary must have its private host filesystem paths sanitized before it can count
+      # as contributed evidence, and if nothing usable survives that sanitization the result
+      # fails closed rather than silently becoming a hollow "contributed" claim.
       def self.evaluate(document)
         return Outcome.new(verdict: :failed, summary: "the analyzer did not return a JSON object") unless
           document.is_a?(Hash)
 
         contributed = document["contributed"] == true
-        summary = document["summary"]
-        usable = summary.is_a?(String) && !summary.strip.empty?
+        raw_summary = document["summary"]
+        usable = raw_summary.is_a?(String) && !raw_summary.strip.empty?
         return Outcome.new(verdict: :failed, summary: "the analyzer reported contributed=true but returned no " \
                                                        "usable summary") if contributed && !usable
+        return Outcome.new(verdict: :not_contributed, summary: "found no usable evidence") unless usable
+
+        summary = clip(sanitize(raw_summary))
+        return Outcome.new(verdict: :failed, summary: "the analyzer's summary named only a private host path, " \
+                                                       "with no other usable evidence") if contributed && !meaningful?(summary)
 
         Outcome.new(verdict: contributed ? :contributed : :not_contributed,
-                   summary: usable ? clip(Redaction.redact(summary)) : "found no usable evidence")
+                   summary: meaningful?(summary) ? summary : "found no usable evidence")
       end
 
       def self.clip(text) = text.to_s[0, MAX_SUMMARY_CHARS].to_s
+
+      def self.sanitize(text) = sanitize_private_paths(Redaction.redact(text))
+
+      # A summary that, once its private-path placeholders are set aside, has no remaining
+      # letter or digit is not evidence — it is the redaction placeholder wearing a costume. This
+      # is what makes `file:///Users/hrmohsen/only/a/path.txt` (nothing else behind it) fail
+      # closed instead of surviving as a "contributed" result whose entire content is
+      # `[PRIVATE_PATH_REDACTED]`.
+      def self.meaningful?(summary) = summary.gsub(PRIVATE_PATH_REDACTION, "").match?(/[[:alnum:]]/)
+
+      # A safe http(s) reference URL is protected from the path pattern below FIRST, so a Jam or
+      # Confluence URL whose own path happens to contain a matching segment is never altered —
+      # only a real local filesystem reference is. Trailing sentence punctuation immediately
+      # after a matched path (`)`, `,`, `.`, …) is kept outside the redaction placeholder, since
+      # `\S+` would otherwise swallow it as though it were part of the path.
+      def self.sanitize_private_paths(text)
+        urls = []
+        protected_text = text.to_s.gsub(%r{https?://\S+}) do |url|
+          urls << url
+          "#{URL_PLACEHOLDER_TAG}_#{urls.length - 1}_"
+        end
+
+        redacted = protected_text.gsub(PRIVATE_PATH_PATTERN) do |match|
+          core = match.sub(/[)\]}>,;:'".]+\z/, "")
+          "#{PRIVATE_PATH_REDACTION}#{match[core.length..]}"
+        end
+
+        redacted.gsub(URL_PLACEHOLDER_PATTERN) { urls[Regexp.last_match(1).to_i] }
+      end
 
       def self.parse_output(stdout)
         text = stdout.to_s

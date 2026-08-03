@@ -133,6 +133,93 @@ class SpecificationReferenceAnalyzerTest < Minitest::Test
     end
   end
 
+  # ------------------------------------------------------------------ F3: a private host path
+  # ------------------------------------------------------------------ must not survive as evidence
+
+  # review-005 finding F3 — the reviewer's live MAPIAI-52 probe returned exactly this text, and
+  # `Redaction.redact` (secret shapes only) let the `file:///Users/...` path straight through.
+  # Pinned verbatim so a regression here reproduces the exact defect the reviewer found.
+  LIVE_MAPIAI_52_SUMMARY =
+    "The 32-second video Jam (page: SpecRelay Runner Setup Verified, at " \
+    "file:///Users/hrmohsen/dev/Teal-managments/tiny-demo-workspace/demo-app/index.html) is a " \
+    "voiceover-only walkthrough with no UI interactions: the reporter states they want the " \
+    "heading text 'SpecRelay Runner Setup Verified' repositioned to be centered both " \
+    "horizontally and vertically on the page."
+
+  def test_the_pinned_live_mapiai_52_summary_has_its_private_path_sanitized_but_stays_contributed
+    outcome = ReferenceAnalyzer.evaluate({ "contributed" => true, "summary" => LIVE_MAPIAI_52_SUMMARY })
+
+    assert outcome.contributed?
+    refute_includes outcome.summary, "file:///Users/hrmohsen"
+    refute_includes outcome.summary, "/Users/hrmohsen"
+    assert_includes outcome.summary, "voiceover-only walkthrough"
+    assert_includes outcome.summary, "centered both horizontally and vertically"
+  end
+
+  def test_a_file_uri_pointing_at_a_local_path_is_sanitized
+    outcome = ReferenceAnalyzer.evaluate({ "contributed" => true,
+                                          "summary" => "See file:///Users/operator/notes.txt for the rest." })
+
+    assert outcome.contributed?
+    refute_includes outcome.summary, "/Users/operator"
+    assert_includes outcome.summary, "for the rest"
+  end
+
+  def test_a_plain_absolute_macos_path_is_sanitized
+    outcome = ReferenceAnalyzer.evaluate({ "contributed" => true,
+                                          "summary" => "/Users/hrmohsen/secrets.txt has the key" })
+
+    assert outcome.contributed?
+    refute_includes outcome.summary, "/Users/hrmohsen"
+    assert_includes outcome.summary, "has the key"
+  end
+
+  def test_a_plain_absolute_linux_home_path_is_sanitized
+    outcome = ReferenceAnalyzer.evaluate({ "contributed" => true,
+                                          "summary" => "config lives at /home/deploy/app/config.yml on the box" })
+
+    assert outcome.contributed?
+    refute_includes outcome.summary, "/home/deploy"
+    assert_includes outcome.summary, "on the box"
+  end
+
+  def test_a_plain_absolute_tmp_path_is_sanitized
+    outcome = ReferenceAnalyzer.evaluate({ "contributed" => true,
+                                          "summary" => "output written to /tmp/upload/output.json for review" })
+
+    assert outcome.contributed?
+    refute_includes outcome.summary, "/tmp/upload"
+    assert_includes outcome.summary, "for review"
+  end
+
+  def test_a_safe_http_url_survives_sanitization_intact
+    outcome = ReferenceAnalyzer.evaluate({ "contributed" => true,
+                                          "summary" => "See https://jam.dev/c/abc123-export-flow for the recording" })
+
+    assert outcome.contributed?
+    assert_equal "See https://jam.dev/c/abc123-export-flow for the recording", outcome.summary
+  end
+
+  # A summary that is ENTIRELY a private path, once sanitized, has nothing behind it — accepting
+  # the redaction placeholder itself as "evidence" would recreate F1 one layer down.
+  def test_a_summary_that_is_only_a_private_path_fails_closed_rather_than_becoming_the_placeholder
+    outcome = ReferenceAnalyzer.evaluate({ "contributed" => true,
+                                          "summary" => "file:///Users/hrmohsen/only/a/path.txt" })
+
+    refute outcome.contributed?
+    assert_equal :failed, outcome.verdict
+    assert_includes outcome.summary, "private host path"
+  end
+
+  def test_a_not_contributed_summary_with_a_private_path_is_still_sanitized
+    outcome = ReferenceAnalyzer.evaluate({ "contributed" => false,
+                                          "summary" => "/tmp/scratch only, could not read anything else" })
+
+    refute outcome.contributed?
+    refute_includes outcome.summary, "/tmp/scratch"
+    assert_includes outcome.summary, "could not read anything else"
+  end
+
   # ------------------------------------------------------------------ the Claude adapter, direct execution
 
   def build_claude_analyzer(result:, profile: claude_profile, env: {}, settings: settings_for({}))
@@ -243,5 +330,19 @@ class SpecificationReferenceAnalyzerTest < Minitest::Test
     refute outcome.contributed?
     assert_equal :failed, outcome.verdict
     assert_includes outcome.summary, "no usable summary"
+  end
+
+  # review-005 finding F3, proven at the adapter boundary with the exact pinned live shape —
+  # not only against `ReferenceAnalyzer.evaluate` in isolation.
+  def test_the_claude_adapter_sanitizes_the_pinned_live_mapiai_52_shape
+    analyzer, = build_claude_analyzer(
+      result: success(stdout: JSON.generate({ "contributed" => true, "summary" => LIVE_MAPIAI_52_SUMMARY }))
+    )
+
+    outcome = analyzer.analyze(kind: "jam_recording", reference: "https://jam.dev/c/062cac93-14f9-4d3e-ad4f-579c49f10966")
+
+    assert outcome.contributed?
+    refute_includes outcome.summary, "/Users/hrmohsen"
+    assert_includes outcome.summary, "voiceover-only walkthrough"
   end
 end

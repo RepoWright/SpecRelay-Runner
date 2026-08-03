@@ -177,6 +177,51 @@ class SpecificationExternalReferenceAnalysisTest < Minitest::Test
     refute_includes spec_document, "abcdefgh12345678"
   end
 
+  # ------------------------------------------------------------------ F3: a private host path must not
+  # ------------------------------------------------------------------ reach the packet, payload, or logs
+
+  # review-005 finding F3, pinned to the exact live MAPIAI-52 shape the reviewer found: a
+  # contributed summary naming the analyst's own host filesystem path. Proven through the whole
+  # InputEvidence/generation path, not only against `ReferenceAnalyzer.evaluate` — the private
+  # path must not reach the generated document, the CLI's own stdout log, or the Platform
+  # generation payload the runner reports back, and the rest of the analysis must still survive.
+  LIVE_MAPIAI_52_SUMMARY =
+    "The 32-second video Jam (page: SpecRelay Runner Setup Verified, at " \
+    "file:///Users/hrmohsen/dev/Teal-managments/tiny-demo-workspace/demo-app/index.html) is a " \
+    "voiceover-only walkthrough with no UI interactions: the reporter states they want the " \
+    "heading text 'SpecRelay Runner Setup Verified' repositioned to be centered both " \
+    "horizontally and vertically on the page."
+
+  def test_a_private_host_path_in_an_analyzer_summary_never_reaches_the_packet_payload_or_logs
+    analyzer = write_analyzer(File.join(@temp, "analyzer"),
+                              response: { "contributed" => true, "summary" => LIVE_MAPIAI_52_SUMMARY })
+    start_platform(deferred_reference_payload)
+
+    exit_code = run_cli(config: build_config(external_reference_command: analyzer))
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, exit_code, @io.string
+    refute_includes spec_document, "/Users/hrmohsen"
+    refute_includes @io.string, "/Users/hrmohsen"
+    generation = @platform.last_specification_generation
+    refute_includes generation.to_s, "/Users/hrmohsen"
+    assert_includes spec_document, "voiceover-only walkthrough"
+    assert_includes spec_document, "centered both horizontally and vertically"
+  end
+
+  def test_a_plain_absolute_local_path_in_an_analyzer_summary_is_sanitized_end_to_end
+    analyzer = write_analyzer(File.join(@temp, "analyzer"),
+                              response: { "contributed" => true,
+                                         "summary" => "found the flow documented at /Users/operator/notes/export.md" })
+    start_platform(deferred_reference_payload)
+
+    exit_code = run_cli(config: build_config(external_reference_command: analyzer))
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, exit_code, @io.string
+    refute_includes spec_document, "/Users/operator"
+    generation = @platform.last_specification_generation
+    refute_includes generation.to_s, "/Users/operator"
+  end
+
   # ------------------------------------------------------------------ no raw payload / secret persistence
 
   def test_only_the_summary_field_reaches_generated_output_never_the_full_analyzer_response
