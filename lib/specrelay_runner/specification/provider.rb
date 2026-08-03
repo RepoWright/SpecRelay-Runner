@@ -179,6 +179,12 @@ module SpecrelayRunner
         # statement, embedded the raw input bundle verbatim inside `spec.md`, and never resolved
         # the ticket's own vague "the text" to the element its Jam evidence actually named. Every
         # rule below traces to one of those failures; none is a style preference.
+        #
+        # Review 006 findings F1 and F2 tightened two more rules the same MAPIAI-52 package
+        # exposed: it never named a linked issue at all, and a malformed open question would have
+        # been silently accepted rather than rejected. Both are now enforced structurally by
+        # {DocumentSet}, not only asked for here — this wording exists so a real model produces
+        # something that PASSES that gate on the first attempt, not to be the only guard against it.
         def prompt_for(packet)
           <<~PROMPT
             You are writing a software specification package for SpecRelay, for a human reviewer
@@ -215,15 +221,19 @@ module SpecrelayRunner
             with nothing under it is rejected.
 
             #{PackagePath::INPUT_EVIDENCE_MD} — one compact `##` entry per SUPPORTING input (a Jam
-            recording, screenshot, Confluence page, log, attachment, or external link) named in the
-            evidence below — never the core Jira fields (description, comments, linked issues)
-            already reflected in spec.md's own "Input summary". For each: its kind and name, whether
-            it was actually read/analyzed (not just referenced), factual observations, what those
-            observations imply for the requirement, limitations, and any conflict with the ticket or
-            another input. Never copy raw transcript or tool output. Never include a credential or a
-            local filesystem path. Label an inference as an inference, not an observation. A URL
-            that was never analyzed is not evidence, however confidently it reads. If there is no
-            supporting input beyond the core Jira fields, say so in one sentence.
+            recording, screenshot, Confluence page, log, attachment, external link, or linked Jira
+            issue) named in the evidence below — never the ticket's own description or comments,
+            already reflected in spec.md's own "Input summary". Include a linked issue if the
+            evidence shows one exists, even if you cannot read its content: say plainly that its
+            content was not captured (an operational limitation, never a guess at what it might
+            say) rather than omitting it, which would make this package look more complete than it
+            is. For each entry: its kind and name, whether it was actually read/analyzed (not just
+            referenced), factual observations, what those observations imply for the requirement,
+            limitations, and any conflict with the ticket or another input. Never copy raw
+            transcript or tool output. Never include a credential or a local filesystem path. Label
+            an inference as an inference, not an observation. A URL that was never analyzed is not
+            evidence, however confidently it reads. If there is no supporting input beyond the
+            ticket's own description and comments, say so in one sentence.
 
             #{PackagePath::BUSINESS_MD} — required `##` sections: "User problem and affected
             workflow", "Stakeholder impact", "Risks, edge cases, and missing product decisions",
@@ -237,8 +247,10 @@ module SpecrelayRunner
             without reading what it contains is a listing, not an analysis.
 
             #{PackagePath::OPEN_QUESTIONS_MD} (only if included) — one `##` entry per question, id
-            "OQ-001", "OQ-002", ... Each entry is exactly three bullets: "- Why it blocks: ...",
-            "- Decision required: ...", "- Consequence: ...". Never invent a question the evidence
+            "OQ-001", "OQ-002", ... Each entry is EXACTLY three bullets, in this order, each with a
+            nonblank value after the colon: "- Why it blocks: ...", "- Decision required: ...",
+            "- Consequence: ...". No other bullet, no repeated bullet, and no blank value — any of
+            those is rejected before the package is written. Never invent a question the evidence
             already answers, and never treat a tool failure or unreadable input as a product
             question — that is an operational limitation and belongs in the technical analysis.
 

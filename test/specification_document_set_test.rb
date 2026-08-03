@@ -8,6 +8,12 @@ require_relative "test_helper"
 # proves the PARSED CONTENT is correct — specifically the exact bug caught while writing this
 # slice: the parser's first draft returned each question's generic "why it blocks" boilerplate
 # (identical across every entry) instead of its distinguishing "decision required" text.
+#
+# Review 006 finding F1 adds the per-question FIELD validation below: a question used to be
+# certified by its heading alone, and a body missing "Decision required" made `#open_questions`
+# silently substitute the first bullet it found — so Platform could display unrelated text as
+# though it were the decision the Product Owner must answer. That fallback is gone; a malformed
+# body is now rejected before the package is ever written.
 class SpecificationDocumentSetTest < Minitest::Test
   DocumentSet = SpecrelayRunner::Specification::DocumentSet
   PackagePath = SpecrelayRunner::Specification::PackagePath
@@ -73,19 +79,21 @@ class SpecificationDocumentSetTest < Minitest::Test
                   "OQ-002: what does the user see on failure?" ], documents.open_questions
   end
 
-  # A question body with no "Decision required:" label falls back to its first bullet, so a
-  # provider that used slightly different wording still surfaces SOMETHING to Platform rather
-  # than an empty string.
-  def test_open_questions_falls_back_to_the_first_bullet_when_unlabelled
+  # A "Decision required" bullet whose value soft-wraps onto a continuation line still joins
+  # into one value rather than being cut at the wrap point or read as a second, unlabelled bullet.
+  def test_open_questions_joins_a_wrapped_decision_required_value
     open_questions_md = <<~MD
       ## OQ-001
 
-      - What should happen on a repeat request? This generation found no stated decision for it.
+      - Why it blocks: a
+      - Decision required: should a repeat request return the cached result
+        or re-run the operation end to end?
+      - Consequence: an implementer must guess.
     MD
     documents = DocumentSet.new(base_files.merge(PackagePath::OPEN_QUESTIONS_MD => open_questions_md))
 
-    assert_equal [ "OQ-001: What should happen on a repeat request? This generation found no " \
-                  "stated decision for it." ], documents.open_questions
+    assert_equal [ "OQ-001: should a repeat request return the cached result or re-run the " \
+                  "operation end to end?" ], documents.open_questions
   end
 
   # ------------------------------------------------------------------ validate! on the new files
@@ -123,5 +131,94 @@ class SpecificationDocumentSetTest < Minitest::Test
     end
 
     assert_includes error.message, "too short"
+  end
+
+  # ------------------------------------------------------ review 006, finding F1: field shapes
+
+  # THE exact shape the fallback used to paper over: no recognized label at all. Removing the
+  # fallback means this is now rejected rather than silently surfaced as though it were the
+  # decision required.
+  def test_validate_rejects_a_question_with_no_labelled_fields_at_all
+    open_questions_md = <<~MD
+      ## OQ-001
+
+      - What should happen on a repeat request? This generation found no stated decision for it.
+    MD
+
+    error = assert_raises(DocumentSet::Invalid) do
+      DocumentSet.validate!(base_files.merge(PackagePath::OPEN_QUESTIONS_MD => open_questions_md))
+    end
+
+    assert_includes error.message, "OQ-001"
+    assert_includes error.message, "missing required field(s)"
+  end
+
+  def test_validate_rejects_a_question_missing_decision_required
+    open_questions_md = <<~MD
+      ## OQ-001
+
+      - Why it blocks: a
+      - Consequence: c
+    MD
+
+    error = assert_raises(DocumentSet::Invalid) do
+      DocumentSet.validate!(base_files.merge(PackagePath::OPEN_QUESTIONS_MD => open_questions_md))
+    end
+
+    assert_includes error.message, "OQ-001"
+    assert_includes error.message, "missing required field(s): decision required"
+  end
+
+  def test_validate_rejects_a_question_with_a_duplicated_field
+    open_questions_md = <<~MD
+      ## OQ-001
+
+      - Why it blocks: a
+      - Why it blocks: a again
+      - Decision required: b
+      - Consequence: c
+    MD
+
+    error = assert_raises(DocumentSet::Invalid) do
+      DocumentSet.validate!(base_files.merge(PackagePath::OPEN_QUESTIONS_MD => open_questions_md))
+    end
+
+    assert_includes error.message, "OQ-001"
+    assert_includes error.message, "duplicate field(s): why it blocks"
+  end
+
+  def test_validate_rejects_a_question_with_a_blank_field
+    open_questions_md = <<~MD
+      ## OQ-001
+
+      - Why it blocks: a
+      - Decision required:
+      - Consequence: c
+    MD
+
+    error = assert_raises(DocumentSet::Invalid) do
+      DocumentSet.validate!(base_files.merge(PackagePath::OPEN_QUESTIONS_MD => open_questions_md))
+    end
+
+    assert_includes error.message, "OQ-001"
+    assert_includes error.message, "blank field: decision required"
+  end
+
+  def test_validate_rejects_a_question_with_an_unexpected_field
+    open_questions_md = <<~MD
+      ## OQ-001
+
+      - Why it blocks: a
+      - Decision required: b
+      - Consequence: c
+      - Priority: high
+    MD
+
+    error = assert_raises(DocumentSet::Invalid) do
+      DocumentSet.validate!(base_files.merge(PackagePath::OPEN_QUESTIONS_MD => open_questions_md))
+    end
+
+    assert_includes error.message, "OQ-001"
+    assert_includes error.message, "unexpected field: priority"
   end
 end

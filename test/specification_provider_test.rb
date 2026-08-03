@@ -211,6 +211,37 @@ class SpecificationProviderTest < Minitest::Test
     assert_includes @io.string, "names no open question"
   end
 
+  # Review 006 finding F1, at the boundary rather than in the DocumentSet unit tests: a question
+  # missing "Decision required" used to pass this same CLI path and reach Platform with an
+  # arbitrary bullet standing in for the decision. It is rejected before anything is written now,
+  # exactly like every other structural gap this boundary already refuses.
+  def test_an_open_questions_file_missing_decision_required_is_rejected
+    documents = valid_documents.merge(
+      "analysis/open-questions.md" => "# Open questions\n\n## OQ-001\n\n- Why it blocks: the ticket " \
+                                       "does not say.\n- Consequence: an implementer would guess.\n"
+    )
+    provider = SpecificationWorkspace.write_provider(File.join(@temp, "provider"), files: documents)
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_with(provider), @io.string
+    assert_empty Dir.children(File.join(@specs, "specs"))
+    assert_includes @io.string, "missing required field(s): decision required"
+  end
+
+  # And the other half of F1: a fourth, unlabelled bullet is rejected rather than silently
+  # ignored — the closed set of three fields is enforced, not just their presence.
+  def test_an_open_questions_file_with_an_extra_field_is_rejected
+    documents = valid_documents.merge(
+      "analysis/open-questions.md" => "# Open questions\n\n## OQ-001\n\n- Why it blocks: the ticket " \
+                                       "does not say.\n- Decision required: confirm the scope.\n" \
+                                       "- Consequence: an implementer would guess.\n- Owner: PO\n"
+    )
+    provider = SpecificationWorkspace.write_provider(File.join(@temp, "provider"), files: documents)
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_with(provider), @io.string
+    assert_empty Dir.children(File.join(@specs, "specs"))
+    assert_includes @io.string, "unexpected field: owner"
+  end
+
   # A provider must not be able to choose its own output paths: that is how a package escapes
   # its folder. The allowlist rejects the file rather than sanitizing the name.
   def test_a_provider_that_returns_an_unexpected_file_is_rejected

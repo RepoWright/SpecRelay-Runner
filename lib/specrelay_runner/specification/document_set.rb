@@ -76,6 +76,21 @@ module SpecrelayRunner
       # `#validate_open_question_ids!` scans for and the pattern `#open_questions` parses.
       OPEN_QUESTION_HEADING = /\A##[ \t]+(OQ-\d+)\b/
 
+      # The exact, closed set of fields spec.md's own contract requires per question: "why it
+      # blocks, the exact decision required and the consequence" — no more, no fewer. Review 006
+      # finding F1: a provider could omit "Decision required" while `#open_questions` silently
+      # substituted the first bullet it found, so Platform displayed unrelated text as though it
+      # were the decision the Product Owner must answer. Validating this at the boundary — not
+      # trusting a parser's fallback to paper over a malformed entry — is what makes "every
+      # question has a decision" a property of the package rather than of this parser's luck.
+      REQUIRED_QUESTION_FIELDS = [ "why it blocks", "decision required", "consequence" ].freeze
+
+      # Sentinel distinct from `nil` (itself a valid `question_fields` key, for an unlabelled
+      # bullet) meaning "no bullet has been seen yet in this body" — text before the first bullet
+      # is filed under `nil` exactly once rather than merged into whatever bullet comes next.
+      NO_BULLET_YET = :no_bullet_yet
+      private_constant :NO_BULLET_YET
+
       attr_reader :files
 
       def self.validate!(files) = new(files).validate!
@@ -122,33 +137,61 @@ module SpecrelayRunner
       # is the one field that actually distinguishes one question from another for a reader
       # scanning a list. Absent the file, there are no questions — spec.md's own rule is to omit
       # the file entirely rather than write an empty one.
-      DECISION_REQUIRED = /\A-\s*decision required:\s*(.+)\z/i
-
       def open_questions
         content = files[PackagePath::OPEN_QUESTIONS_MD]
         return [] if content.nil?
 
-        headings = Markdown.structural_lines(content).select { |line, _number| OPEN_QUESTION_HEADING.match?(line.chomp) }
+        headings = open_question_headings(content)
         headings.each_with_index.map do |(line, number), index|
           id = line.chomp[OPEN_QUESTION_HEADING, 1]
           body = question_body(content, number, headings[index + 1]&.last)
-          "#{id}: #{decision_required(body)}"
+          # `validate!` has already proven this body carries exactly one nonblank "Decision
+          # required" field before this is ever reached (see Generation, which validates before
+          # reading `#open_questions` back out) — so there is no fallback branch here. A body that
+          # does not have one is a bug in validation, not a shape this method is asked to survive.
+          "#{id}: #{question_fields(body).fetch('decision required').first}"
         end
       end
 
       private
+
+      def open_question_headings(content)
+        Markdown.structural_lines(content).select { |line, _number| OPEN_QUESTION_HEADING.match?(line.chomp) }
+      end
 
       def question_body(content, start_number, finish_number)
         lines = content.lines
         lines[start_number..(finish_number ? finish_number - 2 : lines.length - 1)].to_a.join
       end
 
-      def decision_required(body)
-        stripped = body.lines.map(&:strip)
-        labelled = stripped.find { |text| DECISION_REQUIRED.match?(text) }
-        return labelled[DECISION_REQUIRED, 1].to_s.strip unless labelled.nil?
+      # Parses a question body into its labelled bullets, keyed by the LOWERCASED label text
+      # before each bullet's first colon (e.g. `"decision required"`). A field's wrapped
+      # continuation lines join into one value — a real provider may soft-wrap
+      # "- Why it blocks: ..." across two source lines, and a continuation line is not a second,
+      # unlabelled bullet. A bullet with no recognised label, or any non-blank line before the
+      # first bullet, is filed under `nil` so validation can report it as unexpected rather than
+      # silently dropping it.
+      #
+      # Returns a Hash of label => Array of value strings, one per occurrence — a label appearing
+      # twice keeps both, which is exactly what lets validation detect the duplicate instead of
+      # silently keeping the last one written.
+      def question_fields(body)
+        fields = Hash.new { |hash, key| hash[key] = [] }
+        current = NO_BULLET_YET
+        body.lines.map(&:strip).each do |line|
+          next if line.empty?
 
-        stripped.find { |text| text.start_with?("- ") }.to_s.delete_prefix("- ").strip
+          if line.start_with?("-")
+            label, separator, value = line.delete_prefix("-").strip.partition(":")
+            current = separator.empty? ? nil : label.strip.downcase
+            fields[current] << value.strip
+          elsif current == NO_BULLET_YET
+            fields[nil] << line
+          else
+            fields[current][-1] = "#{fields[current][-1]} #{line}".strip
+          end
+        end
+        fields
       end
 
       def validate_document(name)
@@ -159,20 +202,55 @@ module SpecrelayRunner
 
         validate_fences!(name, content)
         REQUIRED_SECTIONS.fetch(name, []).each { |section| validate_section(name, content, section) }
-        validate_open_question_ids!(content) if name == PackagePath::OPEN_QUESTIONS_MD
+        validate_open_questions!(content) if name == PackagePath::OPEN_QUESTIONS_MD
       end
 
       # A present `open-questions.md` exists BECAUSE synthesis found at least one material
       # question — so one with no `## OQ-nnn` heading at all contradicts its own presence, and
       # a repeated id would make Platform's and a later run's reference to "OQ-001" ambiguous.
-      def validate_open_question_ids!(content)
-        ids = Markdown.structural_lines(content).filter_map { |line, _number| line.chomp[OPEN_QUESTION_HEADING, 1] }
+      # Review 006 finding F1 adds the per-question field check: a heading alone no longer
+      # certifies a question, because a body with no "Decision required" bullet used to pass this
+      # gate and reach `#open_questions` only to have its parser guess.
+      def validate_open_questions!(content)
+        headings = open_question_headings(content)
+        ids = headings.filter_map { |line, _number| line.chomp[OPEN_QUESTION_HEADING, 1] }
         raise Invalid, "#{PackagePath::OPEN_QUESTIONS_MD} exists but names no open question " \
                        "(expected a \"## OQ-nnn\" heading)" if ids.empty?
 
         duplicates = ids.tally.select { |_id, count| count > 1 }.keys
         raise Invalid, "#{PackagePath::OPEN_QUESTIONS_MD} reuses question id(s): #{duplicates.join(', ')}" if
           duplicates.any?
+
+        headings.each_with_index do |(_line, number), index|
+          body = question_body(content, number, headings[index + 1]&.last)
+          validate_open_question_fields!(ids[index], body)
+        end
+      end
+
+      # Every question body must carry exactly one nonblank occurrence of each field in
+      # {REQUIRED_QUESTION_FIELDS} and nothing else — no missing field, no duplicate, no blank
+      # value, and no extra or misspelled bullet the parser would otherwise silently ignore. One
+      # failure is reported per call, in the order a reader would want to fix them: what is
+      # missing outright, then what is duplicated, then what is present but empty, then what does
+      # not belong.
+      def validate_open_question_fields!(id, body)
+        fields = question_fields(body)
+
+        missing = REQUIRED_QUESTION_FIELDS - fields.keys
+        raise Invalid, "#{PackagePath::OPEN_QUESTIONS_MD} #{id} is missing required field(s): " \
+                       "#{missing.join(', ')}" if missing.any?
+
+        duplicated = REQUIRED_QUESTION_FIELDS.select { |label| fields.fetch(label).length > 1 }
+        raise Invalid, "#{PackagePath::OPEN_QUESTIONS_MD} #{id} has duplicate field(s): " \
+                       "#{duplicated.join(', ')}" if duplicated.any?
+
+        blank = REQUIRED_QUESTION_FIELDS.select { |label| fields.fetch(label).first.empty? }
+        raise Invalid, "#{PackagePath::OPEN_QUESTIONS_MD} #{id} has a blank field: " \
+                       "#{blank.join(', ')}" if blank.any?
+
+        unexpected = fields.keys - REQUIRED_QUESTION_FIELDS
+        raise Invalid, "#{PackagePath::OPEN_QUESTIONS_MD} #{id} has an unexpected field: " \
+                       "#{unexpected.map { |label| label || '(unlabelled bullet)' }.join(', ')}" if unexpected.any?
       end
 
       # A document with an unterminated fenced code block is not a valid document, whatever

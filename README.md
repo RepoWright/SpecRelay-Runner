@@ -212,14 +212,22 @@ only when generation found at least one material Product Owner decision, using s
 (`## OQ-001`, `## OQ-002`, ...) so a later run can reference the same question. Its filename never
 encodes count or status — a run with zero open questions omits the file entirely rather than
 writing an empty one, and a resolved question's history is retained by keeping the file rather than
-deleting entries from it.
+deleting entries from it. Each question is validated as EXACTLY three nonblank fields — "Why it
+blocks", "Decision required", "Consequence" — with no field missing, duplicated, blank, or
+unexpected (review 006 finding F1): a body that does not have one is rejected before anything is
+written, rather than a parser guessing which bullet was meant as the decision.
 
 `analysis/input-evidence.md` is always present. It carries one compact, independently reviewable
-entry per SUPPORTING input a bundle recorded — a Jam recording, screenshot, Confluence page, log, or
-attachment — never the core Jira fields already reflected in `spec.md`'s own "Input summary" table.
-Each entry states whether the input was actually analysed (not merely referenced), what was
-observed, what that implies for the requirement, and any limitation — never the raw transcript or
-tool output behind it.
+entry per SUPPORTING input a bundle recorded — a Jam recording, screenshot, Confluence page, log,
+attachment, or linked Jira issue — never the ticket's own description or comments, already
+reflected in `spec.md`'s own "Input summary" table. Each entry states whether the input was
+actually analysed (not merely referenced), what was observed, what that implies for the
+requirement, and any limitation — never the raw transcript or tool output behind it. A linked Jira
+issue is reported honestly rather than either omitted or claimed as analysed (review 006 finding
+F2): Platform classifies the whole linked-issues collection as one entry, and its "available"
+verdict means only that Jira exposed the collection, never that this runner read any linked
+issue's own title, description, or acceptance criteria — so a present, nonempty collection gets an
+entry stating that operational limitation, and an empty one produces no entry at all.
 
 The folder name is deterministic — the same issue always produces the same
 directory, so a re-run replaces its own package instead of accumulating
@@ -493,6 +501,9 @@ than committed. **The document contract a provider must satisfy:**
   per-input or per-question entries);
 - a present `open-questions.md` names at least one `## OQ-nnn` heading, each with a
   unique id — its own presence asserts that a question exists;
+- each question heading's body has exactly one nonblank "Why it blocks", "Decision
+  required", and "Consequence" bullet — missing, duplicated, blank, or any other bullet
+  is rejected (review 006 finding F1);
 - that heading **outside** every fenced code block — a heading that exists only
   inside a fence is not a heading, and counts as absent;
 - **balanced fences**: a code block opened and never closed fails validation, because

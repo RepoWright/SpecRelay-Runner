@@ -453,14 +453,41 @@ module SpecrelayRunner
       # ---------------------------------------------------------- analysis/input-evidence.md
       #
       # MVP-0028 remediation, defect 3. One compact, independently reviewable entry per
-      # SUPPORTING input — a Jam recording, screenshot, Confluence page, log, attachment, or
-      # external link — never the core Jira fields already reflected in spec.md's own "Input
-      # summary" table. `input['note']` already carries the real, sanitized analyzer verdict
-      # {ReferenceAnalyzer} produced (MVP-0028 remediation, defect 2); this file is where that
-      # evidence gets its own reviewable entry instead of only a table cell.
-      CORE_INPUT_KINDS = %w[description comments linked_issues].freeze
+      # SUPPORTING input — a Jam recording, screenshot, Confluence page, log, attachment,
+      # external link, or linked Jira issue — never the description or comments already
+      # reflected in spec.md's own "Input summary" table. `input['note']` already carries the
+      # real, sanitized analyzer verdict {ReferenceAnalyzer} produced (MVP-0028 remediation,
+      # defect 2); this file is where that evidence gets its own reviewable entry instead of only
+      # a table cell.
+      CORE_INPUT_KINDS = %w[description comments].freeze
 
-      def supporting_inputs = bundle_inputs.reject { |input| CORE_INPUT_KINDS.include?(input["kind"]) }
+      # Review 006 finding F2: linked issues used to be excluded from this file on the same
+      # footing as description/comments, but they are not core in the same sense — Platform
+      # classifies the ENTIRE linked-issues collection as one entry, and its "available" verdict
+      # means only that Jira exposed the collection to the classifier, never that this runner
+      # received any linked issue's title, description, or acceptance criteria. The controlled
+      # MAPIAI-52 package showed the failure this produced: `spec.md` called a linked issue
+      # "readable" while the evidence file said nothing linked existed at all.
+      LINKED_ISSUES_KIND = "linked_issues"
+
+      # `Jira::SpecCreation::ClassifyInputs#collection_entry` writes exactly this reason string
+      # for a readable collection. Parsing it is reading that contract, not guessing at prose —
+      # it is what tells "0 linked issues" (the ordinary case; nothing to report) apart from
+      # "N linked issues, content not captured" (a real, reportable gap) without this runner ever
+      # needing an individual issue's content, which the input bundle does not carry.
+      LINKED_ISSUES_READABLE_COUNT = /\A(\d+) readable\z/
+
+      def linked_issues_present?(input)
+        match = LINKED_ISSUES_READABLE_COUNT.match(input["reason"].to_s)
+        match ? match[1].to_i.positive? : false
+      end
+
+      def supporting_inputs
+        bundle_inputs.reject do |input|
+          CORE_INPUT_KINDS.include?(input["kind"]) ||
+            (input["kind"] == LINKED_ISSUES_KIND && input["used"] && !linked_issues_present?(input))
+        end
+      end
 
       def input_evidence
         <<~MD
@@ -474,13 +501,15 @@ module SpecrelayRunner
       end
 
       def input_evidence_body
-        return "No supporting input beyond the Jira ticket's own description, comments, and " \
-               "linked issues was recorded for #{issue_key}." if supporting_inputs.empty?
+        return "No supporting input beyond the Jira ticket's own description and comments was " \
+               "recorded for #{issue_key}." if supporting_inputs.empty?
 
         supporting_inputs.map { |input| input_evidence_entry(input) }.join("\n\n")
       end
 
       def input_evidence_entry(input)
+        return linked_issues_entry(input) if input["kind"] == LINKED_ISSUES_KIND && input["used"]
+
         lines = [ "## #{input['kind']}#{input_name_suffix(input)}", "",
                   "- Status: #{input['used'] ? 'analyzed' : 'not analyzed'}",
                   "- Observation: #{input['note']}" ]
@@ -489,6 +518,25 @@ module SpecrelayRunner
         lines << "- Limitation: this runner could not analyse it; treat anything it might show as " \
                  "unverified." unless input["used"]
         lines.join("\n")
+      end
+
+      # Reached only when Platform reports the linked-issues collection as genuinely PRESENT —
+      # `#supporting_inputs` already drops an empty one before this is ever called. `used: true`
+      # in the packet means "Jira exposed the collection", never "this runner read an issue's
+      # content" (see the class comment on {LINKED_ISSUES_KIND}); claiming analysis here would be
+      # exactly the false completeness review 006 found, so this always reports the operational
+      # limitation rather than a "Requirement implication".
+      def linked_issues_entry(input)
+        count = LINKED_ISSUES_READABLE_COUNT.match(input["reason"].to_s)[1]
+        [
+          "## #{input['kind']}#{input_name_suffix(input)}", "",
+          "- Status: not analyzed",
+          "- Observation: Jira reports #{count} linked issue#{count == '1' ? '' : 's'} for " \
+          "#{issue_key}; this runner's input bundle records their presence only, not their " \
+          "individual titles, descriptions, or acceptance criteria.",
+          "- Limitation: any requirement that depends only on a linked issue's own content is " \
+          "unconfirmed here; regenerate after that content is captured if it turns out to matter."
+        ].join("\n")
       end
 
       # -------------------------------------------------------- analysis/open-questions.md

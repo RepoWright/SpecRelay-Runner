@@ -87,7 +87,15 @@ module SpecrelayRunner
         {
           "kind" => clean(input.kind), "name" => clean(input.name),
           "read_status" => clean(input.read_status), "used" => input.readable?,
-          "note" => clean(input.note.to_s), "reference" => clean(input.reference.to_s)
+          "note" => clean(input.note.to_s), "reference" => clean(input.reference.to_s),
+          # MVP-0028 remediation, defect 2 (F2 correction): Platform's own classification reason —
+          # e.g. "3 readable" for the linked-issues collection — was already read into
+          # `input.reason` and already allowlisted for the assignment (SpecCreationPayload::
+          # INPUT_FIELDS), but never left this process. Without it, a provider cannot tell "Jira
+          # exposed zero linked issues" from "Jira exposed some, but not their content" — the
+          # distinction {Composer} needs to report a linked issue honestly instead of either
+          # inventing analysis or manufacturing a limitation nobody asked about.
+          "reason" => clean(input.reason.to_s)
         }
       end
 
