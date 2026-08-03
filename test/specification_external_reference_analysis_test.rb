@@ -83,6 +83,72 @@ class SpecificationExternalReferenceAnalysisTest < Minitest::Test
     assert_includes generation["message"], "exited 1"
   end
 
+  # ------------------------------------------------------------------ F1: a blank/missing/wrong-typed
+  # ------------------------------------------------------------------ summary must not be readable
+
+  # review-005 finding F1, reproduced at the integration level: an analyzer that claims success
+  # with nothing behind it used to be accepted as though the reference had genuinely been read.
+  def test_a_contributed_claim_with_a_blank_summary_refuses_rather_than_being_readable
+    analyzer = write_analyzer(File.join(@temp, "analyzer"), response: { "contributed" => true, "summary" => "" })
+    start_platform(deferred_reference_payload)
+
+    exit_code = run_cli(config: build_config(external_reference_command: analyzer))
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, exit_code, @io.string
+    generation = @platform.last_specification_generation
+    assert_equal "external_reference_analysis_unavailable", generation["failure_class"]
+    assert_includes generation["message"], "no usable summary"
+  end
+
+  def test_a_contributed_claim_with_a_missing_summary_key_refuses
+    analyzer = write_analyzer(File.join(@temp, "analyzer"), response: { "contributed" => true })
+    start_platform(deferred_reference_payload)
+
+    exit_code = run_cli(config: build_config(external_reference_command: analyzer))
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, exit_code, @io.string
+    assert_equal "external_reference_analysis_unavailable", @platform.last_specification_generation["failure_class"]
+  end
+
+  def test_a_contributed_claim_with_a_non_string_summary_refuses
+    analyzer = write_analyzer(File.join(@temp, "analyzer"), response: { "contributed" => true, "summary" => 42 })
+    start_platform(deferred_reference_payload)
+
+    exit_code = run_cli(config: build_config(external_reference_command: analyzer))
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, exit_code, @io.string
+    assert_equal "external_reference_analysis_unavailable", @platform.last_specification_generation["failure_class"]
+  end
+
+  # A recorded substitute is the existing approved policy and must still apply even to THIS
+  # failure mode — F1 item 3.
+  def test_a_contributed_claim_with_a_blank_summary_and_a_recorded_substitute_still_only_warns
+    analyzer = write_analyzer(File.join(@temp, "analyzer"), response: { "contributed" => true, "summary" => "" })
+    start_platform(deferred_reference_payload)
+
+    exit_code = run_cli(config: build_config(external_reference_command: analyzer,
+                                             external_references_substitute: "the reporter described it in the ticket"))
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, exit_code, @io.string
+  end
+
+  # ------------------------------------------------------------------ F2: the ordinary Claude path
+
+  # review-005 finding F2 — the ordinary connected Runner, with a real Claude profile already
+  # configured for generation and NO analyzer command, must be able to analyse a reference with
+  # nothing further to install or configure.
+  def test_the_ordinary_configured_claude_profile_analyses_the_reference_with_no_extra_configuration
+    claude = write_fake_claude(File.join(@temp, "claude"),
+                               response: { "contributed" => true,
+                                          "summary" => "Claude read the reference via its own tool access." })
+    start_platform(deferred_reference_payload)
+
+    exit_code = run_cli(config: build_config(claude_command: claude))
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, exit_code, @io.string
+    assert_includes spec_document, "Claude read the reference via its own tool access."
+  end
+
   # A substitute is still the approved way to proceed without a working analyzer — unchanged
   # from the existing policy, and it must still apply when a configured analyzer fails.
   def test_an_analyzer_that_fails_with_a_recorded_substitute_still_only_warns
@@ -142,12 +208,28 @@ class SpecificationExternalReferenceAnalysisTest < Minitest::Test
     path
   end
 
+  # A minimal double for the real Claude Code CLI: it must be literally named `claude` for
+  # {SpecrelayRunner::ClaudeProfile} validation, and it ignores its prompt argument entirely —
+  # this test's only Claude invocation is the reference analysis, since generation is configured
+  # to use the deterministic `fake` provider explicitly.
+  def write_fake_claude(path, response:)
+    File.write(path, <<~SH)
+      #!/bin/sh
+      cat <<'SPECRELAY_FAKE_CLAUDE_EOF'
+      #{JSON.generate(response)}
+      SPECRELAY_FAKE_CLAUDE_EOF
+      exit 0
+    SH
+    FileUtils.chmod(0o755, path)
+    path
+  end
+
   def start_platform(payload)
     @platform = FakePlatform.new(claim_payload: payload).start
   end
 
   def build_config(external_reference_command: nil, external_references_available: nil,
-                   external_references_substitute: nil)
+                   external_references_substitute: nil, claude_command: nil)
     path = File.join(Dir.mktmpdir("cfg"), "runner.yml")
     File.write(path, <<~YAML)
       platform:
@@ -158,6 +240,7 @@ class SpecificationExternalReferenceAnalysisTest < Minitest::Test
         display_name: Test Runner
         claim_policy:
           mode: all_eligible
+        #{executor_block(claude_command)}
         specification:
           provider:
             kind: fake
@@ -173,6 +256,20 @@ class SpecificationExternalReferenceAnalysisTest < Minitest::Test
         tiny-demo-workspace: #{@source}
     YAML
     SpecrelayRunner::Config.load(path)
+  end
+
+  # The SAME real Claude profile a fixed D1 would use for generation — configured here purely so
+  # the reference analyzer can be offered it, with `specification.provider.kind: fake` above
+  # keeping generation itself on the deterministic composer.
+  def executor_block(claude_command)
+    return "" if claude_command.nil?
+
+    <<~YAML.strip
+      executor:
+          provider: claude
+          command: #{claude_command}
+          args: ["--print", "--dangerously-skip-permissions"]
+    YAML
   end
 
   def run_cli(config:)

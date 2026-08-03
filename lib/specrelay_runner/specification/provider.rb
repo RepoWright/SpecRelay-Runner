@@ -210,37 +210,12 @@ module SpecrelayRunner
         # brace inside a quoted string is not counted, so a trailing sentence or aside the model
         # appended despite instruction — one that itself happens to contain braces — cannot pull
         # the match past the object's own close. Only real object nesting inside the JSON can.
+        # {BalancedJson} is the shared implementation; {ReferenceAnalyzer::Claude} (MVP-0028
+        # remediation, defect 2) needs the identical judgment call against the same real profile.
         def json_object(text)
-          start = text.index("{")
-          raise Failed, "the Claude specification provider returned no JSON object" if start.nil?
-
-          finish = matching_brace(text, start)
-          raise Failed, "the Claude specification provider returned no JSON object" if finish.nil?
-
-          text[start..finish]
-        end
-
-        def matching_brace(text, start)
-          depth = 0
-          in_string = false
-          escaped = false
-          (start...text.length).each do |index|
-            char = text[index]
-            if escaped
-              escaped = false
-            elsif in_string
-              escaped = true if char == "\\"
-              in_string = false if char == '"'
-            elsif char == '"'
-              in_string = true
-            elsif char == "{"
-              depth += 1
-            elsif char == "}"
-              depth -= 1
-              return index if depth.zero?
-            end
-          end
-          nil
+          BalancedJson.extract_object(text)
+        rescue BalancedJson::NotFound
+          raise Failed, "the Claude specification provider returned no JSON object"
         end
       end
 

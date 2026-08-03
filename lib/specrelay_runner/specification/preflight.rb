@@ -99,7 +99,13 @@ module SpecrelayRunner
       end
 
       def gather_and_verify(checkout, package, source_root)
-        inputs = InputEvidence.gather(assignment: assignment, settings: settings, env: env)
+        # The SAME real Claude profile {resolve_provider} would use, offered here as the ordinary
+        # external-reference analyzer (MVP-0028 remediation, defect 2 — review-005 finding F2). A
+        # profile invalid enough to raise still surfaces exactly where it already did, a few lines
+        # below at `resolve_provider` — this does not add a new failure path, only a new use for
+        # the same validated value.
+        inputs = InputEvidence.gather(assignment: assignment, settings: settings, env: env,
+                                      claude_profile: config.selected_claude_profile)
         blocked = check_inputs(inputs)
         return blocked if blocked
 

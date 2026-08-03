@@ -1,7 +1,5 @@
 # frozen_string_literal: true
 
-require "json"
-
 module SpecrelayRunner
   module Specification
     # What the assignment's input bundle actually offers, and which of it this runner can
@@ -51,11 +49,12 @@ module SpecrelayRunner
 
       def self.gather(**kwargs) = new(**kwargs).gather
 
-      def initialize(assignment:, settings:, env: ENV, command_runner: CommandRunner)
+      def initialize(assignment:, settings:, env: ENV, command_runner: CommandRunner, claude_profile: nil)
         @assignment = assignment
         @settings = settings
         @env = env
         @command_runner = command_runner
+        @claude_profile = claude_profile
       end
 
       def gather
@@ -66,7 +65,7 @@ module SpecrelayRunner
 
       private
 
-      attr_reader :assignment, :settings, :env, :command_runner
+      attr_reader :assignment, :settings, :env, :command_runner, :claude_profile
 
       def classify(entry)
         status = entry["read_status"].to_s
@@ -114,13 +113,17 @@ module SpecrelayRunner
       # copied verbatim into the generated business analysis is not evidence that it was read,
       # and an operator who had set `available: true` believing it meant something got a
       # specification that quietly claimed it. Readability is now a FACT this process proves by
-      # actually running the configured analyzer against THIS reference — never a flag taken on
-      # trust — and a substitute remains the only way to proceed without one.
+      # actually running a real analyzer against THIS reference — {ReferenceAnalyzer} decides
+      # WHICH one (the operator's explicit command, or the real Claude profile already validated
+      # for generation) — never a flag taken on trust, and a substitute remains the only way to
+      # proceed without one.
       def apply_deferred_verdict(input)
         analysis = input.image? ? "image analysis" : "external-reference fetching"
-        return unavailable_deferred_verdict(input, analysis) if settings.external_reference_command.nil?
+        analyzer = ReferenceAnalyzer.resolve(settings: settings, claude_profile: claude_profile, env: env,
+                                             command_runner: command_runner)
+        return unavailable_deferred_verdict(input, analysis) if analyzer.nil?
 
-        apply_analysis_outcome(input, analysis, analyze_reference(input))
+        apply_analysis_outcome(input, analysis, analyzer.analyze(kind: input.kind, reference: input.reference))
       end
 
       def unavailable_deferred_verdict(input, analysis)
@@ -130,7 +133,10 @@ module SpecrelayRunner
           input.note = "#{analysis} is unavailable — approved substitute: #{capability.substitute}"
         else
           input.readable = false
-          input.note = "#{analysis} is unavailable on this runner and no substitute was recorded"
+          input.note = "#{analysis} is unavailable on this runner and no substitute was recorded: configure " \
+                       "runner.executor with a Claude profile, set " \
+                       "runner.specification.external_references.command, or record " \
+                       "runner.specification.external_references.substitute"
         end
       end
 
@@ -145,59 +151,6 @@ module SpecrelayRunner
             "#{analysis} ran but did not contribute: #{outcome.summary}"
           end
       end
-
-      # One reference, one process launch: an argv array (never a shell) naming the input's kind
-      # and its reference, under the same bounded-output, bounded-timeout discipline every other
-      # command this runner launches uses. The contract is deliberately the smallest one that can
-      # answer "did this contribute, and what did it find": a JSON object with `contributed`
-      # (boolean) and `summary` (a string this runner then redacts and clips before it can reach
-      # any generated document, a Platform payload, or a log line). Nothing else the command
-      # prints — no raw fetched page, no transcript, no other field — is ever read.
-      MAX_REFERENCE_OUTPUT_BYTES = 200_000
-      MAX_REFERENCE_SUMMARY_CHARS = 2_000
-
-      Outcome = Struct.new(:verdict, :summary, keyword_init: true) do
-        def contributed? = verdict == :contributed
-      end
-
-      def analyze_reference(input)
-        result = command_runner.run([ settings.external_reference_command, input.kind, input.reference ],
-                                     chdir: Dir.pwd, env: { "PATH" => env["PATH"].to_s },
-                                     timeout_seconds: settings.external_reference_timeout_seconds)
-        return Outcome.new(verdict: :failed, summary: "the analyzer timed out") if result.timed_out?
-        return Outcome.new(verdict: :failed, summary: "the analyzer exited #{result.exit_code}") unless
-          result.success?
-
-        parse_reference_output(result.stdout)
-      rescue SystemCallError => e
-        Outcome.new(verdict: :failed, summary: "the analyzer could not be launched: #{e.message}")
-      end
-
-      def parse_reference_output(stdout)
-        text = stdout.to_s
-        return Outcome.new(verdict: :failed, summary: "the analyzer produced more output than this runner " \
-                                                       "will accept") if text.bytesize > MAX_REFERENCE_OUTPUT_BYTES
-
-        document = JSON.parse(text)
-        raise JSON::ParserError, "not a JSON object" unless document.is_a?(Hash)
-
-        reference_outcome(document)
-      rescue JSON::ParserError
-        Outcome.new(verdict: :failed, summary: "the analyzer did not return valid JSON")
-      end
-
-      def reference_outcome(document)
-        summary = clip(Redaction.redact(document["summary"].to_s))
-        contributed = document["contributed"] == true
-        Outcome.new(verdict: contributed ? :contributed : :not_contributed,
-                   summary: summary.empty? ? default_summary(contributed) : summary)
-      end
-
-      def default_summary(contributed)
-        contributed ? "the analyzer reported success but recorded no summary" : "found no usable evidence"
-      end
-
-      def clip(text) = text.to_s[0, MAX_REFERENCE_SUMMARY_CHARS].to_s
 
       # A blocker is an input the bundle offers as usable that this runner cannot actually
       # use, with no recorded substitute. Note what is NOT a blocker: a deferred input the
