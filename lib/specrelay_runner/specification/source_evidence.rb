@@ -128,11 +128,19 @@ module SpecrelayRunner
       # repository whose sources this runner cannot classify, and failing closed on a
       # classification gap is how the allowlist above caused this in the first place.
       def inspection_warnings
-        return [] unless entry_points.empty?
-
-        [ "No source file could be read in the `#{File.basename(root)}` checkout, so this " \
-          "specification is grounded in the Jira ticket alone. Check that the workspace root " \
-          "points at the right directory; the generated documents say they are ungrounded." ]
+        warnings = []
+        warnings << "Graphify is not installed for this checkout; direct source inspection was used instead." if
+          graphify_absent?
+        unless settings.context_plus.usable?
+          warnings << "Context+ is not available on this runner; direct source inspection was used without " \
+                      "semantic Context+ evidence."
+        end
+        if entry_points.empty?
+          warnings << "No source file could be read in the `#{File.basename(root)}` checkout, so this " \
+                      "specification is grounded in the Jira ticket alone. Check that the workspace root " \
+                      "points at the right directory; the generated documents say they are ungrounded."
+        end
+        warnings
       end
 
       private
@@ -203,15 +211,34 @@ module SpecrelayRunner
       # from an out-of-date graph can be recorded as if it described the current source.
       def graphify_evidence
         @graphify_evidence ||= begin
-          check = wrapper_path(GRAPH_CHECK)
-          query = wrapper_path(GRAPH_QUERY)
-          if check.nil? || query.nil?
-            unusable_graph("the workspace Graphify wrappers are not present in this checkout " \
-                           "(expected #{GRAPH_CHECK} and #{GRAPH_QUERY})")
+          if graphify_absent?
+            optional_graph_fallback
           else
-            run_graph_check(check, query)
+            check = wrapper_path(GRAPH_CHECK)
+            query = wrapper_path(GRAPH_QUERY)
+            if check.nil? || query.nil?
+              unusable_graph("the workspace Graphify installation is incomplete or not executable " \
+                             "(expected executable #{GRAPH_CHECK} and #{GRAPH_QUERY})")
+            else
+              run_graph_check(check, query)
+            end
           end
         end
+      end
+
+      # Graphify is an optional enhancement for repositories that do not ship the workspace
+      # wrappers. Complete absence is therefore different from a damaged installation: when
+      # neither wrapper exists, direct source inspection is the explicit fallback. If either
+      # wrapper exists, both must be executable and healthy so a broken tool cannot be silently
+      # reclassified as "not installed".
+      def graphify_absent?
+        [ GRAPH_CHECK, GRAPH_QUERY ].none? { |relative| File.exist?(File.join(root, relative)) }
+      end
+
+      def optional_graph_fallback
+        reason = "Graphify is not installed for this checkout (neither #{GRAPH_CHECK} nor " \
+                 "#{GRAPH_QUERY} exists); direct source inspection was used instead"
+        Tool.new(name: "graphify", usable: true, contributed: false, summary: reason, detail: reason)
       end
 
       def run_graph_check(check, query)
@@ -266,8 +293,9 @@ module SpecrelayRunner
       # "Result: used", Platform's run page said "contributed evidence", and nothing had
       # queried anything.
       #
-      # `usable` keeps its meaning and still gates preflight, so no refusal behaviour changes.
-      # What changes is that the document and the durable record now say who gathered what.
+      # `usable` records whether the operator supplied a declaration or substitute. It does not
+      # gate preflight: this process cannot query Context+, so requiring that declaration would
+      # make the guided runner flow depend on an unverifiable configuration claim.
       #
       # An operator CAN put real semantic evidence into the package — `queries:` and
       # `evidence:` under `runner.specification.context_plus` are reproduced verbatim below.

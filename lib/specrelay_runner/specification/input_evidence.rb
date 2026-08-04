@@ -49,9 +49,12 @@ module SpecrelayRunner
 
       def self.gather(**kwargs) = new(**kwargs).gather
 
-      def initialize(assignment:, settings:)
+      def initialize(assignment:, settings:, env: ENV, command_runner: CommandRunner, claude_profile: nil)
         @assignment = assignment
         @settings = settings
+        @env = env
+        @command_runner = command_runner
+        @claude_profile = claude_profile
       end
 
       def gather
@@ -62,7 +65,7 @@ module SpecrelayRunner
 
       private
 
-      attr_reader :assignment, :settings
+      attr_reader :assignment, :settings, :env, :command_runner, :claude_profile
 
       def classify(entry)
         status = entry["read_status"].to_s
@@ -104,19 +107,49 @@ module SpecrelayRunner
       # both. That is deliberate: they are the same MCP surface in practice, and splitting
       # the switch would let a runner claim it analysed a screenshot because it could reach
       # Confluence.
+      #
+      # MVP-0028 remediation, defect 2 — this used to read `capability.available?` and mark the
+      # input `readable` on that flag ALONE, with nothing ever fetched or analysed. A Jam link
+      # copied verbatim into the generated business analysis is not evidence that it was read,
+      # and an operator who had set `available: true` believing it meant something got a
+      # specification that quietly claimed it. Readability is now a FACT this process proves by
+      # actually running a real analyzer against THIS reference — {ReferenceAnalyzer} decides
+      # WHICH one (the operator's explicit command, or the real Claude profile already validated
+      # for generation) — never a flag taken on trust, and a substitute remains the only way to
+      # proceed without one.
       def apply_deferred_verdict(input)
-        capability = settings.external_references
         analysis = input.image? ? "image analysis" : "external-reference fetching"
-        if capability.available?
-          input.readable = true
-          input.note = "#{analysis} is available on this runner"
-        elsif capability.substitute?
+        analyzer = ReferenceAnalyzer.resolve(settings: settings, claude_profile: claude_profile, env: env,
+                                             command_runner: command_runner)
+        return unavailable_deferred_verdict(input, analysis) if analyzer.nil?
+
+        apply_analysis_outcome(input, analysis, analyzer.analyze(kind: input.kind, reference: input.reference))
+      end
+
+      def unavailable_deferred_verdict(input, analysis)
+        capability = settings.external_references
+        if capability.substitute?
           input.readable = false
           input.note = "#{analysis} is unavailable — approved substitute: #{capability.substitute}"
         else
           input.readable = false
-          input.note = "#{analysis} is unavailable on this runner and no substitute was recorded"
+          input.note = "#{analysis} is unavailable on this runner and no substitute was recorded: configure " \
+                       "runner.executor with a Claude profile, set " \
+                       "runner.specification.external_references.command, or record " \
+                       "runner.specification.external_references.substitute"
         end
+      end
+
+      def apply_analysis_outcome(input, analysis, outcome)
+        input.readable = outcome.contributed?
+        input.note =
+          if outcome.contributed?
+            "#{analysis}: #{outcome.summary}"
+          elsif outcome.verdict == :failed
+            "#{analysis} failed: #{outcome.summary}"
+          else
+            "#{analysis} ran but did not contribute: #{outcome.summary}"
+          end
       end
 
       # A blocker is an input the bundle offers as usable that this runner cannot actually

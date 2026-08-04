@@ -86,6 +86,7 @@ module SpecrelayRunner
             "(run #{assignment.run_id}).")
         log("  Repository: #{assignment.publication_repository_url}")
         log("  Branch:     #{assignment.publication_branch} (base #{assignment.publication_base_branch})")
+        log("  Updates:    #{assignment.existing_pull_request_url}") unless assignment.existing_pull_request_url.empty?
         log("  Package:    #{assignment.generated_package_path}")
       end
 
@@ -111,25 +112,74 @@ module SpecrelayRunner
       # `gh` is checked BEFORE the commit, not after the push. A host without an authenticated
       # GitHub CLI can still push, so checking later would leave a branch on a shared repository
       # for a publication that was never going to be reviewable.
+      #
+      # MVP-0028 adds one step in front of the commit and none after it: resolving WHICH BRANCH
+      # this publication belongs on. That has to happen before any git mutation, because for a
+      # ticket that already has a `Spec PR` the answer comes from GitHub, and every way it can
+      # come back unusable (closed, merged, missing, wrong base, from a fork) must refuse the
+      # publication rather than fork a second branch off it.
       def push_and_open(assignment, checkout, verified)
         commands = GitCommands.new(checkout_root: checkout, env: env)
         return fail_closed(PullRequestPublisher::GH_UNAVAILABLE, PullRequestPublisher.unavailable_message) unless
           PullRequestPublisher.available?(commands: commands)
 
-        pushed = GitPublisher.call(commands: commands, assignment: assignment, files: verified, io: io)
+        branch = resolve_branch(assignment, commands)
+        return branch if branch.is_a?(Result)
+
+        pushed = GitPublisher.call(commands: commands, assignment: assignment, branch: branch,
+                                   files: verified, io: io)
         return fail_closed(pushed.failure_class, pushed.message) unless pushed.ok?
 
-        opened = PullRequestPublisher.call(commands: commands, assignment: assignment, files: verified,
-                                           head_commit: pushed.head_commit, io: io)
+        opened = PullRequestPublisher.call(commands: commands, assignment: assignment, branch: branch,
+                                           files: verified, head_commit: pushed.head_commit, io: io)
         return fail_closed(opened.failure_class, opened.message, pushed: pushed) unless opened.ok?
 
         checkpoint!
         succeed(verified, pushed, opened)
       end
 
+      # The branch this publication belongs on: the head of the ticket's existing specification
+      # pull request when Jira names one, otherwise the branch Platform derived.
+      #
+      # Asking GitHub rather than re-deriving is the whole of criterion 3's rename case. The
+      # ticket-owned branch name carries a slug of the ticket TITLE, and a ticket can be renamed
+      # after its pull request is open; the open pull request remains the source of truth and
+      # keeps the branch it was opened on. Re-deriving would open a second pull request for one
+      # ticket, which is what this MVP exists to stop.
+      #
+      # Returns the branch, or a Result when the existing pull request cannot be used — in which
+      # case nothing has been committed, pushed, or opened.
+      def resolve_branch(assignment, commands)
+        url = assignment.existing_pull_request_url
+        return assignment.publication_branch if url.empty?
+
+        existing = ExistingPullRequest.call(commands: commands, slug: assignment.publication_slug,
+                                           base_branch: assignment.publication_base_branch, url: url, io: io)
+        return fail_closed(existing.failure_class, existing.message) unless existing.ok?
+
+        @publication_branch = existing.branch
+      end
+
+      # What the runner REPORTS as the branch it published on, which is what Platform validates.
+      # Falls back to the assigned branch, so a failure that happens before resolution still names
+      # the branch Platform expected rather than nothing.
+      def publication_branch = @publication_branch || assignment&.publication_branch
+
       # This machine's clone of the specification repository, resolved through the same operator
-      # configuration generation used — so the two phases can never disagree about where the
-      # package lives.
+      # configuration MECHANISM generation used.
+      #
+      # That is NOT the same as "the two phases can never disagree about where the package lives",
+      # which this comment used to claim. The live MAPIAI-53 run disproved it: generation and
+      # publication are separate invocations, `SPECRELAY_RUNNER_SPEC_REPOSITORY_ROOT` is read fresh
+      # from the environment each time, and a publication run started with a different value for it
+      # resolved a different clone and refused with `generated_package_missing` — correctly, having
+      # written nothing. The resolution is also not identical in code: {Preflight} falls back to
+      # reusing a verified source-workspace checkout, and this does not.
+      #
+      # Fail-closed behaviour is right and unchanged. What is missing is that nothing PINS the
+      # checkout across the generation → publication boundary; see the MVP-0028 follow-up. The
+      # pin belongs on the runner, not in the assignment — a local filesystem path is exactly what
+      # {Runner::Api::SpecCreationPayload} must never carry.
       def resolve_checkout(assignment)
         slug = assignment.publication_slug
         slug = assignment.publication_repository_url if slug.empty?
@@ -170,10 +220,18 @@ module SpecrelayRunner
         return report_refused(refusal, pushed, opened) if refusal
 
         log("")
-        log("Published #{verified.length} files on #{assignment.publication_branch} as a draft pull request:")
+        log("Published #{verified.length} files on #{publication_branch} as a draft pull request:")
         log("  #{opened.url}")
-        log("No Jira field was written, no status was transitioned, and no comment was added.")
-        Result.new(outcome: PUBLISHED, pull_request_url: opened.url, branch: assignment.publication_branch,
+        # MVP-0028 remediation, defect 8. This line used to read "No Jira field was written, no
+        # status was transitioned, and no comment was added" — true of the RUNNER, and printed
+        # microseconds before Platform wrote all three. An operator reading the last line of a
+        # successful run was told the ticket was untouched when it was about to be updated.
+        #
+        # The fix is to state the BOUNDARY rather than a moment: the runner never writes Jira, and
+        # Platform finalizes after accepting this result. That stays true whenever it is read.
+        log("This runner does not write Jira. Platform finalizes the ticket — Spec PR field, " \
+            "comment and status — after accepting this publication.")
+        Result.new(outcome: PUBLISHED, pull_request_url: opened.url, branch: publication_branch,
                    head_commit: pushed.head_commit,
                    message: "Runner outcome: published (draft pull request #{opened.url}).")
       end
@@ -192,10 +250,10 @@ module SpecrelayRunner
         log("Platform REFUSED this publication result: #{message}")
         log("The draft pull request exists on GitHub, but Platform holds no record of it and the " \
             "run was NOT moved to awaiting approval.")
-        log("  Branch:       #{assignment.publication_branch}")
+        log("  Branch:       #{publication_branch}")
         log("  Pull request: #{opened.url}")
         log("Fix what Platform refused; the next attempt on this run reuses both.")
-        Result.new(outcome: FAILED, pull_request_url: opened.url, branch: assignment.publication_branch,
+        Result.new(outcome: FAILED, pull_request_url: opened.url, branch: publication_branch,
                    head_commit: pushed.head_commit,
                    message: "Runner outcome: publication_failed (#{REPORT_REFUSED}).")
       end
@@ -213,7 +271,7 @@ module SpecrelayRunner
         # Already a failure, so the outcome does not change — but the operator must not be left
         # believing Platform recorded a failure it in fact refused.
         log("Platform REFUSED this failure report: #{refusal}") if refusal
-        Result.new(outcome: FAILED, branch: pushed ? assignment.publication_branch : nil,
+        Result.new(outcome: FAILED, branch: pushed ? publication_branch : nil,
                    head_commit: pushed&.head_commit,
                    message: "Runner outcome: publication_failed (#{failure_class}).")
       end
@@ -236,7 +294,7 @@ module SpecrelayRunner
       def success_payload(verified, pushed, opened)
         base_payload(OUTCOME_PUBLISHED).merge(
           "repository_url" => assignment.publication_repository_url,
-          "branch" => assignment.publication_branch,
+          "branch" => publication_branch,
           "head_commit" => pushed.head_commit,
           "pull_request_url" => opened.url,
           "pull_request_draft" => opened.draft?,
@@ -249,7 +307,7 @@ module SpecrelayRunner
       def failure_payload(failure_class, message, pushed)
         base_payload(OUTCOME_FAILED).merge(
           "repository_url" => assignment&.publication_repository_url.to_s,
-          "branch" => pushed ? assignment.publication_branch : "",
+          "branch" => pushed ? publication_branch : "",
           "head_commit" => pushed&.head_commit.to_s,
           "failure_class" => failure_class,
           "message" => message

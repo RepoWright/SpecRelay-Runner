@@ -33,9 +33,12 @@ module SpecrelayRunner
 
       # `available_check` is run BEFORE any git mutation by the orchestrator and again here only
       # if it was not; see {Publication} for why the order matters.
-      def initialize(commands:, assignment:, files:, head_commit:, io: $stdout)
+      # +branch+ is explicit for the same reason it is on {GitPublisher}: MVP-0028 gave it two
+      # possible sources, and choosing between them is the caller's job.
+      def initialize(commands:, assignment:, branch:, files:, head_commit:, io: $stdout)
         @commands = commands
         @assignment = assignment
+        @branch = branch
         @files = files
         @head_commit = head_commit
         @io = io
@@ -60,10 +63,9 @@ module SpecrelayRunner
 
       private
 
-      attr_reader :commands, :assignment, :files, :head_commit, :io
+      attr_reader :commands, :assignment, :branch, :files, :head_commit, :io
 
       def slug = assignment.publication_slug
-      def branch = assignment.publication_branch
 
       # Only an OPEN pull request on this exact branch may be reused. `--state open` rather than
       # `all`: a closed or merged pull request from an earlier round no longer tracks the branch,

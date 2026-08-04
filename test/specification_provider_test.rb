@@ -167,6 +167,126 @@ class SpecificationProviderTest < Minitest::Test
     assert_includes @io.string, "analysis/technical.md"
   end
 
+  # MVP-0028 remediation, defect 10 — the live MAPIAI-53 revision, at the real boundary.
+  #
+  # The provider returned a `technical.md` whose title was its own first section name, with its
+  # instructions narrated underneath. Every required `##` section was present, so the package was
+  # written, digested, reported to Platform, and became publishable. These prove the whole chain
+  # now stops at the same place a missing section stops it: before anything reaches disk.
+  def test_a_document_titled_with_a_section_name_is_rejected_before_anything_is_written
+    documents = valid_documents
+    documents["analysis/technical.md"] = documents["analysis/technical.md"]
+      .sub(/\A# .*$/, "# Source entry points inspected\n\n(placeholder-free content follows)")
+    provider = SpecificationWorkspace.write_provider(File.join(@temp, "provider"), files: documents)
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_with(provider), @io.string
+    assert_empty Dir.children(File.join(@specs, "specs")), "no package, and no staging leftovers"
+    assert_equal "generated_output_invalid", @platform.last_specification_generation["failure_class"]
+    assert_includes @io.string, "analysis/technical.md"
+  end
+
+  # The refusal must reach Platform as a REFUSAL, not as a generation that produced something.
+  # A package Platform believes exists is a package Platform will offer for publication.
+  def test_a_malformed_document_never_becomes_publishable
+    documents = valid_documents
+    documents["analysis/technical.md"] = documents["analysis/technical.md"]
+      .sub(/\A# .*$/, "# Source entry points inspected")
+    provider = SpecificationWorkspace.write_provider(File.join(@temp, "provider"), files: documents)
+
+    run_with(provider)
+
+    generation = @platform.last_specification_generation
+    assert_equal "failed", generation["outcome"]
+    assert generation["zero_output_files_written"], generation.inspect
+    assert_nil generation["package"], "a refused generation must record no package to publish"
+  end
+
+  def test_provider_scaffolding_in_a_document_is_rejected_before_anything_is_written
+    documents = valid_documents
+    documents["analysis/business.md"] = documents["analysis/business.md"]
+      .sub("\n\n##", "\n\n(placeholder-free content follows)\n\n##")
+    provider = SpecificationWorkspace.write_provider(File.join(@temp, "provider"), files: documents)
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_with(provider), @io.string
+    assert_empty Dir.children(File.join(@specs, "specs"))
+    assert_includes @io.string, "scaffolding"
+  end
+
+  # MVP-0028 remediation, defect 3 — the input-evidence file is REQUIRED, not conditional; only
+  # the open-questions file is optional.
+  def test_missing_input_evidence_is_rejected
+    documents = valid_documents
+    documents.delete("analysis/input-evidence.md")
+    provider = SpecificationWorkspace.write_provider(File.join(@temp, "provider"), files: documents)
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_with(provider), @io.string
+    assert_empty Dir.children(File.join(@specs, "specs"))
+    assert_includes @io.string, "analysis/input-evidence.md"
+  end
+
+  # The optional file is accepted when present and structurally valid, and its digest is
+  # written alongside the required four.
+  def test_a_present_and_valid_open_questions_file_is_accepted
+    documents = valid_documents.merge(
+      "analysis/open-questions.md" => "# Open questions\n\n## OQ-001\n\n- Why it blocks: the ticket " \
+                                       "does not say.\n- Decision required: confirm the scope.\n" \
+                                       "- Consequence: an implementer would guess.\n"
+    )
+    provider = SpecificationWorkspace.write_provider(File.join(@temp, "provider"), files: documents)
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, run_with(provider), @io.string
+    assert File.exist?(File.join(@specs, "specs", PACKAGE_DIR, "analysis", "open-questions.md"))
+    generation = @platform.last_specification_generation
+    assert generation.dig("package", "files").any? { |file| file["path"] == "analysis/open-questions.md" },
+          generation.inspect
+  end
+
+  # A present `open-questions.md` with no "## OQ-nnn" heading contradicts its own existence and
+  # is rejected before anything is written — the same fail-closed standard every other
+  # structural gap in this boundary gets.
+  def test_an_open_questions_file_with_no_question_heading_is_rejected
+    documents = valid_documents.merge(
+      "analysis/open-questions.md" => "# Open questions\n\nNothing here names a question, but this " \
+                                       "text is long enough to clear the minimum length floor.\n"
+    )
+    provider = SpecificationWorkspace.write_provider(File.join(@temp, "provider"), files: documents)
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_with(provider), @io.string
+    assert_empty Dir.children(File.join(@specs, "specs"))
+    assert_includes @io.string, "names no open question"
+  end
+
+  # Review 006 finding F1, at the boundary rather than in the DocumentSet unit tests: a question
+  # missing "Decision required" used to pass this same CLI path and reach Platform with an
+  # arbitrary bullet standing in for the decision. It is rejected before anything is written now,
+  # exactly like every other structural gap this boundary already refuses.
+  def test_an_open_questions_file_missing_decision_required_is_rejected
+    documents = valid_documents.merge(
+      "analysis/open-questions.md" => "# Open questions\n\n## OQ-001\n\n- Why it blocks: the ticket " \
+                                       "does not say.\n- Consequence: an implementer would guess.\n"
+    )
+    provider = SpecificationWorkspace.write_provider(File.join(@temp, "provider"), files: documents)
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_with(provider), @io.string
+    assert_empty Dir.children(File.join(@specs, "specs"))
+    assert_includes @io.string, "missing required field(s): decision required"
+  end
+
+  # And the other half of F1: a fourth, unlabelled bullet is rejected rather than silently
+  # ignored — the closed set of three fields is enforced, not just their presence.
+  def test_an_open_questions_file_with_an_extra_field_is_rejected
+    documents = valid_documents.merge(
+      "analysis/open-questions.md" => "# Open questions\n\n## OQ-001\n\n- Why it blocks: the ticket " \
+                                       "does not say.\n- Decision required: confirm the scope.\n" \
+                                       "- Consequence: an implementer would guess.\n- Owner: PO\n"
+    )
+    provider = SpecificationWorkspace.write_provider(File.join(@temp, "provider"), files: documents)
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_with(provider), @io.string
+    assert_empty Dir.children(File.join(@specs, "specs"))
+    assert_includes @io.string, "unexpected field: owner"
+  end
+
   # A provider must not be able to choose its own output paths: that is how a package escapes
   # its folder. The allowlist rejects the file rather than sanitizing the name.
   def test_a_provider_that_returns_an_unexpected_file_is_rejected
@@ -232,6 +352,8 @@ class SpecificationProviderTest < Minitest::Test
     {
       "spec.md" => document(SpecrelayRunner::Specification::DocumentSet::REQUIRED_SECTIONS
                               .fetch("spec.md"), "Specification for #{ISSUE}"),
+      "analysis/input-evidence.md" => "# Input evidence for #{ISSUE}\n\n" \
+                                       "No supporting input beyond the Jira ticket was recorded.\n",
       "analysis/business.md" => document(SpecrelayRunner::Specification::DocumentSet::REQUIRED_SECTIONS
                                            .fetch("analysis/business.md"), "Business analysis for #{ISSUE}"),
       "analysis/technical.md" => document(SpecrelayRunner::Specification::DocumentSet::REQUIRED_SECTIONS

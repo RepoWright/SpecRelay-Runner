@@ -21,7 +21,7 @@ class SpecificationMarkdownTest < Minitest::Test
   REQUIRED_SPEC_SECTIONS = [
     "Problem", "Outcome", "Input summary", "Proposed behavior", "Non-goals",
     "Acceptance criteria", "Validation expectations",
-    "Dependencies, assumptions, and open questions", "Analysis"
+    "Dependencies and assumptions", "Analysis"
   ].freeze
 
   def teardown
@@ -81,7 +81,7 @@ class SpecificationMarkdownTest < Minitest::Test
   # model, most plausibly — can return exactly this, and the previous validator could not see it.
   def test_validate_rejects_a_document_with_an_unterminated_fence
     error = assert_raises(SpecrelayRunner::Specification::DocumentSet::Invalid) do
-      SpecrelayRunner::Specification::DocumentSet.validate!(document_set(spec: broken_fence_spec))
+      SpecrelayRunner::Specification::DocumentSet.validate!(document_set(spec: broken_fence_spec), issue_key: "SR-700")
     end
 
     assert_includes error.message, "spec.md"
@@ -93,7 +93,7 @@ class SpecificationMarkdownTest < Minitest::Test
   # contained the characters.
   def test_validate_rejects_a_required_heading_that_appears_only_inside_a_code_block
     error = assert_raises(SpecrelayRunner::Specification::DocumentSet::Invalid) do
-      SpecrelayRunner::Specification::DocumentSet.validate!(document_set(spec: fenced_headings_spec))
+      SpecrelayRunner::Specification::DocumentSet.validate!(document_set(spec: fenced_headings_spec), issue_key: "SR-700")
     end
 
     assert_includes error.message, "## #{spec_sections[6]}", "the FIRST hidden section must be named"
@@ -103,7 +103,7 @@ class SpecificationMarkdownTest < Minitest::Test
   def test_validate_accepts_a_document_whose_fenced_block_contains_heading_like_lines
     documents = document_set(spec: spec_with_fenced_bundle)
 
-    assert SpecrelayRunner::Specification::DocumentSet.validate!(documents)
+    assert SpecrelayRunner::Specification::DocumentSet.validate!(documents, issue_key: "SR-700")
   end
 
   # ------------------------------------------------------------------------- helpers
@@ -199,8 +199,12 @@ class SpecificationMarkdownTest < Minitest::Test
   def document_set(spec:)
     {
       "spec.md" => spec,
-      "analysis/business.md" => document(required_sections("analysis/business.md")),
-      "analysis/technical.md" => document(required_sections("analysis/technical.md"))
+      "analysis/input-evidence.md" => "# Input evidence\n\nNo supporting input beyond the Jira ticket " \
+                                       "was recorded.\n",
+      "analysis/business.md" => document(required_sections("analysis/business.md"),
+                                         title: "# Business analysis — SR-700\n\n"),
+      "analysis/technical.md" => document(required_sections("analysis/technical.md"),
+                                          title: "# Technical analysis — SR-700\n\n")
     }
   end
 
@@ -208,7 +212,7 @@ class SpecificationMarkdownTest < Minitest::Test
     SpecrelayRunner::Specification::DocumentSet::REQUIRED_SECTIONS.fetch(name)
   end
 
-  def document(sections, title: "# Generated document\n\n")
+  def document(sections, title: "# SR-700 — generated document\n\n")
     title + sections.map { |section| "## #{section}\n\n#{BODY}\n" }.join
   end
 
@@ -233,6 +237,6 @@ class SpecificationMarkdownTest < Minitest::Test
       body = section == "Input summary" ? "#{BODY}\n````markdown\n#{bundle}\n````\n" : BODY
       "## #{section}\n\n#{body}\n"
     end
-    "# Generated document\n\n#{sections.join}"
+    "# SR-700 — generated document\n\n#{sections.join}"
   end
 end

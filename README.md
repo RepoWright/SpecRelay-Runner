@@ -200,10 +200,39 @@ MVP-0028, and the assignment says so as data
 ```text
 <specification-root>/<ISSUE-KEY>-<sanitized-summary-slug>/
   spec.md
+  analysis/input-evidence.md
   analysis/business.md
   analysis/technical.md
+  analysis/open-questions.md    # only when synthesis found a material product decision
   generation-manifest.json
 ```
+
+`analysis/open-questions.md` is the one CONDITIONAL file (MVP-0028 remediation, defect 3): present
+only when generation found at least one material Product Owner decision, using stable ids
+(`## OQ-001`, `## OQ-002`, ...) so a later run can reference the same question. Its filename never
+encodes count or status — a run with zero open questions omits the file entirely rather than
+writing an empty one, and a resolved question's history is retained by keeping the file rather than
+deleting entries from it. Each question is validated as EXACTLY three nonblank fields — "Why it
+blocks", "Decision required", "Consequence" — with no field missing, duplicated, blank, or
+unexpected (review 006 finding F1): a body that does not have one is rejected before anything is
+written, rather than a parser guessing which bullet was meant as the decision.
+
+`analysis/input-evidence.md` is always present. It carries one compact, independently reviewable
+entry per SUPPORTING input a bundle recorded — a Jam recording, screenshot, Confluence page, log,
+attachment, or linked Jira issue — never the ticket's own description or comments, already
+reflected in `spec.md`'s own "Input summary" table. Each entry states whether the input was
+actually analysed (not merely referenced), what was observed, what that implies for the
+requirement, and any limitation — never the raw transcript or tool output behind it.
+
+A linked Jira issue is analysed from its OWN content, not disclosed as a gap (review 006 finding
+F2, second pass): Platform now reads each linked issue's key, title, and description one level
+deep (`Jira::SpecCreation::EnrichLinkedIssues`) before classifying the bundle, and an issue whose
+content could not be read BLOCKS intake through the same terminally-blocked, marked-comment path
+as any other unreadable required input — it never reaches generation looking complete. A linked
+issue that does reach generation therefore always carries real content, which the built-in
+composer excerpts (its first paragraph) and a real provider is asked to genuinely analyse,
+including its own stated acceptance criteria. A ticket with no linked issues produces no entry at
+all, the same as any other absent supporting input.
 
 The folder name is deterministic — the same issue always produces the same
 directory, so a re-run replaces its own package instead of accumulating
@@ -308,8 +337,8 @@ a property of the control flow rather than of a cleanup routine that might fail.
 | `source_workspace_unresolved` | Map the workspace to its local source checkout (`SPECRELAY_RUNNER_WORKSPACE_ROOT_<KEY>`). |
 | `input_content_unreadable` | The bundle offers an input Platform classified as unusable. Re-read the ticket. |
 | `external_reference_analysis_unavailable` | A Confluence page or screenshot was deferred to this runner. Enable the capability or record a substitute. |
-| `graphify_unavailable` | Run `bin/graph-build` in the source checkout, or record a substitute. A **stale** graph counts as unavailable — a stale graph is not evidence. |
-| `context_plus_unavailable` | Declare Context+ available, or record what was used instead. |
+| `graphify_unavailable` | Graphify is present but incomplete, not executable, stale, or unhealthy. Repair it with `bin/graph-build`, or record a substitute. A repository with neither wrapper installed continues with direct source inspection and records that Graphify contributed nothing. |
+| `context_plus_unavailable` | Legacy result from older runners. Current runners continue with an explicit warning when Context+ is unavailable. |
 | `generation_provider_unavailable` | The configured provider command is missing or not executable. |
 | `redaction_validation_unavailable` | The redaction guard failed its own self-check; generated output cannot be proven safe. |
 
@@ -343,15 +372,15 @@ belongs here — the provider is a local executable path.
 runner:
   specification:
     provider:
-      kind: composed        # composed (built-in deterministic composer) | command
+      kind: composed        # composed (built-in deterministic composer) | claude | command
       command: /abs/path/to/spec-writer   # required for kind: command
       timeout_seconds: 900
     repository_roots:
       "SpecRelay/SpecRelay-Specs": /abs/path/to/your/specs-checkout
     on_existing_package: replace          # replace (default) | refuse
     context_plus:
-      available: true
-      # Optional. Semantic evidence YOU gathered — the runner cannot query Context+.
+      available: true       # optional declaration; never treated as proof of use
+      # Optional semantic evidence YOU gathered — the runner cannot query Context+.
       queries:
         - "where is the weekly report rendered"
       evidence: "ReportsController#weekly and ExportReport are the material hits"
@@ -374,32 +403,47 @@ unsuffixed `SPECRELAY_RUNNER_SPEC_REPOSITORY_ROOT`), `SPECRELAY_RUNNER_SPEC_PROV
 **The `substitute:` keys are not off switches.** Each is a sentence you write, and
 the runner copies it verbatim into `analysis/technical.md` and into the evidence
 Platform stores. Recording the gap is what makes proceeding honest; omitting the key
-is what makes preflight refuse. A substituted tool is reported as having contributed
-**nothing** — "we were allowed to continue without Graphify" and "Graphify produced
-evidence" are different facts and are never collapsed.
+can make preflight refuse for capabilities that must handle deferred input. A substituted
+tool is reported as having contributed **nothing** — "we were allowed to continue without
+Graphify" and "Graphify produced evidence" are different facts and are never collapsed.
 
 **Context+ is always reported as having contributed nothing.** The runner is a
 separate OS process with no MCP client, so it can neither run a semantic query nor
-verify that one ran; `context_plus.available: true` lets generation proceed and
-changes nothing about what the runner may claim. If you have gathered semantic
-evidence yourself, put it in `context_plus.queries` and `context_plus.evidence` —
-the runner reproduces both verbatim under `## Context+ evidence` and attributes them
-to you. It still does not mark the tool as having contributed, because the
-contributor was a person, not this process.
+verify that one ran. Its absence does not refuse generation: the runner records a warning
+and grounds the package in direct source inspection without semantic Context+ evidence.
+`context_plus.available: true` changes nothing about what the runner may claim. If you
+have gathered semantic evidence yourself, put it in `context_plus.queries` and
+`context_plus.evidence` — the runner reproduces both verbatim under
+`## Context+ evidence` and attributes them to you. It still does not mark the tool as
+having contributed, because the contributor was a person, not this process.
 
 #### The generation provider boundary
 
 Everything that turns evidence into prose goes through one interface with two
 methods — `describe` and `generate(packet)` — and the entire input a provider
-receives is one reviewable, redacted packet. Two implementations ship:
+receives is one reviewable, redacted packet. Three implementations ship:
 
-- **`composed`** (the default) is the built-in deterministic composer: same packet,
-  same bytes, no model, no network. It is both the test double and a genuinely usable
-  default, because it composes from the real bundle and the real source evidence.
+- **`composed`** (the default when nothing else is configured) is the built-in
+  deterministic composer: same packet, same bytes, no model, no network. It is both
+  the test double and a genuinely usable default, because it composes from the real
+  bundle and the real source evidence.
+- **`claude`** is the operator's real, already-validated Claude profile (the same one
+  `runner.executor` configures) writing the specification directly — the ordinary path
+  for an operator who wants model-authored synthesis, requiring no separate
+  configuration. Its prompt (reviewable in full in `provider.rb`) states the document
+  contract below and the synthesis discipline MVP-0028 requires: describe the
+  requested product behaviour rather than Jira labels, resolve a vague ticket
+  reference (e.g. "the text") from the title and the evidence, avoid raw
+  input-bundle or transcript dumps, and never claim a current publication or Jira
+  state a later reader could find false.
 - **`command`** runs an operator-configured local executable with the packet as JSON
   on stdin, expecting the file map as JSON on stdout. No shell, no inherited
   environment beyond `PATH`, and a throwaway working directory — the provider is
   never handed either checkout, because writing is not its job.
+
+An explicit `provider.kind` always wins; otherwise a configured Claude profile is used;
+otherwise generation refuses rather than silently falling back to the composer
+(MVP-0028 remediation, defect 1).
 
 #### What the built-in composer takes from the ticket
 
@@ -453,7 +497,27 @@ Whatever a provider returns is validated before anything is written, so a
 plausible-looking document that silently omits acceptance criteria is rejected rather
 than committed. **The document contract a provider must satisfy:**
 
-- every required section present as a `##` heading with a substantive body;
+- exactly the required keys — `spec.md`, `analysis/input-evidence.md`,
+  `analysis/business.md`, `analysis/technical.md` — plus `analysis/open-questions.md`
+  ONLY when at least one material open question exists; any other key is rejected;
+- every document opening with a `#` TITLE that names its role, matched
+  case-insensitively as a substring so your own wording and separator are yours to
+  choose: `spec.md` names its ticket's key, `input-evidence.md` names "input evidence",
+  `business.md` "business analysis", `technical.md` "technical analysis", and
+  `open-questions.md` "open questions". Promoting a `##` section name to the title does
+  not satisfy this;
+- no line that is entirely a parenthesised aside about the document's own construction
+  ("placeholder", "content follows", "as instructed", "per the instructions", "omitted
+  for brevity") — these documents carry specification content and nothing else;
+- every SECTIONED document's required section present as a `##` heading with a
+  substantive body (`spec.md`, the two analyses — `input-evidence.md` and
+  `open-questions.md` have no fixed heading list, since each is a variable number of
+  per-input or per-question entries);
+- a present `open-questions.md` names at least one `## OQ-nnn` heading, each with a
+  unique id — its own presence asserts that a question exists;
+- each question heading's body has exactly one nonblank "Why it blocks", "Decision
+  required", and "Consequence" bullet — missing, duplicated, blank, or any other bullet
+  is rejected (review 006 finding F1);
 - that heading **outside** every fenced code block — a heading that exists only
   inside a fence is not a heading, and counts as absent;
 - **balanced fences**: a code block opened and never closed fails validation, because

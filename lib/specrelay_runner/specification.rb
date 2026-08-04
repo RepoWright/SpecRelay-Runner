@@ -44,15 +44,19 @@ end
 require_relative "specification/markdown"
 require_relative "specification/ticket_sections"
 require_relative "specification/assignment"
+require_relative "specification/repository_slug"
+require_relative "specification/balanced_json"
 require_relative "specification/settings"
 require_relative "specification/package_path"
+require_relative "specification/provider"
+require_relative "specification/reference_analyzer"
 require_relative "specification/input_evidence"
 require_relative "specification/source_evidence"
 require_relative "specification/packet"
 require_relative "specification/composer"
 require_relative "specification/document_set"
-require_relative "specification/provider"
 require_relative "specification/package_writer"
+require_relative "specification/previous_specification_package"
 require_relative "specification/preflight"
 require_relative "specification/generation"
 # MVP-0027 — the lane's third phase: publish the generated package as a draft pull request.
@@ -66,8 +70,14 @@ require_relative "specification/generation"
 #
 # The same two properties hold as for generation: nothing mutates a repository before
 # PackageVerification succeeds, and nothing in this namespace requires Rails or reaches Jira.
+#
+# MVP-0028 adds ONE class to that list and no new capability: ExistingPullRequest, which reads
+# and validates the specification pull request a ticket already has, so a second run for one
+# ticket updates that pull request instead of opening another. It still reaches no Jira — the
+# URL arrives in the assignment, Platform having read it from the ticket.
 require_relative "specification/package_verification"
 require_relative "specification/git_commands"
+require_relative "specification/existing_pull_request"
 require_relative "specification/git_publisher"
 require_relative "specification/pull_request_publisher"
 require_relative "specification/publication"

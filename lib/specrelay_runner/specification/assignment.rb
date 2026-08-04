@@ -96,6 +96,42 @@ module SpecrelayRunner
       def target_owner = target["owner"].to_s
       def target_repository = target["repository"].to_s
 
+      # MVP-0028 decision D6 — the pull request Jira's `Spec PR` field already named for this
+      # TICKET at THIS run's own intake, or "" for a first specification. Present on a
+      # `specification_revision` block Platform sends on EVERY spec_creation assignment, unlike
+      # `existing_pull_request_url` below, which only exists on a publication assignment. A
+      # generation that finds one here is a REVISION: {Preflight} validates it exactly as
+      # {ExistingPullRequest} validates a publication's, then reads the previous package from its
+      # branch as revision context.
+      def revision_pull_request_url = section("specification_revision")["existing_pull_request_url"].to_s
+
+      # The real provider profile the operator selected in Platform's Project Setup, or nil when
+      # they selected the deterministic fixture — which this lane cannot use, and which
+      # {Provider.resolve} must therefore refuse rather than quietly substitute the composer for.
+      #
+      # MVP-0028 remediation, defect 4. The specification lane LAUNCHES a provider, but until now
+      # it resolved one from this runner's own YAML alone (`Config#selected_claude_profile`). A
+      # guided connection writes no YAML at all, so a project whose operator had correctly selected
+      # "Claude Code (real provider)" in Project Setup refused every generation with
+      # `generation_provider_unavailable`. The selection is Platform's fact and had no channel to
+      # travel through; this is that channel, and it is the same one the implementation lane has
+      # always used (`payload["executor"]`).
+      #
+      # {ClaudeProfile} validates the argv it is handed and raises on anything it will not launch,
+      # so this reads a profile that Platform NAMED, not a command Platform may run. That
+      # independent refusal is what keeps a Platform-supplied block from being an arbitrary
+      # instruction — the same guarantee `Execution#guard_selected_executor!` relies on.
+      def selected_claude_profile
+        executor = section("specification_provider")["executor"].to_h
+
+        ClaudeProfile.selected?(executor) ? ClaudeProfile.new(executor) : nil
+      end
+
+      # What Platform says was selected, for a refusal that can name it. "fake" is the ordinary
+      # reason `selected_claude_profile` is nil, and an operator reading "no provider is
+      # configured" when they DID configure one deserves to be told which one they picked.
+      def selected_provider_profile = section("specification_provider")["profile"].to_s
+
       # Every input the bundle recorded, as plain hashes with string keys. The runner reads
       # them but never trusts them as file paths or commands — they are evidence metadata.
       def inputs = Array(section("input_bundle")["inputs"]).map { |entry| entry.to_h }
@@ -142,6 +178,14 @@ module SpecrelayRunner
       def publication_slug = publication["slug"].to_s
       def create_pull_request? = publication["create_pull_request"] == true
       def draft_pull_request? = publication["pull_request_draft"] == true
+
+      # MVP-0028 criterion 3 — the pull request Jira's `Spec PR` field already names for this
+      # TICKET, or "" for a first publication. Platform checked it is a pull request on the
+      # configured specification repository and stopped there, because it holds no GitHub
+      # credentials; {ExistingPullRequest} is what asks GitHub whether it is usable and takes its
+      # head branch. Absent for a first publication, which is what tells the runner to use
+      # `publication_branch` instead.
+      def existing_pull_request_url = publication["existing_pull_request_url"].to_s
 
       # The package Platform RECORDED at generation, with a digest per file. This is the
       # evidence the runner verifies its local checkout against before it is allowed to touch

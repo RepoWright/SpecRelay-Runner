@@ -28,11 +28,14 @@ module SpecrelayRunner
     class Packet
       def self.build(**kwargs) = new(**kwargs).build
 
-      def initialize(assignment:, source:, inputs:, package_path:)
+      # +revision+ is nil for a first specification, or a {PreviousSpecificationPackage::Result}
+      # when this generation is a same-ticket REVISION (MVP-0028 decision D6).
+      def initialize(assignment:, source:, inputs:, package_path:, revision: nil)
         @assignment = assignment
         @source = source
         @inputs = inputs
         @package_path = package_path
+        @revision = revision
       end
 
       def build
@@ -42,13 +45,14 @@ module SpecrelayRunner
           "package" => package_block,
           "input_bundle" => bundle_block,
           "source" => source_block,
-          "tool_evidence" => tool_evidence_block
+          "tool_evidence" => tool_evidence_block,
+          "revision" => revision_block
         }
       end
 
       private
 
-      attr_reader :assignment, :source, :inputs, :package_path
+      attr_reader :assignment, :source, :inputs, :package_path, :revision
 
       def issue_block
         {
@@ -87,7 +91,15 @@ module SpecrelayRunner
         {
           "kind" => clean(input.kind), "name" => clean(input.name),
           "read_status" => clean(input.read_status), "used" => input.readable?,
-          "note" => clean(input.note.to_s), "reference" => clean(input.reference.to_s)
+          "note" => clean(input.note.to_s), "reference" => clean(input.reference.to_s),
+          # MVP-0028 remediation, defect 2 (F2 correction): Platform's own classification reason —
+          # e.g. "3 readable" for the linked-issues collection — was already read into
+          # `input.reason` and already allowlisted for the assignment (SpecCreationPayload::
+          # INPUT_FIELDS), but never left this process. Without it, a provider cannot tell "Jira
+          # exposed zero linked issues" from "Jira exposed some, but not their content" — the
+          # distinction {Composer} needs to report a linked issue honestly instead of either
+          # inventing analysis or manufacturing a limitation nobody asked about.
+          "reason" => clean(input.reason.to_s)
         }
       end
 
@@ -106,6 +118,16 @@ module SpecrelayRunner
           { "name" => tool.name, "usable" => tool.usable?, "contributed" => tool.contributed?,
             "summary" => clean(tool.summary), "detail" => clean(tool.detail.to_s) }
         end
+      end
+
+      # nil for a first specification. For a same-ticket REVISION (MVP-0028 decision D6), the
+      # previous package's own files — read off its pull request's branch, never from provider
+      # payloads or Platform's digest record — so the provider can revise from the real prior
+      # text instead of writing one with no memory of it.
+      def revision_block
+        return nil if revision.nil?
+
+        { "previous_files" => revision.files.transform_values { |content| clean(content) } }
       end
 
       # Every string in the packet passes through here. Applying redaction at the boundary

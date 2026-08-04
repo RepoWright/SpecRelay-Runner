@@ -122,16 +122,39 @@ class SpecificationPreflightTest < Minitest::Test
     assert_includes @io.string, "graphify.substitute"
   end
 
-  def test_missing_graphify_wrappers_with_no_substitute_refuse
+  def test_missing_graphify_wrappers_use_direct_source_inspection_without_a_substitute
     rebuild_source(graph: :missing)
+    start_platform(spec_creation_payload_for(issue_key: ISSUE))
+    exit_code = run_cli(config: build_config)
 
-    assert_refusal "graphify_unavailable"
-    assert_includes @io.string, "bin/graph-check"
+    assert_equal SpecrelayRunner::CLI::SUCCESS, exit_code, @io.string
+    technical = File.read(File.join(@specs, "specs", "SR-700-add-an-export-button", "analysis", "technical.md"))
+    assert_includes technical, "Graphify is not installed for this checkout"
+    assert_includes technical, "Result: did NOT contribute evidence"
+    warnings = @platform.last_specification_generation["warnings"]
+    assert_includes warnings, "Graphify is not installed for this checkout; direct source inspection was used instead."
   end
 
-  def test_context_plus_neither_available_nor_substituted_refuses
-    assert_refusal "context_plus_unavailable", context_plus: false
-    assert_includes @io.string, "context_plus.substitute"
+  def test_a_partial_graphify_installation_still_refuses
+    rebuild_source(graph: :fresh)
+    FileUtils.rm(File.join(@source, "bin", "graph-query"))
+
+    assert_refusal "graphify_unavailable"
+    assert_includes @io.string, "incomplete or not executable"
+  end
+
+  def test_context_plus_neither_available_nor_substituted_continues_with_an_explicit_warning
+    start_platform(spec_creation_payload_for(issue_key: ISSUE))
+    config = build_config(context_plus: false)
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli(config: config), @io.string
+    warning = "Context+ is not available on this runner; direct source inspection was used without " \
+              "semantic Context+ evidence."
+    assert_includes @platform.last_specification_generation["warnings"], warning
+    tool = @platform.last_specification_generation["tool_evidence"]
+             .find { |entry| entry["name"] == "context_plus" }
+    refute tool["usable"]
+    refute tool["contributed"]
   end
 
   def test_a_configured_provider_command_that_is_missing_refuses
@@ -180,6 +203,7 @@ class SpecificationPreflightTest < Minitest::Test
     # CR-001 must-fix 2; the property this line protects — a substituted tool is recorded as
     # having contributed nothing — did not.
     assert_includes technical, "Result: did NOT contribute evidence"
+    refute @platform.last_specification_generation["warnings"].any? { |warning| warning.include?("not installed") }
   end
 
   def test_a_substituted_external_reference_is_a_warning_rather_than_a_refusal

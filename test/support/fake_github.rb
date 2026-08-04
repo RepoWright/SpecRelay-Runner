@@ -35,6 +35,8 @@ module FakeGithub
   #         "list_fails_once" — the FIRST `pr list` fails, later ones succeed, so a
   #                             retry after a transient error can be exercised
   #         "list_garbage"    — `pr list` exits 0 with unparseable stdout
+  #         "view_fails"      — `pr view` fails (the pull request is gone, or the API is
+  #                             unreachable); MVP-0028's "cannot be inspected safely" case
   #
   # `bare` lets the fake resolve REAL head shas from the bare remote, so `headRefOid`
   # is a fact rather than a fixture. `seed` pre-populates pull requests (each a hash of
@@ -119,6 +121,21 @@ module FakeGithub
           end
           puts JSON.generate(rows)
           exit 0
+        when "view"
+          # MVP-0028: `gh pr view <url> --json ...`. Answered from the SAME state file `pr list`
+          # reads, so a pull request seeded as closed, on the wrong base, or from a fork is one
+          # fact rather than two that can disagree.
+          abort("gh: could not resolve to a PullRequest (simulated)") if MODE == "view_fails"
+          wanted = ARGV[2]
+          row = prs.find { |pr| pr["url"].to_s == wanted }
+          abort("gh: no pull request found for \#{wanted}") if row.nil?
+          row = row.merge("headRefOid" => head_oid(row["headRefName"])) if row["headRefOid"].to_s == "live"
+          puts JSON.generate({ "url" => row["url"], "state" => row["state"],
+                               "headRefName" => row["headRefName"],
+                               "baseRefName" => row.fetch("baseRefName", "main"),
+                               "isDraft" => row.fetch("isDraft", true),
+                               "isCrossRepository" => row.fetch("isCrossRepository", false) })
+          exit 0
         when "create"
           abort("gh: pull request creation failed (simulated)") if MODE == "create_fails"
           head = flag("--head")
@@ -143,6 +160,7 @@ module FakeGithub
   end
 
   def pr_lists(log) = invocations(log).count { |line| line.start_with?("pr list") }
+  def pr_views(log) = invocations(log).count { |line| line.start_with?("pr view") }
 
   def invocations(log) = File.exist?(log) ? File.read(log).lines.map(&:strip).reject(&:empty?) : []
   def pr_creates(log) = invocations(log).count { |line| line.start_with?("pr create") }

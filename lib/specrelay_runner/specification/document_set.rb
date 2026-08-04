@@ -2,8 +2,10 @@
 
 module SpecrelayRunner
   module Specification
-    # The three generated documents, and the gate every provider's output must pass before
-    # any of it reaches disk (MVP-0026 scope 9, criteria 2-4).
+    # The generated documents — spec.md, its required input evidence, business and technical
+    # analyses, and its OPTIONAL open questions — and the gate every provider's output must pass
+    # before any of it reaches disk (MVP-0026 scope 9, criteria 2-4; MVP-0028 remediation,
+    # defect 3 adds the evidence and open-question files).
     #
     # A generation provider is the one component here whose output this runner cannot
     # predict — a configured external command may be a language model, and a language model
@@ -31,11 +33,15 @@ module SpecrelayRunner
       # Required `##` sections per document, in the order a reader meets them. Criterion 2
       # for the specification, 3 for the business analysis, 4 for the technical analysis —
       # each line here traces to one required element in the spec.
+      # `INPUT_EVIDENCE_MD` and `OPEN_QUESTIONS_MD` (MVP-0028 remediation, defect 3) deliberately
+      # have no entry here: one is a variable number of per-input entries and the other is a
+      # variable number of `## OQ-nnn` questions, neither of which fits a fixed heading list.
+      # Both still go through the fence and minimum-length checks in `#validate_document`, and
+      # `OPEN_QUESTIONS_MD` additionally through `#validate_open_question_ids!`.
       REQUIRED_SECTIONS = {
         PackagePath::SPEC_MD => [
           "Problem", "Outcome", "Input summary", "Proposed behavior", "Non-goals",
-          "Acceptance criteria", "Validation expectations",
-          "Dependencies, assumptions, and open questions", "Analysis"
+          "Acceptance criteria", "Validation expectations", "Dependencies and assumptions", "Analysis"
         ].freeze,
         PackagePath::BUSINESS_MD => [
           "User problem and affected workflow", "Stakeholder impact",
@@ -50,17 +56,100 @@ module SpecrelayRunner
         ].freeze
       }.freeze
 
+      # The ROLE each document's `#` title must name, matched case-insensitively as a substring
+      # (MVP-0028 remediation, defect 10).
+      #
+      # A substring of a role, not an exact title, because real providers word a title differently
+      # and all of the wordings below are honest: "Input evidence — SR-700", "Supporting input
+      # evidence — SR-700", "Technical Analysis: SR-700". Pinning the exact string would reject
+      # correct documents and teach an operator to fight the gate rather than fix the package.
+      #
+      # What it is NOT is "does the document start with a `#`". The live MAPIAI-53 revision
+      # returned a technical analysis titled "# Source entry points inspected" — its own first
+      # required SECTION name, promoted to H1 and then repeated as the H2 below it. Every `##`
+      # section was present, so every check this class had passed it, and a package whose
+      # technical analysis had no title reached a pull request. A section name is not a title.
+      #
+      # `SPEC_MD` is the one whose role is the TICKET rather than a document kind: the
+      # specification is titled for the thing it specifies, which both the built-in composer
+      # ("SR-700: add an export button") and a real model ("SR-700 — Add an export button")
+      # already do. Its role is therefore supplied per call — see `#validate!`.
+      REQUIRED_TITLE_ROLES = {
+        PackagePath::INPUT_EVIDENCE_MD => "input evidence",
+        PackagePath::BUSINESS_MD => "business analysis",
+        PackagePath::TECHNICAL_MD => "technical analysis",
+        PackagePath::OPEN_QUESTIONS_MD => "open questions"
+      }.freeze
+
+      # A whole line that is nothing but a parenthesised aside about the document's own
+      # construction — the provider narrating its instructions instead of writing content. The
+      # live run emitted "(placeholder-free content follows)" directly under the broken title.
+      #
+      # Deliberately narrow: the line must be ENTIRELY a parenthetical, and it must carry one of
+      # these phrases. That is a lexical net rather than a structural proof, and it is the
+      # SECONDARY guard here — the title check above is the one that catches the defect class.
+      # A wider rule (any standalone parenthetical, any mention of "template") would reject
+      # legitimate asides, and a gate an operator learns to distrust is worse than none.
+      SCAFFOLDING_PHRASES = [
+        "placeholder", "content follows", "as instructed", "per the instructions", "omitted for brevity"
+      ].freeze
+      SCAFFOLDING_LINE = /\A\(([^()]*)\)\z/
+
       # A section heading with nothing under it satisfies a naive "does it contain the
       # words" check while telling a reader nothing. This is the floor below which a
       # section counts as absent.
       MIN_SECTION_BODY_CHARS = 40
 
-      # A whole document below this is not a specification, whatever headings it carries.
+      # A whole SECTIONED document (spec.md, business.md, technical.md) below this is not a
+      # specification, whatever headings it carries.
       MIN_DOCUMENT_CHARS = 400
+
+      # `input-evidence.md` and `open-questions.md` are legitimately short — a single input, or
+      # a single question, or (for input evidence) one sentence saying no supporting input was
+      # recorded. Holding them to `MIN_DOCUMENT_CHARS` would reject an honest minimal document
+      # for being exactly what it should be.
+      MIN_SUPPLEMENTARY_DOCUMENT_CHARS = 40
+
+      # A stable open-question id, exactly as spec.md's "Generated evidence and open questions"
+      # requires: "use stable question ids such as OQ-001". Reused as both the heading pattern
+      # `#validate_open_question_ids!` scans for and the pattern `#open_questions` parses.
+      OPEN_QUESTION_HEADING = /\A##[ \t]+(OQ-\d+)\b/
+
+      # The exact, closed set of fields spec.md's own contract requires per question: "why it
+      # blocks, the exact decision required and the consequence" — no more, no fewer. Review 006
+      # finding F1: a provider could omit "Decision required" while `#open_questions` silently
+      # substituted the first bullet it found, so Platform displayed unrelated text as though it
+      # were the decision the Product Owner must answer. Validating this at the boundary — not
+      # trusting a parser's fallback to paper over a malformed entry — is what makes "every
+      # question has a decision" a property of the package rather than of this parser's luck.
+      REQUIRED_QUESTION_FIELDS = [ "why it blocks", "decision required", "consequence" ].freeze
+
+      # MVP-0028 decision D6 — a same-ticket revision may carry forward a question the PREVIOUS
+      # package raised and the current ticket has now settled. Retaining its own "## OQ-nnn"
+      # heading (spec.md's own rule: "retain it on later runs so resolved history remains
+      # visible") with the open three-field body would misrepresent it as still blocking, so a
+      # resolved entry uses this DIFFERENT closed field set instead — "status" is what
+      # distinguishes the two shapes from each other (see `#resolved?`). Absent entirely, a body
+      # is judged against {REQUIRED_QUESTION_FIELDS} exactly as it always has been: every package
+      # ever generated before this decision omitted "status", so the open shape must keep meaning
+      # "open" with no field added, and only a body that explicitly opts in is held to the second
+      # shape.
+      REQUIRED_RESOLVED_QUESTION_FIELDS = [ "status", "decision", "source" ].freeze
+      RESOLVED_STATUS = "resolved"
+
+      # Sentinel distinct from `nil` (itself a valid `question_fields` key, for an unlabelled
+      # bullet) meaning "no bullet has been seen yet in this body" — text before the first bullet
+      # is filed under `nil` exactly once rather than merged into whatever bullet comes next.
+      NO_BULLET_YET = :no_bullet_yet
+      private_constant :NO_BULLET_YET
 
       attr_reader :files
 
-      def self.validate!(files) = new(files).validate!
+      # `issue_key` is required for validation and absent from `.new`, because only the TITLE
+      # check needs it: `spec.md`'s title is the ticket's own, so proving the document is this
+      # ticket's specification means proving its title names this ticket. Parsing open questions
+      # needs no such context, and demanding one there would be ceremony.
+      def self.validate!(files, issue_key:) = new(files).validate!(issue_key: issue_key)
 
       def initialize(files)
         @files = files.to_h { |name, content| [ name.to_s, content.to_s ] }
@@ -69,58 +158,222 @@ module SpecrelayRunner
       # Raises Invalid on the FIRST structural problem, naming the document and the section.
       # A provider whose output is rejected must be able to see what to fix from the message
       # alone; "invalid output" would send the operator to read this class.
-      def validate!
+      def validate!(issue_key:)
         missing = PackagePath::REQUIRED_FILES - files.keys
         raise Invalid, "the provider returned no #{missing.join(', ')}" if missing.any?
 
         extra = files.keys - PackagePath::ALL_FILES
         raise Invalid, "the provider returned unexpected files: #{extra.sort.join(', ')}" if extra.any?
 
-        PackagePath::REQUIRED_FILES.each { |name| validate_document(name) }
+        validated_names.each { |name| validate_document(name, issue_key) }
         self
+      end
+
+      # The required files, plus `OPEN_QUESTIONS_MD` only when the provider actually included
+      # it — an absent optional file is not a structural problem; a present-but-broken one is.
+      def validated_names
+        PackagePath::REQUIRED_FILES + (files.key?(PackagePath::OPEN_QUESTIONS_MD) ?
+          [ PackagePath::OPEN_QUESTIONS_MD ] : [])
       end
 
       # Every generated file, keyed by its package-relative path. Ordered so the manifest
       # and the digest list are stable across runs.
       def each_file(&block) = PackagePath::ALL_FILES.select { |name| files.key?(name) }.each(&block)
 
-      # The open questions the generated specification raises, read back out of the document
-      # rather than passed alongside it.
+      # The open questions the generated specification raises, read back out of
+      # `analysis/open-questions.md` rather than passed alongside it.
       #
       # Reading them from the file is what makes this work for EVERY provider. A configured
       # external command returns Markdown and nothing else, so a structured side-channel
       # would be populated only by the built-in composer — and Platform's run page would then
       # show open questions for one provider and none for the other, which is worse than
-      # showing none at all. The `### Open questions` subheading is part of the documented
-      # document contract, so parsing it is reading the contract, not guessing at prose.
-      OPEN_QUESTIONS_HEADING = "### Open questions"
-
+      # showing none at all. The `## OQ-nnn` heading and its `- Decision required:` bullet are
+      # part of the documented document contract (MVP-0028 remediation, defect 3), so parsing
+      # them is reading the contract, not guessing at prose — the decision, not "why it blocks",
+      # is the one field that actually distinguishes one question from another for a reader
+      # scanning a list. Absent the file, there are no questions — spec.md's own rule is to omit
+      # the file entirely rather than write an empty one.
+      #
+      # A RESOLVED entry (MVP-0028 decision D6) is excluded here: this list is what Platform
+      # shows as what THIS run still needs a decision on, and a question the current ticket
+      # already settled is history, not a live blocker. Its heading and body still exist in the
+      # file itself, unabridged — only this summary omits it.
       def open_questions
-        body = subsection_body(files.fetch(PackagePath::SPEC_MD, ""), OPEN_QUESTIONS_HEADING)
-        body.to_s.lines.filter_map do |line|
-          text = line.strip
-          next unless text.start_with?("- ")
+        content = files[PackagePath::OPEN_QUESTIONS_MD]
+        return [] if content.nil?
 
-          question = text.delete_prefix("- ").strip
-          question unless question.downcase.start_with?("none")
+        headings = open_question_headings(content)
+        headings.each_with_index.filter_map do |(line, number), index|
+          id = line.chomp[OPEN_QUESTION_HEADING, 1]
+          body = question_body(content, number, headings[index + 1]&.last)
+          fields = question_fields(body)
+          next if resolved?(fields)
+
+          # `validate!` has already proven this body carries exactly one nonblank "Decision
+          # required" field before this is ever reached (see Generation, which validates before
+          # reading `#open_questions` back out) — so there is no fallback branch here. A body that
+          # does not have one is a bug in validation, not a shape this method is asked to survive.
+          "#{id}: #{fields.fetch('decision required').first}"
         end
       end
 
       private
 
-      # The lines under one `###` subheading, up to the next heading of any level. Separate
-      # from #section_body because that one deliberately treats `###` as part of the body.
-      def subsection_body(content, heading)
-        bounded_body(content, /\A#{Regexp.escape(heading)}\z/, /\A\#{1,3}[ \t]+\S/)
+      def resolved?(fields) = fields["status"]&.first.to_s.casecmp?(RESOLVED_STATUS)
+
+      def open_question_headings(content)
+        Markdown.structural_lines(content).select { |line, _number| OPEN_QUESTION_HEADING.match?(line.chomp) }
       end
 
-      def validate_document(name)
+      def question_body(content, start_number, finish_number)
+        lines = content.lines
+        lines[start_number..(finish_number ? finish_number - 2 : lines.length - 1)].to_a.join
+      end
+
+      # Parses a question body into its labelled bullets, keyed by the LOWERCASED label text
+      # before each bullet's first colon (e.g. `"decision required"`). A field's wrapped
+      # continuation lines join into one value — a real provider may soft-wrap
+      # "- Why it blocks: ..." across two source lines, and a continuation line is not a second,
+      # unlabelled bullet. A bullet with no recognised label, or any non-blank line before the
+      # first bullet, is filed under `nil` so validation can report it as unexpected rather than
+      # silently dropping it.
+      #
+      # Returns a Hash of label => Array of value strings, one per occurrence — a label appearing
+      # twice keeps both, which is exactly what lets validation detect the duplicate instead of
+      # silently keeping the last one written.
+      def question_fields(body)
+        fields = Hash.new { |hash, key| hash[key] = [] }
+        current = NO_BULLET_YET
+        body.lines.map(&:strip).each do |line|
+          next if line.empty?
+
+          if line.start_with?("-")
+            label, separator, value = line.delete_prefix("-").strip.partition(":")
+            current = separator.empty? ? nil : label.strip.downcase
+            fields[current] << value.strip
+          elsif current == NO_BULLET_YET
+            fields[nil] << line
+          else
+            fields[current][-1] = "#{fields[current][-1]} #{line}".strip
+          end
+        end
+        fields
+      end
+
+      def validate_document(name, issue_key)
         content = files.fetch(name)
+        floor = REQUIRED_SECTIONS.key?(name) ? MIN_DOCUMENT_CHARS : MIN_SUPPLEMENTARY_DOCUMENT_CHARS
         raise Invalid, "#{name} is too short to be a generated document (#{content.length} characters)" if
-          content.strip.length < MIN_DOCUMENT_CHARS
+          content.strip.length < floor
 
         validate_fences!(name, content)
-        REQUIRED_SECTIONS.fetch(name).each { |section| validate_section(name, content, section) }
+        validate_title!(name, content, issue_key)
+        validate_scaffolding!(name, content)
+        REQUIRED_SECTIONS.fetch(name, []).each { |section| validate_section(name, content, section) }
+        validate_open_questions!(content) if name == PackagePath::OPEN_QUESTIONS_MD
+      end
+
+      # The document must OPEN with a level-1 heading naming its role. Checked against the
+      # structural lines, so a title that exists only inside a fenced block is absent — the same
+      # answer `#bounded_body` gives a heading in the same position, and for the same reason: a
+      # reader never sees it.
+      def validate_title!(name, content, issue_key)
+        title = document_title(content)
+        raise Invalid, "#{name} does not open with a level-1 title (\"# …\"); its first line is " \
+                       "#{first_structural_line(content).inspect}" if title.nil?
+
+        role = REQUIRED_TITLE_ROLES.fetch(name, issue_key.to_s)
+        return if !role.empty? && title.downcase.include?(role.downcase)
+
+        raise Invalid, "#{name} is titled #{title.inspect}, which does not name the document: " \
+                       "its title must contain #{role.inspect}"
+      end
+
+      def document_title(content)
+        line = first_structural_line(content)
+        return nil unless line.start_with?("# ")
+
+        line.delete_prefix("#").strip
+      end
+
+      def first_structural_line(content)
+        Markdown.structural_lines(content).map { |line, _number| line.chomp }
+                .find { |line| !line.strip.empty? }.to_s
+      end
+
+      def validate_scaffolding!(name, content)
+        Markdown.structural_lines(content).each do |line, number|
+          inside = line.chomp.strip[SCAFFOLDING_LINE, 1]
+          next if inside.nil? || SCAFFOLDING_PHRASES.none? { |phrase| inside.downcase.include?(phrase) }
+
+          raise Invalid, "#{name} line #{number} is provider scaffolding rather than specification " \
+                         "content: #{line.chomp.strip.inspect}"
+        end
+      end
+
+      # A present `open-questions.md` exists BECAUSE synthesis found at least one material
+      # question — so one with no `## OQ-nnn` heading at all contradicts its own presence, and
+      # a repeated id would make Platform's and a later run's reference to "OQ-001" ambiguous.
+      # Review 006 finding F1 adds the per-question field check: a heading alone no longer
+      # certifies a question, because a body with no "Decision required" bullet used to pass this
+      # gate and reach `#open_questions` only to have its parser guess.
+      def validate_open_questions!(content)
+        headings = open_question_headings(content)
+        ids = headings.filter_map { |line, _number| line.chomp[OPEN_QUESTION_HEADING, 1] }
+        raise Invalid, "#{PackagePath::OPEN_QUESTIONS_MD} exists but names no open question " \
+                       "(expected a \"## OQ-nnn\" heading)" if ids.empty?
+
+        duplicates = ids.tally.select { |_id, count| count > 1 }.keys
+        raise Invalid, "#{PackagePath::OPEN_QUESTIONS_MD} reuses question id(s): #{duplicates.join(', ')}" if
+          duplicates.any?
+
+        headings.each_with_index do |(_line, number), index|
+          body = question_body(content, number, headings[index + 1]&.last)
+          validate_open_question_fields!(ids[index], body)
+        end
+      end
+
+      # Every question body must carry exactly one nonblank occurrence of each field in
+      # {REQUIRED_QUESTION_FIELDS} and nothing else — no missing field, no duplicate, no blank
+      # value, and no extra or misspelled bullet the parser would otherwise silently ignore. One
+      # failure is reported per call, in the order a reader would want to fix them: what is
+      # missing outright, then what is duplicated, then what is present but empty, then what does
+      # not belong.
+      # MVP-0028 decision D6 — a body opts into the RESOLVED shape solely by carrying a "status"
+      # bullet; every package generated before this decision has none, so the absence of that
+      # one field is what keeps every one of them validating exactly as it always did. A body
+      # that opts in with anything other than "resolved" is rejected as an unrecognized status
+      # rather than silently accepted as open, which would let a typo pass as a live question.
+      def validate_open_question_fields!(id, body)
+        fields = question_fields(body)
+
+        if fields.key?("status")
+          validate_question_field_set!(id, fields, REQUIRED_RESOLVED_QUESTION_FIELDS)
+          status = fields.fetch("status").first
+          raise Invalid, "#{PackagePath::OPEN_QUESTIONS_MD} #{id} has an unrecognized status: " \
+                         "#{status.inspect} (expected #{RESOLVED_STATUS.inspect})" unless
+            status.casecmp?(RESOLVED_STATUS)
+        else
+          validate_question_field_set!(id, fields, REQUIRED_QUESTION_FIELDS)
+        end
+      end
+
+      def validate_question_field_set!(id, fields, required_fields)
+        missing = required_fields - fields.keys
+        raise Invalid, "#{PackagePath::OPEN_QUESTIONS_MD} #{id} is missing required field(s): " \
+                       "#{missing.join(', ')}" if missing.any?
+
+        duplicated = required_fields.select { |label| fields.fetch(label).length > 1 }
+        raise Invalid, "#{PackagePath::OPEN_QUESTIONS_MD} #{id} has duplicate field(s): " \
+                       "#{duplicated.join(', ')}" if duplicated.any?
+
+        blank = required_fields.select { |label| fields.fetch(label).first.empty? }
+        raise Invalid, "#{PackagePath::OPEN_QUESTIONS_MD} #{id} has a blank field: " \
+                       "#{blank.join(', ')}" if blank.any?
+
+        unexpected = fields.keys - required_fields
+        raise Invalid, "#{PackagePath::OPEN_QUESTIONS_MD} #{id} has an unexpected field: " \
+                       "#{unexpected.map { |label| label || '(unlabelled bullet)' }.join(', ')}" if unexpected.any?
       end
 
       # A document with an unterminated fenced code block is not a valid document, whatever

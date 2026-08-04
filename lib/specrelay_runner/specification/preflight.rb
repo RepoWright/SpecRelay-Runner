@@ -35,12 +35,20 @@ module SpecrelayRunner
       CONTEXT_PLUS_UNAVAILABLE = "context_plus_unavailable"
       GENERATION_PROVIDER_UNAVAILABLE = "generation_provider_unavailable"
       REDACTION_VALIDATION_UNAVAILABLE = "redaction_validation_unavailable"
+      # MVP-0028 decision D6 — a same-ticket revision fails CLOSED at two distinct points, each
+      # with its own operator-actionable remedy: the pull request itself is unusable (closed,
+      # merged, wrong repository, wrong base, unreadable — the same judgment {ExistingPullRequest}
+      # already makes at publication time), or it is usable but its previous package could not be
+      # read off its branch (a git-level failure, or the branch genuinely carries none).
+      SPECIFICATION_REVISION_PULL_REQUEST_UNUSABLE = "specification_revision_pull_request_unusable"
+      SPECIFICATION_REVISION_UNREADABLE = PreviousSpecificationPackage::UNREADABLE
 
       FAILURE_CLASSES = [
         ASSIGNMENT_MALFORMED, SPECIFICATION_REPOSITORY_UNRESOLVED, SPECIFICATION_FOLDER_UNSAFE,
         SPECIFICATION_FOLDER_UNWRITABLE, EXISTING_PACKAGE_PRESENT, SOURCE_WORKSPACE_UNRESOLVED,
         INPUT_CONTENT_UNREADABLE, EXTERNAL_REFERENCE_ANALYSIS_UNAVAILABLE, GRAPHIFY_UNAVAILABLE,
-        CONTEXT_PLUS_UNAVAILABLE, GENERATION_PROVIDER_UNAVAILABLE, REDACTION_VALIDATION_UNAVAILABLE
+        CONTEXT_PLUS_UNAVAILABLE, GENERATION_PROVIDER_UNAVAILABLE, REDACTION_VALIDATION_UNAVAILABLE,
+        SPECIFICATION_REVISION_PULL_REQUEST_UNUSABLE, SPECIFICATION_REVISION_UNREADABLE
       ].freeze
 
       # A refusal. `message` is written for the operator who has to fix it, so it names the
@@ -51,7 +59,10 @@ module SpecrelayRunner
 
       # Everything the later stages need, gathered once. Passing this forward rather than
       # re-deriving is what guarantees the writer targets the very path preflight validated.
-      Ready = Struct.new(:package_path, :checkout_root, :source, :inputs, :provider, keyword_init: true) do
+      # `revision` is nil for a first specification and a {PreviousSpecificationPackage::Result}
+      # for a same-ticket revision (MVP-0028 decision D6).
+      Ready = Struct.new(:package_path, :checkout_root, :source, :inputs, :provider, :revision,
+                        keyword_init: true) do
         def refused? = false
       end
 
@@ -99,7 +110,16 @@ module SpecrelayRunner
       end
 
       def gather_and_verify(checkout, package, source_root)
-        inputs = InputEvidence.gather(assignment: assignment, settings: settings)
+        # Resolved ONCE, before anything reads it, because it can refuse: a profile Platform
+        # named but this runner will not launch has to become a refusal here rather than an
+        # exception raised from inside evidence gathering.
+        profile = claude_profile
+        return profile if profile.is_a?(Refusal)
+
+        # The SAME real Claude profile {resolve_provider} would use, offered here as the ordinary
+        # external-reference analyzer (MVP-0028 remediation, defect 2 — review-005 finding F2).
+        inputs = InputEvidence.gather(assignment: assignment, settings: settings, env: env,
+                                      claude_profile: profile)
         blocked = check_inputs(inputs)
         return blocked if blocked
 
@@ -107,25 +127,62 @@ module SpecrelayRunner
         tools = check_tools(source)
         return tools if tools
 
-        provider = resolve_provider
+        provider = resolve_provider(profile)
         return provider if provider.is_a?(Refusal)
 
         redaction = check_redaction
         return redaction if redaction
 
+        revision = resolve_revision(checkout, package)
+        return revision if revision.is_a?(Refusal)
+
         Ready.new(package_path: package, checkout_root: checkout, source: source, inputs: inputs,
-                  provider: provider)
+                  provider: provider, revision: revision)
+      end
+
+      # MVP-0028 decision D6 — nil for a first specification. For a same-ticket revision, this
+      # runs the identical judgment {ExistingPullRequest} makes at publication time (the pull
+      # request must exist, be open, target the configured base, and belong to this repository)
+      # against `specification_target`'s facts rather than `publication`'s — the only section
+      # available this early — then reads the previous package off its branch.
+      def resolve_revision(checkout, package)
+        url = assignment.revision_pull_request_url
+        return nil if url.empty?
+
+        commands = GitCommands.new(checkout_root: checkout, env: env)
+        existing = ExistingPullRequest.call(commands: commands, slug: assignment.target_slug,
+                                           base_branch: assignment.default_branch, url: url)
+        return refuse(SPECIFICATION_REVISION_PULL_REQUEST_UNUSABLE, existing.message) unless existing.ok?
+
+        previous = PreviousSpecificationPackage.call(commands: commands, branch: existing.branch,
+                                                     package_path: package.relative_package_path)
+        return refuse(SPECIFICATION_REVISION_UNREADABLE, previous.message) unless previous.ok?
+
+        previous
       end
 
       # The operator's local clone of the specification repository. Platform knows the
       # repository URL; only this machine knows where it is checked out, and it is never
       # cloned automatically — a runner that silently cloned a repository would be doing
       # network work nobody asked for, into a directory nobody chose.
+      #
+      # An EXPLICIT mapping always wins when one is configured — the same "an operator who
+      # named one has decided" precedence {Provider.resolve} uses for the generation provider.
+      # Only when none exists is reuse of the source workspace checkout even considered
+      # (MVP-0028 remediation, defect 5), and only when it can be VERIFIED, never assumed from
+      # workspace naming alone.
       def resolve_specification_checkout
         slug = assignment.target_slug || assignment.repository_url
-        root = settings.repository_root(slug, repository_url: assignment.repository_url)
-        return missing_checkout(slug) if root.nil?
+        configured = settings.repository_root(slug, repository_url: assignment.repository_url)
+        return resolve_configured_checkout(configured) unless configured.nil?
 
+        reused = reuse_source_workspace_checkout
+        return reused unless reused.nil?
+
+        missing_checkout(slug)
+      end
+
+      def resolve_configured_checkout(root)
         expanded = File.expand_path(root)
         return refuse(SPECIFICATION_REPOSITORY_UNRESOLVED,
                       "the configured specification repository checkout does not exist: #{expanded}") unless
@@ -134,11 +191,42 @@ module SpecrelayRunner
         expanded
       end
 
+      # Reuse the SOURCE workspace checkout Platform already assigned and this runner already
+      # validated (`config.workspace_root`) when it is verifiably a clone of the SAME repository
+      # the specification is destined for. Before this, an operator whose specification
+      # repository IS their source workspace repository had to configure a second, duplicate
+      # mapping under `runner.specification.repository_roots` for the identical clone — a step
+      # a guided connection, which writes no runner YAML at all, could never satisfy.
+      #
+      # Reuse is offered, never assumed. "Same workspace" is not evidence of "same repository":
+      # the destination could genuinely be a separate specification repository, and Platform's
+      # assignment carries no repository URL for the source workspace to compare against (by
+      # design — this lane creates no worktree and runs no test, so it was never given one). So
+      # the ONLY safe signal is the workspace checkout's own ACTUAL git remote, verified exactly
+      # the way {GitPublisher} verifies a publication checkout: resolved to a GitHub `owner/repo`
+      # and compared to the one Platform assigned. Anything inconclusive — no workspace mapping,
+      # no remote, a remote that does not resolve, or one that resolves to something else —
+      # is treated as "cannot be matched unambiguously" and falls through to the ordinary
+      # missing-checkout refusal, which correctly tells the operator to add the explicit mapping
+      # instead.
+      def reuse_source_workspace_checkout
+        expected = assignment.target_slug
+        return nil if expected.to_s.empty?
+
+        root = config.workspace_root(assignment.workspace_key, env: env)
+        remote = GitCommands.new(checkout_root: root, env: env).git_value(%w[remote get-url origin])
+        RepositorySlug.for(remote) == expected ? File.expand_path(root) : nil
+      rescue Config::Error
+        nil
+      end
+
       def missing_checkout(slug)
         refuse(SPECIFICATION_REPOSITORY_UNRESOLVED,
                "no local checkout is configured for the specification repository " \
                "#{assignment.repository_url}. Set #{settings.repository_root_env(slug)} to its absolute path, " \
-               "or add it under runner.specification.repository_roots.")
+               "or add it under runner.specification.repository_roots. If this repository is also this run's " \
+               "source workspace, this runner will reuse that checkout automatically once its `origin` remote " \
+               "matches — no separate mapping is needed in that case.")
       end
 
       def resolve_package_path(checkout)
@@ -219,7 +307,6 @@ module SpecrelayRunner
 
       def check_tools(source)
         return graphify_refusal(source) unless source.graphify.usable?
-        return context_plus_refusal unless settings.context_plus.usable?
 
         nil
       end
@@ -231,17 +318,40 @@ module SpecrelayRunner
                "under runner.specification.graphify.substitute.")
       end
 
-      def context_plus_refusal
-        refuse(CONTEXT_PLUS_UNAVAILABLE,
-               "Context+ is required for this lane and is neither available nor substituted on this runner. " \
-               "Set runner.specification.context_plus.available, or record what was used instead under " \
-               "runner.specification.context_plus.substitute.")
+      # WHERE the real provider profile comes from, in precedence order:
+      #
+      #   1. this runner's own `runner.executor:` block, when the operator hand-wrote one —
+      #      an operator who names a profile locally has decided, exactly as they have for
+      #      every other setting with both a local and a Platform source;
+      #   2. otherwise the profile Platform's Project Setup selected and sent with this
+      #      assignment (MVP-0028 remediation, defect 4).
+      #
+      # Order 2 is the ordinary case and used to be missing entirely, which is what made a
+      # correctly configured project refuse: a guided connection writes no YAML, so step 1
+      # is nil for every runner set up the supported way.
+      def claude_profile
+        config.selected_claude_profile || assignment.selected_claude_profile
+      rescue ClaudeProfile::Error => e
+        refuse(GENERATION_PROVIDER_UNAVAILABLE, e.message)
       end
 
-      def resolve_provider
-        @injected_provider || Provider.resolve(settings: settings, env: env)
+      def resolve_provider(profile)
+        # Provider.resolve turns a nil profile into a refusal rather than a quiet fixture. The
+        # message is Provider's own except when Platform selected a profile this lane has no
+        # provider for — the fixture — where naming the selection is the difference between an
+        # operator re-reading their YAML and going back to the screen they chose it on.
+        @injected_provider || Provider.resolve(settings: settings, claude_profile: profile, env: env)
       rescue Provider::Unavailable, Settings::Error => e
-        refuse(GENERATION_PROVIDER_UNAVAILABLE, e.message)
+        refuse(GENERATION_PROVIDER_UNAVAILABLE, provider_unavailable_message(e))
+      end
+
+      def provider_unavailable_message(error)
+        profile = assignment.selected_provider_profile
+        return error.message if profile.empty? || profile == ClaudeProfile::PROVIDER
+
+        "#{error.message} This project's workspace is set to the `#{profile}` executor profile in " \
+          "Platform's Project Setup, and the specification lane has no provider for it: select " \
+          "\"Claude Code (real provider)\" there, or choose a specification provider explicitly."
       end
 
       # Redaction is a pure function in this runner, so "unavailable" can only mean it is

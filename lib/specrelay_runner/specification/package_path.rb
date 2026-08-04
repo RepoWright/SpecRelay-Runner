@@ -25,14 +25,20 @@ module SpecrelayRunner
     class PackagePath
       Unsafe = Class.new(StandardError)
 
-      # The three required documents, repository-relative to the package folder. Ordered
-      # as a reader meets them: the specification first, then its two analyses.
+      # The required documents, repository-relative to the package folder. Ordered as a
+      # reader meets them: the specification, the evidence it draws on, then its two
+      # analyses. `OPEN_QUESTIONS_MD` (MVP-0028 remediation, defect 3) is deliberately NOT
+      # in `REQUIRED_FILES` — it exists only when synthesis found a material Product Owner
+      # decision, and its own filename never encodes count or status (spec.md's "Generated
+      # evidence and open questions").
       SPEC_MD = "spec.md"
+      INPUT_EVIDENCE_MD = "analysis/input-evidence.md"
       BUSINESS_MD = "analysis/business.md"
       TECHNICAL_MD = "analysis/technical.md"
+      OPEN_QUESTIONS_MD = "analysis/open-questions.md"
       MANIFEST_JSON = "generation-manifest.json"
-      REQUIRED_FILES = [ SPEC_MD, BUSINESS_MD, TECHNICAL_MD ].freeze
-      ALL_FILES = (REQUIRED_FILES + [ MANIFEST_JSON ]).freeze
+      REQUIRED_FILES = [ SPEC_MD, INPUT_EVIDENCE_MD, BUSINESS_MD, TECHNICAL_MD ].freeze
+      ALL_FILES = (REQUIRED_FILES + [ OPEN_QUESTIONS_MD, MANIFEST_JSON ]).freeze
 
       # A Jira issue key is a closed shape (PROJECT-123). Validating it as such is what
       # lets the folder name be trusted as a path segment without escaping: anything that
