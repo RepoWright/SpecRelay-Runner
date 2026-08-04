@@ -153,7 +153,8 @@ module SpecrelayRunner
         url = assignment.existing_pull_request_url
         return assignment.publication_branch if url.empty?
 
-        existing = ExistingPullRequest.call(commands: commands, assignment: assignment, url: url, io: io)
+        existing = ExistingPullRequest.call(commands: commands, slug: assignment.publication_slug,
+                                           base_branch: assignment.publication_base_branch, url: url, io: io)
         return fail_closed(existing.failure_class, existing.message) unless existing.ok?
 
         @publication_branch = existing.branch
@@ -165,8 +166,20 @@ module SpecrelayRunner
       def publication_branch = @publication_branch || assignment&.publication_branch
 
       # This machine's clone of the specification repository, resolved through the same operator
-      # configuration generation used — so the two phases can never disagree about where the
-      # package lives.
+      # configuration MECHANISM generation used.
+      #
+      # That is NOT the same as "the two phases can never disagree about where the package lives",
+      # which this comment used to claim. The live MAPIAI-53 run disproved it: generation and
+      # publication are separate invocations, `SPECRELAY_RUNNER_SPEC_REPOSITORY_ROOT` is read fresh
+      # from the environment each time, and a publication run started with a different value for it
+      # resolved a different clone and refused with `generated_package_missing` — correctly, having
+      # written nothing. The resolution is also not identical in code: {Preflight} falls back to
+      # reusing a verified source-workspace checkout, and this does not.
+      #
+      # Fail-closed behaviour is right and unchanged. What is missing is that nothing PINS the
+      # checkout across the generation → publication boundary; see the MVP-0028 follow-up. The
+      # pin belongs on the runner, not in the assignment — a local filesystem path is exactly what
+      # {Runner::Api::SpecCreationPayload} must never carry.
       def resolve_checkout(assignment)
         slug = assignment.publication_slug
         slug = assignment.publication_repository_url if slug.empty?

@@ -141,6 +141,21 @@ class SpecificationClaudeProviderGenerationTest < Minitest::Test
     assert_includes prompt, "its own stated acceptance criteria"
   end
 
+  # MVP-0028 decision D6 — a same-ticket revision must preserve stable open-question ids and
+  # resolution history rather than starting from a blank slate every run.
+  def test_the_prompt_requires_stable_open_question_ids_and_the_resolved_shape_on_revision
+    provider, runner = provider_for(result: success(stdout: JSON.generate(VALID_DOCUMENTS)))
+
+    provider.generate({ "issue_key" => "SR-700",
+                       "revision" => { "previous_files" => { "spec.md" => "# SR-700\n\nprevious text" } } })
+
+    prompt = runner.calls.fetch(0).argv.last
+    assert_includes prompt, "reuse the previous package's own"
+    assert_includes prompt, "never renumber or reissue it"
+    assert_includes prompt, "Status: resolved"
+    assert_includes prompt, "Never resolve"
+  end
+
   # ------------------------------------------------------------------ the provider misbehaves
 
   def test_a_non_zero_provider_exit_is_a_generation_failure

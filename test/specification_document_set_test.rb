@@ -221,4 +221,107 @@ class SpecificationDocumentSetTest < Minitest::Test
     assert_includes error.message, "OQ-001"
     assert_includes error.message, "unexpected field: priority"
   end
+
+  # ------------------------------------------------------ MVP-0028 decision D6: resolved shape
+
+  def test_a_resolved_question_validates_with_its_own_three_field_shape
+    open_questions_md = <<~MD
+      ## OQ-001
+
+      - Status: resolved
+      - Decision: cache the result and return it unchanged on a repeat request.
+      - Source: Jira comment from the reporter, 2026-08-02.
+    MD
+
+    assert DocumentSet.validate!(base_files.merge(PackagePath::OPEN_QUESTIONS_MD => open_questions_md))
+  end
+
+  def test_open_questions_omits_a_resolved_entry_from_the_run_summary
+    open_questions_md = <<~MD
+      ## OQ-001
+
+      - Status: resolved
+      - Decision: cache the result.
+      - Source: Jira comment.
+
+      ## OQ-002
+
+      - Why it blocks: the recorded inputs do not decide this.
+      - Decision required: what does the user see on failure?
+      - Consequence: an implementer must guess.
+    MD
+    documents = DocumentSet.new(base_files.merge(PackagePath::OPEN_QUESTIONS_MD => open_questions_md))
+
+    assert_equal [ "OQ-002: what does the user see on failure?" ], documents.open_questions
+  end
+
+  def test_a_resolved_question_missing_its_own_required_field_is_rejected
+    open_questions_md = <<~MD
+      ## OQ-001
+
+      - Status: resolved
+      - Decision: cache the result.
+    MD
+
+    error = assert_raises(DocumentSet::Invalid) do
+      DocumentSet.validate!(base_files.merge(PackagePath::OPEN_QUESTIONS_MD => open_questions_md))
+    end
+
+    assert_includes error.message, "OQ-001"
+    assert_includes error.message, "missing required field(s): source"
+  end
+
+  # The open shape is unaffected: no "status" bullet at all still means "open", exactly as every
+  # package generated before this decision already relied on.
+  def test_a_resolved_question_reusing_an_open_field_is_rejected_as_unexpected
+    open_questions_md = <<~MD
+      ## OQ-001
+
+      - Status: resolved
+      - Decision: cache the result.
+      - Source: Jira comment.
+      - Why it blocks: this used to block.
+    MD
+
+    error = assert_raises(DocumentSet::Invalid) do
+      DocumentSet.validate!(base_files.merge(PackagePath::OPEN_QUESTIONS_MD => open_questions_md))
+    end
+
+    assert_includes error.message, "unexpected field: why it blocks"
+  end
+
+  def test_an_unrecognized_status_value_is_rejected
+    open_questions_md = <<~MD
+      ## OQ-001
+
+      - Status: closed
+      - Decision: cache the result.
+      - Source: Jira comment.
+    MD
+
+    error = assert_raises(DocumentSet::Invalid) do
+      DocumentSet.validate!(base_files.merge(PackagePath::OPEN_QUESTIONS_MD => open_questions_md))
+    end
+
+    assert_includes error.message, "OQ-001"
+    assert_includes error.message, "unrecognized status"
+  end
+
+  def test_a_mix_of_open_and_resolved_questions_both_validate_in_one_file
+    open_questions_md = <<~MD
+      ## OQ-001
+
+      - Status: resolved
+      - Decision: cache the result.
+      - Source: Jira comment.
+
+      ## OQ-002
+
+      - Why it blocks: the recorded inputs do not decide this.
+      - Decision required: what happens on a timeout?
+      - Consequence: an implementer must guess.
+    MD
+
+    assert DocumentSet.validate!(base_files.merge(PackagePath::OPEN_QUESTIONS_MD => open_questions_md))
+  end
 end

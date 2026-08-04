@@ -110,7 +110,7 @@ module SpecrelayRunner
       # be deleted afterwards.
       def produce(ready)
         packet = Packet.build(assignment: assignment, source: ready.source, inputs: ready.inputs,
-                              package_path: ready.package_path)
+                              package_path: ready.package_path, revision: ready.revision)
         DocumentSet.validate!(ready.provider.generate(packet))
       end
 

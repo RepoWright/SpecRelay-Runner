@@ -584,25 +584,6 @@ module SpecrelayRunner
         fenced&.strip
       end
 
-      # Reached only when Platform reports the linked-issues collection as genuinely PRESENT —
-      # `#supporting_inputs` already drops an empty one before this is ever called. `used: true`
-      # in the packet means "Jira exposed the collection", never "this runner read an issue's
-      # content" (see the class comment on {LINKED_ISSUES_KIND}); claiming analysis here would be
-      # exactly the false completeness review 006 found, so this always reports the operational
-      # limitation rather than a "Requirement implication".
-      def linked_issues_entry(input)
-        count = LINKED_ISSUES_READABLE_COUNT.match(input["reason"].to_s)[1]
-        [
-          "## #{input['kind']}#{input_name_suffix(input)}", "",
-          "- Status: not analyzed",
-          "- Observation: Jira reports #{count} linked issue#{count == '1' ? '' : 's'} for " \
-          "#{issue_key}; this runner's input bundle records their presence only, not their " \
-          "individual titles, descriptions, or acceptance criteria.",
-          "- Limitation: any requirement that depends only on a linked issue's own content is " \
-          "unconfirmed here; regenerate after that content is captured if it turns out to matter."
-        ].join("\n")
-      end
-
       # -------------------------------------------------------- analysis/open-questions.md
       #
       # MVP-0028 remediation, defect 3. Present only when `#open_questions` found at least one —

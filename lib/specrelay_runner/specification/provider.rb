@@ -57,8 +57,15 @@ module SpecrelayRunner
       def self.resolve(settings:, claude_profile: nil, env: ENV)
         return Composed.new if settings.composed_provider?
         return Command.build(settings: settings, env: env) if settings.provider_kind == Settings::PROVIDER_COMMAND
-        return Claude.build(profile: claude_profile, settings: settings) if settings.claude_provider?
-        return Claude.new(profile: claude_profile, settings: settings) if claude_profile
+        # `env` is forwarded, not defaulted. Process.spawn resolves the executable through the PATH
+        # it is handed, so a Claude provider built without it would look `claude` up on the runner
+        # PROCESS's environment while every other stage — the readiness probe, the executor
+        # mismatch guard — used the runner's own. That is the precise failure ClaudeProfile warns
+        # about: "readiness pass against one CLI and execution run another". Found while proving
+        # the defect-4 fix, when a test that put a stub `claude` first on its runner PATH launched
+        # the host's real CLI instead.
+        return Claude.build(profile: claude_profile, settings: settings, env: env) if settings.claude_provider?
+        return Claude.new(profile: claude_profile, settings: settings, env: env) if claude_profile
 
         raise Unavailable, UNCONFIGURED
       end
@@ -112,10 +119,10 @@ module SpecrelayRunner
           "configure runner.executor with provider `claude`, or select another specification " \
           "provider kind."
 
-        def self.build(profile:, settings:)
+        def self.build(profile:, settings:, env: ENV)
           raise Unavailable, MISSING_PROFILE if profile.nil?
 
-          new(profile: profile, settings: settings)
+          new(profile: profile, settings: settings, env: env)
         end
 
         def initialize(profile:, settings:, env: ENV, command_runner: CommandRunner)
@@ -185,6 +192,10 @@ module SpecrelayRunner
         # been silently accepted rather than rejected. Both are now enforced structurally by
         # {DocumentSet}, not only asked for here — this wording exists so a real model produces
         # something that PASSES that gate on the first attempt, not to be the only guard against it.
+        #
+        # MVP-0028 decision D6 adds the REVISION section below: present only when {Packet} carries
+        # a previous package (a same-ticket revision), it is what lets stable open-question ids and
+        # resolution history survive a real model's rewrite instead of a fresh, memoryless attempt.
         def prompt_for(packet)
           <<~PROMPT
             You are writing a software specification package for SpecRelay, for a human reviewer
@@ -257,6 +268,31 @@ module SpecrelayRunner
             those is rejected before the package is written. Never invent a question the evidence
             already answers, and never treat a tool failure or unreadable input as a product
             question — that is an operational limitation and belongs in the technical analysis.
+
+            REVISION (only when the evidence below has a "revision" key) — this ticket already has
+            a published specification package on an open pull request, reproduced verbatim as
+            "revision.previous_files", and this generation REVISES it rather than writing a first
+            one. Base every document on the CURRENT ticket and evidence, but do not silently drop a
+            requirement, risk, or acceptance criterion the previous package recorded unless the
+            current ticket now contradicts it, and do not restate settled analysis just to sound
+            different from before.
+            - Stable ids: reuse the previous package's own "OQ-nnn" id for a question that is
+              STILL open and substantively the same question — never renumber or reissue it. Only
+              a genuinely NEW question gets a new id.
+            - Mark a previous open question RESOLVED only when the CURRENT ticket, its comments, or
+              another Product-Owner-approved source states the resolution explicitly. Never resolve
+              from inference alone, and never because the linked pull request looks further along. A resolved
+              entry keeps its own "## OQ-nnn" heading, and its body is EXACTLY these three bullets
+              instead of the open three: "- Status: resolved", "- Decision: ...", "- Source: ..."
+              (the authoritative place the resolution came from — a named Jira comment or field).
+              Drop the prior argumentative prose; keep only the decision and its source.
+            - Never resolve a question the current evidence does not actually settle: it keeps its
+              original three open-question bullets unchanged.
+            - Retain every previously RESOLVED question's own entry unchanged (same id, same
+              "Status: resolved" body) so the file's resolution history stays visible across runs.
+            - If the previous package recorded no #{PackagePath::OPEN_QUESTIONS_MD}, and this
+              revision raises no material question either, omit the file exactly as a first
+              generation would.
 
             BREVITY — this is an acceptance rule, not a style preference. Include a sentence,
             bullet, or row only when it changes a requirement, observation, decision, risk,

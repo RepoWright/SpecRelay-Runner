@@ -85,6 +85,19 @@ module SpecrelayRunner
       # question has a decision" a property of the package rather than of this parser's luck.
       REQUIRED_QUESTION_FIELDS = [ "why it blocks", "decision required", "consequence" ].freeze
 
+      # MVP-0028 decision D6 — a same-ticket revision may carry forward a question the PREVIOUS
+      # package raised and the current ticket has now settled. Retaining its own "## OQ-nnn"
+      # heading (spec.md's own rule: "retain it on later runs so resolved history remains
+      # visible") with the open three-field body would misrepresent it as still blocking, so a
+      # resolved entry uses this DIFFERENT closed field set instead — "status" is what
+      # distinguishes the two shapes from each other (see `#resolved?`). Absent entirely, a body
+      # is judged against {REQUIRED_QUESTION_FIELDS} exactly as it always has been: every package
+      # ever generated before this decision omitted "status", so the open shape must keep meaning
+      # "open" with no field added, and only a body that explicitly opts in is held to the second
+      # shape.
+      REQUIRED_RESOLVED_QUESTION_FIELDS = [ "status", "decision", "source" ].freeze
+      RESOLVED_STATUS = "resolved"
+
       # Sentinel distinct from `nil` (itself a valid `question_fields` key, for an unlabelled
       # bullet) meaning "no bullet has been seen yet in this body" — text before the first bullet
       # is filed under `nil` exactly once rather than merged into whatever bullet comes next.
@@ -137,23 +150,33 @@ module SpecrelayRunner
       # is the one field that actually distinguishes one question from another for a reader
       # scanning a list. Absent the file, there are no questions — spec.md's own rule is to omit
       # the file entirely rather than write an empty one.
+      #
+      # A RESOLVED entry (MVP-0028 decision D6) is excluded here: this list is what Platform
+      # shows as what THIS run still needs a decision on, and a question the current ticket
+      # already settled is history, not a live blocker. Its heading and body still exist in the
+      # file itself, unabridged — only this summary omits it.
       def open_questions
         content = files[PackagePath::OPEN_QUESTIONS_MD]
         return [] if content.nil?
 
         headings = open_question_headings(content)
-        headings.each_with_index.map do |(line, number), index|
+        headings.each_with_index.filter_map do |(line, number), index|
           id = line.chomp[OPEN_QUESTION_HEADING, 1]
           body = question_body(content, number, headings[index + 1]&.last)
+          fields = question_fields(body)
+          next if resolved?(fields)
+
           # `validate!` has already proven this body carries exactly one nonblank "Decision
           # required" field before this is ever reached (see Generation, which validates before
           # reading `#open_questions` back out) — so there is no fallback branch here. A body that
           # does not have one is a bug in validation, not a shape this method is asked to survive.
-          "#{id}: #{question_fields(body).fetch('decision required').first}"
+          "#{id}: #{fields.fetch('decision required').first}"
         end
       end
 
       private
+
+      def resolved?(fields) = fields["status"]&.first.to_s.casecmp?(RESOLVED_STATUS)
 
       def open_question_headings(content)
         Markdown.structural_lines(content).select { |line, _number| OPEN_QUESTION_HEADING.match?(line.chomp) }
@@ -233,22 +256,39 @@ module SpecrelayRunner
       # failure is reported per call, in the order a reader would want to fix them: what is
       # missing outright, then what is duplicated, then what is present but empty, then what does
       # not belong.
+      # MVP-0028 decision D6 — a body opts into the RESOLVED shape solely by carrying a "status"
+      # bullet; every package generated before this decision has none, so the absence of that
+      # one field is what keeps every one of them validating exactly as it always did. A body
+      # that opts in with anything other than "resolved" is rejected as an unrecognized status
+      # rather than silently accepted as open, which would let a typo pass as a live question.
       def validate_open_question_fields!(id, body)
         fields = question_fields(body)
 
-        missing = REQUIRED_QUESTION_FIELDS - fields.keys
+        if fields.key?("status")
+          validate_question_field_set!(id, fields, REQUIRED_RESOLVED_QUESTION_FIELDS)
+          status = fields.fetch("status").first
+          raise Invalid, "#{PackagePath::OPEN_QUESTIONS_MD} #{id} has an unrecognized status: " \
+                         "#{status.inspect} (expected #{RESOLVED_STATUS.inspect})" unless
+            status.casecmp?(RESOLVED_STATUS)
+        else
+          validate_question_field_set!(id, fields, REQUIRED_QUESTION_FIELDS)
+        end
+      end
+
+      def validate_question_field_set!(id, fields, required_fields)
+        missing = required_fields - fields.keys
         raise Invalid, "#{PackagePath::OPEN_QUESTIONS_MD} #{id} is missing required field(s): " \
                        "#{missing.join(', ')}" if missing.any?
 
-        duplicated = REQUIRED_QUESTION_FIELDS.select { |label| fields.fetch(label).length > 1 }
+        duplicated = required_fields.select { |label| fields.fetch(label).length > 1 }
         raise Invalid, "#{PackagePath::OPEN_QUESTIONS_MD} #{id} has duplicate field(s): " \
                        "#{duplicated.join(', ')}" if duplicated.any?
 
-        blank = REQUIRED_QUESTION_FIELDS.select { |label| fields.fetch(label).first.empty? }
+        blank = required_fields.select { |label| fields.fetch(label).first.empty? }
         raise Invalid, "#{PackagePath::OPEN_QUESTIONS_MD} #{id} has a blank field: " \
                        "#{blank.join(', ')}" if blank.any?
 
-        unexpected = fields.keys - REQUIRED_QUESTION_FIELDS
+        unexpected = fields.keys - required_fields
         raise Invalid, "#{PackagePath::OPEN_QUESTIONS_MD} #{id} has an unexpected field: " \
                        "#{unexpected.map { |label| label || '(unlabelled bullet)' }.join(', ')}" if unexpected.any?
       end

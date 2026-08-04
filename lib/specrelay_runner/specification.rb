@@ -56,6 +56,7 @@ require_relative "specification/packet"
 require_relative "specification/composer"
 require_relative "specification/document_set"
 require_relative "specification/package_writer"
+require_relative "specification/previous_specification_package"
 require_relative "specification/preflight"
 require_relative "specification/generation"
 # MVP-0027 — the lane's third phase: publish the generated package as a draft pull request.

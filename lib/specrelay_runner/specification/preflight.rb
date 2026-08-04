@@ -35,12 +35,20 @@ module SpecrelayRunner
       CONTEXT_PLUS_UNAVAILABLE = "context_plus_unavailable"
       GENERATION_PROVIDER_UNAVAILABLE = "generation_provider_unavailable"
       REDACTION_VALIDATION_UNAVAILABLE = "redaction_validation_unavailable"
+      # MVP-0028 decision D6 — a same-ticket revision fails CLOSED at two distinct points, each
+      # with its own operator-actionable remedy: the pull request itself is unusable (closed,
+      # merged, wrong repository, wrong base, unreadable — the same judgment {ExistingPullRequest}
+      # already makes at publication time), or it is usable but its previous package could not be
+      # read off its branch (a git-level failure, or the branch genuinely carries none).
+      SPECIFICATION_REVISION_PULL_REQUEST_UNUSABLE = "specification_revision_pull_request_unusable"
+      SPECIFICATION_REVISION_UNREADABLE = PreviousSpecificationPackage::UNREADABLE
 
       FAILURE_CLASSES = [
         ASSIGNMENT_MALFORMED, SPECIFICATION_REPOSITORY_UNRESOLVED, SPECIFICATION_FOLDER_UNSAFE,
         SPECIFICATION_FOLDER_UNWRITABLE, EXISTING_PACKAGE_PRESENT, SOURCE_WORKSPACE_UNRESOLVED,
         INPUT_CONTENT_UNREADABLE, EXTERNAL_REFERENCE_ANALYSIS_UNAVAILABLE, GRAPHIFY_UNAVAILABLE,
-        CONTEXT_PLUS_UNAVAILABLE, GENERATION_PROVIDER_UNAVAILABLE, REDACTION_VALIDATION_UNAVAILABLE
+        CONTEXT_PLUS_UNAVAILABLE, GENERATION_PROVIDER_UNAVAILABLE, REDACTION_VALIDATION_UNAVAILABLE,
+        SPECIFICATION_REVISION_PULL_REQUEST_UNUSABLE, SPECIFICATION_REVISION_UNREADABLE
       ].freeze
 
       # A refusal. `message` is written for the operator who has to fix it, so it names the
@@ -51,7 +59,10 @@ module SpecrelayRunner
 
       # Everything the later stages need, gathered once. Passing this forward rather than
       # re-deriving is what guarantees the writer targets the very path preflight validated.
-      Ready = Struct.new(:package_path, :checkout_root, :source, :inputs, :provider, keyword_init: true) do
+      # `revision` is nil for a first specification and a {PreviousSpecificationPackage::Result}
+      # for a same-ticket revision (MVP-0028 decision D6).
+      Ready = Struct.new(:package_path, :checkout_root, :source, :inputs, :provider, :revision,
+                        keyword_init: true) do
         def refused? = false
       end
 
@@ -99,13 +110,16 @@ module SpecrelayRunner
       end
 
       def gather_and_verify(checkout, package, source_root)
+        # Resolved ONCE, before anything reads it, because it can refuse: a profile Platform
+        # named but this runner will not launch has to become a refusal here rather than an
+        # exception raised from inside evidence gathering.
+        profile = claude_profile
+        return profile if profile.is_a?(Refusal)
+
         # The SAME real Claude profile {resolve_provider} would use, offered here as the ordinary
-        # external-reference analyzer (MVP-0028 remediation, defect 2 — review-005 finding F2). A
-        # profile invalid enough to raise still surfaces exactly where it already did, a few lines
-        # below at `resolve_provider` — this does not add a new failure path, only a new use for
-        # the same validated value.
+        # external-reference analyzer (MVP-0028 remediation, defect 2 — review-005 finding F2).
         inputs = InputEvidence.gather(assignment: assignment, settings: settings, env: env,
-                                      claude_profile: config.selected_claude_profile)
+                                      claude_profile: profile)
         blocked = check_inputs(inputs)
         return blocked if blocked
 
@@ -113,14 +127,38 @@ module SpecrelayRunner
         tools = check_tools(source)
         return tools if tools
 
-        provider = resolve_provider
+        provider = resolve_provider(profile)
         return provider if provider.is_a?(Refusal)
 
         redaction = check_redaction
         return redaction if redaction
 
+        revision = resolve_revision(checkout, package)
+        return revision if revision.is_a?(Refusal)
+
         Ready.new(package_path: package, checkout_root: checkout, source: source, inputs: inputs,
-                  provider: provider)
+                  provider: provider, revision: revision)
+      end
+
+      # MVP-0028 decision D6 — nil for a first specification. For a same-ticket revision, this
+      # runs the identical judgment {ExistingPullRequest} makes at publication time (the pull
+      # request must exist, be open, target the configured base, and belong to this repository)
+      # against `specification_target`'s facts rather than `publication`'s — the only section
+      # available this early — then reads the previous package off its branch.
+      def resolve_revision(checkout, package)
+        url = assignment.revision_pull_request_url
+        return nil if url.empty?
+
+        commands = GitCommands.new(checkout_root: checkout, env: env)
+        existing = ExistingPullRequest.call(commands: commands, slug: assignment.target_slug,
+                                           base_branch: assignment.default_branch, url: url)
+        return refuse(SPECIFICATION_REVISION_PULL_REQUEST_UNUSABLE, existing.message) unless existing.ok?
+
+        previous = PreviousSpecificationPackage.call(commands: commands, branch: existing.branch,
+                                                     package_path: package.relative_package_path)
+        return refuse(SPECIFICATION_REVISION_UNREADABLE, previous.message) unless previous.ok?
+
+        previous
       end
 
       # The operator's local clone of the specification repository. Platform knows the
@@ -280,15 +318,40 @@ module SpecrelayRunner
                "under runner.specification.graphify.substitute.")
       end
 
-      def resolve_provider
-        # The operator's Claude profile is passed in, because "which provider writes the
-        # specification" now depends on what they configured for EXECUTION too — see
-        # Provider.resolve. `config.selected_claude_profile` is nil when they selected no real
-        # provider, and Provider.resolve turns that into a refusal rather than a quiet fixture.
-        @injected_provider || Provider.resolve(settings: settings, claude_profile: config.selected_claude_profile,
-                                               env: env)
-      rescue Provider::Unavailable, Settings::Error => e
+      # WHERE the real provider profile comes from, in precedence order:
+      #
+      #   1. this runner's own `runner.executor:` block, when the operator hand-wrote one —
+      #      an operator who names a profile locally has decided, exactly as they have for
+      #      every other setting with both a local and a Platform source;
+      #   2. otherwise the profile Platform's Project Setup selected and sent with this
+      #      assignment (MVP-0028 remediation, defect 4).
+      #
+      # Order 2 is the ordinary case and used to be missing entirely, which is what made a
+      # correctly configured project refuse: a guided connection writes no YAML, so step 1
+      # is nil for every runner set up the supported way.
+      def claude_profile
+        config.selected_claude_profile || assignment.selected_claude_profile
+      rescue ClaudeProfile::Error => e
         refuse(GENERATION_PROVIDER_UNAVAILABLE, e.message)
+      end
+
+      def resolve_provider(profile)
+        # Provider.resolve turns a nil profile into a refusal rather than a quiet fixture. The
+        # message is Provider's own except when Platform selected a profile this lane has no
+        # provider for — the fixture — where naming the selection is the difference between an
+        # operator re-reading their YAML and going back to the screen they chose it on.
+        @injected_provider || Provider.resolve(settings: settings, claude_profile: profile, env: env)
+      rescue Provider::Unavailable, Settings::Error => e
+        refuse(GENERATION_PROVIDER_UNAVAILABLE, provider_unavailable_message(e))
+      end
+
+      def provider_unavailable_message(error)
+        profile = assignment.selected_provider_profile
+        return error.message if profile.empty? || profile == ClaudeProfile::PROVIDER
+
+        "#{error.message} This project's workspace is set to the `#{profile}` executor profile in " \
+          "Platform's Project Setup, and the specification lane has no provider for it: select " \
+          "\"Claude Code (real provider)\" there, or choose a specification provider explicitly."
       end
 
       # Redaction is a pure function in this runner, so "unavailable" can only mean it is

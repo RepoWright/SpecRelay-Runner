@@ -40,15 +40,22 @@ module SpecrelayRunner
 
       def self.call(**kwargs) = new(**kwargs).call
 
-      def initialize(commands:, assignment:, url:, io: $stdout)
+      # +slug+ (`owner/repository`) and +base_branch+ are passed explicitly rather than read off
+      # an assignment, because MVP-0028 decision D6 gave this class a SECOND caller: the same
+      # validation runs at GENERATION time, against `specification_target`'s facts, and at
+      # PUBLICATION time, against `publication`'s — two different sections of two different
+      # assignment phases. The caller resolves which; this class only ever asks GitHub and
+      # judges what comes back.
+      def initialize(commands:, slug:, base_branch:, url:, io: $stdout)
         @commands = commands
-        @assignment = assignment
+        @slug = slug.to_s
+        @base_branch = base_branch.to_s
         @url = url.to_s
         @io = io
       end
 
       def call
-        result = commands.gh([ "pr", "view", url, "--repo", assignment.publication_slug, "--json", FIELDS ])
+        result = commands.gh([ "pr", "view", url, "--repo", slug, "--json", FIELDS ])
         return unreadable(result) unless result.success?
 
         pull_request = parse(result.stdout)
@@ -59,7 +66,7 @@ module SpecrelayRunner
 
       private
 
-      attr_reader :commands, :assignment, :url, :io
+      attr_reader :commands, :slug, :base_branch, :url, :io
 
       # Every reason a pull request Jira points at may not be updated by this run, each with the
       # remedy that actually fixes it. A table rather than a chain of guards, because the list IS
@@ -72,7 +79,7 @@ module SpecrelayRunner
 
         return failure(closed_message(state)) unless state == OPEN
         return failure(fork_message) if pull_request["isCrossRepository"] == true
-        return failure(base_message(base)) unless base == assignment.publication_base_branch
+        return failure(base_message(base)) unless base == base_branch
         return failure("GitHub reported no head branch for #{url}, so SpecRelay cannot tell which " \
                        "branch to add this specification to") if branch.empty?
 
@@ -102,7 +109,7 @@ module SpecrelayRunner
 
       def base_message(base)
         "the specification pull request this ticket links (#{url}) targets #{base.empty? ? 'an unknown branch' : base} " \
-          "but this project publishes specifications against #{assignment.publication_base_branch}. Resolve that " \
+          "but this project publishes specifications against #{base_branch}. Resolve that " \
           "in GitHub or clear the Jira Spec PR field, then retry publication"
       end
 

@@ -22,7 +22,8 @@ require_relative "support/specification_workspace"
 # `repositories`, or `report_contract` block, because Platform sends none for this lane — a
 # fixture that included them would be testing a payload this product does not produce.
 def spec_creation_payload_for(issue_key:, title: "Add an export button", inputs: nil,
-                              specification_root: "specs", complete: true, content: nil)
+                              specification_root: "specs", complete: true, content: nil,
+                              existing_pull_request_url: nil, specification_provider: nil)
   {
     "contract_version" => "mvp-0025",
     "claim" => { "runner_execution_id" => "rex_spec123", "runner_id" => "test-runner",
@@ -47,6 +48,13 @@ def spec_creation_payload_for(issue_key:, title: "Add an export button", inputs:
       "specification_root" => specification_root, "host" => "github.com", "owner" => "SpecRelay",
       "repository" => "SpecRelay-Specs"
     },
+    # MVP-0028 decision D6 — nil for a first specification, present on EVERY spec_creation
+    # assignment (unlike `publication`, which only exists once a package has been generated).
+    "specification_revision" => { "existing_pull_request_url" => existing_pull_request_url },
+    # MVP-0028 remediation defect 4 — the profile Project Setup selected. Null here by default so
+    # the existing tests keep selecting their provider through `runner.specification.provider.kind`
+    # as they always have; specification_provider_propagation_test.rb populates it.
+    "specification_provider" => specification_provider || { "profile" => nil, "executor" => nil },
     "workspace" => { "project_key" => "tiny-demo", "workspace_key" => "tiny-demo-workspace",
                      "display_name" => "Tiny Demo Workspace" },
     "links" => { "run_url" => "http://127.0.0.1:3200/runs/run_spec123",
