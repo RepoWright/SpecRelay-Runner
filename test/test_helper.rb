@@ -16,6 +16,7 @@ require_relative "support/demo_workspace"
 require_relative "support/fake_github"
 require_relative "support/fake_claude_cli"
 require_relative "support/specification_workspace"
+require_relative "support/recording_terminal"
 
 # A specification-creation assignment exactly as Runner::Api::SpecCreationPayload builds it
 # (MVP-0025 scope 3, consumed by MVP-0026). It deliberately carries NO `executor`,

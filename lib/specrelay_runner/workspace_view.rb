@@ -36,7 +36,7 @@ module SpecrelayRunner
         # terminal. Returning to the top level is the honest response, not an error.
         return if connection.nil?
 
-        action = menu.select(title: "#{Dashboard::TITLE} — #{workspace_key}",
+        action = menu.select(title: "#{Dashboard::TITLE} — #{ConnectionView.selection_label(connection)}",
                              header: detail_rows(connection), entries: entries(workspace_key),
                              footer: FOOTER)
         return if action == TerminalMenu::CANCEL || action == :back
@@ -61,7 +61,7 @@ module SpecrelayRunner
     def entries(workspace_key)
       default = operations.listing.default_workspace_key == workspace_key
       [
-        entry("L", "Start loop — poll and execute work for this workspace", :loop),
+        entry("L", "Start live loop — poll and execute work for this project", :loop),
         entry("O", "Claim once — one controlled single-shot execution", :claim_once),
         entry("T", "Test connection and readiness (claims nothing)", :test),
         entry("S", "Show details", :show),
@@ -77,7 +77,7 @@ module SpecrelayRunner
     # Returns :leave when this view should close, otherwise nil.
     def perform(workspace_key, action)
       case action
-      when :loop then run_command([ "loop", "--workspace", workspace_key ])
+      when :loop then run_command([ "loop", "--workspace", workspace_key ], acknowledge: false)
       when :claim_once then run_command([ "claim-once", "--workspace", workspace_key ])
       when :test then test(workspace_key)
       when :show then show(workspace_key)
@@ -93,21 +93,39 @@ module SpecrelayRunner
     # handling behave exactly as they do when it is typed directly. The echoed command line is
     # printed for the same reason: an operator should be able to see, copy, and re-run what the
     # menu just did.
-    def run_command(argv)
+    def run_command(argv, acknowledge: true)
       menu.restore
       menu.clear
       out.puts "$ specrelay-runner #{argv.join(' ')}"
       out.puts ""
       status = dispatch.call(argv)
-      out.puts ""
-      out.puts "(#{argv.first} exited #{status})"
-      menu.pause
+      acknowledge_exit(argv, status, acknowledge)
       nil
     rescue Interrupt
       # Ctrl-C stops the dispatched command and returns here — the same contract `loop`
       # documents for a directly-typed invocation. The dashboard itself is not torn down.
       out.puts ""
       out.puts "Interrupted. Nothing was left claimed by this terminal."
+      menu.pause
+      nil
+    end
+
+    # WHERE Ctrl-C LEAVES YOU is a property of HOW the command was invoked, so it is passed in
+    # here rather than inferred from anything mutable (RUNNER-0001 scope 6).
+    #
+    # A live loop the operator started from THIS menu returns straight back to it when it
+    # stopped cleanly: Ctrl-C was the operator asking to come back, and a `Press any key`
+    # in between is a keypress they did not ask for. The loop has already printed its own
+    # final summary.
+    #
+    # Everything else keeps the deliberate acknowledgement — a one-shot `claim-once`, and a
+    # loop that ended in a failed run or a rejected credential. The next menu frame clears
+    # the screen, so without the pause the result would be erased before it could be read.
+    def acknowledge_exit(argv, status, acknowledge)
+      return nil if !acknowledge && status == CLI::SUCCESS
+
+      out.puts ""
+      out.puts "(#{argv.first} exited #{status})"
       menu.pause
       nil
     end

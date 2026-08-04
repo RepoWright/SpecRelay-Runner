@@ -70,7 +70,10 @@ module SpecrelayRunner
       return empty_header(listing) if listing.empty?
 
       count = listing.connections.length
-      [ "#{count} connected workspace#{'s' unless count == 1}", default_header(listing) ]
+      # Projects, because that is what the operator connected and what they are choosing
+      # between (RUNNER-0001 scope 1). The workspace key stays on every row and in the default
+      # line below, because it is what routing and `--workspace` actually use.
+      [ "#{count} project#{'s' unless count == 1} connected to this runner", default_header(listing) ]
     end
 
     def default_header(listing)
@@ -89,7 +92,7 @@ module SpecrelayRunner
     # Round 001 printed that line unconditionally; the real-pty evidence for CR-001 is what made
     # it visible.
     def no_default_header(listing)
-      return "Default workspace: none set (not needed — only one workspace is connected)" if
+      return "Default workspace: none set (not needed — only one project is connected)" if
         listing.connections.one?
 
       "Default workspace: none set — `loop` needs --workspace while several are connected"
@@ -98,7 +101,7 @@ module SpecrelayRunner
     # The empty state names the ONE command that fixes it and where the code comes from. An
     # empty dashboard that only said "no connections" would send the operator to the docs.
     def empty_header(_listing)
-      [ "This machine is not connected to any workspace yet.",
+      [ "This machine is not connected to any project yet.",
         "Run:  specrelay-runner connect <enrollment-code>",
         "Get the code from your project's setup page in Platform (\"Connect a Runner\")." ]
     end
@@ -109,7 +112,7 @@ module SpecrelayRunner
         "Move it aside, then run `specrelay-runner connect <enrollment-code>` again." ]
     end
 
-    # Workspaces get 1–9. A machine with more than nine connected workspaces is not a case this
+    # Projects get 1–9. A machine with more than nine connected projects is not a case this
     # MVP designs for; the tenth onward stay reachable with the arrow keys, so nothing is hidden.
     #
     # No absolute local path appears on this screen — see ConnectionView for why the detail view

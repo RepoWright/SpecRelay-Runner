@@ -34,6 +34,9 @@ require_relative "specrelay_runner/connection_diagnosis"
 require_relative "specrelay_runner/connection_operations"
 require_relative "specrelay_runner/connections_command"
 require_relative "specrelay_runner/terminal_menu"
+# RUNNER-0001: the one terminal write boundary shared by loop status and live
+# executor output — transient rows for what is true now, durable lines for the record.
+require_relative "specrelay_runner/terminal_presenter"
 require_relative "specrelay_runner/workspace_view"
 require_relative "specrelay_runner/dashboard"
 require_relative "specrelay_runner/workspace"

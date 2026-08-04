@@ -60,6 +60,14 @@ module SpecrelayRunner
 
     attr_reader :out, :err, :env, :input
 
+    # The ONE terminal write boundary for everything that runs while work is in
+    # progress (RUNNER-0001 scope 2). Built once per invocation and shared by the
+    # loop's transient status, the live executor stream, the lease heartbeat, and
+    # the execution's own lines, so no two of them can interleave and every durable
+    # line clears the transient row first. Capability is detected from `out`, so a
+    # pipe or a CI log gets plain lines and no cursor control.
+    def presenter = @presenter ||= TerminalPresenter.for(out: out, err: err)
+
     # No arguments means two DIFFERENT things, decided by whether a human is actually there
     # (MVP-0021 scope 1).
     #
@@ -248,11 +256,30 @@ module SpecrelayRunner
     def run_loop(config, auth, interval, policy)
       client = PlatformClient.new(base_url: config.base_url, token: auth.token)
       result = LoopRunner.call(
-        out: out, err: err, poll_seconds: interval.seconds, on_failure: policy,
+        out: out, err: err, presenter: presenter, label: loop_label(config),
+        poll_seconds: interval.seconds, on_failure: policy,
         claim: -> { client.claim(config.claim_runner_params) },
         execute: ->(payload) { execute(config, client, payload) == SUCCESS }
       )
       result == LoopRunner::OK ? SUCCESS : RUN_FAILED
+    end
+
+    # What the transient status row says this runner is polling for. The PROJECT is the
+    # operator's concept, so it leads; the workspace key follows because it is the
+    # routing fact and the only thing that disambiguates two connections to the same
+    # project. A legacy record with no project metadata falls back to the workspace
+    # key rather than inventing a name.
+    #
+    # An advanced/legacy `--config` invocation has NO connection record and therefore
+    # no project identity, so it gets no label: the announce block above already
+    # printed `Source: config file …`, and a config filename on the status row would
+    # be identity theatre.
+    def loop_label(config)
+      connection = config.connection
+      return nil if connection.nil?
+
+      project = connection.project_slug.to_s.strip
+      project.empty? ? connection.workspace_key.to_s : "#{project} (#{connection.workspace_key})"
     end
 
     # Print PLATFORM's reason for a not-claimed poll, so an unconnected runner is told to run
@@ -294,8 +321,9 @@ module SpecrelayRunner
         Specification::Assignment.specification?(payload)
 
       announce_claim(payload)
-      result = Execution.new(config: config, client: client, payload: payload, env: env, io: out).call
-      out.puts result.message
+      result = Execution.new(config: config, client: client, payload: payload, env: env,
+                             io: presenter).call
+      presenter.line result.message
       result.success? ? SUCCESS : RUN_FAILED
     end
 
@@ -334,8 +362,8 @@ module SpecrelayRunner
 
     def generate_specification(config, client, payload)
       result = Specification::Generation.call(config: config, client: client, payload: payload,
-                                              env: env, io: out)
-      out.puts result.message
+                                              env: env, io: presenter)
+      presenter.line result.message
       result.success? ? SUCCESS : RUN_FAILED
     end
 
@@ -344,8 +372,8 @@ module SpecrelayRunner
     # as success would poll forever against a runner that cannot reach GitHub, reporting health.
     def publish_specification(config, client, payload)
       result = Specification::Publication.call(config: config, client: client, payload: payload,
-                                               env: env, io: out)
-      out.puts result.message
+                                               env: env, io: presenter)
+      presenter.line result.message
       result.success? ? SUCCESS : RUN_FAILED
     end
 
@@ -525,8 +553,8 @@ module SpecrelayRunner
 
     def announce_claim(payload)
       claim = payload.fetch("claim")
-      out.puts "Claimed run #{payload.dig('run', 'task_id')} (#{payload.dig('run', 'id')}); " \
-               "execution #{claim['runner_execution_id']} via #{claim['claim_policy_mode']}."
+      presenter.line "Claimed run #{payload.dig('run', 'task_id')} (#{payload.dig('run', 'id')}); " \
+                     "execution #{claim['runner_execution_id']} via #{claim['claim_policy_mode']}."
     end
 
     def path_from(args)
