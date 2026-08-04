@@ -167,6 +167,51 @@ class SpecificationProviderTest < Minitest::Test
     assert_includes @io.string, "analysis/technical.md"
   end
 
+  # MVP-0028 remediation, defect 10 — the live MAPIAI-53 revision, at the real boundary.
+  #
+  # The provider returned a `technical.md` whose title was its own first section name, with its
+  # instructions narrated underneath. Every required `##` section was present, so the package was
+  # written, digested, reported to Platform, and became publishable. These prove the whole chain
+  # now stops at the same place a missing section stops it: before anything reaches disk.
+  def test_a_document_titled_with_a_section_name_is_rejected_before_anything_is_written
+    documents = valid_documents
+    documents["analysis/technical.md"] = documents["analysis/technical.md"]
+      .sub(/\A# .*$/, "# Source entry points inspected\n\n(placeholder-free content follows)")
+    provider = SpecificationWorkspace.write_provider(File.join(@temp, "provider"), files: documents)
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_with(provider), @io.string
+    assert_empty Dir.children(File.join(@specs, "specs")), "no package, and no staging leftovers"
+    assert_equal "generated_output_invalid", @platform.last_specification_generation["failure_class"]
+    assert_includes @io.string, "analysis/technical.md"
+  end
+
+  # The refusal must reach Platform as a REFUSAL, not as a generation that produced something.
+  # A package Platform believes exists is a package Platform will offer for publication.
+  def test_a_malformed_document_never_becomes_publishable
+    documents = valid_documents
+    documents["analysis/technical.md"] = documents["analysis/technical.md"]
+      .sub(/\A# .*$/, "# Source entry points inspected")
+    provider = SpecificationWorkspace.write_provider(File.join(@temp, "provider"), files: documents)
+
+    run_with(provider)
+
+    generation = @platform.last_specification_generation
+    assert_equal "failed", generation["outcome"]
+    assert generation["zero_output_files_written"], generation.inspect
+    assert_nil generation["package"], "a refused generation must record no package to publish"
+  end
+
+  def test_provider_scaffolding_in_a_document_is_rejected_before_anything_is_written
+    documents = valid_documents
+    documents["analysis/business.md"] = documents["analysis/business.md"]
+      .sub("\n\n##", "\n\n(placeholder-free content follows)\n\n##")
+    provider = SpecificationWorkspace.write_provider(File.join(@temp, "provider"), files: documents)
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_with(provider), @io.string
+    assert_empty Dir.children(File.join(@specs, "specs"))
+    assert_includes @io.string, "scaffolding"
+  end
+
   # MVP-0028 remediation, defect 3 — the input-evidence file is REQUIRED, not conditional; only
   # the open-questions file is optional.
   def test_missing_input_evidence_is_rejected

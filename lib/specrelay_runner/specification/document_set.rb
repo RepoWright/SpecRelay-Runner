@@ -56,6 +56,45 @@ module SpecrelayRunner
         ].freeze
       }.freeze
 
+      # The ROLE each document's `#` title must name, matched case-insensitively as a substring
+      # (MVP-0028 remediation, defect 10).
+      #
+      # A substring of a role, not an exact title, because real providers word a title differently
+      # and all of the wordings below are honest: "Input evidence — SR-700", "Supporting input
+      # evidence — SR-700", "Technical Analysis: SR-700". Pinning the exact string would reject
+      # correct documents and teach an operator to fight the gate rather than fix the package.
+      #
+      # What it is NOT is "does the document start with a `#`". The live MAPIAI-53 revision
+      # returned a technical analysis titled "# Source entry points inspected" — its own first
+      # required SECTION name, promoted to H1 and then repeated as the H2 below it. Every `##`
+      # section was present, so every check this class had passed it, and a package whose
+      # technical analysis had no title reached a pull request. A section name is not a title.
+      #
+      # `SPEC_MD` is the one whose role is the TICKET rather than a document kind: the
+      # specification is titled for the thing it specifies, which both the built-in composer
+      # ("SR-700: add an export button") and a real model ("SR-700 — Add an export button")
+      # already do. Its role is therefore supplied per call — see `#validate!`.
+      REQUIRED_TITLE_ROLES = {
+        PackagePath::INPUT_EVIDENCE_MD => "input evidence",
+        PackagePath::BUSINESS_MD => "business analysis",
+        PackagePath::TECHNICAL_MD => "technical analysis",
+        PackagePath::OPEN_QUESTIONS_MD => "open questions"
+      }.freeze
+
+      # A whole line that is nothing but a parenthesised aside about the document's own
+      # construction — the provider narrating its instructions instead of writing content. The
+      # live run emitted "(placeholder-free content follows)" directly under the broken title.
+      #
+      # Deliberately narrow: the line must be ENTIRELY a parenthetical, and it must carry one of
+      # these phrases. That is a lexical net rather than a structural proof, and it is the
+      # SECONDARY guard here — the title check above is the one that catches the defect class.
+      # A wider rule (any standalone parenthetical, any mention of "template") would reject
+      # legitimate asides, and a gate an operator learns to distrust is worse than none.
+      SCAFFOLDING_PHRASES = [
+        "placeholder", "content follows", "as instructed", "per the instructions", "omitted for brevity"
+      ].freeze
+      SCAFFOLDING_LINE = /\A\(([^()]*)\)\z/
+
       # A section heading with nothing under it satisfies a naive "does it contain the
       # words" check while telling a reader nothing. This is the floor below which a
       # section counts as absent.
@@ -106,7 +145,11 @@ module SpecrelayRunner
 
       attr_reader :files
 
-      def self.validate!(files) = new(files).validate!
+      # `issue_key` is required for validation and absent from `.new`, because only the TITLE
+      # check needs it: `spec.md`'s title is the ticket's own, so proving the document is this
+      # ticket's specification means proving its title names this ticket. Parsing open questions
+      # needs no such context, and demanding one there would be ceremony.
+      def self.validate!(files, issue_key:) = new(files).validate!(issue_key: issue_key)
 
       def initialize(files)
         @files = files.to_h { |name, content| [ name.to_s, content.to_s ] }
@@ -115,14 +158,14 @@ module SpecrelayRunner
       # Raises Invalid on the FIRST structural problem, naming the document and the section.
       # A provider whose output is rejected must be able to see what to fix from the message
       # alone; "invalid output" would send the operator to read this class.
-      def validate!
+      def validate!(issue_key:)
         missing = PackagePath::REQUIRED_FILES - files.keys
         raise Invalid, "the provider returned no #{missing.join(', ')}" if missing.any?
 
         extra = files.keys - PackagePath::ALL_FILES
         raise Invalid, "the provider returned unexpected files: #{extra.sort.join(', ')}" if extra.any?
 
-        validated_names.each { |name| validate_document(name) }
+        validated_names.each { |name| validate_document(name, issue_key) }
         self
       end
 
@@ -217,15 +260,55 @@ module SpecrelayRunner
         fields
       end
 
-      def validate_document(name)
+      def validate_document(name, issue_key)
         content = files.fetch(name)
         floor = REQUIRED_SECTIONS.key?(name) ? MIN_DOCUMENT_CHARS : MIN_SUPPLEMENTARY_DOCUMENT_CHARS
         raise Invalid, "#{name} is too short to be a generated document (#{content.length} characters)" if
           content.strip.length < floor
 
         validate_fences!(name, content)
+        validate_title!(name, content, issue_key)
+        validate_scaffolding!(name, content)
         REQUIRED_SECTIONS.fetch(name, []).each { |section| validate_section(name, content, section) }
         validate_open_questions!(content) if name == PackagePath::OPEN_QUESTIONS_MD
+      end
+
+      # The document must OPEN with a level-1 heading naming its role. Checked against the
+      # structural lines, so a title that exists only inside a fenced block is absent — the same
+      # answer `#bounded_body` gives a heading in the same position, and for the same reason: a
+      # reader never sees it.
+      def validate_title!(name, content, issue_key)
+        title = document_title(content)
+        raise Invalid, "#{name} does not open with a level-1 title (\"# …\"); its first line is " \
+                       "#{first_structural_line(content).inspect}" if title.nil?
+
+        role = REQUIRED_TITLE_ROLES.fetch(name, issue_key.to_s)
+        return if !role.empty? && title.downcase.include?(role.downcase)
+
+        raise Invalid, "#{name} is titled #{title.inspect}, which does not name the document: " \
+                       "its title must contain #{role.inspect}"
+      end
+
+      def document_title(content)
+        line = first_structural_line(content)
+        return nil unless line.start_with?("# ")
+
+        line.delete_prefix("#").strip
+      end
+
+      def first_structural_line(content)
+        Markdown.structural_lines(content).map { |line, _number| line.chomp }
+                .find { |line| !line.strip.empty? }.to_s
+      end
+
+      def validate_scaffolding!(name, content)
+        Markdown.structural_lines(content).each do |line, number|
+          inside = line.chomp.strip[SCAFFOLDING_LINE, 1]
+          next if inside.nil? || SCAFFOLDING_PHRASES.none? { |phrase| inside.downcase.include?(phrase) }
+
+          raise Invalid, "#{name} line #{number} is provider scaffolding rather than specification " \
+                         "content: #{line.chomp.strip.inspect}"
+        end
       end
 
       # A present `open-questions.md` exists BECAUSE synthesis found at least one material

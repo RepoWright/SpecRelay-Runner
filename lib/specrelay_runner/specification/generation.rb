@@ -111,7 +111,7 @@ module SpecrelayRunner
       def produce(ready)
         packet = Packet.build(assignment: assignment, source: ready.source, inputs: ready.inputs,
                               package_path: ready.package_path, revision: ready.revision)
-        DocumentSet.validate!(ready.provider.generate(packet))
+        DocumentSet.validate!(ready.provider.generate(packet), issue_key: assignment.issue_key)
       end
 
       def write_package(assignment, ready, documents)

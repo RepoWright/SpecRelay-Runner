@@ -83,7 +83,7 @@ class SpecificationInputEvidenceTest < Minitest::Test
                                            status: "Open", body: "Center it.")
     package = compose(linked_issue_input(key: "SR-750", title: "Style title in center"), linked_markdown)
 
-    assert SpecrelayRunner::Specification::DocumentSet.validate!(package)
+    assert SpecrelayRunner::Specification::DocumentSet.validate!(package, issue_key: "SR-800")
   end
 
   # ------------------------------------------------------------------------ helpers

@@ -125,9 +125,12 @@ class SpecificationGenerationRevisionTest < Minitest::Test
     sections = SpecrelayRunner::Specification::DocumentSet::REQUIRED_SECTIONS
     body = "Filler content for this section, long enough to pass the minimum length check.\n\n"
     {
-      "spec.md" => sections.fetch("spec.md").map { |h| "## #{h}\n\n#{body}" }.join,
-      "analysis/business.md" => sections.fetch("analysis/business.md").map { |h| "## #{h}\n\n#{body}" }.join,
-      "analysis/technical.md" => sections.fetch("analysis/technical.md").map { |h| "## #{h}\n\n#{body}" }.join,
+      "spec.md" => "# #{ISSUE} — a specification\n\n" +
+        sections.fetch("spec.md").map { |h| "## #{h}\n\n#{body}" }.join,
+      "analysis/business.md" => "# Business analysis — #{ISSUE}\n\n" +
+        sections.fetch("analysis/business.md").map { |h| "## #{h}\n\n#{body}" }.join,
+      "analysis/technical.md" => "# Technical analysis — #{ISSUE}\n\n" +
+        sections.fetch("analysis/technical.md").map { |h| "## #{h}\n\n#{body}" }.join,
       "analysis/input-evidence.md" => "# Input evidence\n\nNo supporting input beyond the ticket.\n"
     }
   end

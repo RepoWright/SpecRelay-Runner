@@ -500,6 +500,15 @@ than committed. **The document contract a provider must satisfy:**
 - exactly the required keys — `spec.md`, `analysis/input-evidence.md`,
   `analysis/business.md`, `analysis/technical.md` — plus `analysis/open-questions.md`
   ONLY when at least one material open question exists; any other key is rejected;
+- every document opening with a `#` TITLE that names its role, matched
+  case-insensitively as a substring so your own wording and separator are yours to
+  choose: `spec.md` names its ticket's key, `input-evidence.md` names "input evidence",
+  `business.md` "business analysis", `technical.md` "technical analysis", and
+  `open-questions.md` "open questions". Promoting a `##` section name to the title does
+  not satisfy this;
+- no line that is entirely a parenthesised aside about the document's own construction
+  ("placeholder", "content follows", "as instructed", "per the instructions", "omitted
+  for brevity") — these documents carry specification content and nothing else;
 - every SECTIONED document's required section present as a `##` heading with a
   substantive body (`spec.md`, the two analyses — `input-evidence.md` and
   `open-questions.md` have no fixed heading list, since each is a variable number of

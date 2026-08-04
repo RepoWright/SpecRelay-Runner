@@ -208,6 +208,16 @@ module SpecrelayRunner
             genuinely material (a decision that changes scope, behavior, or acceptance). Omit that
             key entirely otherwise; never include it as an empty string.
 
+            TITLES — every document begins with its own `#` title on the first line, naming what
+            the document is. "spec.md" is titled for the ticket (its key and summary);
+            "#{PackagePath::INPUT_EVIDENCE_MD}" names "input evidence",
+            "#{PackagePath::BUSINESS_MD}" names "business analysis",
+            "#{PackagePath::TECHNICAL_MD}" names "technical analysis", and
+            "#{PackagePath::OPEN_QUESTIONS_MD}" names "open questions". Never promote a `##`
+            section name to the title, and never write anything about your own instructions,
+            placeholders, or what content follows — the documents contain specification content
+            and nothing else. Both are rejected before the package is written.
+
             SOURCE OF TRUTH
             - The Jira summary, description, acceptance criteria, and any reproduced ticket
               sections in the evidence below are the reporter's own words. Treat them as
