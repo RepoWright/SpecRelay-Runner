@@ -59,10 +59,12 @@ class ConnectionsCommandTest < Minitest::Test
     status, out, = run_cli(%w[connections list])
 
     assert_equal 0, status
-    listed = out.lines.grep(/^ [ *] /).map { |line| line.strip.sub(/\A\*\s*/, "").split(" ").first }
+    # RUNNER-0001: the row leads with the PROJECT and carries the workspace key after it, in
+    # the dashboard and here — both render through ConnectionView, which is the point.
+    listed = out.lines.grep(/^ [ *] /).map { |line| line.split("·")[1].to_s.strip }
     assert_equal %w[development-workspace tiny-demo-workspace], listed
-    assert_match(/^ \* tiny-demo-workspace/, out, "the default is marked in the list itself")
-    assert_match(/^   development-workspace/, out, "and non-defaults are not")
+    assert_match(/^ \* tiny-demo  ·  tiny-demo-workspace/, out, "the default is marked in the list itself")
+    assert_match(/^   tiny-demo  ·  development-workspace/, out, "and non-defaults are not")
     assert_match(/Default workspace: tiny-demo-workspace \(marked \*\)/, out)
   end
 

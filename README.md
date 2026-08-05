@@ -556,11 +556,48 @@ code path that starts a second executor.
 [loop] stopped by signal DURING an execution — the run finished and reported its result first
 ```
 
+An interrupt DURING an execution is acknowledged while the run is still finishing,
+so a Ctrl-C in the middle of a long provider run does not look ignored:
+
+```text
+[loop] stop requested — nothing further will be claimed; the run in progress finishes its report first
+```
+
 Foreground only, deliberately: no LaunchAgent, no daemonization, no supervisor.
 
-When nothing was claimed either command prints the reason **Platform** returned, so
+#### Two kinds of terminal output (RUNNER-0001)
+
+| | |
+|---|---|
+| **Transient** | True only *now*, worthless as history: polling, the countdown, a quiet executor. ONE reusable row, redrawn in place, erased when it stops being true. |
+| **Durable** | The record: the start block, a claimed task, real executor stdout/stderr, phase transitions, failures, backoff, recovery, results, the session summary. |
+
+```text
+[loop] started — polling every 60s, one run at a time, --on-failure continue
+[loop] press Ctrl-C to stop; an in-progress execution finishes its report first
+| tiny-demo (tiny-demo-workspace) — no eligible work; next check in 43s
+```
+
+That third row is the only one that moves; five idle polls add no history at all.
+The row is erased before **every** durable line and on every exit path — normal
+stop, Ctrl-C, `SIGTERM`, a rejected credential, an exception on its way out — and
+all writes from the loop, the live executor stream, the lease heartbeat, and the
+execution go through one serialized boundary (`TerminalPresenter`), which is what
+keeps three threads from splitting a line.
+
+Every word on that row corresponds to a state the runner is really in. The runner
+never displays `Thinking`, `Compiling`, or `Analyzing` unless a real executor line
+or a real runner phase produced it, and it never exposes model reasoning.
+
+**Rendering is a capability, not an assumption.** It needs an output terminal;
+redirected output (a pipe, a log file, CI) gets no carriage returns, spinner frames,
+or ANSI at all, and healthy idling there prints Platform's not-claimed reason once
+and again only when it changes.
+
+When nothing was claimed either command reports the reason **Platform** returned, so
 a machine that is not connected (or not ready) is told to run `connect` rather than
-reading a refusal as a healthy idle.
+reading a refusal as a healthy idle — on the transient row in a terminal, as a line
+where there is no row to redraw.
 
 ### Live executor output (MVP-0018)
 
@@ -579,6 +616,13 @@ The supported Claude profile runs with `--print` and emits nothing until it
 finishes (`--output-format` is a forbidden flag), so a `core.progress` **heartbeat**
 is emitted every 15s of silence naming the elapsed time. It is a fallback, never a
 substitute: real output, when available, is what you see.
+
+In a terminal that heartbeat is **transient** (RUNNER-0001): the `[claude:status]`
+row replaces itself instead of appending a line every 15s, and real provider output
+clears it before printing. Platform still receives every `core.progress` event and
+the report evidence still records each one — the durable protocol and evidence
+records are unchanged; only the terminal representation became transient. With no
+terminal to redraw it stays a plain line at the same bounded interval.
 
 Every line is redacted before the terminal write **and** before upload, clipped at
 2000 bytes, and counted against a 131072-byte per-run budget whose exhaustion emits
@@ -608,10 +652,21 @@ bin/specrelay-runner            # with no terminal: prints usage, exits 2
 bin/specrelay-runner help       # always prints help, exits 0
 ```
 
-The dashboard lists every workspace this machine is connected to and, for a
-selected one, offers: `Start loop`, `Claim once`, `Test connection/readiness`,
+The dashboard lists the **projects** this machine is connected to and, for a
+selected one, offers: `Start live loop`, `Claim once`, `Test connection/readiness`,
 `Show details`, `Set as default` / `Clear default`, `Disconnect locally`,
 `Disconnect from Platform`, `Back`.
+
+Each row leads with the project and keeps its workspace key beside it (RUNNER-0001):
+
+```text
+ 1  tiny-demo  ·  tiny-demo-workspace  ·  specrelay/tiny-demo-runs@main  ·  2d ago
+```
+
+The project is the operator's concept; the workspace key is the routing fact
+`--workspace` takes, and the only thing that distinguishes two connections to the
+same project. A record stored before project metadata existed falls back to the
+workspace key rather than to a guessed name.
 
 Keys match `./bin/worktree`: single-key shortcuts act immediately, arrows move a
 highlight that Enter runs, `Esc`/`Ctrl-C` backs out. The terminal is restored on
@@ -626,9 +681,16 @@ pass as a successful run that executed nothing.
 
 **The dashboard is a presentation layer and nothing else.** Every action calls one
 `ConnectionOperations` method — the same one the equivalent direct command calls —
-and `Start loop` / `Claim once` hand `["loop", "--workspace", <key>]` to the CLI's
-own dispatcher. They cannot drift from the direct commands, because they *are*
-them; the command line is echoed before it runs so it can be copied.
+and `Start live loop` / `Claim once` hand `["loop", "--workspace", <key>]` to the
+CLI's own dispatcher. They cannot drift from the direct commands, because they
+*are* them; the command line is echoed before it runs so it can be copied.
+
+**Ctrl-C in a menu-launched live loop returns straight to that project's menu**,
+with no acknowledgement keypress: the operator pressed Ctrl-C to come back, and the
+loop has already printed its own session summary. `Claim once`, and a loop that
+ended in a failed run or a rejected credential, still wait for a key — the next
+menu frame clears the screen, so without the pause the result would be unreadable.
+Which behaviour applies is passed in explicitly per action, never inferred.
 
 Every action is also scriptable, needs no terminal, and never prompts:
 

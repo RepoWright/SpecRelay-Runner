@@ -119,7 +119,7 @@ class DashboardTest < Minitest::Test
 
     assert_equal 0, run_dashboard(menu)
     header = menu.frames.first[:header].join("\n")
-    assert_match(/not connected to any workspace yet/, header)
+    assert_match(/not connected to any project yet/, header)
     assert_match(/specrelay-runner connect <enrollment-code>/, header)
     assert_equal [ %w[H], %w[Q] ], menu.frames.first[:entries].map { |shortcut, _, _| [ shortcut ] }
   end
@@ -142,23 +142,60 @@ class DashboardTest < Minitest::Test
 
     workspaces = menu.frames.first[:entries].select { |shortcut, _, _| shortcut.match?(/\d/) }
     assert_equal [ [ "1", "development-workspace" ], [ "2", "tiny-demo-workspace" ] ],
-                 workspaces.map { |shortcut, label, _| [ shortcut, label.split(" ").first ] }
+                 workspaces.map { |shortcut, label, _| [ shortcut, label.split("·")[1].strip ] }
+    assert_equal %w[tiny-demo tiny-demo],
+                 workspaces.map { |_, label, _| label.split("·").first.strip },
+                 "the project leads every row"
   end
 
-  def test_the_list_shows_the_facts_needed_to_choose_and_no_local_path
+  # RUNNER-0001 acceptance criterion 1: the PROJECT is the primary identity an operator reads,
+  # and the workspace key stays on the row because it is what `--workspace` routes on.
+  def test_the_list_leads_with_the_project_and_keeps_the_workspace_key_visible
     store_connection("tiny-demo-workspace")
     menu = ScriptedMenu.new([ :quit ])
 
     run_dashboard(menu)
 
     label = menu.frames.first[:entries].first[1]
-    assert_match(/tiny-demo-workspace/, label, "the workspace key")
-    assert_match(/·  tiny-demo  ·/, label, "the project")
+    assert_match(/\Atiny-demo  ·  tiny-demo-workspace  ·/, label, "project first, workspace key second")
     assert_match(%r{specrelay/tiny-demo-runs@main}, label, "the repository and its default branch")
     assert_match(/\dd ago/, label, "how old this connection is")
     # Every field survives an 80-column terminal, which is the whole reason the row is short.
     assert_operator label.length, :<=, 80
     refute_includes label, @checkout, "the top-level list must not name the operator's filesystem"
+  end
+
+  # Scenario 3: two connections to the same project must still be distinguishable. The project
+  # name alone cannot do it, so the row carries the workspace key and the repository.
+  def test_two_connections_to_the_same_project_are_still_told_apart
+    store_connection("tiny-demo-workspace", connected_at: "2026-07-20T10:00:00Z")
+    store_connection("tiny-demo-staging", connected_at: "2026-07-27T10:00:00Z")
+    menu = ScriptedMenu.new([ :quit ])
+
+    run_dashboard(menu)
+
+    rows = menu.frames.first[:entries].select { |shortcut, _, _| shortcut.match?(/\d/) }.map { |_, label, _| label }
+    assert_equal rows.uniq, rows, "two rows an operator cannot tell apart is an unsafe choice"
+    assert(rows.all? { |row| row.start_with?("tiny-demo  ·") }, "both are the same project")
+    assert_includes rows.join("\n"), "tiny-demo-staging"
+    assert_includes rows.join("\n"), "tiny-demo-workspace"
+  end
+
+  # Scenario 4: a connection stored before project metadata existed must still be usable, and
+  # must fall back VISIBLY to the workspace key rather than to a dash or an invented name.
+  def test_a_legacy_record_without_project_metadata_falls_back_to_the_workspace_key
+    store_connection("tiny-demo-workspace")
+    rewrite_state do |doc|
+      doc["connections"].each { |entry| entry["project_slug"] = entry["project_key"] = nil }
+    end
+    menu = ScriptedMenu.new([ "tiny-demo-workspace", :show, :back, :quit ])
+
+    printed = capture_dashboard(menu)
+
+    assert_match(/\Atiny-demo-workspace  ·  specrelay/, menu.frames.first[:entries].first[1])
+    assert_equal "#{SpecrelayRunner::Dashboard::TITLE} — tiny-demo-workspace", menu.frames[1][:title]
+    assert_match(/Project +—/, printed, "the missing fact is shown as missing, not guessed")
+    assert_match(/Workspace +tiny-demo-workspace/, printed)
   end
 
   def test_the_default_workspace_is_visible_on_the_top_level
@@ -180,7 +217,7 @@ class DashboardTest < Minitest::Test
     sole = ScriptedMenu.new([ :quit ])
     run_dashboard(sole)
 
-    assert_match(/none set \(not needed — only one workspace is connected\)/,
+    assert_match(/none set \(not needed — only one project is connected\)/,
                  sole.frames.first[:header].join("\n"))
 
     store_connection("development-workspace", connected_at: "2026-07-27T10:00:00Z")
@@ -266,7 +303,7 @@ class DashboardTest < Minitest::Test
     run_dashboard(menu)
 
     assert_equal [ SpecrelayRunner::Dashboard::TITLE,
-                  "#{SpecrelayRunner::Dashboard::TITLE} — tiny-demo-workspace",
+                  "#{SpecrelayRunner::Dashboard::TITLE} — tiny-demo  ·  tiny-demo-workspace",
                   SpecrelayRunner::Dashboard::TITLE ],
                  menu.frames.map { |frame| frame[:title] }
   end
@@ -382,6 +419,28 @@ class DashboardTest < Minitest::Test
     assert_equal [ "tiny-demo-workspace" ], stored_keys
     assert_equal 1, menu.confirmations.length, "the credential is still needed, so it is not asked about"
     assert_empty @secret_store.deletes
+    # Scenario 30: a LOCAL disconnect is local. Platform still authorizes this runner, and no
+    # request may be sent on its behalf — the honest posture the two actions exist to separate.
+    assert_empty @platform.requests.reject { |request| request[:path] == "/api/runner/claim" },
+                 "a local disconnect must reach Platform not at all"
+    assert_equal [ "tiny-demo-workspace" ], @platform.grants
+  end
+
+  # Scenario 36. A grant Platform no longer holds is a safe, successful outcome — and the
+  # follow-up must still be about the LOCAL entry only, never implying a project or workspace
+  # was deleted.
+  def test_an_already_absent_platform_grant_is_safe_and_still_offers_local_cleanup
+    store_connection("tiny-demo-workspace")
+    @platform.grants.clear
+    menu = ScriptedMenu.new([ "tiny-demo-workspace", :disconnect_platform, :quit ],
+                            confirmations: [ true, true, true ])
+
+    printed = capture_dashboard(menu)
+
+    assert_empty stored_keys, "the operator asked for the local entry to go too"
+    assert_match(/Platform confirmed/, menu.confirmations[1])
+    refute_match(/deleted the (project|workspace)/i, printed)
+    assert_match(/local entry/, menu.confirmations[1])
   end
 
   # Acceptance criterion 11: the credential question is SEPARATE, and only asked when nothing

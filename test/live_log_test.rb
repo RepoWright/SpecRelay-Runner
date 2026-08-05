@@ -213,6 +213,95 @@ class LiveLogTest < Minitest::Test
                     "the evidence file must record the heartbeats, not only the chatty moments"
   end
 
+  # ---- RUNNER-0001 scope 5: the quiet executor in a terminal ---------------
+
+  # Scenario 13. Elapsed liveness is true only NOW, so in a terminal it replaces one row
+  # instead of appending a line every interval — while Platform still receives the same
+  # bounded `core.progress` event, and the report evidence still records it. Only the
+  # TERMINAL representation became transient.
+  def test_a_quiet_executor_uses_the_transient_row_and_still_emits_its_platform_progress_event
+    clock = FakeClock.new
+    terminal = RecordingTerminal.new
+    presenter = SpecrelayRunner::TerminalPresenter.new(out: terminal, transient: true, columns: 100)
+    stream, _io, emitter = build_stream(clock: clock, heartbeat_interval: 10, io: presenter)
+    clock.advance(11)
+    stream.send(:heartbeat_if_quiet)
+    clock.advance(11)
+    stream.send(:heartbeat_if_quiet)
+
+    assert_equal 2, emitter.events_of("core.progress").size, "Platform still gets every heartbeat"
+    assert_empty terminal.durable_lines, "two heartbeats must not add two lines of history"
+    assert_equal 2, terminal.transient_rows.length
+    assert_includes terminal.transient_rows.last, "no new output yet"
+    assert_includes stream.evidence_text, "[status] fake executor running for",
+                    "the report evidence is unchanged — it is the durable record of the same fact"
+  end
+
+  def test_real_executor_output_clears_the_quiet_status_before_it_is_printed
+    clock = FakeClock.new
+    terminal = RecordingTerminal.new
+    presenter = SpecrelayRunner::TerminalPresenter.new(out: terminal, transient: true, columns: 100)
+    stream, _io, _emitter = build_stream(clock: clock, heartbeat_interval: 10, io: presenter)
+    clock.advance(11)
+    stream.send(:heartbeat_if_quiet)
+    stream.accept("stdout", "Reading the approved specification")
+    stream.finish
+
+    assert_equal [ "  [fake:stdout] Reading the approved specification" ], terminal.durable_lines
+    erase = terminal.writes[terminal.writes.index { |w| w.include?("Reading the approved") } - 1]
+    assert_match(/\A\r +\r\z/, erase, "the status row was still on screen under the real line")
+  end
+
+  def test_finishing_the_stream_leaves_no_quiet_status_row_on_screen
+    clock = FakeClock.new
+    terminal = RecordingTerminal.new
+    presenter = SpecrelayRunner::TerminalPresenter.new(out: terminal, transient: true, columns: 100)
+    stream, _io, _emitter = build_stream(clock: clock, heartbeat_interval: 10, io: presenter)
+    clock.advance(11)
+    stream.send(:heartbeat_if_quiet)
+    stream.finish
+
+    assert_match(/\A\r +\r\z/, terminal.writes.last, "a quiet-executor row is only true while it runs")
+  end
+
+  # With no row to redraw, the same fact stays a plain bounded line: a CI log has nowhere else
+  # to show that a silent executor is still alive.
+  def test_without_a_terminal_the_quiet_heartbeat_remains_line_oriented
+    clock = FakeClock.new
+    stream, io, emitter = build_stream(clock: clock, heartbeat_interval: 10)
+    clock.advance(11)
+    stream.send(:heartbeat_if_quiet)
+
+    assert_includes io.string, "no new output yet"
+    refute_includes io.string, "\r"
+    assert_equal 1, emitter.events_of("core.progress").size
+  end
+
+  # Criterion 16 / scenario 24: a heartbeat timer and provider output arriving at the same
+  # moment must produce complete, ordered lines. This drives the real stream from several
+  # threads at once, which is exactly how CommandRunner's readers call it.
+  def test_concurrent_provider_output_and_a_heartbeat_never_split_a_line
+    clock = FakeClock.new
+    terminal = RecordingTerminal.new
+    presenter = SpecrelayRunner::TerminalPresenter.new(out: terminal, transient: true, columns: 200)
+    stream, _io, _emitter = build_stream(clock: clock, heartbeat_interval: 1, io: presenter)
+    readers = %w[stdout stderr].map do |source|
+      Thread.new { 40.times { |i| stream.accept(source, "#{source} line #{i} #{'-' * 30}") } }
+    end
+    beater = Thread.new { 40.times { clock.advance(2) and stream.send(:heartbeat_if_quiet) } }
+    (readers + [ beater ]).each(&:join)
+    stream.finish
+
+    lines = terminal.durable_lines
+    assert_equal 80, lines.count { |line| line.include?(" line ") }
+    lines.each do |line|
+      next unless line.include?(" line ")
+
+      assert_match(/\A  \[fake:(stdout|stderr)\] (stdout|stderr) line \d+ -{30}\z/, line,
+                   "a durable executor line was split or interleaved: #{line.inspect}")
+    end
+  end
+
   def test_an_upload_failure_is_counted_and_reported_but_never_raised
     stream, io, emitter = build_stream
     emitter.fail_next!
@@ -302,8 +391,7 @@ class LiveLogTest < Minitest::Test
 
   # A stream wired to a recording emitter, with the timer thread never started so
   # the heartbeat/flush schedule is driven explicitly by the test.
-  def build_stream(clock: FakeClock.new, heartbeat_interval: 15)
-    io = StringIO.new
+  def build_stream(clock: FakeClock.new, heartbeat_interval: 15, io: StringIO.new)
     emitter = RecordingEmitter.new
     stream = SpecrelayRunner::ExecutorLogStream.new(
       emitter: emitter, io: io, provider: "fake", task_id: "DEMO-0018",

@@ -58,11 +58,16 @@ module SpecrelayRunner
 
     # `provider` only names the executor in operator-facing text. `io` is the CLI's
     # own writer, shared with Heartbeater, so terminal output stays on one stream.
+    #
+    # RUNNER-0001: it is wrapped in a TerminalPresenter (a no-op when the caller
+    # already passed one) so this stream's writes and the loop's transient status
+    # share ONE write boundary. Without it, a heartbeat timer and a reader thread
+    # could each land half a line while the loop was redrawing its status row.
     def initialize(emitter:, io:, provider:, task_id:, clock: Process,
                    heartbeat_interval: HEARTBEAT_INTERVAL_SECONDS,
                    flush_interval: FLUSH_INTERVAL_SECONDS)
       @emitter = emitter
-      @io = io
+      @io = TerminalPresenter.wrap(io)
       @provider = provider.to_s
       @task_id = task_id.to_s
       @clock = clock
@@ -117,6 +122,8 @@ module SpecrelayRunner
       flush_all
       announce_truncation
       report_upload_failures
+      # A quiet-provider status row is only true while the provider is running.
+      io.clear_status
       self
     end
 
@@ -268,11 +275,9 @@ module SpecrelayRunner
     # Ruby BLOCK-buffers stdout when it is not a terminal, so a redirected or piped
     # run showed nothing until the process exited — which is precisely the silence
     # this feature exists to remove, just moved from "no output" to "no output yet".
-    # Live output has to be flushed to be live.
-    def write(line)
-      io.puts line
-      io.flush if io.respond_to?(:flush)
-    end
+    # Live output has to be flushed to be live; the presenter flushes every line,
+    # and clears any transient status row before writing it.
+    def write(line) = io.line(line)
 
     def chunk_summary(source, text)
       count = text.count("\n") + 1
@@ -315,7 +320,15 @@ module SpecrelayRunner
       return if elapsed.nil?
 
       message = "#{provider} executor running for #{elapsed}s on #{task_id} (no new output yet)"
-      print_line("status", message)
+      # RUNNER-0001 scope 5: elapsed liveness is true only NOW, so in a terminal it
+      # replaces the status row instead of appending a line every interval — and the
+      # next real provider line clears it before printing. With no row to redraw it
+      # stays a plain bounded line, because a CI log has nowhere else to show it.
+      #
+      # The Platform `core.progress` event and the report evidence below are
+      # unchanged: they are the durable protocol/evidence record of the same fact,
+      # and only its TERMINAL representation became transient.
+      io.status("[#{provider}:status] #{message}", fallback: :line)
       # Recorded in the evidence file too: the quiet periods are part of what the
       # operator saw, and a report that showed only the talkative moments would not
       # explain why a run took as long as it did.

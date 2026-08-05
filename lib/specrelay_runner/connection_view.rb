@@ -26,14 +26,35 @@ module SpecrelayRunner
 
     # The one-line list row: enough to choose safely, and nothing that identifies the host.
     #
+    # THE PROJECT LEADS (RUNNER-0001 scope 1). An operator connected an application, not a
+    # workspace key, and the row they scan should say so. The workspace key stays on the row
+    # immediately after it — it is the deterministic routing key `--workspace` takes, and with
+    # two connections to the same project it is the only thing that tells them apart.
+    #
     # Every field has to survive an 80-column terminal, so the repository appears as
     # `owner/repo@branch` rather than as a full URL. That is the part an operator actually reads
     # to tell two connections apart, and a row whose branch and age get truncated away is a row
     # that cannot be chosen from — the detail view carries the full URL.
     def summary_line(connection, default: false, width: 100)
-      label = "#{connection.workspace_key}#{' (default)' if default}"
-      clip("#{label}  ·  #{project_label(connection)}  ·  #{short_repository_label(connection)}" \
-           "@#{present(connection.default_branch)}  ·  #{age(connection)}", width)
+      fields = [ "#{selection_label(connection)}#{' (default)' if default}",
+                 "#{short_repository_label(connection)}@#{present(connection.default_branch)}",
+                 age(connection) ]
+      clip(fields.join("  ·  "), width)
+    end
+
+    # How one connection is NAMED wherever it has to be identified in one string: the project
+    # and then its workspace key. An older local record with no project metadata falls back
+    # visibly to the workspace key alone — never to a guessed name, and never to a bare dash
+    # that would leave the row unidentifiable.
+    def selection_label(connection)
+      project = project_name(connection)
+      project.nil? ? present(connection.workspace_key) : "#{project}  ·  #{connection.workspace_key}"
+    end
+
+    # The stored project identity, or nil when this record predates it.
+    def project_name(connection)
+      label = project_label(connection)
+      label == "—" ? nil : label
     end
 
     # `owner/repo`, dropping the host, transport, and any userinfo. Two connections on the same
@@ -50,8 +71,8 @@ module SpecrelayRunner
     # the ORDER is part of the design: identity first, then what it points at, then when.
     def detail_rows(connection, default: false, readiness: nil)
       [
-        [ "Workspace", "#{connection.workspace_key} (#{present(connection.workspace_display_name)})" ],
         [ "Project", project_label(connection) ],
+        [ "Workspace", "#{connection.workspace_key} (#{present(connection.workspace_display_name)})" ],
         [ "Platform", present(connection.base_url) ],
         [ "Repository", repository_label(connection) ],
         [ "Default branch", present(connection.default_branch) ],

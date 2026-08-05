@@ -77,8 +77,37 @@ class LoopModeTest < Minitest::Test
 
     assert_equal Loop::OK, status
     assert_equal [ "DEMO-1" ], executed, "two idle polls must not stop the loop"
-    assert_equal 2, output.scan("idle —").size
+    # RUNNER-0001 scope 3/10: a healthy no-work poll is not a durable event. With no
+    # terminal to redraw (this is a StringIO) Platform's REASON is still printed —
+    # "Platform authorized no run for this runner" is the one not-claimed answer an
+    # operator has to act on — but ONCE, not once per poll.
+    assert_equal 1, output.scan("idle —").size, "two identical idle polls must not print twice"
     assert_includes output, "nothing eligible"
+    refute_includes output, "sleeping", "a healthy wait is not a durable event"
+  end
+
+  def test_a_changed_idle_reason_is_printed_again_so_a_new_state_is_never_hidden
+    reasons = [ "nothing eligible", "nothing eligible", "runner has no workspace grant" ]
+    run_loop(claim: -> { not_claimed(reasons.shift) }, execute: ->(_p) { true }, max_iterations: 3)
+
+    assert_equal 2, output.scan("idle —").size
+    assert_includes output, "runner has no workspace grant"
+  end
+
+  # The transient half of the same behaviour: with a terminal to redraw, a healthy
+  # poll adds NO line at all — the row is replaced in place.
+  def test_in_a_terminal_healthy_idle_polls_add_no_durable_lines_at_all
+    io = StringIO.new
+    presenter = SpecrelayRunner::TerminalPresenter.new(out: io, transient: true, columns: 100)
+    run_loop(claim: -> { not_claimed("nothing eligible") }, execute: ->(_p) { true },
+             max_iterations: 5, presenter: presenter)
+
+    # Only the runner's own `[loop] ` lines are durable; the transient row carries no
+    # prefix, so counting the prefix counts terminal history exactly.
+    assert_equal 4, io.string.scan("[loop] ").size,
+                 "five idle polls may add nothing beyond the 2 start lines and the 2 stop lines"
+    refute_includes io.string, "[loop] idle"
+    assert_includes io.string, "no eligible work", "the state is still visible — on the transient row"
   end
 
   def test_it_claims_and_executes_exactly_one_run_at_a_time
@@ -253,23 +282,36 @@ class LoopModeTest < Minitest::Test
   end
 
   def run_loop(claim:, execute:, max_iterations:, poll_seconds: 60,
-               on_failure: Loop::ON_FAILURE_CONTINUE, install_signals: false)
+               on_failure: Loop::ON_FAILURE_CONTINUE, install_signals: false, presenter: nil)
     @io = StringIO.new
+    @clock = FakeClock.new
     Loop.call(out: @io, err: @io, claim: claim, execute: execute, poll_seconds: poll_seconds,
               on_failure: on_failure, install_signals: install_signals, max_iterations: max_iterations,
-              sleeper: sleeper)
+              sleeper: sleeper, clock: @clock, presenter: presenter)
   end
 
-  # Never actually sleeps, so the suite stays fast, and delivers a queued signal at
-  # the first slice — which is exactly where an operator's Ctrl-C lands while the
-  # runner is waiting for work.
+  # Never actually sleeps: it ADVANCES the injected monotonic clock by the slice the
+  # loop asked for, so a 300-second backoff costs no wall-clock time and the
+  # countdown is still driven by real elapsed-time arithmetic rather than by a
+  # counter that only exists in the test.
+  #
+  # It also delivers a queued signal at the first slice — which is exactly where an
+  # operator's Ctrl-C lands while the runner is waiting for work.
   def sleeper
-    lambda do |_slice|
+    lambda do |slice|
+      @clock.advance(slice)
       pending = @pending_signal
       @pending_signal = nil
       pending&.call
       nil
     end
+  end
+
+  # A monotonic clock the test owns, so waiting is deterministic and instant.
+  class FakeClock
+    def initialize = @now = 5_000.0
+    def advance(seconds) = @now += seconds.to_f
+    def clock_gettime(_id) = @now
   end
 
   def signal_on_first_sleep!

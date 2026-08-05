@@ -26,6 +26,13 @@ module SpecrelayRunner
   # Everything about the CLAIM is still Platform's decision. This adds no
   # eligibility logic; it only asks more than once.
   #
+  # RUNNER-0001 changed what a healthy poll LOOKS LIKE, and nothing else. Waiting,
+  # the countdown, and "nothing eligible" are now TRANSIENT: one reusable row that
+  # replaces itself, so an afternoon of idling adds no terminal history. Everything
+  # an operator would scroll back for — the claim, executor output, failures,
+  # backoff, recovery, results, the session summary — stays DURABLE, and the
+  # transient row is always erased before one is written. See TerminalPresenter.
+  #
   # Foreground only, deliberately (see the spec's non-goals): no LaunchAgent, no
   # daemonization, no supervisor. The status output is shaped so that a future
   # supervisor could read it, but nothing here assumes one.
@@ -36,8 +43,13 @@ module SpecrelayRunner
     BACKOFF_FACTOR = 2
 
     # Sleep is served in slices so SIGINT is observed promptly instead of after a
-    # full poll interval.
+    # full poll interval, and so the countdown row can be redrawn as it changes.
     SLICE_SECONDS = 0.25
+
+    # How often the stop-acknowledgement watcher looks at the flag while an
+    # execution is in progress. Short enough that Ctrl-C is answered immediately,
+    # slow enough to cost nothing.
+    STOP_NOTICE_SECONDS = 0.1
 
     ON_FAILURE_CONTINUE = "continue"
     ON_FAILURE_STOP = "stop"
@@ -56,19 +68,31 @@ module SpecrelayRunner
     #
     #   claim   -> PlatformClient::ClaimResult
     #   execute -> truthy when the claimed run succeeded
+    #
+    # `presenter`, `clock`, and `sleeper` are the injection seams that make the
+    # terminal behaviour testable: capability, time, and waiting are all explicit
+    # dependencies rather than facts about the developer's machine.
     def initialize(out:, err:, claim:, execute:, poll_seconds:, on_failure: ON_FAILURE_CONTINUE,
-                   install_signals: true, max_iterations: nil, sleeper: nil)
-      @out = out
-      @err = err
+                   install_signals: true, max_iterations: nil, sleeper: nil, presenter: nil,
+                   clock: Process, label: nil)
       @claim = claim
       @execute = execute
       @poll_seconds = poll_seconds
       @on_failure = on_failure
       @install_signals = install_signals
       @max_iterations = max_iterations
+      @clock = clock
+      @label = label.to_s
+      # OWNERSHIP decides how the row is cleaned up. A loop that built its own presenter also
+      # ends it; a loop handed one — every dashboard-launched loop, which shares the CLI's
+      # single write boundary — only RELEASES the row, because the presenter outlives this
+      # session and the operator can start another loop from the same menu.
+      @owns_presenter = presenter.nil?
+      @presenter = presenter || TerminalPresenter.for(out: out, err: err)
       @sleeper = sleeper || ->(seconds) { sleep seconds }
       @stop_requested = false
       @stopped_during_execution = false
+      @execution_active = false
       @failures = 0
       @consecutive_errors = 0
       @executed = 0
@@ -82,12 +106,16 @@ module SpecrelayRunner
       announce_stop
       status
     ensure
+      # The row is erased here, on EVERY exit path — a normal stop, Ctrl-C,
+      # SIGTERM, a fatal credential rejection, or an exception on its way past.
+      @owns_presenter ? presenter.finish : presenter.clear_status
       restore_signals
     end
 
     private
 
-    attr_reader :out, :err, :claim, :execute, :poll_seconds, :on_failure, :max_iterations, :sleeper
+    attr_reader :claim, :execute, :poll_seconds, :on_failure, :max_iterations, :sleeper, :presenter,
+                :clock, :label
 
     def poll_loop
       iterations = 0
@@ -106,9 +134,9 @@ module SpecrelayRunner
 
     # One poll. Returns :continue to keep looping or :stop to end the session.
     def one_iteration
-      status "waiting — polling Platform for eligible work"
+      transient "checking for eligible work"
       result = claim.call
-      @consecutive_errors = 0
+      note_recovery
       result.claimed? ? run_claimed(result.payload) : idle(result)
     rescue PlatformClient::Unauthorized => e
       fatal("this runner's credential was rejected by Platform (#{Redaction.redact(e.message)})",
@@ -117,9 +145,21 @@ module SpecrelayRunner
       back_off(e)
     end
 
+    # A healthy no-work answer is the thing this loop does most and the thing an
+    # operator least needs a record of, so it stays on the transient row.
+    #
+    # With no row to put it on — a pipe, a log file, CI — the reason is printed
+    # once, and again only when it CHANGES. It is not per-poll noise, and it is the
+    # only place a redirected runner can say something an operator must act on
+    # ("Platform authorized no run for this runner" is not the same answer as
+    # "nothing is ready yet").
     def idle(result)
-      status "idle — #{idle_reason(result)}"
-      pause(poll_seconds, "next poll")
+      reason = idle_reason(result)
+      if reason != @last_idle_reason
+        @last_idle_reason = reason
+        line "idle — #{reason}" unless presenter.transient?
+      end
+      wait(poll_seconds, state: "no eligible work", until_label: "next check")
     end
 
     # Platform's own explanation, so an unconnected runner is told that rather than
@@ -133,8 +173,8 @@ module SpecrelayRunner
     # poll happens immediately rather than after the interval, because a queue of
     # ready tickets should drain without an artificial wait.
     def run_claimed(payload)
-      status "executing — claimed #{payload.dig('run', 'task_id')} (#{payload.dig('run', 'id')})"
-      succeeded = execute.call(payload)
+      line "executing — claimed #{payload.dig('run', 'task_id')} (#{payload.dig('run', 'id')})"
+      succeeded = watching_for_stop { execute.call(payload) }
       # Remembered separately from @stop_requested: an operator who interrupts
       # DURING an execution needs to be told the run finished reporting first, which
       # is a materially different situation from an interrupt while idle.
@@ -143,8 +183,36 @@ module SpecrelayRunner
       succeeded ? run_succeeded : run_failed
     end
 
+    # Ctrl-C during a long execution has to be ACKNOWLEDGED while the run is still
+    # finishing, or the operator has no way to tell a received signal from an
+    # ignored one and presses it again. The signal handler cannot say so itself —
+    # it may only set a flag — so one short-lived watcher does it from a normal
+    # execution path, writing through the presenter's single write boundary.
+    def watching_for_stop
+      @execution_active = true
+      watcher = Thread.new { acknowledge_stop_while_executing }
+      yield
+    ensure
+      @execution_active = false
+      watcher&.join
+    end
+
+    # A real `sleep`, deliberately not the injected `sleeper`: the sleeper is how the
+    # POLL WAIT is made instant in a test, and using it here would turn this watcher
+    # into a hot spin. It runs concurrently with the execution, so no test waits on it.
+    def acknowledge_stop_while_executing
+      sleep(STOP_NOTICE_SECONDS) while @execution_active && !@stop_requested
+      return unless @stop_requested
+
+      line "stop requested — nothing further will be claimed; the run in progress finishes " \
+           "its report first"
+    rescue StandardError
+      # An acknowledgement is a courtesy. It must never take an execution down.
+      nil
+    end
+
     def run_succeeded
-      status "run completed — polling again immediately"
+      line(@stop_requested ? "run completed — stopping as requested" : "run completed — polling again immediately")
       :continue
     end
 
@@ -153,23 +221,38 @@ module SpecrelayRunner
     # as a quiet idle, and that the session's exit code remembers it.
     def run_failed
       @failures += 1
-      status "run FAILED — the failure was reported to Platform through the terminal-result contract"
+      line "run FAILED — the failure was reported to Platform through the terminal-result contract"
       unless continue_on_failure?
-        status "stopping after a failed run (--on-failure #{ON_FAILURE_STOP})"
+        line "stopping after a failed run (--on-failure #{ON_FAILURE_STOP})"
         return :stop
       end
 
-      status "continuing to poll (--on-failure #{ON_FAILURE_CONTINUE})"
+      line "continuing to poll (--on-failure #{ON_FAILURE_CONTINUE})"
       :continue
     end
 
     def continue_on_failure? = on_failure.to_s != ON_FAILURE_STOP
 
+    # A polling failure and the wait it causes are durable: the operator has to be
+    # able to see, afterwards, that Platform was unreachable and for how long.
+    # Changing backoff durations therefore stay in the record; only the countdown
+    # between them is transient.
     def back_off(error)
       @consecutive_errors += 1
       seconds = backoff_seconds
-      status "polling failed — #{Redaction.redact(error.message)}"
-      pause(seconds, "retry ##{@consecutive_errors}")
+      line "polling failed — #{Redaction.redact(error.message)}"
+      line "sleeping #{format_seconds(seconds)} until retry ##{@consecutive_errors}"
+      wait(seconds, state: "polling failed", until_label: "retry ##{@consecutive_errors}")
+    end
+
+    # Printed ONCE, when Platform answers again after a failed poll: an operator
+    # watching an outage needs the recovery in the record, not only the failures.
+    def note_recovery
+      recovered = @consecutive_errors
+      @consecutive_errors = 0
+      return if recovered.zero?
+
+      line "recovered — Platform answered again after #{recovered} failed poll(s)"
     end
 
     def backoff_seconds
@@ -179,31 +262,38 @@ module SpecrelayRunner
 
     def fatal(reason, remedy)
       @failures += 1
-      out.flush if out.respond_to?(:flush)
-      err.puts "[loop] stopping — #{reason}"
-      err.puts "[loop] remedy: #{remedy}"
+      presenter.error "[loop] stopping — #{reason}"
+      presenter.error "[loop] remedy: #{remedy}"
       :stop
     end
 
-    # Sleeps in slices so a signal is noticed promptly. Returns :stop when the
+    # Waits in slices so a signal is noticed promptly, redrawing the countdown on
+    # the transient row as the whole second changes. Returns :stop when the
     # operator interrupted mid-wait, so the caller does not poll one more time.
-    def pause(seconds, label)
-      status "sleeping #{format_seconds(seconds)} until #{label}"
-      remaining = seconds.to_f
-      while remaining > 0
+    #
+    # The deadline is MONOTONIC: a countdown computed from wall-clock time lies
+    # when the laptop sleeps or the clock steps.
+    def wait(seconds, state:, until_label:)
+      deadline = monotonic + seconds.to_f
+      loop do
         return :stop if @stop_requested
 
+        remaining = deadline - monotonic
+        break if remaining <= 0
+
+        transient state, "; #{until_label} in #{format_seconds(remaining.ceil)}"
         sleeper.call([ remaining, SLICE_SECONDS ].min)
-        remaining -= SLICE_SECONDS
       end
       @stop_requested ? :stop : :continue
     end
 
     def format_seconds(seconds) = seconds == seconds.to_i ? "#{seconds.to_i}s" : format("%.1fs", seconds)
+    def monotonic = clock.clock_gettime(Process::CLOCK_MONOTONIC)
 
     # Only an assignment happens in the handler — nothing that allocates, logs, or
     # takes a lock, because a trap can interrupt any of those mid-operation. The
-    # loop prints and unwinds on the main thread.
+    # loop prints and unwinds on the main thread; the watcher above is what turns
+    # the flag into an operator-visible line.
     def trap_signals
       return unless @install_signals
 
@@ -215,24 +305,35 @@ module SpecrelayRunner
       @previous_traps.clear
     end
 
-    # Flushed, because Ruby block-buffers a non-terminal stdout: a loop whose output
-    # is redirected to a log file would otherwise show nothing until it exited, and
-    # "is it alive?" is the exact question this status line exists to answer.
-    def status(message)
-      out.puts "[loop] #{message}"
-      out.flush if out.respond_to?(:flush)
+    # The record. `[loop] ` prefixed so runner lines stay distinguishable from
+    # executor output, and flushed by the presenter because Ruby block-buffers a
+    # redirected stdout — "is it alive?" is exactly the question this answers.
+    def line(message) = presenter.line("[loop] #{message}")
+
+    # What is true right now. One row, replaced in place, gone when it stops being
+    # true.
+    #
+    # A narrow terminal gets the most informative message that FITS, in this order:
+    # identity + state + countdown, then state + countdown, then the bare state. It
+    # loses detail rather than being handed a clipped half-truth — the identity was
+    # already named durably at start, and half a workspace key is worse than none.
+    # The presenter still clips, but only if even the bare state does not fit.
+    def transient(state, countdown = nil)
+      rows = [ "#{label} — #{state}#{countdown}", "#{state}#{countdown}", state ]
+      rows.shift if label.empty?
+      presenter.status(rows.find { |row| row.length <= presenter.columns - 2 } || rows.last)
     end
 
     def announce_start
-      status "started — polling every #{poll_seconds}s, one run at a time, --on-failure #{on_failure}"
-      status "press Ctrl-C to stop; an in-progress execution finishes its report first"
+      line "started — polling every #{poll_seconds}s, one run at a time, --on-failure #{on_failure}"
+      line "press Ctrl-C to stop; an in-progress execution finishes its report first"
     end
 
     # Names what the runner was doing when it stopped, so an operator who hits
     # Ctrl-C knows whether a run is mid-flight.
     def announce_stop
-      status(stop_description)
-      status "session totals — #{@executed} run(s) executed, #{@failures} failed"
+      line(stop_description)
+      line "session totals — #{@executed} run(s) executed, #{@failures} failed"
     end
 
     def stop_description
