@@ -74,9 +74,10 @@ module SpecrelayRunner
     # dependencies rather than facts about the developer's machine.
     def initialize(out:, err:, claim:, execute:, poll_seconds:, on_failure: ON_FAILURE_CONTINUE,
                    install_signals: true, max_iterations: nil, sleeper: nil, presenter: nil,
-                   clock: Process, label: nil)
+                   clock: Process, label: nil, presence: Presence::NONE)
       @claim = claim
       @execute = execute
+      @presence = presence
       @poll_seconds = poll_seconds
       @on_failure = on_failure
       @install_signals = install_signals
@@ -102,10 +103,15 @@ module SpecrelayRunner
     def call
       trap_signals
       announce_start
-      status = poll_loop
+      status = announce_presence == :stop ? FAILED : poll_loop
       announce_stop
       status
     ensure
+      # MVP-0031: the best-effort goodbye, on EVERY exit path — a normal stop, Ctrl-C,
+      # SIGTERM, a fatal credential rejection, or an exception on its way past. It cannot
+      # change `status`, which has already been decided: a machine that failed to say goodbye
+      # ages to Offline on its own, and that is the right answer anyway.
+      presence.stopped
       # The row is erased here, on EVERY exit path — a normal stop, Ctrl-C,
       # SIGTERM, a fatal credential rejection, or an exception on its way past.
       @owns_presenter ? presenter.finish : presenter.clear_status
@@ -115,7 +121,7 @@ module SpecrelayRunner
     private
 
     attr_reader :claim, :execute, :poll_seconds, :on_failure, :max_iterations, :sleeper, :presenter,
-                :clock, :label
+                :clock, :label, :presence
 
     def poll_loop
       iterations = 0
@@ -174,11 +180,20 @@ module SpecrelayRunner
     # ready tickets should drain without an artificial wait.
     def run_claimed(payload)
       line "executing — claimed #{payload.dig('run', 'task_id')} (#{payload.dig('run', 'id')})"
+      # Idle presence stops for the duration of the attempt: from here the run's own lease
+      # heartbeat is the authoritative liveness signal, and a second one would let a watcher
+      # look like it owned the run rather than being the process executing it.
+      presence.pause
       succeeded = watching_for_stop { execute.call(payload) }
       # Remembered separately from @stop_requested: an operator who interrupts
       # DURING an execution needs to be told the run finished reporting first, which
       # is a materially different situation from an interrupt while idle.
+      #
+      # Read BEFORE presence resumes, because a superseded presence session also sets
+      # @stop_requested — and reporting that as "interrupted by signal during an execution"
+      # would describe something the operator did not do.
       @stopped_during_execution ||= @stop_requested
+      resume_presence
       @executed += 1
       succeeded ? run_succeeded : run_failed
     end
@@ -281,10 +296,40 @@ module SpecrelayRunner
         remaining = deadline - monotonic
         break if remaining <= 0
 
+        # Presence has to stay current DURING the wait, not only between polls: with the
+        # default interval a poll boundary is further apart than Platform's presence window,
+        # so a runner that only signalled per poll would flicker to Offline while healthy.
+        # The call is cheap and cadence-gated — it sends nothing until Platform's advertised
+        # interval is due.
+        return :stop if keep_presence_current == :stop
+
         transient state, "; #{until_label} in #{format_seconds(remaining.ceil)}"
         sleeper.call([ remaining, SLICE_SECONDS ].min)
       end
       @stop_requested ? :stop : :continue
+    end
+
+    # Presence outcomes that are PERMANENT stop the session, for the same reason a rejected
+    # claim credential does: a superseded session and a revoked credential both mean this
+    # process will never be current again. A transient failure is left alone — the loop keeps
+    # polling and Platform's own window reports Offline until the network returns.
+    def keep_presence_current
+      act_on_presence(presence.heartbeat_if_due)
+    end
+
+    def resume_presence
+      act_on_presence(presence.resume)
+    end
+
+    def announce_presence
+      act_on_presence(presence.started)
+    end
+
+    def act_on_presence(outcome)
+      return :continue unless outcome.stop?
+
+      @stop_requested = true
+      fatal(outcome.message, outcome.remedy)
     end
 
     def format_seconds(seconds) = seconds == seconds.to_i ? "#{seconds.to_i}s" : format("%.1fs", seconds)
