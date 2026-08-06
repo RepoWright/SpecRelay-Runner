@@ -23,6 +23,12 @@ module SpecrelayRunner
   # credential and a newer session both mean this process will never be current again, and a
   # machine silently spinning on that is worse than one that stops and says why.
   class Presence
+    # A session is ESTABLISHED in two steps, because its order is Platform's to decide and no
+    # clock on this machine may be trusted with it. `open` asks for this loop's place in line;
+    # `started` then claims the connection with it, and Platform refuses a place in line it has
+    # already passed. That is what stops a loop whose start was delayed — by a suspended
+    # laptop or a dropped network — from displacing the machine that is watching right now.
+    OPEN = "open"
     STARTED = "started"
     HEARTBEAT = "heartbeat"
     STOPPED = "stopped"
@@ -80,21 +86,26 @@ module SpecrelayRunner
       @next_due = nil
       @consecutive_errors = 0
       @last_notice = nil
+      @established = false
     end
 
     def enabled? = true
 
     # Sent before the first claim poll, so Platform shows Watching from the moment the command
     # is running rather than from the first idle wait.
-    def started = deliver(STARTED)
+    def started = establish
 
     # Called from the poll wait. Does nothing until the advertised cadence is due, so the wait
     # loop can call it on every slice without generating a request per slice.
+    #
+    # A session that never got established — Platform was unreachable when the loop began —
+    # is retried here rather than heartbeated. Beating for a session Platform never recorded
+    # would be answered `superseded` and would stop a loop that is perfectly healthy.
     def heartbeat_if_due(now = monotonic)
       return Outcome.new(status: OK) if @paused
       return Outcome.new(status: OK) if @next_due && now < @next_due
 
-      deliver(HEARTBEAT)
+      @established ? deliver(HEARTBEAT) : establish
     end
 
     # A claim is starting. Idle presence stops until the attempt reaches a terminal result:
@@ -110,13 +121,14 @@ module SpecrelayRunner
     def resume
       @paused = false
       @next_due = nil
-      deliver(HEARTBEAT)
+      @established ? deliver(HEARTBEAT) : establish
     end
 
     # Best effort, by contract. Every failure is swallowed: the session's real result has
-    # already been decided by the work it did, and a failed goodbye must not change it.
+    # already been decided by the work it did, and a failed goodbye must not change it. A
+    # session Platform never recorded has nothing to say goodbye about.
     def stopped
-      deliver(STOPPED)
+      deliver(STOPPED) if @established
       nil
     rescue StandardError
       nil
@@ -126,8 +138,23 @@ module SpecrelayRunner
 
     attr_reader :client, :workspace_key, :session_id, :interval_seconds, :clock
 
-    def deliver(event)
-      body = client.report_presence(workspace_key: workspace_key, session_id: session_id, event: event)
+    # The two-step handshake. The opening call is the one that can be refused on ordering
+    # grounds later, so nothing is considered established until Platform has accepted the
+    # `started` that presents the sequence it issued.
+    def establish
+      opened = deliver(OPEN)
+      return opened unless opened.ok?
+
+      started = deliver(STARTED, session_seq: @session_seq)
+      @established = started.ok?
+      started
+    end
+
+    def deliver(event, session_seq: nil)
+      body = client.report_presence(workspace_key: workspace_key, event: event,
+                                    session_id: (session_id unless event == OPEN),
+                                    session_seq: session_seq)
+      @session_seq = body.dig("presence", "session_seq") if event == OPEN && body.is_a?(Hash)
       recovered
       outcome_for(body)
     rescue PlatformClient::Unauthorized => e

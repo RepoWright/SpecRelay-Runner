@@ -15,13 +15,45 @@ class LoopPresenceTest < Minitest::Test
 
   # ---- the session lifecycle ----------------------------------------------
 
-  def test_started_is_sent_before_the_first_claim_poll
+  def test_the_session_is_established_before_the_first_claim_poll
     order = []
     client = FakePresenceClient.new(on_call: ->(event) { order << event })
     run_loop(client: client, claim: -> { order << :claim; not_claimed }, max_iterations: 1)
 
-    assert_equal "started", order.first, "presence must be established before any claim is attempted"
+    assert_equal %w[open started], order.first(2),
+                 "presence must be established, in that order, before any claim is attempted"
     assert_includes order, :claim
+  end
+
+  # CR-001 F1. The runner ships no ordering logic of its own: it asks Platform for a place in
+  # line and hands that exact value back. Anything derived on this machine — a clock, a
+  # counter, a random id — is what the defect was.
+  def test_the_start_presents_the_place_in_line_platform_issued
+    client = FakePresenceClient.new
+    run_loop(client: client, max_iterations: 1)
+
+    opened = client.calls.find { |call| call[:event] == "open" }
+    started = client.calls.find { |call| call[:event] == "started" }
+
+    assert_nil opened[:session_id], "the opening call carries no session — it is the request for one"
+    assert_nil opened[:session_seq]
+    assert_equal 1, started[:session_seq]
+    assert_equal "session-test-000001", started[:session_id]
+  end
+
+  # A loop whose Platform was unreachable at startup has no session to beat for. Beating anyway
+  # would be answered `superseded` and would stop a perfectly healthy loop, so the establish is
+  # retried instead.
+  def test_a_session_that_could_not_be_established_is_retried_rather_than_heartbeated
+    client = FakePresenceClient.new(fail_on: "open", fail_times: 1, heartbeat_seconds: 10)
+    status = run_loop(client: client, poll_seconds: 60, max_iterations: 3)
+
+    assert_equal Loop::OK, status, "an unreachable Platform at startup must not end the session"
+    assert_equal 2, client.events.count("open"), "the handshake is retried"
+    assert_includes client.events, "started"
+    refute_operator client.events.index("heartbeat") || Float::INFINITY, :<,
+                    client.events.index("started"),
+                    "no beat may be sent for a session Platform never recorded"
   end
 
   def test_the_cadence_platform_advertises_drives_the_idle_heartbeat
@@ -65,7 +97,7 @@ class LoopPresenceTest < Minitest::Test
     run_loop(client: client, claim: -> { claims.shift }, execute: execute,
              poll_seconds: 60, max_iterations: 2)
 
-    assert_equal [ "started" ], during, "no idle beat may be sent while a claim is executing"
+    assert_equal %w[open started], during, "no idle beat may be sent while a claim is executing"
     # The resume is a heartbeat on the SAME session, never a second `started`.
     assert_equal 1, client.events.count("started"), "a completed run must not open a new session"
     assert_operator client.events.count("heartbeat"), :>=, 1
@@ -199,26 +231,30 @@ class LoopPresenceTest < Minitest::Test
     def clock_gettime(_id) = @now
   end
 
-  # Records every presence call and answers exactly as Platform does.
+  # Records every presence call and answers exactly as Platform does, including the place in
+  # line an `open` hands back (CR-001 F1).
   class FakePresenceClient
-    attr_reader :events
+    attr_reader :events, :calls
 
     def initialize(outcome: SpecrelayRunner::Presence::ACCEPTED, heartbeat_seconds: 30,
                    fail_on: nil, fail_times: Float::INFINITY, raise_on_started: nil,
                    raise_on_stopped: nil, on_call: nil)
       @events = []
+      @calls = []
       @outcome = outcome
       @heartbeat_seconds = heartbeat_seconds
       @fail_on = fail_on
       @fail_times = fail_times
       @failures = 0
+      @issued = 0
       @raise_on_started = raise_on_started
       @raise_on_stopped = raise_on_stopped
       @on_call = on_call
     end
 
-    def report_presence(workspace_key:, session_id:, event:)
+    def report_presence(workspace_key:, event:, session_id: nil, session_seq: nil)
       @events << event
+      @calls << { event: event, session_id: session_id, session_seq: session_seq }
       @on_call&.call(event)
       raise @raise_on_started if @raise_on_started && event == SpecrelayRunner::Presence::STARTED
       raise @raise_on_stopped if @raise_on_stopped && event == SpecrelayRunner::Presence::STOPPED
@@ -228,9 +264,19 @@ class LoopPresenceTest < Minitest::Test
         raise SpecrelayRunner::PlatformClient::Error, "could not reach Platform at http://127.0.0.1:3200"
       end
 
-      { "contract_version" => "mvp-0031",
-        "presence" => { "outcome" => @outcome, "workspace_key" => workspace_key,
-                        "heartbeat_seconds" => @heartbeat_seconds, "recent_for_seconds" => 90 } }
+      { "contract_version" => "mvp-0031", "presence" => presence_body(workspace_key, event) }
+    end
+
+    private
+
+    # Platform never answers `superseded` to an opening call — that call only allocates a place
+    # in line. Ordering is decided when the `started` presenting it arrives.
+    def presence_body(workspace_key, event)
+      body = { "outcome" => @outcome, "workspace_key" => workspace_key,
+               "heartbeat_seconds" => @heartbeat_seconds, "recent_for_seconds" => 90 }
+      return body unless event == SpecrelayRunner::Presence::OPEN
+
+      body.merge("outcome" => SpecrelayRunner::Presence::ACCEPTED, "session_seq" => (@issued += 1))
     end
   end
 

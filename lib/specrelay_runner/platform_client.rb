@@ -180,9 +180,15 @@ module SpecrelayRunner
     # keep, so the response is read for what it DECIDED rather than assumed. Both are 200: a
     # superseded session is a well-formed request with a meaningful answer, not a transport
     # failure to retry.
-    def report_presence(workspace_key:, session_id:, event:)
-      status, body = post_json("/api/runner/presence",
-                               { workspace_key: workspace_key, session_id: session_id, event: event })
+    # `session_id` is absent on the opening call — that call is the request for a session, and
+    # Platform answers it with the sequence the following `started` must present. Keys that do
+    # not apply to an event are omitted rather than sent as null, so the payload stays the
+    # closed set the endpoint validates.
+    def report_presence(workspace_key:, event:, session_id: nil, session_seq: nil)
+      payload = { workspace_key: workspace_key, event: event }
+      payload[:session_id] = session_id if session_id
+      payload[:session_seq] = session_seq if session_seq
+      status, body = post_json("/api/runner/presence", payload)
       status == 200 ? body : raise_for(status, body)
     end
 
