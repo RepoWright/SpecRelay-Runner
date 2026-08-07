@@ -30,8 +30,8 @@ class ConnectionStoreTest < Minitest::Test
       base_url: "http://127.0.0.1:3100", runner_id: "host-runner", runner_public_id: runner_public_id,
       runner_display_name: "host runner", project_slug: "tiny-demo", workspace_key: workspace_key,
       project_key: "tiny-demo", workspace_display_name: "Tiny Demo Workspace",
-      repository_url: "https://github.com/SpecRelay/tiny-demo-runs", default_branch: "main",
-      local_path: "/Users/someone/dev/tiny-demo-runs", connected_at: connected_at
+      repository_url: "https://github.com/SpecRelay/tiny-demo-workspace", default_branch: "main",
+      local_path: "/Users/someone/dev/tiny-demo-workspace", connected_at: connected_at
     )
   end
 

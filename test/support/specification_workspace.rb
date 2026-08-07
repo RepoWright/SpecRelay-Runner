@@ -22,7 +22,7 @@ module SpecificationWorkspace
   # so a single `remove_entry` cleans up.
   def build(graph: :fresh)
     root = Dir.mktmpdir("specrelay-spec-lane-")
-    source = File.join(root, "tiny-demo-runs")
+    source = File.join(root, "tiny-demo-workspace")
     specs = File.join(root, "SpecRelay-Specs")
     build_source(source, graph: graph)
     build_specs(specs)

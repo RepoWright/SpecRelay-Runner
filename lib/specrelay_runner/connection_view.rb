@@ -22,6 +22,8 @@ module SpecrelayRunner
   # Every value is width-bounded so a narrow terminal degrades to truncation rather than to
   # wrapped, misaligned rows that hide which action a highlighted line would take.
   module ConnectionView
+    ROW_SEPARATOR = " · "
+
     module_function
 
     # The one-line list row: enough to choose safely, and nothing that identifies the host.
@@ -35,20 +37,24 @@ module SpecrelayRunner
     # `owner/repo@branch` rather than as a full URL. That is the part an operator actually reads
     # to tell two connections apart, and a row whose branch and age get truncated away is a row
     # that cannot be chosen from — the detail view carries the full URL.
+    #
+    # The row separates fields more tightly than a title does, because the width budget is spent
+    # on the fields themselves: a workspace key and a repository name that repeat the same words
+    # already cost most of the 80 columns.
     def summary_line(connection, default: false, width: 100)
-      fields = [ "#{selection_label(connection)}#{' (default)' if default}",
+      fields = [ "#{selection_label(connection, separator: ROW_SEPARATOR)}#{' (default)' if default}",
                  "#{short_repository_label(connection)}@#{present(connection.default_branch)}",
                  age(connection) ]
-      clip(fields.join("  ·  "), width)
+      clip(fields.join(ROW_SEPARATOR), width)
     end
 
     # How one connection is NAMED wherever it has to be identified in one string: the project
     # and then its workspace key. An older local record with no project metadata falls back
     # visibly to the workspace key alone — never to a guessed name, and never to a bare dash
     # that would leave the row unidentifiable.
-    def selection_label(connection)
+    def selection_label(connection, separator: "  ·  ")
       project = project_name(connection)
-      project.nil? ? present(connection.workspace_key) : "#{project}  ·  #{connection.workspace_key}"
+      project.nil? ? present(connection.workspace_key) : "#{project}#{separator}#{connection.workspace_key}"
     end
 
     # The stored project identity, or nil when this record predates it.

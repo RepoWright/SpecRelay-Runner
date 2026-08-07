@@ -26,7 +26,7 @@ module SpecrelayRunner
   #       provider: fake
   #       command: ./bin/fake-executor
   #   workspace_roots:                           # optional; else env resolution
-  #     tiny-demo-workspace: /abs/path/to/tiny-demo-runs
+  #     tiny-demo-workspace: /abs/path/to/tiny-demo-workspace
   #
   # Two authentication modes, clearly separated (MVP-0011):
   #   - registered mode (primary): the per-runner credential is read from the env

@@ -35,7 +35,7 @@ class ConnectFlowTest < Minitest::Test
 
   # --- fixtures -------------------------------------------------------------
 
-  def start_platform(repository_url: "https://github.com/SpecRelay/tiny-demo-runs")
+  def start_platform(repository_url: "https://github.com/SpecRelay/tiny-demo-workspace")
     payload = claim_payload_for(task_id: "DEMO-0017", executor_command: "specrelay-fake-executor")
     payload["workspace"]["repository_url"] = repository_url
     @platform = FakePlatform.new(claim_payload: payload).start
@@ -51,7 +51,7 @@ class ConnectFlowTest < Minitest::Test
 
   # A real Git repository with a real `origin` remote and a real `main` branch, so
   # RepositoryCheck runs its real git commands rather than a stub.
-  def git_checkout(remote: "https://github.com/SpecRelay/tiny-demo-runs", branch: "main")
+  def git_checkout(remote: "https://github.com/SpecRelay/tiny-demo-workspace", branch: "main")
     path = Dir.mktmpdir("checkout")
     run_git(path, %w[init --quiet])
     run_git(path, [ "symbolic-ref", "HEAD", "refs/heads/#{branch}" ])
@@ -459,7 +459,7 @@ class ConnectFlowTest < Minitest::Test
                  base_url: platform.base_url, runner_id: "host-runner", runner_public_id: "rnr_fake",
                  runner_display_name: "host runner", project_slug: "tiny-demo",
                  workspace_key: "first-workspace",
-                 repository_url: "https://github.com/SpecRelay/tiny-demo-runs",
+                 repository_url: "https://github.com/SpecRelay/tiny-demo-workspace",
                  default_branch: "main", local_path: "/tmp/first",
                  connected_at: "2026-07-26T00:00:00Z"
                ))

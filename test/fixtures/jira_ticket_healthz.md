@@ -26,15 +26,15 @@ Every expected input was readable.
 
 - Host: github.com
 - Owner: SpecRelay
-- Repository: tiny-demo-runs
-- Repository URL: https://github.com/SpecRelay/tiny-demo-runs
+- Repository: tiny-demo-workspace
+- Repository URL: https://github.com/SpecRelay/tiny-demo-workspace
 - Default branch: `main`
 - Specification root: `specs`
 
 ## Jira description
 
 ```text
-Reviewer-created verification fixture for SpecRelay MVP-0026 (runner specification generation), review round 002. Safe for the Product Owner to close or delete once the review is filed. It describes a real, implementable change to the Tiny Demo app in SpecRelay/tiny-demo-runs.
+Reviewer-created verification fixture for SpecRelay MVP-0026 (runner specification generation), review round 002. Safe for the Product Owner to close or delete once the review is filed. It describes a real, implementable change to the Tiny Demo app in SpecRelay/tiny-demo-workspace.
 
 Problem
 

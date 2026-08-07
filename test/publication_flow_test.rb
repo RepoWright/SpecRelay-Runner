@@ -82,7 +82,7 @@ class PublicationFlowTest < Minitest::Test
     assert_match(/\A[0-9a-f]{40,64}\z/, repo["base_commit"])
     assert_match(/\A[0-9a-f]{40,64}\z/, repo["head_commit"])
     refute_equal repo["base_commit"], repo["head_commit"], "publication must create a real commit"
-    assert_equal "https://github.com/SpecRelay/tiny-demo-runs/pull/7", repo["pull_request_url"]
+    assert_equal "https://github.com/SpecRelay/tiny-demo-workspace/pull/7", repo["pull_request_url"]
     assert_nil repo["publication_error"]
 
     # The branch really exists in the remote, at exactly the reported head commit.
@@ -260,11 +260,11 @@ class PublicationFlowTest < Minitest::Test
   # CR-001 criterion 2. A closed or merged pull request on the same deterministic
   # branch must never be reported as this round's output.
   def test_merged_pull_request_on_the_same_branch_is_never_reused
-    assert_not_reused("MERGED", "https://github.com/SpecRelay/tiny-demo-runs/pull/3")
+    assert_not_reused("MERGED", "https://github.com/SpecRelay/tiny-demo-workspace/pull/3")
   end
 
   def test_closed_pull_request_on_the_same_branch_is_never_reused
-    assert_not_reused("CLOSED", "https://github.com/SpecRelay/tiny-demo-runs/pull/4")
+    assert_not_reused("CLOSED", "https://github.com/SpecRelay/tiny-demo-workspace/pull/4")
   end
 
   # The stale pull request is seeded with a foreign head sha, exactly as a previous
@@ -273,7 +273,7 @@ class PublicationFlowTest < Minitest::Test
     start
     seed = [ { "url" => stale_url, "state" => state, "headRefName" => BRANCH,
                "headRefOid" => "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" } ]
-    fresh_url = "https://github.com/SpecRelay/tiny-demo-runs/pull/9"
+    fresh_url = "https://github.com/SpecRelay/tiny-demo-workspace/pull/9"
     gh_dir, gh_log, = FakeGithub.gh_bin(mode: "ok", pull_request_url: fresh_url, bare: @bare, seed: seed)
     code, output = run_cli({}, gh_dir: gh_dir)
 
@@ -302,7 +302,7 @@ class PublicationFlowTest < Minitest::Test
   # mode, refreshed from the bare remote, which is how GitHub actually tracks a tip.
   def test_existing_open_pull_request_is_reused_when_this_run_creates_the_commit
     start
-    existing = "https://github.com/SpecRelay/tiny-demo-runs/pull/11"
+    existing = "https://github.com/SpecRelay/tiny-demo-workspace/pull/11"
     seed = [ { "url" => existing, "state" => "OPEN", "headRefName" => BRANCH,
                "headRefOid" => "live" } ]
     gh_dir, gh_log, = FakeGithub.gh_bin(mode: "ok", bare: @bare, seed: seed)
@@ -385,7 +385,7 @@ class PublicationFlowTest < Minitest::Test
   def test_a_pull_request_ahead_of_this_run_is_refused_with_a_truthful_reason
     chain = build_commit_chain
     publication = predicate_publication(chain[:repo])
-    entries = [ { "url" => "https://github.com/SpecRelay/tiny-demo-runs/pull/71",
+    entries = [ { "url" => "https://github.com/SpecRelay/tiny-demo-workspace/pull/71",
                   "state" => "OPEN", "headRefName" => BRANCH, "headRefOid" => chain[:tip] } ]
 
     lookup = publication.send(:reusable, entries, BRANCH, chain[:mid])
@@ -420,12 +420,12 @@ class PublicationFlowTest < Minitest::Test
   def test_a_lagging_reported_head_reuses_the_pull_request
     chain = build_commit_chain
     publication = predicate_publication(chain[:repo])
-    entries = [ { "url" => "https://github.com/SpecRelay/tiny-demo-runs/pull/70",
+    entries = [ { "url" => "https://github.com/SpecRelay/tiny-demo-workspace/pull/70",
                   "state" => "OPEN", "headRefName" => BRANCH, "headRefOid" => chain[:mid] } ]
 
     lookup = publication.send(:reusable, entries, BRANCH, chain[:tip])
 
-    assert_equal "https://github.com/SpecRelay/tiny-demo-runs/pull/70", lookup.url,
+    assert_equal "https://github.com/SpecRelay/tiny-demo-workspace/pull/70", lookup.url,
                  "a head that is an ancestor of ours is contained by the branch"
     assert_nil lookup.error
   ensure
@@ -437,14 +437,14 @@ class PublicationFlowTest < Minitest::Test
   # round's reviewable artifact. Both must now fail closed and create nothing.
   def test_an_open_pull_request_with_an_absent_head_is_not_reused_end_to_end
     assert_undetermined_head_fails_closed(
-      { "url" => "https://github.com/SpecRelay/tiny-demo-runs/pull/77",
+      { "url" => "https://github.com/SpecRelay/tiny-demo-workspace/pull/77",
         "state" => "OPEN", "headRefName" => BRANCH }               # key omitted entirely
     )
   end
 
   def test_an_open_pull_request_with_an_empty_head_is_not_reused_end_to_end
     assert_undetermined_head_fails_closed(
-      { "url" => "https://github.com/SpecRelay/tiny-demo-runs/pull/78",
+      { "url" => "https://github.com/SpecRelay/tiny-demo-workspace/pull/78",
         "state" => "OPEN", "headRefName" => BRANCH, "headRefOid" => "" }
     )
   end
@@ -473,7 +473,7 @@ class PublicationFlowTest < Minitest::Test
   def test_an_undetermined_reported_head_refuses_with_a_next_step
     chain = build_commit_chain
     publication = predicate_publication(chain[:repo])
-    entries = [ { "url" => "https://github.com/SpecRelay/tiny-demo-runs/pull/77",
+    entries = [ { "url" => "https://github.com/SpecRelay/tiny-demo-workspace/pull/77",
                   "state" => "OPEN", "headRefName" => BRANCH } ] # headRefOid absent entirely
 
     lookup = publication.send(:reusable, entries, BRANCH, chain[:tip])
@@ -540,7 +540,7 @@ class PublicationFlowTest < Minitest::Test
   # suite, which is how it kept a stale call arity through CR-002's signature change.
   def test_pull_request_url_is_recovered_when_create_prints_nothing
     start
-    created_url = "https://github.com/SpecRelay/tiny-demo-runs/pull/12"
+    created_url = "https://github.com/SpecRelay/tiny-demo-workspace/pull/12"
     gh_dir, gh_log, = FakeGithub.gh_bin(mode: "create_silent", pull_request_url: created_url, bare: @bare)
 
     code, output = run_cli({}, gh_dir: gh_dir)
@@ -556,7 +556,7 @@ class PublicationFlowTest < Minitest::Test
   # commit is reviewable, so it fails closed rather than being reported.
   def test_open_pull_request_with_a_foreign_head_fails_closed
     start
-    seed = [ { "url" => "https://github.com/SpecRelay/tiny-demo-runs/pull/5", "state" => "OPEN",
+    seed = [ { "url" => "https://github.com/SpecRelay/tiny-demo-workspace/pull/5", "state" => "OPEN",
                "headRefName" => BRANCH, "headRefOid" => "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" } ]
     gh_dir, gh_log, = FakeGithub.gh_bin(mode: "ok", bare: @bare, seed: seed)
     run_cli({}, gh_dir: gh_dir)
