@@ -235,6 +235,18 @@ module SpecrelayRunner
       status == 201 ? body : raise_for(status, body)
     end
 
+    # POST /api/runner/review_results (MVP-0033). Submits ONE structured review outcome for a
+    # claimed review attempt. A sibling of the specification result endpoints, not a shape of
+    # `submit_report`: this body carries a verdict about a frozen target and Platform records
+    # it without touching Jira or GitHub.
+    #
+    # A 422 is a REFUSAL, not a transport failure — Platform validated the result and did not
+    # accept it — so it raises like any other refusal and the caller reports the attempt as
+    # failed rather than retrying a body that will never be accepted.
+    def submit_review_result(claim:, review:)
+      post_json("/api/runner/review_results", { claim: claim, review: review })
+    end
+
     # POST /api/runner/reports. bundle is { round_label:, files: [...] }.
     # terminal_result, when given, is the MVP-0013 terminal-result envelope
     # validated by Platform BEFORE import; a rejected envelope returns non-201 and

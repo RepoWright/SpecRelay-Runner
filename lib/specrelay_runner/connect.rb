@@ -46,6 +46,10 @@ module SpecrelayRunner
     CODE_PREFIX = "sre_"
     CODE_SEPARATOR = "."
 
+    # MVP-0033 — this machine advertises no reviewer capability. A normal state, not a
+    # failure: it stays a fully usable executor (S12).
+    NO_REVIEWER = "not_configured"
+
     # The readiness classification Platform accepts as ready.
     READY = "ready"
 
@@ -329,10 +333,44 @@ module SpecrelayRunner
           default_branch: checkout.fetch(:default_branch),
           executor_provider: readiness[:provider],
           executor_readiness: readiness[:classification],
-          detail: readiness[:detail]
+          detail: readiness[:detail],
+          **reviewer_report(readiness)
         }
       )
       build_result(assignment, response)
+    end
+
+    # MVP-0033 contract 3 — the REVIEWER capability, advertised alongside the executor one.
+    #
+    # Bounded public facts only: role, name, provider, version and a one-way digest of the
+    # local configuration. The command, its arguments, the timeout and the operator's paths
+    # stay on this machine — Platform is never given a local command to store or to run.
+    #
+    # A machine with no `runner.reviewer:` block reports `not_configured` and nothing else.
+    # That leaves review waiting for another machine and does not affect this one's executor
+    # readiness in any way (S12).
+    def reviewer_report(readiness)
+      settings = reviewer_settings(readiness)
+      return { reviewer_readiness: NO_REVIEWER } unless settings&.configured?
+
+      { reviewer_readiness: READY,
+        reviewer_profile: settings.public_identity(version: SpecrelayRunner::VERSION) }
+    end
+
+    # The guided path writes no YAML, so the reviewer is resolved the way the specification
+    # lane's provider is: an explicit environment override wins, and otherwise the machine
+    # reviews with the SAME provider installation its executor already proved ready.
+    #
+    # That default is contract 3's "ordinary solo setup may select the same provider
+    # installation for both roles" — the independence this MVP requires comes from a separate
+    # role profile, a separate process and separate fixed instructions, not from a second
+    # installation. A machine whose executor is NOT ready advertises no reviewer: an
+    # unauthenticated CLI cannot review any more than it can implement.
+    def reviewer_settings(readiness)
+      return Review::Settings.new({}, env: env) if env[Review::Settings::PROVIDER_ENV].to_s.strip != ""
+      return nil unless readiness[:classification] == READY && readiness[:provider] == ClaudeProfile::PROVIDER
+
+      Review::Settings.new({ "provider" => Review::Settings::PROVIDER_CLAUDE }, env: env)
     end
 
     def build_result(_assignment, response)

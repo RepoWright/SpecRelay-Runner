@@ -336,12 +336,34 @@ module SpecrelayRunner
     # readiness assumptions, the worktree, or the report contract — and a specification
     # assignment reaching an older code path is impossible rather than merely unlikely.
     def execute(config, client, payload)
+      # MVP-0033 — a REVIEW assignment is recognised by its explicit `assignment_type`, never
+      # by what it lacks, so a future assignment kind can never be executed as an
+      # implementation run by an older runner build.
+      return review(config, client, payload) if Review::Assignment.review?(payload)
       return specification(config, client, payload) if
         Specification::Assignment.specification?(payload)
 
       announce_claim(payload)
       result = Execution.new(config: config, client: client, payload: payload, env: env,
                              io: presenter).call
+      presenter.line result.message
+      result.success? ? SUCCESS : RUN_FAILED
+    end
+
+    # MVP-0033 — one claimed review, executed by a fresh provider process.
+    #
+    # A refused or failed review exits NON-ZERO, like a refused specification generation and
+    # for the same reason: the claim did not produce what it was made for, and a `loop`
+    # session that treated it as success would poll forever against a machine whose reviewer
+    # is misconfigured while reporting health.
+    def review(config, client, payload)
+      assignment = Review::Assignment.new(payload)
+      # Its own announcement rather than `announce_claim`: a review packet has no `run` block
+      # and no claim policy, and printing empty fields for them would read as a broken claim.
+      presenter.line "Claimed review of #{assignment.ticket_id} " \
+                     "(attempt #{assignment.attempt_ordinal}); claim #{assignment.claim_token}."
+      result = Review::Execution.call(config: config, client: client, payload: payload,
+                                      env: env, io: presenter)
       presenter.line result.message
       result.success? ? SUCCESS : RUN_FAILED
     end
