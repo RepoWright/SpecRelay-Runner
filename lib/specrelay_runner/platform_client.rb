@@ -168,6 +168,30 @@ module SpecrelayRunner
       end
     end
 
+    # POST /api/runner/presence (MVP-0031). One IDLE presence signal for one workspace
+    # connection: started, heartbeat, or stopped.
+    #
+    # A sibling of #heartbeat, never a variant of it. A heartbeat renews the lease on a run
+    # this process CLAIMED and is proof of active work; this says only that a loop is watching
+    # and owns nothing. Platform keeps them apart so an idle watcher can never appear to hold
+    # work, and the two must not share a method that could send one where the other is meant.
+    #
+    # Platform decides the outcome — `accepted` or `superseded` — and advertises the cadence to
+    # keep, so the response is read for what it DECIDED rather than assumed. Both are 200: a
+    # superseded session is a well-formed request with a meaningful answer, not a transport
+    # failure to retry.
+    # `session_id` is absent on the opening call — that call is the request for a session, and
+    # Platform answers it with the sequence the following `started` must present. Keys that do
+    # not apply to an event are omitted rather than sent as null, so the payload stays the
+    # closed set the endpoint validates.
+    def report_presence(workspace_key:, event:, session_id: nil, session_seq: nil)
+      payload = { workspace_key: workspace_key, event: event }
+      payload[:session_id] = session_id if session_id
+      payload[:session_seq] = session_seq if session_seq
+      status, body = post_json("/api/runner/presence", payload)
+      status == 200 ? body : raise_for(status, body)
+    end
+
     # POST /api/runner/heartbeat.
     def heartbeat(claim:)
       status, body = post_json("/api/runner/heartbeat", { claim: claim })

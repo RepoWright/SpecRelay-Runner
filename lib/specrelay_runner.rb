@@ -55,5 +55,6 @@ require_relative "specrelay_runner/execution"
 # The whole lane lives under one namespace; see specification.rb for the pipeline order.
 require_relative "specrelay_runner/specification"
 require_relative "specrelay_runner/poll_interval"
+require_relative "specrelay_runner/presence"
 require_relative "specrelay_runner/loop_runner"
 require_relative "specrelay_runner/cli"

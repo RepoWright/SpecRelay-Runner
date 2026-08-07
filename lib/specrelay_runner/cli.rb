@@ -258,10 +258,29 @@ module SpecrelayRunner
       result = LoopRunner.call(
         out: out, err: err, presenter: presenter, label: loop_label(config),
         poll_seconds: interval.seconds, on_failure: policy,
+        presence: loop_presence(config, client, interval),
         claim: -> { client.claim(config.claim_runner_params) },
         execute: ->(payload) { execute(config, client, payload) == SUCCESS }
       )
       result == LoopRunner::OK ? SUCCESS : RUN_FAILED
+    end
+
+    # MVP-0031 — the idle presence session for this loop.
+    #
+    # Presence is recorded per runner/WORKSPACE connection, so a loop that has no connection
+    # record (an advanced `--config` invocation) can address none and reports none. That is a
+    # real limitation of the legacy path rather than something to paper over: Platform would
+    # have no connection to attach the signal to.
+    #
+    # `claim-once` deliberately gets none at all. A single controlled shot is never Watching —
+    # it may be Busy for the lease it holds, and Connected before and after.
+    def loop_presence(config, client, interval)
+      connection = config.connection
+      return Presence::NONE if connection.nil?
+
+      Presence.new(client: client, workspace_key: connection.workspace_key,
+                   interval_seconds: interval.seconds,
+                   on_notice: ->(message) { presenter.line("[loop] #{message}") })
     end
 
     # What the transient status row says this runner is polling for. The PROJECT is the
