@@ -244,7 +244,8 @@ module SpecrelayRunner
     # accept it — so it raises like any other refusal and the caller reports the attempt as
     # failed rather than retrying a body that will never be accepted.
     def submit_review_result(claim:, review:)
-      post_json("/api/runner/review_results", { claim: claim, review: review })
+      status, body = post_json("/api/runner/review_results", { claim: claim, review: review })
+      status == 201 ? body : raise_for(status, body)
     end
 
     # POST /api/runner/reports. bundle is { round_label:, files: [...] }.

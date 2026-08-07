@@ -49,6 +49,26 @@ class ReviewFlowTest < Minitest::Test
     assert_includes result.message, "does not contain the reviewed head"
   end
 
+  # A git WORKTREE has a `.git` FILE, not a directory. SpecRelay's own task environments check
+  # out every component repository that way, so a reviewer that only recognised plain clones
+  # would refuse the primary place it runs. The first real-provider execution of this MVP
+  # failed exactly here.
+  def test_accepts_a_git_worktree_whose_dot_git_is_a_file
+    build_repo
+    worktree_root = File.join(@root, "worktree")
+    FileUtils.mkdir_p(worktree_root)
+    linked = File.join(worktree_root, "specrelay-platform")
+    system("git -C #{@repo} worktree add --quiet --detach #{linked} #{pinned_head}",
+           out: File::NULL, err: File::NULL)
+    refute File.directory?(File.join(linked, ".git")), "expected a worktree .git FILE"
+
+    verified = SpecrelayRunner::Review::Checkout.verify(
+      assignment: SpecrelayRunner::Review::Assignment.new(review_payload), workspace_root: worktree_root
+    )
+
+    assert verified.ok?, verified.reason
+  end
+
   def test_refuses_when_there_is_no_local_checkout_at_all
     result = run_review
 
@@ -195,6 +215,20 @@ class ReviewFlowTest < Minitest::Test
 
     assert_includes @platform.last_review["summary"], "[REDACTED]"
     refute_includes @platform.last_review["summary"], "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345"
+  end
+
+  # Platform is the trust boundary, so a submission it REFUSES must fail the attempt here too.
+  # The first real-provider execution of this MVP reported "Submitted CHANGES_REQUESTED" and
+  # exited 0 while Platform had recorded the attempt FAILED, because the client returned the
+  # 422 instead of raising on it.
+  def test_a_refused_submission_is_a_failure_rather_than_a_success
+    build_repo
+    @platform.review_response = [ 422, { accepted: false, errors: [ "ACCEPT requires zero blocking findings" ] } ]
+
+    result = run_review(command: reviewer_script(%({"outcome":"ACCEPT","summary":"Fine."})))
+
+    refute result.success?
+    assert_includes result.message, "Platform refused the review result"
   end
 
   # --- configuration -------------------------------------------------------

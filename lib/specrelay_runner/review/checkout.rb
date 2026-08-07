@@ -71,7 +71,17 @@ module SpecrelayRunner
 
         TIMEOUT_SECONDS = 120
 
-        def repository?(root) = File.directory?(File.join(root, ".git"))
+        # Ask GIT whether this is a repository, rather than inspecting the filesystem layout.
+        #
+        # `.git` is a DIRECTORY only in a plain clone. In a git worktree — which is exactly how
+        # SpecRelay's own task environments check out every component repository — and in a
+        # submodule, it is a FILE pointing elsewhere. A `File.directory?` check therefore
+        # refuses the primary place a reviewer actually runs; the first real-provider execution
+        # of this MVP failed on precisely that.
+        def repository?(root)
+          result = run(root, %w[rev-parse --git-dir])
+          !result.nil? && result.exit_code.to_i.zero?
+        end
 
         def remote_url(root)
           run(root, %w[remote get-url origin])&.stdout.to_s.strip

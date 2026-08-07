@@ -47,6 +47,9 @@ module SpecrelayRunner
       # Present only when continuing after a Product Owner answer (S38).
       def continuation = payload["continuation"]
 
+      # What Platform will accept back, including its per-field length limits.
+      def result_contract = payload.fetch("result_contract", {}).to_h
+
       def timeout_seconds = payload.dig("execution_policy", "attempt_timeout_seconds").to_i
       def lease_renewal_seconds = payload.dig("execution_policy", "lease_renewal_seconds").to_i
 

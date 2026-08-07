@@ -72,6 +72,9 @@ module SpecrelayRunner
           added automatically — do not include one. Use NEEDS_INPUT only for a decision a human
           must make, never for something you could have investigated yourself.
         - Omit "question" entirely unless the outcome is NEEDS_INPUT.
+        - Every field is LENGTH-BOUNDED and an over-long one loses the whole review. Stay
+          inside the limits under "Length limits" below: be specific and short, and put the
+          detail in the location rather than in prose.
       TEXT
 
       def initialize(assignment)
@@ -80,13 +83,25 @@ module SpecrelayRunner
 
       # The complete prompt text handed to one fresh provider process.
       def prompt
-        [ INSTRUCTIONS, ticket_section, specification_section, change_section,
+        [ INSTRUCTIONS, limits_section, ticket_section, specification_section, change_section,
           evidence_section, continuation_section ].compact.join("\n\n")
       end
 
       private
 
       attr_reader :assignment
+
+      # Platform states its own limits in the packet, so the reviewer is told the exact rule its
+      # submission will be judged against rather than discovering it as a refusal after an
+      # eight-minute pass. Rendered from what Platform sent — never a copy kept here, which
+      # would be free to drift.
+      def limits_section
+        limits = assignment.result_contract.select { |key, _| key.to_s.start_with?("max_") }
+        return nil if limits.empty?
+
+        rows = limits.map { |key, value| "- #{key.to_s.delete_prefix('max_').tr('_', ' ')}: #{value}" }
+        "## Length limits (an over-long field loses the whole review)\n#{rows.join("\n")}"
+      end
 
       def ticket_section
         <<~TEXT.strip
