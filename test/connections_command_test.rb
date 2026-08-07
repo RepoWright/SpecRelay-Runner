@@ -24,7 +24,7 @@ class ConnectionsCommandTest < Minitest::Test
   RUNNER_ACCOUNT = "runner:rnr_fake"
   SECOND_RUNNER_ACCOUNT = "runner:rnr_second"
   CREDENTIAL = FakePlatform::ISSUED_CREDENTIAL
-  REPOSITORY = "https://github.com/SpecRelay/tiny-demo-runs"
+  REPOSITORY = "https://github.com/SpecRelay/tiny-demo-workspace"
 
   def setup
     @dir = Dir.mktmpdir("connections-command")
@@ -63,8 +63,8 @@ class ConnectionsCommandTest < Minitest::Test
     # the dashboard and here — both render through ConnectionView, which is the point.
     listed = out.lines.grep(/^ [ *] /).map { |line| line.split("·")[1].to_s.strip }
     assert_equal %w[development-workspace tiny-demo-workspace], listed
-    assert_match(/^ \* tiny-demo  ·  tiny-demo-workspace/, out, "the default is marked in the list itself")
-    assert_match(/^   tiny-demo  ·  development-workspace/, out, "and non-defaults are not")
+    assert_match(/^ \* tiny-demo · tiny-demo-workspace/, out, "the default is marked in the list itself")
+    assert_match(/^   tiny-demo · development-workspace/, out, "and non-defaults are not")
     assert_match(/Default workspace: tiny-demo-workspace \(marked \*\)/, out)
   end
 

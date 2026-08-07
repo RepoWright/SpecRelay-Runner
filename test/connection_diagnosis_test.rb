@@ -16,7 +16,7 @@ require_relative "test_helper"
 class ConnectionDiagnosisTest < Minitest::Test
   RUNNER_ACCOUNT = "runner:rnr_fake"
   CREDENTIAL = FakePlatform::ISSUED_CREDENTIAL
-  REPOSITORY = "https://github.com/SpecRelay/tiny-demo-runs"
+  REPOSITORY = "https://github.com/SpecRelay/tiny-demo-workspace"
 
   def setup
     @dir = Dir.mktmpdir("diagnosis")
@@ -176,9 +176,9 @@ class ConnectionDiagnosisTest < Minitest::Test
     result = diagnose(connection: connection(repository_url: "https://github.com/SpecRelay/old-repo"))
 
     assert_equal SpecrelayRunner::ConnectionDiagnosis::REPOSITORY_MISMATCH, result.outcome
-    assert_match(%r{Platform now defines this workspace as https://github.com/SpecRelay/tiny-demo-runs}, result.summary)
+    assert_match(%r{Platform now defines this workspace as https://github.com/SpecRelay/tiny-demo-workspace}, result.summary)
     assert_match(%r{old-repo}, result.summary)
-    assert_match(%r{point it at a checkout of https://github.com/SpecRelay/tiny-demo-runs}, result.remedy)
+    assert_match(%r{point it at a checkout of https://github.com/SpecRelay/tiny-demo-workspace}, result.remedy)
   end
 
   def test_a_checkout_repointed_at_another_repository_is_reported_against_the_checkout

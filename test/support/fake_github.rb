@@ -15,7 +15,7 @@ module FakeGithub
   module_function
 
   # Create a bare remote and register it as `origin` on the workspace root.
-  def add_remote(root, name: "tiny-demo-runs")
+  def add_remote(root, name: "tiny-demo-workspace")
     remote = Dir.mktmpdir("specrelay-runner-remote-")
     bare = File.join(remote, "#{name}.git")
     system("git", "init", "-q", "--bare", bare, exception: true)
@@ -42,7 +42,7 @@ module FakeGithub
   # is a fact rather than a fixture. `seed` pre-populates pull requests (each a hash of
   # url/state/headRefName/headRefOid) so a closed or merged pull request from an earlier
   # round can be represented — the review-001 finding-2 scenario.
-  def gh_bin(mode: "ok", pull_request_url: "https://github.com/SpecRelay/tiny-demo-runs/pull/7",
+  def gh_bin(mode: "ok", pull_request_url: "https://github.com/SpecRelay/tiny-demo-workspace/pull/7",
              bare: nil, seed: [])
     dir = Dir.mktmpdir("specrelay-runner-gh-")
     log = File.join(dir, "gh.log")

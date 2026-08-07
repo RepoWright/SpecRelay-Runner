@@ -21,13 +21,13 @@ class RedactionTest < Minitest::Test
 
   # The whole point of finding 8(b): `git push` can fail quoting the remote it used.
   def test_url_userinfo_is_stripped_from_a_raw_git_error
-    raw = "fatal: unable to access 'https://octocat:s3cr3t-p4ssw0rd@github.com/SpecRelay/tiny-demo-runs.git/'"
+    raw = "fatal: unable to access 'https://octocat:s3cr3t-p4ssw0rd@github.com/SpecRelay/tiny-demo-workspace.git/'"
 
     redacted = R.redact(raw)
 
     refute_match(/s3cr3t-p4ssw0rd/, redacted)
     refute_match(/octocat:/, redacted)
-    assert_match(%r{https://\[REDACTED\]@github\.com/SpecRelay/tiny-demo-runs}, redacted,
+    assert_match(%r{https://\[REDACTED\]@github\.com/SpecRelay/tiny-demo-workspace}, redacted,
                  "the host and path are evidence and must survive")
   end
 
@@ -41,8 +41,8 @@ class RedactionTest < Minitest::Test
   # An scp-like git remote carries no secret; rewriting it would destroy evidence for
   # no benefit.
   def test_scp_style_remote_is_not_touched
-    assert_equal "git@github.com:SpecRelay/tiny-demo-runs.git",
-                 R.redact("git@github.com:SpecRelay/tiny-demo-runs.git")
+    assert_equal "git@github.com:SpecRelay/tiny-demo-workspace.git",
+                 R.redact("git@github.com:SpecRelay/tiny-demo-workspace.git")
   end
 
   # Commit shas and branch names are structured evidence, not free text.

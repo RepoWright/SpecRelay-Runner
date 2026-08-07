@@ -148,7 +148,7 @@ def claim_payload_for(task_id:, executor_command:, publication: nil)
   payload.merge(
     "repositories" => [ {
       "id" => "tiny-demo-workspace",
-      "clone_url" => publication.fetch(:clone_url, "https://github.com/SpecRelay/tiny-demo-runs"),
+      "clone_url" => publication.fetch(:clone_url, "https://github.com/SpecRelay/tiny-demo-workspace"),
       "default_branch" => "main",
       "access" => publication.fetch(:access, "write"),
       "branch" => publication.fetch(:branch, "specrelay/#{task_id}")
@@ -170,7 +170,7 @@ def base_claim_payload(task_id:, executor_command:)
     "run" => { "id" => "run_test123", "task_id" => task_id, "canonical_branch" => task_id },
     "workspace" => {
       "project_key" => "tiny-demo", "workspace_key" => "tiny-demo-workspace",
-      "display_name" => "Tiny Demo Workspace", "repository_url" => "https://github.com/SpecRelay/tiny-demo-runs",
+      "display_name" => "Tiny Demo Workspace", "repository_url" => "https://github.com/SpecRelay/tiny-demo-workspace",
       "default_branch" => "main",
       "worktree_create_command" => "./bin/worktree create #{task_id}",
       "worktree_release_command" => "./bin/worktree release #{task_id}",

@@ -358,7 +358,7 @@ class LoopTtyTest < Minitest::Test
                            "project_slug" => "tiny-demo", "project_key" => "tiny-demo",
                            "workspace_key" => "tiny-demo-workspace",
                            "workspace_display_name" => "Tiny Demo Workspace",
-                           "repository_url" => "https://github.com/SpecRelay/tiny-demo-runs",
+                           "repository_url" => "https://github.com/SpecRelay/tiny-demo-workspace",
                            "default_branch" => "main", "local_path" => @dir,
                            "connected_at" => "2026-07-20T10:00:00Z" } ]
     ))

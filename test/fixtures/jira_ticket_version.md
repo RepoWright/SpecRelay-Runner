@@ -26,15 +26,15 @@ Every expected input was readable.
 
 - Host: github.com
 - Owner: SpecRelay
-- Repository: tiny-demo-runs
-- Repository URL: https://github.com/SpecRelay/tiny-demo-runs
+- Repository: tiny-demo-workspace
+- Repository URL: https://github.com/SpecRelay/tiny-demo-workspace
 - Default branch: `main`
 - Specification root: `specs`
 
 ## Jira description
 
 ```text
-Real change request for the Tiny Demo app in SpecRelay/tiny-demo-runs, raised while verifying SpecRelay MVP-0026 (runner specification generation), round 003. Safe for the Product Owner to close or delete once the round is filed.
+Real change request for the Tiny Demo app in SpecRelay/tiny-demo-workspace, raised while verifying SpecRelay MVP-0026 (runner specification generation), round 003. Safe for the Product Owner to close or delete once the round is filed.
 
 Problem
 

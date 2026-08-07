@@ -167,7 +167,7 @@ class DashboardTtyTest < Minitest::Test
       "runner_public_id" => "rnr_fake", "runner_display_name" => "host runner",
       "project_slug" => "tiny-demo", "workspace_key" => workspace_key, "project_key" => "tiny-demo",
       "workspace_display_name" => "Tiny Demo Workspace",
-      "repository_url" => "https://github.com/SpecRelay/tiny-demo-runs", "default_branch" => "main",
+      "repository_url" => "https://github.com/SpecRelay/tiny-demo-workspace", "default_branch" => "main",
       "local_path" => @dir, "connected_at" => connected_at }
   end
 

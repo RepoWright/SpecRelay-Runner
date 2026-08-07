@@ -23,7 +23,7 @@ require_relative "test_helper"
 class DashboardTest < Minitest::Test
   RUNNER_ACCOUNT = "runner:rnr_fake"
   CREDENTIAL = FakePlatform::ISSUED_CREDENTIAL
-  REPOSITORY = "https://github.com/SpecRelay/tiny-demo-runs"
+  REPOSITORY = "https://github.com/SpecRelay/tiny-demo-workspace"
 
   def setup
     @dir = Dir.mktmpdir("dashboard")
@@ -157,8 +157,8 @@ class DashboardTest < Minitest::Test
     run_dashboard(menu)
 
     label = menu.frames.first[:entries].first[1]
-    assert_match(/\Atiny-demo  ·  tiny-demo-workspace  ·/, label, "project first, workspace key second")
-    assert_match(%r{specrelay/tiny-demo-runs@main}, label, "the repository and its default branch")
+    assert_match(/\Atiny-demo · tiny-demo-workspace ·/, label, "project first, workspace key second")
+    assert_match(%r{specrelay/tiny-demo-workspace@main}, label, "the repository and its default branch")
     assert_match(/\dd ago/, label, "how old this connection is")
     # Every field survives an 80-column terminal, which is the whole reason the row is short.
     assert_operator label.length, :<=, 80
@@ -176,7 +176,7 @@ class DashboardTest < Minitest::Test
 
     rows = menu.frames.first[:entries].select { |shortcut, _, _| shortcut.match?(/\d/) }.map { |_, label, _| label }
     assert_equal rows.uniq, rows, "two rows an operator cannot tell apart is an unsafe choice"
-    assert(rows.all? { |row| row.start_with?("tiny-demo  ·") }, "both are the same project")
+    assert(rows.all? { |row| row.start_with?("tiny-demo ·") }, "both are the same project")
     assert_includes rows.join("\n"), "tiny-demo-staging"
     assert_includes rows.join("\n"), "tiny-demo-workspace"
   end
@@ -192,7 +192,7 @@ class DashboardTest < Minitest::Test
 
     printed = capture_dashboard(menu)
 
-    assert_match(/\Atiny-demo-workspace  ·  specrelay/, menu.frames.first[:entries].first[1])
+    assert_match(/\Atiny-demo-workspace · specrelay/, menu.frames.first[:entries].first[1])
     assert_equal "#{SpecrelayRunner::Dashboard::TITLE} — tiny-demo-workspace", menu.frames[1][:title]
     assert_match(/Project +—/, printed, "the missing fact is shown as missing, not guessed")
     assert_match(/Workspace +tiny-demo-workspace/, printed)
@@ -404,7 +404,7 @@ class DashboardTest < Minitest::Test
     printed = capture_dashboard(menu)
 
     assert_match(/tiny-demo-workspace/, menu.confirmations.first)
-    assert_match(%r{github.com/SpecRelay/tiny-demo-runs}, menu.confirmations.first)
+    assert_match(%r{github.com/SpecRelay/tiny-demo-workspace}, menu.confirmations.first)
     assert_match(/will remove only THIS MACHINE's memory/, printed)
     assert_match(/will NOT remove Platform-side authorization/, printed)
   end

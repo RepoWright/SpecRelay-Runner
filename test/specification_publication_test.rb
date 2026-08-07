@@ -22,7 +22,7 @@ class SpecificationPublicationTest < Minitest::Test
   def setup
     @temp = Dir.mktmpdir("specrelay-publication-")
     @specs = File.join(@temp, "SpecRelay-Specs")
-    @source = File.join(@temp, "tiny-demo-runs")
+    @source = File.join(@temp, "tiny-demo-workspace")
     FileUtils.mkdir_p(@source)
     build_specification_checkout
     @io = StringIO.new

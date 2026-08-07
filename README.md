@@ -660,7 +660,7 @@ selected one, offers: `Start live loop`, `Claim once`, `Test connection/readines
 Each row leads with the project and keeps its workspace key beside it (RUNNER-0001):
 
 ```text
- 1  tiny-demo  ·  tiny-demo-workspace  ·  specrelay/tiny-demo-runs@main  ·  2d ago
+ 1  tiny-demo · tiny-demo-workspace · specrelay/tiny-demo-workspace@main · 2d ago
 ```
 
 The project is the operator's concept; the workspace key is the routing fact

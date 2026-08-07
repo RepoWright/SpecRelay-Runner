@@ -177,14 +177,14 @@ class RepositoryBoundaryTest < Minitest::Test
   # reverse), so the agreement is asserted directly on the cases that differ in the wild.
   def test_repository_identity_normalization_matches_the_documented_platform_rule
     expectations = {
-      "https://github.com/SpecRelay/tiny-demo-runs" => "github.com/specrelay/tiny-demo-runs",
-      "https://github.com/SpecRelay/tiny-demo-runs.git" => "github.com/specrelay/tiny-demo-runs",
-      "https://github.com/SpecRelay/tiny-demo-runs/" => "github.com/specrelay/tiny-demo-runs",
-      "git@github.com:SpecRelay/tiny-demo-runs.git" => "github.com/specrelay/tiny-demo-runs",
-      "ssh://git@github.com/SpecRelay/tiny-demo-runs" => "github.com/specrelay/tiny-demo-runs",
+      "https://github.com/SpecRelay/tiny-demo-workspace" => "github.com/specrelay/tiny-demo-workspace",
+      "https://github.com/SpecRelay/tiny-demo-workspace.git" => "github.com/specrelay/tiny-demo-workspace",
+      "https://github.com/SpecRelay/tiny-demo-workspace/" => "github.com/specrelay/tiny-demo-workspace",
+      "git@github.com:SpecRelay/tiny-demo-workspace.git" => "github.com/specrelay/tiny-demo-workspace",
+      "ssh://git@github.com/SpecRelay/tiny-demo-workspace" => "github.com/specrelay/tiny-demo-workspace",
       # Credentials embedded in a remote must not change identity (and must not survive it).
-      "https://user:secret@github.com/SpecRelay/tiny-demo-runs" => "github.com/specrelay/tiny-demo-runs",
-      "https://github.com:443/SpecRelay/tiny-demo-runs" => "github.com/specrelay/tiny-demo-runs"
+      "https://user:secret@github.com/SpecRelay/tiny-demo-workspace" => "github.com/specrelay/tiny-demo-workspace",
+      "https://github.com:443/SpecRelay/tiny-demo-workspace" => "github.com/specrelay/tiny-demo-workspace"
     }
 
     expectations.each do |url, expected|
@@ -193,9 +193,9 @@ class RepositoryBoundaryTest < Minitest::Test
   end
 
   def test_repository_identity_still_distinguishes_different_repositories
-    tiny = SpecrelayRunner::RepositoryCheck.repository_identity("https://github.com/SpecRelay/tiny-demo-runs")
+    tiny = SpecrelayRunner::RepositoryCheck.repository_identity("https://github.com/SpecRelay/tiny-demo-workspace")
     other = SpecrelayRunner::RepositoryCheck.repository_identity("https://github.com/SpecRelay/some-other-repo")
-    forked = SpecrelayRunner::RepositoryCheck.repository_identity("https://github.com/Other/tiny-demo-runs")
+    forked = SpecrelayRunner::RepositoryCheck.repository_identity("https://github.com/Other/tiny-demo-workspace")
 
     refute_equal tiny, other
     refute_equal tiny, forked

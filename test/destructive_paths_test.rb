@@ -22,7 +22,7 @@ require_relative "test_helper"
 class DestructivePathsTest < Minitest::Test
   RUNNER_ACCOUNT = "runner:rnr_fake"
   CREDENTIAL = FakePlatform::ISSUED_CREDENTIAL
-  REPOSITORY = "https://github.com/SpecRelay/tiny-demo-runs"
+  REPOSITORY = "https://github.com/SpecRelay/tiny-demo-workspace"
 
   R = SpecrelayRunner::CommandRunner::Result
 
