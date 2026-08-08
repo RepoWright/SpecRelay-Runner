@@ -20,6 +20,10 @@ module SpecrelayRunner
     class Execution
       Result = Struct.new(:outcome, :message, keyword_init: true) do
         def success? = outcome == :submitted
+        # A moved target is not a machine fault: the reviewer correctly refused to judge code
+        # that is no longer there. Distinct from `success?` because no verdict exists, and
+        # distinct from a failure because there is nothing on this machine to fix.
+        def stale? = outcome == :stale
       end
 
       def self.call(**kwargs) = new(**kwargs).call
@@ -39,6 +43,7 @@ module SpecrelayRunner
 
         workspace_root = config.workspace_root(assignment.workspace_key, env: env)
         checkout = Checkout.verify(assignment: assignment, workspace_root: workspace_root)
+        return stale(checkout.reason) if checkout.stale?
         return failure(checkout.reason) unless checkout.ok?
 
         review(workspace_root)
@@ -56,9 +61,20 @@ module SpecrelayRunner
         parsed = parse(launch(workspace_root))
         return failure(parsed.error) unless parsed.ok?
 
-        submit(parsed.review)
+        verdict(parsed.review, workspace_root)
       ensure
         heartbeater&.stop
+      end
+
+      # The head can move WHILE the reviewer works — a review takes minutes and a push takes
+      # seconds. Re-verified here, immediately before the only call that can record a verdict,
+      # so a move during the review can never produce acceptance (CR-001 F3).
+      def verdict(review, workspace_root)
+        recheck = Checkout.verify(assignment: assignment, workspace_root: workspace_root)
+        return stale(recheck.reason) if recheck.stale?
+        return failure(recheck.reason) unless recheck.ok?
+
+        submit(review)
       end
 
       # A timeout and a non-zero exit are provider FAILURES, not results: whatever the process
@@ -97,6 +113,18 @@ module SpecrelayRunner
         Result.new(outcome: :submitted, message: "Review submitted: #{review['outcome']}.")
       rescue PlatformClient::Error => e
         failure("Platform refused the review result: #{Redaction.redact(e.message)}")
+      end
+
+      # Reported through the dedicated stale endpoint rather than as an outcome-less result:
+      # Platform must be able to tell "this reviewer failed, offer another attempt" from "this
+      # target is gone, close the assignment", and an outcome-less body cannot say which.
+      def stale(reason)
+        safe = Redaction.redact(reason.to_s)
+        client.report_stale_target(claim: assignment.claim_token, reason: safe)
+        log "Review stopped: #{safe}"
+        Result.new(outcome: :stale, message: "Review stopped: #{safe}")
+      rescue PlatformClient::Error => e
+        failure("Platform refused the stale-target report: #{Redaction.redact(e.message)}")
       end
 
       # A refusal is reported, never merely printed: Platform must record the failed attempt so

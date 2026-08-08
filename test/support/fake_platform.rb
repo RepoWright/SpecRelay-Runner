@@ -132,7 +132,13 @@ class FakePlatform
 
   # MVP-0033 — what the runner actually submitted for a claimed review. `review_results` being
   # EMPTY is as load-bearing as its contents: a refused checkout must not produce a verdict.
-  def review_results = requests_to("/api/runner/review_results")
+  #
+  # A stale-target report goes to the same endpoint with a different body, and is kept apart
+  # here for the same reason Platform keeps it apart: "no verdict because the reviewer failed"
+  # and "no verdict because the target moved" are different facts (CR-001 F3).
+  def review_submissions = requests_to("/api/runner/review_results")
+  def review_results = review_submissions.reject { |request| request[:body].to_h.key?("stale") }
+  def stale_reports = review_submissions.filter_map { |request| request[:body].to_h if request[:body].to_h.key?("stale") }
   def last_review = review_results.last&.dig(:body, "review")
   def last_registration = requests_to("/api/runner/registration").last
   def last_enrollment = requests_to("/api/runner/enrollment").last
@@ -260,6 +266,8 @@ class FakePlatform
   # said "published" would let a fail-closed path look identical to a success in the output.
   def review_result(request)
     return review_response if review_response
+    return [ 201, { contract_version: "mvp-0033",
+                    review: { attempt_id: "rvt_fake", state: "STALE", outcome: nil } } ] if request[:body].to_h.key?("stale")
 
     review = request[:body].to_h["review"].to_h
     [ 201, { contract_version: "mvp-0033",

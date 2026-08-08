@@ -365,7 +365,10 @@ module SpecrelayRunner
       result = Review::Execution.call(config: config, client: client, payload: payload,
                                       env: env, io: presenter)
       presenter.line result.message
-      result.success? ? SUCCESS : RUN_FAILED
+      # A STALE target exits zero. The claim did not produce a verdict, but the runner did
+      # exactly what it should have — the code it was sent to review moved. Treating that as a
+      # machine fault would stop a `loop` session on a healthy runner (CR-001 F3).
+      result.success? || result.stale? ? SUCCESS : RUN_FAILED
     end
 
     # MVP-0026 — the specification lane now generates rather than acknowledging and stopping.

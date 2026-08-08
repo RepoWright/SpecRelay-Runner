@@ -135,6 +135,8 @@ module SpecrelayRunner
         "## Change under review\n#{lines.join("\n")}"
       end
 
+      PROMPT_CHANGED_FILES = 100
+
       def evidence_section
         evidence = assignment.execution_evidence
         files = Array(evidence["files"]).map { |file| "- #{file['path']} (#{file['category']})" }
@@ -142,12 +144,25 @@ module SpecrelayRunner
           ## Executor's own report (claims, not evidence — verify them)
           #{evidence['executor_summary']}
 
-          Files changed: #{evidence['files_changed_summary']}
+          #{changed_files_block(evidence)}
           Validation commands the executor says it ran: #{Array(evidence['validation_commands']).join(', ')}
           Report: #{assignment.report_url}
           Attached evidence:
           #{files.empty? ? '(none)' : files.join("\n")}
         TEXT
+      end
+
+      # The MEASURED change set, listed rather than summarized. The executor's own
+      # `files_changed_summary` is prose it wrote and the runner truncates, so it is shown as a
+      # claim; `changed_files` is what git reported and is what the review's browser-evidence
+      # requirement is decided from (CR-001 F2).
+      def changed_files_block(evidence)
+        changed = Array(evidence["changed_files"])
+        return "Files changed (executor's summary): #{evidence['files_changed_summary']}" if changed.empty?
+
+        listed = changed.first(PROMPT_CHANGED_FILES).map { |path| "- #{path}" }
+        listed << "- …and #{changed.size - PROMPT_CHANGED_FILES} more" if changed.size > PROMPT_CHANGED_FILES
+        "Files changed (measured, #{changed.size}):\n#{listed.join("\n")}"
       end
 
       # Only on a follow-up attempt. It carries the prior FINDINGS and the Product Owner's

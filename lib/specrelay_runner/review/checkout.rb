@@ -17,8 +17,12 @@ module SpecrelayRunner
     module Checkout
       module_function
 
-      Result = Struct.new(:ok, :reason, :roots, keyword_init: true) do
+      # `stale` separates the two refusals Platform must not confuse. A generic refusal means
+      # THIS MACHINE cannot review (fix the checkout and try again); a stale one means THE
+      # TARGET IS GONE, and no machine should review it (CR-001 F3).
+      Result = Struct.new(:ok, :reason, :roots, :stale, keyword_init: true) do
         def ok? = ok
+        def stale? = !!stale
       end
 
       # `fetch` is attempted once per repository whose pinned head is absent, because a
@@ -28,8 +32,8 @@ module SpecrelayRunner
         roots = {}
         assignment.repositories.each do |repository|
           root = File.join(workspace_root, repository["repository_key"].to_s)
-          reason = verify_repository(repository, root, git)
-          return Result.new(ok: false, reason: reason) if reason
+          refusal = verify_repository(repository, root, git)
+          return refusal if refusal
 
           roots[repository["repository_key"].to_s] = root
         end
@@ -38,20 +42,53 @@ module SpecrelayRunner
 
       def verify_repository(repository, root, git)
         key = repository["repository_key"]
-        return "no local checkout for '#{key}' at the expected workspace path" unless git.repository?(root)
+        return refuse("no local checkout for '#{key}' at the expected workspace path") unless git.repository?(root)
 
         expected = identity(repository["clone_url"])
         actual = identity(git.remote_url(root))
-        return "'#{key}' points at a different remote than the reviewed repository" unless expected == actual && !expected.empty?
+        return refuse("'#{key}' points at a different remote than the reviewed repository") unless expected == actual && !expected.empty?
 
         head = repository["head_commit"].to_s
+        moved = remote_refusal(repository, root, git, head)
+        return moved if moved
+
+        present_locally(repository, root, git, head)
+      end
+
+      # The pinned commit must still be the head of the pull request's BRANCH on the remote.
+      #
+      # Holding the object locally proves only that the commit once existed here. A push
+      # advances `refs/heads/<branch>` and leaves the old object in the local store forever, so
+      # a purely local check lets a reviewer read old code and attach its verdict to a pull
+      # request that now shows something else (CR-001 F3).
+      #
+      # A remote that cannot be read is a REFUSAL, not a move: not knowing is not the same as
+      # knowing it changed, and only a real mismatch may burn the assignment.
+      def remote_refusal(repository, root, git, head)
+        branch = repository["branch"].to_s
+        key = repository["repository_key"]
+        return nil if branch.empty?
+
+        observed = git.remote_head(root, branch)
+        return refuse("could not read the remote head of '#{key}'; refusing to review") if observed.nil?
+        return nil if observed.casecmp?(head)
+        return stale("the reviewed branch of '#{key}' no longer exists on the remote") if observed.empty?
+
+        stale("the pull-request head of '#{key}' moved from #{head[0, 12]} to #{observed[0, 12]}")
+      end
+
+      def present_locally(repository, root, git, head)
         return nil if git.commit?(root, head)
 
         git.fetch(root)
         return nil if git.commit?(root, head)
 
-        "'#{key}' does not contain the reviewed head #{head[0, 12]}; it cannot be reviewed here"
+        refuse("'#{repository['repository_key']}' does not contain the reviewed head " \
+               "#{head[0, 12]}; it cannot be reviewed here")
       end
+
+      def refuse(reason) = Result.new(ok: false, reason: reason, stale: false)
+      def stale(reason) = Result.new(ok: false, reason: reason, stale: true)
 
       # `host/owner/repo`, lowercased — the same normalization Platform's connection identity
       # uses, so an https remote and an scp-like ssh remote for the same repository compare
@@ -83,8 +120,23 @@ module SpecrelayRunner
           !result.nil? && result.exit_code.to_i.zero?
         end
 
+        REMOTE = "origin"
+
         def remote_url(root)
-          run(root, %w[remote get-url origin])&.stdout.to_s.strip
+          run(root, [ "remote", "get-url", REMOTE ])&.stdout.to_s.strip
+        end
+
+        # ONE read-only ref query. `ls-remote` asks the remote what a branch points at and
+        # transfers no objects, writes nothing to the object store, and touches no working
+        # tree — the whole freshness boundary is this single bounded call.
+        #
+        # Returns the sha, "" when the branch is gone, and nil when the question could not be
+        # answered at all.
+        def remote_head(root, branch)
+          result = run(root, [ "ls-remote", "--heads", REMOTE, "refs/heads/#{branch}" ])
+          return nil if result.nil? || !result.exit_code.to_i.zero?
+
+          result.stdout.to_s.each_line.first.to_s.split(/\s+/).first.to_s
         end
 
         # `<sha>^{commit}` resolves only if the object exists AND is a commit, so a tag or a
@@ -97,7 +149,7 @@ module SpecrelayRunner
         end
 
         def fetch(root)
-          run(root, %w[fetch --quiet origin])
+          run(root, [ "fetch", "--quiet", REMOTE ])
         end
 
         def run(root, args)
