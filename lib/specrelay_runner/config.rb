@@ -149,6 +149,16 @@ module SpecrelayRunner
       value.is_a?(Hash) ? value.transform_keys(&:to_s) : {}
     end
 
+    # The operator's optional, NON-SECRET `runner.reviewer:` block (MVP-0033). It configures
+    # the REVIEWER role, independently of the executor: a machine may have one, both or
+    # neither. Returns {} when absent, which is a usable state meaning "this machine does not
+    # review" — never an error, because a missing reviewer must not affect implementation
+    # claiming.
+    def reviewer_settings
+      value = runner["reviewer"]
+      value.is_a?(Hash) ? value.transform_keys(&:to_s) : {}
+    end
+
     # The operator's optional, NON-SECRET `runner.executor:` override block. It is
     # logical config only (provider/command/args/prompt delivery/timeout/env) and
     # is sent to Platform, which merges it over the workspace's stored executor

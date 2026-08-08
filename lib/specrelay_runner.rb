@@ -54,6 +54,9 @@ require_relative "specrelay_runner/execution"
 # MVP-0026: turning that recognized assignment into a generated specification package.
 # The whole lane lives under one namespace; see specification.rb for the pipeline order.
 require_relative "specrelay_runner/specification"
+# MVP-0033: the REVIEWER role — a claimed review of a frozen implementation target, executed
+# by a fresh provider process with its own fixed instructions.
+require_relative "specrelay_runner/review"
 require_relative "specrelay_runner/poll_interval"
 require_relative "specrelay_runner/presence"
 require_relative "specrelay_runner/loop_runner"

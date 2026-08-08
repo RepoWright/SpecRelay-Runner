@@ -46,6 +46,10 @@ class FakePlatform
   # the runner treats as a transport fault rather than a refusal.
   attr_accessor :publication_response
 
+  # MVP-0033: script the review-result endpoint's answer, so a test can model Platform's
+  # strict validation refusing a submission the runner considered fine.
+  attr_accessor :review_response
+
   # Lets a test model a SECOND workspace on the same Platform and the same machine, which is the
   # shape that used to orphan the first workspace's stored credential (review-002, F3 residual).
   def claim_payload_workspace_key=(key)
@@ -125,6 +129,17 @@ class FakePlatform
 
   def requests_to(path) = requests.select { |r| r[:path] == path }
   def last_report = requests_to("/api/runner/reports").last
+
+  # MVP-0033 — what the runner actually submitted for a claimed review. `review_results` being
+  # EMPTY is as load-bearing as its contents: a refused checkout must not produce a verdict.
+  #
+  # A stale-target report goes to the same endpoint with a different body, and is kept apart
+  # here for the same reason Platform keeps it apart: "no verdict because the reviewer failed"
+  # and "no verdict because the target moved" are different facts (CR-001 F3).
+  def review_submissions = requests_to("/api/runner/review_results")
+  def review_results = review_submissions.reject { |request| request[:body].to_h.key?("stale") }
+  def stale_reports = review_submissions.filter_map { |request| request[:body].to_h if request[:body].to_h.key?("stale") }
+  def last_review = review_results.last&.dig(:body, "review")
   def last_registration = requests_to("/api/runner/registration").last
   def last_enrollment = requests_to("/api/runner/enrollment").last
   def last_enrollment_preview = requests_to("/api/runner/enrollment_preview").last
@@ -226,6 +241,7 @@ class FakePlatform
     when "/api/runner/reports" then report(request)
     when "/api/runner/specification_generations" then specification_generation(request)
     when "/api/runner/specification_publications" then specification_publication(request)
+    when "/api/runner/review_results" then review_result(request)
     else [ 404, { error: "not found" } ]
     end
   end
@@ -248,6 +264,16 @@ class FakePlatform
   # same reason its sibling is — Platform's own specs cover the real validation — but honest
   # about the run state it reports back, because the runner prints it and a fake that always
   # said "published" would let a fail-closed path look identical to a success in the output.
+  def review_result(request)
+    return review_response if review_response
+    return [ 201, { contract_version: "mvp-0033",
+                    review: { attempt_id: "rvt_fake", state: "STALE", outcome: nil } } ] if request[:body].to_h.key?("stale")
+
+    review = request[:body].to_h["review"].to_h
+    [ 201, { contract_version: "mvp-0033",
+             review: { attempt_id: "rvt_fake", state: "COMPLETED", outcome: review["outcome"] } } ]
+  end
+
   def specification_publication(request)
     return @publication_response if @publication_response
 
