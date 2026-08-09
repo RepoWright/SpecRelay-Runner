@@ -235,6 +235,19 @@ module SpecrelayRunner
       status == 201 ? body : raise_for(status, body)
     end
 
+    # POST /api/runner/specification_packages (MVP-0034 CR-001). Submits ONE closed
+    # specification-package preflight result — either the bytes this runner read at the pinned
+    # commit, or the classified reason it refused.
+    #
+    # Platform decides everything the response reports: it recomputes every digest from these
+    # bytes, compares them to its own recorded publication, pins the package, and only then moves
+    # Jira. The runner reads `authorized` for whether it may launch a provider and never infers it
+    # from having submitted successfully.
+    def submit_specification_package(claim:, package:)
+      status, body = post_json("/api/runner/specification_packages", { claim: claim, package: package })
+      status == 201 ? body : raise_for(status, body)
+    end
+
     # POST /api/runner/review_results (MVP-0033). Submits ONE structured review outcome for a
     # claimed review attempt. A sibling of the specification result endpoints, not a shape of
     # `submit_report`: this body carries a verdict about a frozen target and Platform records
