@@ -50,6 +50,9 @@ require_relative "specrelay_runner/executor_log_stream"
 require_relative "specrelay_runner/pull_request_reuse"
 require_relative "specrelay_runner/publication"
 require_relative "specrelay_runner/terminal_result"
+# MVP-0034: the pinned package the executor implements, verified and written read-only before
+# `execution` launches a provider on it.
+require_relative "specrelay_runner/specification_package"
 require_relative "specrelay_runner/execution"
 # MVP-0026: turning that recognized assignment into a generated specification package.
 # The whole lane lives under one namespace; see specification.rb for the pipeline order.

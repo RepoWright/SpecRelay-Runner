@@ -65,12 +65,24 @@ module DemoWorkspace
   # A deterministic fake executor: applies one idempotent edit to the demo file.
   # It intentionally prints a fake-secret-shaped token to stdout so the runner's
   # client-side transcript redaction can be asserted.
+  #
+  # MVP-0034: it also reports, for every specification-package document the prompt names, whether
+  # that document is readable FROM THE EXECUTOR at the moment it runs. A real executor reads them;
+  # this stand-in only proves they arrived, which is what makes "the executor received all
+  # documents, not only spec.md" a deterministic assertion rather than a live-run observation.
   def write_fake_executor(root)
     path = File.join(root, "bin", "fake-executor")
     File.write(path, <<~RUBY)
       #!/usr/bin/env ruby
       # frozen_string_literal: true
       puts "leaking sk-live-DO-NOT-LEAK-0123456789 to stdout"
+      prompt = ARGV.last.to_s
+      if File.file?(prompt)
+        File.read(prompt).scan(%r{^\\s+- `(\\S*/specification-package/\\S+)`$}).flatten.each do |document|
+          state = File.readable?(document) ? "readable" : "MISSING"
+          puts "[fake-executor] package document \#{state}: \#{document.split('/specification-package/').last}"
+        end
+      end
       file = "demo-app/index.html"
       content = File.read(file)
       if content.include?("Hello Demo")
