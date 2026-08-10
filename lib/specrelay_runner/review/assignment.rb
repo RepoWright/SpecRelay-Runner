@@ -35,10 +35,11 @@ module SpecrelayRunner
       def repositories = Array(payload["repositories"])
 
       # The approved specification as a DOCUMENT MANIFEST. Read as a list rather than as one
-      # `content` string: today it holds a single document, because the implementation intake
-      # still derives authority from the Jira `Approved Specification:` line, but a later MVP
-      # that resolves a Spec PR into a complete package will add entries here and this runner
-      # must keep working without a change.
+      # `content` string, which is what let MVP-0034 widen it without touching this runner: the
+      # manifest now carries the whole pinned Spec PR package — specification, input evidence,
+      # both analyses, the generation manifest and any open questions — derived from the
+      # implementation run's own pin rather than rebuilt, so Executor and Reviewer read the same
+      # immutable input.
       def specification_documents = Array(payload.dig("specification", "documents"))
       def specification_digest = payload.dig("specification", "digest").to_s
 

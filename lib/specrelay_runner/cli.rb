@@ -342,6 +342,12 @@ module SpecrelayRunner
       return review(config, client, payload) if Review::Assignment.review?(payload)
       return specification(config, client, payload) if
         Specification::Assignment.specification?(payload)
+      # MVP-0034 CR-001 — a package PREFLIGHT is recognised the same explicit way, and it leads
+      # the implementation path because it is the gate in front of it: the run it belongs to has
+      # no pinned specification yet, so falling through to `Execution` would launch a provider on
+      # a specification nobody has verified.
+      return package_preflight(config, client, payload) if
+        PackagePreflight::Assignment.preflight?(payload)
 
       announce_claim(payload)
       result = Execution.new(config: config, client: client, payload: payload, env: env,
@@ -402,6 +408,41 @@ module SpecrelayRunner
       err.puts "Upgrade the runner, or release the claim so a newer one can take it:"
       err.puts "  #{assignment.release_command}"
       RUN_FAILED
+    end
+
+    # MVP-0034 CR-001 — verify the ticket's Spec PR package, submit it, and execute ONLY if
+    # Platform pins it and authorizes.
+    #
+    # The executor runs inside this same claim rather than after a re-claim, which is what keeps
+    # one-active-task-per-runner true across both halves: the runner never holds two claims and
+    # never releases this one between verifying a package and implementing it.
+    #
+    # A refusal exits non-zero for the same reason a refused generation does — the claim did not
+    # produce what it was made for, and a `loop` session treating it as success would poll forever
+    # against a machine whose GitHub access is misconfigured while reporting health.
+    def package_preflight(config, client, payload)
+      assignment = PackagePreflight::Assignment.new(payload)
+      presenter.line "Claimed a specification-package check for #{assignment.ticket_key}; " \
+                     "claim #{assignment.claim_token}."
+      result = PackagePreflight::Execution.call(config: config, client: client, payload: payload,
+                                                env: env, io: presenter)
+      presenter.line result.message
+      return RUN_FAILED unless result.authorized?
+
+      execute_authorized(config, client, result.assignment_payload)
+    end
+
+    # The executable assignment Platform returned with its authorization. Absent it there is
+    # nothing to run — and inventing one from the preflight payload is exactly the shortcut this
+    # protocol forbids, because that payload deliberately carries no executor block.
+    def execute_authorized(config, client, assignment_payload)
+      return RUN_FAILED if assignment_payload.nil?
+
+      announce_claim(assignment_payload)
+      result = Execution.new(config: config, client: client, payload: assignment_payload, env: env,
+                             io: presenter).call
+      presenter.line result.message
+      result.success? ? SUCCESS : RUN_FAILED
     end
 
     def generate_specification(config, client, payload)

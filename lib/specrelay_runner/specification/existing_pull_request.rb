@@ -29,11 +29,14 @@ module SpecrelayRunner
 
       # Everything needed to decide, requested in one call so no two facts can be read at
       # different moments.
-      FIELDS = "url,state,headRefName,baseRefName,isDraft,isCrossRepository"
+      # `headRefOid` is MVP-0034's addition: the implementation lane must pin a package to an
+      # exact commit, and asking for it in the SAME call as the state and base is what stops two
+      # facts being read at two different moments while the branch moves between them.
+      FIELDS = "url,state,headRefName,headRefOid,baseRefName,isDraft,isCrossRepository"
 
       OPEN = "OPEN"
 
-      Result = Struct.new(:url, :branch, :draft, :failure_class, :message, keyword_init: true) do
+      Result = Struct.new(:url, :branch, :head_sha, :draft, :failure_class, :message, keyword_init: true) do
         def ok? = failure_class.nil?
         def draft? = draft ? true : false
       end
@@ -89,6 +92,7 @@ module SpecrelayRunner
         # because a Jira field can hold a redirect or a shortened form of the same pull request.
         reported = pull_request["url"].to_s
         Result.new(url: reported.empty? ? url : reported, branch: branch,
+                   head_sha: pull_request["headRefOid"].to_s,
                    draft: pull_request["isDraft"] == true)
       end
 

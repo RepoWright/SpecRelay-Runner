@@ -163,6 +163,32 @@ def claim_payload_for(task_id:, executor_command:, publication: nil)
   )
 end
 
+# The pinned specification package exactly as Runner::Api::RunPayload builds it (MVP-0034
+# contract 4): identity, then every document with the role, path, digest, byte size and content
+# Platform recomputed itself. `digest` is real, so a test that alters one byte without restating
+# it is testing the refusal rather than the fixture.
+def specification_package_block(task_id, documents: nil)
+  documents ||= [
+    [ "specification", "spec.md", "# Approved spec for #{task_id}\nImplement it.\n" ],
+    [ "input_evidence", "analysis/input-evidence.md", "# Input evidence\n" ],
+    [ "business_analysis", "analysis/business.md", "# Business analysis\n" ],
+    [ "technical_analysis", "analysis/technical.md", "# Technical analysis\n" ],
+    [ "generation_manifest", "generation-manifest.json", "{\"round\":1}\n" ]
+  ]
+  head = "a" * 40
+  {
+    "manifest_digest" => "d" * 64,
+    "spec_pull_request_url" => "https://github.com/SpecRelay/specs/pull/7",
+    "repository_slug" => "SpecRelay/specs", "pull_request_number" => 7,
+    "base_branch" => "main", "head_sha" => head, "package_path" => "specs/#{task_id}",
+    "documents" => documents.map do |role, path, content|
+      { "role" => role, "path" => path, "digest" => Digest::SHA256.hexdigest(content),
+        "byte_size" => content.bytesize, "content" => content }
+    end,
+    "handoff_prompt" => "# Approved spec for #{task_id}\nImplement it."
+  }
+end
+
 def base_claim_payload(task_id:, executor_command:)
   {
     "contract_version" => "mvp-0010",
@@ -181,8 +207,7 @@ def base_claim_payload(task_id:, executor_command:)
       "prompt_delivery" => "file_argument", "mode" => "", "semantic_events" => "auto",
       "timeout_seconds" => 120, "env" => {}
     },
-    "approved_specification" => { "authority" => "approved_existing_specification",
-                                 "handoff_prompt" => "# Approved spec for #{task_id}\nImplement it." },
+    "specification_package" => specification_package_block(task_id),
     "report_contract" => { "round_label" => "001-initial",
                           "release_instructions" => "./bin/worktree release #{task_id}",
                           "report_path" => "specs/#{task_id}/execution-reports/001-initial" }

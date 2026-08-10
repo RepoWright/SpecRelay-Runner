@@ -49,6 +49,7 @@ module SpecrelayRunner
       @heartbeater = nil
       @log_stream = nil
       @lease_stop_reason = nil
+      @package = nil
       @controls = ProtocolControls.new(env: env)
       @emitter = EventEmitter.new(client: client, run_id: @run.fetch("id"), attempt_id: @claim)
     end
@@ -158,6 +159,14 @@ module SpecrelayRunner
 
       emit("workspace.preparing", "Preparing worktree for #{run['task_id']}", phase: "workspace")
       worktree = create_worktree(root)
+
+      # MVP-0034 contract 4 — the pinned package is verified and written read-only BEFORE the
+      # provider starts. A document whose bytes do not reproduce the digest Platform pinned ends
+      # the attempt here, with a failed report and no executor (S23).
+      @package = SpecificationPackage.call(payload: payload, staging_dir: staging)
+      unless @package.ok?
+        return package_refused(root, worktree, @package.failure)
+      end
 
       emit("core.started", "Running #{provider} executor for #{run['task_id']}", phase: "core")
       executor_result = run_executor(worktree, staging)
@@ -333,6 +342,18 @@ module SpecrelayRunner
       Result.new(outcome: outcome.to_sym, message: "Runner outcome: #{outcome}.")
     end
 
+    # MVP-0034 S23 — the assignment's package did not reproduce what Platform pinned. Reported as
+    # a failed attempt with NO executor: `launch_error` is what the report bundle already uses to
+    # say "the provider was never started", so the evidence reads truthfully rather than blaming a
+    # task nobody ran.
+    def package_refused(root, worktree, reason)
+      message = "Refusing to implement #{run['task_id']}: #{reason}. The executor was not started."
+      never_launched = Executor::Result.new(exit_code: nil, stdout: "", stderr: "", duration_seconds: 0,
+                                            timed_out: false, argv: [], launch_error: reason)
+      failed_report(root, worktree, never_launched, message,
+                    classification: SpecificationPackage::REFUSED)
+    end
+
     # A failed executor: emit the terminal event and upload a failed report + a
     # failed terminal envelope so Platform records the attempt (run marked FAILED;
     # Jira is not advanced).
@@ -433,13 +454,24 @@ module SpecrelayRunner
         - Worktree (your working directory): `#{worktree_path}`
         - Task id: `#{run['task_id']}`
         - Canonical branch: `#{run['canonical_branch']}`
+        #{package_lines.join("\n")}
 
         Rules:
         - Change ONLY files inside the worktree above, per the approved specification.
         - Do NOT edit any `spec.md`/`spec_persian.md`, push, open a PR, or write to Platform.
         - Make the change idempotently.
       MD
-      "#{preamble}\n\n---\n\n#{payload.dig('approved_specification', 'handoff_prompt')}"
+      "#{preamble}\n\n---\n\n#{payload.dig('specification_package', 'handoff_prompt')}"
+    end
+
+    # Where the verified package actually IS on this machine. The handoff prompt tells the
+    # executor every document was "delivered read-only with your assignment"; without these lines
+    # that sentence names nothing it can open.
+    def package_lines
+      return [] if @package.nil? || !@package.ok?
+
+      [ "- Specification package (read-only, read ALL of it before implementing): `#{@package.root}`" ] +
+        @package.paths.map { |path| "  - `#{File.join(@package.root, path)}`" }
     end
 
     # Emit ONE ordered v1 protocol event, then heartbeat. Both responses carry the
