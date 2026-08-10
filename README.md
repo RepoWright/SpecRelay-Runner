@@ -332,8 +332,8 @@ a property of the control flow rather than of a cleanup routine that might fail.
 |---|---|
 | `assignment_malformed` | Platform sent an assignment without required generation data, or with an incomplete bundle. |
 | `specification_repository_unresolved` | Point this machine at its checkout of the specification repository (below). |
-| `specification_folder_unsafe` / `specification_folder_unwritable` | The configured specification root is not a safe, writable repository-relative folder. |
-| `existing_package_present` | Only with `on_existing_package: refuse`. Move the existing package, or switch back to `replace`. |
+| `specification_folder_unsafe` | The configured specification root is not a safe repository-relative folder. |
+| `package_workspace_unavailable` | This machine cannot hold a package workspace: its state root is not writable, or the seed checkout has no resolvable commit. Check `SPECRELAY_RUNNER_SPEC_WORKSPACE_ROOT`, or fetch the specification repository's default branch. |
 | `source_workspace_unresolved` | Map the workspace to its local source checkout (`SPECRELAY_RUNNER_WORKSPACE_ROOT_<KEY>`). |
 | `input_content_unreadable` | The bundle offers an input Platform classified as unusable. Re-read the ticket. |
 | `external_reference_analysis_unavailable` | A Confluence page or screenshot was deferred to this runner. Enable the capability or record a substitute. |
@@ -376,8 +376,9 @@ runner:
       command: /abs/path/to/spec-writer   # required for kind: command
       timeout_seconds: 900
     repository_roots:
+      # A SEED, not a destination: the runner reads git objects, `origin` and your
+      # credential helper from here and writes the package into its own worktree.
       "SpecRelay/SpecRelay-Specs": /abs/path/to/your/specs-checkout
-    on_existing_package: replace          # replace (default) | refuse
     context_plus:
       available: true       # optional declaration; never treated as proof of use
       # Optional semantic evidence YOU gathered — the runner cannot query Context+.
@@ -398,7 +399,26 @@ being told the intended default was a stub.
 
 Environment overrides: `SPECRELAY_RUNNER_SPEC_REPOSITORY_ROOT_<OWNER>_<REPO>` (or the
 unsuffixed `SPECRELAY_RUNNER_SPEC_REPOSITORY_ROOT`), `SPECRELAY_RUNNER_SPEC_PROVIDER`,
-`SPECRELAY_RUNNER_SPEC_PROVIDER_COMMAND`, `SPECRELAY_RUNNER_SPEC_ON_EXISTING_PACKAGE`.
+`SPECRELAY_RUNNER_SPEC_PROVIDER_COMMAND`, `SPECRELAY_RUNNER_SPEC_WORKSPACE_ROOT`.
+
+### Where a generated package lives
+
+The runner creates one detached, `--no-checkout` git worktree per generation under
+`~/.specrelay/runner/specification-packages/<opaque-id>/` (override the root with
+`SPECRELAY_RUNNER_SPEC_WORKSPACE_ROOT`) and writes the package there. Your
+specification checkout is never written to.
+
+Publication resumes that exact workspace by its opaque id and verifies the metadata,
+the worktree, the base commit, the exact file set and every digest before it runs a
+git command. Platform stores the id and the machine that owns it, and offers the
+publication to no other machine.
+
+Retention is fixed and not configurable: an unpublished workspace is kept for **seven
+days**, at most **twenty** per machine, oldest removed first. A successful publication
+removes its own workspace once Platform has accepted the result — never before, so a
+lost response can be replayed onto the same commit. If a package expires or its
+machine is gone, use **Generate again** on the run page; any connected runner can then
+produce a fresh one.
 
 **The `substitute:` keys are not off switches.** Each is a sentence you write, and
 the runner copies it verbatim into `analysis/technical.md` and into the evidence

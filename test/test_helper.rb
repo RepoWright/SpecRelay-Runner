@@ -75,7 +75,7 @@ end
 # different `expected_runner_action` — the same document with a different authorization, which
 # is precisely what the runner branches on. `files` carries REAL digests supplied by the caller,
 # because every interesting case here is about whether the bytes on disk match them.
-def spec_publication_payload_for(issue_key:, files:, package_path:, branch:,
+def spec_publication_payload_for(issue_key:, files:, package_path:, branch:, workspace_id:,
                                  repository_url: "https://github.com/SpecRelay/SpecRelay-Specs",
                                  slug: "SpecRelay/SpecRelay-Specs", base_branch: "main",
                                  draft: true, title: "Add an export button",
@@ -87,8 +87,11 @@ def spec_publication_payload_for(issue_key:, files:, package_path:, branch:,
                                "publication" => "publish_draft_pull_request_only",
                                "expected_runner_action" => "publish_specification_package",
                                "release_command" => "bin/platform runner release run_spec123" },
+    # MAPIAI-62 — `workspace_id` is the opaque address of the Runner-owned workspace that
+    # generated this package. Required by the contract, so it is required by the fixture: a
+    # publication payload without one is not a document Platform can produce.
     "generated_package" => { "path" => package_path, "generated_at" => "2026-08-01T09:00:00Z",
-                             "files" => files },
+                             "workspace_id" => workspace_id, "files" => files },
     "publication" => { "repository_url" => repository_url, "slug" => slug,
                        "specification_root" => "specs", "branch" => branch,
                        "base_branch" => base_branch, "create_pull_request" => true,

@@ -87,7 +87,8 @@ module SpecrelayRunner
       end
 
       # The generating half. Everything before `write_package` is reversible by doing nothing;
-      # `write_package` is the first and only step that changes the operator's disk.
+      # `write_package` writes into the Runner-owned isolated worktree preflight created, and
+      # nothing in this method can reach the operator's checkout at all.
       def generate(assignment, ready)
         start_heartbeater(assignment)
         log("Preflight passed. Generating with #{ready.provider.describe}.")
@@ -98,8 +99,9 @@ module SpecrelayRunner
         report_success(assignment, ready, written, documents)
       rescue Aborted => e
         aborted(e)
-      rescue Provider::Failed, DocumentSet::Invalid, PackageWriter::Error, PackagePath::Unsafe => e
-        fail_generation(assignment, e)
+      rescue Provider::Failed, DocumentSet::Invalid, PackageWriter::Error, PackagePath::Unsafe,
+             PackageWorkspace::Error => e
+        fail_generation(ready, e)
       ensure
         @heartbeater&.stop
       end
@@ -114,10 +116,18 @@ module SpecrelayRunner
         DocumentSet.validate!(ready.provider.generate(packet), issue_key: assignment.issue_key)
       end
 
+      # The write, and the promotion of the workspace to `ready` in the same step. The digests
+      # are recorded in the workspace's own metadata as well as reported to Platform, because
+      # publication proves the files against BOTH: Platform's copy says what this run is
+      # authorized to publish, and the local copy says what this workspace was created to hold.
       def write_package(assignment, ready, documents)
-        PackageWriter.call(package_path: ready.package_path, documents: documents, assignment: assignment,
-                           provider: ready.provider, source: ready.source, inputs: ready.inputs,
-                           settings: settings, clock: clock)
+        written = PackageWriter.call(package_path: ready.package_path,
+                                     destination_root: ready.workspace.worktree_root,
+                                     documents: documents, assignment: assignment,
+                                     provider: ready.provider, source: ready.source,
+                                     inputs: ready.inputs, clock: clock)
+        ready.workspace.finalize!(files: written.files)
+        written
       end
 
       # ------------------------------------------------------------------ outcomes
@@ -135,11 +145,11 @@ module SpecrelayRunner
         log("")
         log("Generated #{written.file_paths.length} files at #{written.relative_package_path}:")
         written.files.each { |file| log("  #{file.path}  sha256:#{file.sha256[0, 16]}…  #{file.bytes} bytes") }
-        log("Replaced an existing package at this path.") if written.replaced_existing?
         written.warnings.each { |warning| log("  warning: #{warning}") }
         log("")
-        log("Nothing was published: no branch, no commit, no push, no pull request, no Jira field")
-        log("write, and no approval transition. Review the package locally; publication is MVP-0027.")
+        log("The package is held in this runner's own isolated worktree, not in your specification")
+        log("checkout, which is unchanged. Nothing was published: no branch, no commit, no push, no")
+        log("pull request, no Jira field write, and no approval transition.")
       end
 
       # A preflight refusal. Reported to Platform so the run leaves the claimable state and
@@ -149,7 +159,7 @@ module SpecrelayRunner
       def refuse(refusal)
         log("")
         log("Refusing to generate a specification: #{refusal.message}")
-        log("No output file was created or modified, and Jira was not touched.")
+        log("No output file was created, no local workspace was made, and Jira was not touched.")
         log("Fix the cause above and re-run, or release the claim so another runner can take it:")
         log("  #{release_command}")
         submit(refusal_payload(refusal, outcome: "refused", zero_files: true))
@@ -162,38 +172,40 @@ module SpecrelayRunner
       # carried through to Platform: a refusal means a precondition was missing, a failure
       # means generation was attempted and did not produce a usable package.
       #
-      # Whether the destination is untouched is ASKED, not asserted. Almost every path here
-      # leaves it unchanged — the writer stages and renames once — but "almost every" is not a
-      # guarantee, and this line used to state the guarantee as a literal `true`. A failure in
-      # the bookkeeping after a completed rename then told the operator nothing had been
-      # written while the package sat fully replaced on their disk. Only PackageWriter knows
-      # which side of the rename a failure fell on, so only PackageWriter answers.
-      def fail_generation(assignment, error)
+      # Whether the package landed is ASKED, not asserted: only PackageWriter knows which side
+      # of its single rename a failure fell on, and an operator deciding whether the retained
+      # workspace is worth inspecting needs the answer.
+      #
+      # The workspace is RETAINED either way (design 4). A partial or absent package in a
+      # Runner-owned directory is inspectable state with a seven-day life, not litter in
+      # someone's checkout, so there is nothing here to clean up and no reason to.
+      def fail_generation(ready, error)
         message = Redaction.redact(error.message.to_s)
         wrote = wrote_package?(error)
         log("")
         log("Specification generation failed: #{message}")
-        log(wrote ? "The generated package IS in place at #{error.package_path} — it was not removed. " \
-                    "Inspect it before re-running." :
-                    "No partial package was left at #{package_hint}; the destination is unchanged.")
+        log(wrote ? "A complete package for #{error.package_path} IS held in this runner's isolated " \
+                    "worktree and was not removed." :
+                    "No package was completed. Your specification checkout is unchanged either way.")
+        log("The workspace is retained for #{PackageWorkspaceStore::RETENTION_DAYS} days so it can be inspected.")
         log("Re-run after fixing the cause, or release the claim:")
         log("  #{assignment.release_command}")
         refusal = Preflight::Refusal.new(failure_class: failure_class_for(error),
                                          message: failure_message(error, message, wrote))
-        submit(refusal_payload(refusal, outcome: "failed", zero_files: !wrote))
+        submit(refusal_payload(refusal, outcome: "failed", zero_files: !wrote, workspace: ready&.workspace))
         Result.new(outcome: FAILED, message: "Runner outcome: generation_failed (#{failure_class_for(error)}).")
       end
 
       def wrote_package?(error) = error.is_a?(PackageWriter::Error) && error.wrote_package?
 
-      # When a package IS on disk, the message names its path. The failure class alone sends
-      # an operator to the runner's configuration; the path is what sends them to the one
-      # place that now holds unreviewed generated files.
+      # When a package IS on disk, the message names its repository-relative path — never the
+      # local one. The failure class sends an operator to the runner's configuration; the path
+      # tells them what the retained workspace holds.
       def failure_message(error, message, wrote)
         return message unless wrote
 
-        "#{message}. The generated package IS in place at #{error.package_path} and was not removed; " \
-          "inspect it before re-running."
+        "#{message}. A complete package for #{error.package_path} is retained in this runner's " \
+          "isolated worktree and was not removed."
       end
 
       # Stable failure classes for the post-preflight failures, distinct from the preflight
@@ -221,7 +233,7 @@ module SpecrelayRunner
         log("")
         log("Stopping: Platform reports #{reason}. No generation result was submitted.")
         log("Platform owns the outcome — an expired lease is reclaimed, a cancelled run is terminal.")
-        log("Any files already written locally are left in place and are NOT recorded as this run's result.")
+        log("Any isolated workspace already created is retained and is NOT recorded as this run's result.")
         Result.new(outcome: ABORTED,
                    message: "Runner outcome: aborted (#{reason}); no generation result was reported.")
       end
@@ -233,9 +245,9 @@ module SpecrelayRunner
           "package" => {
             "path" => written.relative_package_path,
             "files" => written.files.map(&:to_h),
-            "manifest" => written.manifest,
-            "replaced_existing_package" => written.replaced_existing?
+            "manifest" => written.manifest
           },
+          "package_workspace" => workspace_block(ready.workspace),
           "tool_evidence" => tool_evidence(ready),
           # Source-inspection warnings travel with the rest. A zero-file inspection is the one
           # this exists for: it is the difference between a specification grounded in code and
@@ -246,13 +258,27 @@ module SpecrelayRunner
         )
       end
 
-      def refusal_payload(refusal, outcome:, zero_files:)
-        base_payload(assignment, outcome).merge(
+      def refusal_payload(refusal, outcome:, zero_files:, workspace: nil)
+        base = base_payload(assignment, outcome).merge(
           "failure_class" => refusal.failure_class,
           "message" => refusal.message,
           "zero_output_files_written" => zero_files,
           "diagnostics" => diagnostics
         )
+        workspace ? base.merge("package_workspace" => workspace_block(workspace)) : base
+      end
+
+      # The ONLY thing about a local workspace that reaches Platform: an opaque id and when it
+      # expires. No path, no machine name, no seed, no directory listing. Platform stores the id
+      # beside the registered runner that reported it and hands it back at publication; that
+      # pair is the whole ownership contract (design 2).
+      #
+      # It travels on a FAILURE too, and deliberately. A failed generation still retains a
+      # workspace, and the run page has to be able to say which machine holds it and until when
+      # — otherwise "inspect the retained package" is advice with no address.
+      def workspace_block(workspace)
+        { "id" => workspace.id, "expires_at" => workspace.expires_at&.iso8601.to_s,
+          "retention_days" => PackageWorkspaceStore::RETENTION_DAYS }
       end
 
       # Read from the RAW payload, not from the parsed assignment.
@@ -298,7 +324,8 @@ module SpecrelayRunner
       def diagnostics
         [
           "provider: #{settings.provider_kind}",
-          "on_existing_package: #{settings.on_existing_package}",
+          "package workspace retention: #{PackageWorkspaceStore::RETENTION_DAYS} days, " \
+          "at most #{PackageWorkspaceStore::MAX_RETAINED} retained",
           *capability_diagnostics
         ]
       end
@@ -381,8 +408,6 @@ module SpecrelayRunner
         reason = @heartbeater&.stop_reason || @lease_stop_reason
         raise Aborted, reason if reason
       end
-
-      def package_hint = assignment ? "the configured specification folder" : "the destination"
 
       # Usable even for a payload that failed validation, for the same reason the claim token
       # is: an operator reading a refusal needs the recovery command most when the assignment

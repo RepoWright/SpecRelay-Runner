@@ -21,8 +21,7 @@ module SpecrelayRunner
     #         args: []
     #         timeout_seconds: 900
     #       repository_roots:
-    #         "SpecRelay/SpecRelay-Specs": /abs/path/to/specs-checkout
-    #       on_existing_package: replace # replace | refuse
+    #         "SpecRelay/SpecRelay-Specs": /abs/path/to/specs-checkout   # a SEED, not a destination
     #       graphify:
     #         substitute: "<why, when the wrappers are absent>"
     #       context_plus:
@@ -77,19 +76,6 @@ module SpecrelayRunner
       PROVIDER_KINDS = [ PROVIDER_COMPOSED, PROVIDER_COMMAND, PROVIDER_CLAUDE ].freeze
       PROVIDER_ALIASES = { PROVIDER_FAKE => PROVIDER_COMPOSED }.freeze
 
-      # What to do when a package for this issue already exists locally. MVP-0026 scope 10
-      # requires ONE documented behaviour; `replace` is it, and `refuse` exists for an
-      # operator who wants a hand-edited package protected from an automated overwrite.
-      #
-      # `replace` is the default because the alternative makes the ordinary case — a
-      # re-run after a bad generation — require a manual `rm -rf` before the runner will
-      # work, and an operator who does that under time pressure is one slip away from
-      # deleting the wrong directory. The replacement is atomic and is recorded in the
-      # manifest, so nothing is lost silently.
-      REPLACE = "replace"
-      REFUSE = "refuse"
-      EXISTING_POLICIES = [ REPLACE, REFUSE ].freeze
-
       DEFAULT_TIMEOUT_SECONDS = 900
 
       # Per-repository root override, e.g.
@@ -99,7 +85,6 @@ module SpecrelayRunner
       REPOSITORY_ROOT_ENV = "SPECRELAY_RUNNER_SPEC_REPOSITORY_ROOT"
       PROVIDER_KIND_ENV = "SPECRELAY_RUNNER_SPEC_PROVIDER"
       PROVIDER_COMMAND_ENV = "SPECRELAY_RUNNER_SPEC_PROVIDER_COMMAND"
-      EXISTING_POLICY_ENV = "SPECRELAY_RUNNER_SPEC_ON_EXISTING_PACKAGE"
       # MVP-0028 remediation, defect 2 — the REAL tool/MCP boundary that fetches and analyses an
       # external reference (a Jam smart link, a Confluence page, a screenshot) a bundle defers to
       # the runner. Named the same way `provider.command` is, because it is the same shape of
@@ -133,7 +118,7 @@ module SpecrelayRunner
       end
 
       attr_reader :provider_kind, :provider_command, :provider_args, :provider_timeout_seconds,
-                  :repository_roots, :on_existing_package, :graphify, :context_plus, :external_references,
+                  :repository_roots, :graphify, :context_plus, :external_references,
                   :external_reference_command, :external_reference_timeout_seconds
 
       def self.from(config, env: ENV) = new(config.specification_settings, env: env)
@@ -147,7 +132,6 @@ module SpecrelayRunner
         @provider_args = Array(provider["args"]).map(&:to_s)
         @provider_timeout_seconds = positive_int(provider["timeout_seconds"]) || DEFAULT_TIMEOUT_SECONDS
         @repository_roots = string_map(@document["repository_roots"])
-        @on_existing_package = resolve_existing_policy
         @graphify = capability("graphify", default_available: true)
         @context_plus = capability("context_plus", default_available: false, operator_evidence: true)
         @external_references = capability("external_references", default_available: false)
@@ -174,8 +158,6 @@ module SpecrelayRunner
       def repository_root_env(slug)
         "#{REPOSITORY_ROOT_ENV}_#{slug.to_s.upcase.gsub(/[^A-Z0-9]+/, '_')}"
       end
-
-      def replace_existing? = on_existing_package == REPLACE
 
       # NOT "is the kind unset or composed". An unset kind is a question for {Provider.resolve},
       # which knows what else the operator configured; answering it here as `composed` is exactly
@@ -205,14 +187,6 @@ module SpecrelayRunner
           PROVIDER_KINDS.include?(kind)
 
         kind
-      end
-
-      def resolve_existing_policy
-        policy = presence(env[EXISTING_POLICY_ENV]) || presence(document["on_existing_package"]) || REPLACE
-        raise Error, "runner.specification.on_existing_package must be one of: #{EXISTING_POLICIES.join(', ')}" unless
-          EXISTING_POLICIES.include?(policy)
-
-        policy
       end
 
       # Availability defaults differ on purpose. Graphify defaults to AVAILABLE because the

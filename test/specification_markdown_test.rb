@@ -118,11 +118,14 @@ class SpecificationMarkdownTest < Minitest::Test
     exit_code = SpecrelayRunner::CLI.run(
       %W[claim-once --config #{config.source_path}], out: @io, err: @io,
       env: { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN, "PATH" => ENV["PATH"] }
+            .merge(SpecificationWorkspace.lane_env(@temp))
     )
     assert_equal SpecrelayRunner::CLI::SUCCESS, exit_code, @io.string
   end
 
-  def read_package(name) = File.read(File.join(@specs, PACKAGE, name))
+  def read_package(name)
+    File.read(File.join(SpecificationWorkspace.isolated_worktree(@temp), PACKAGE, name))
+  end
 
   def write_config
     path = File.join(Dir.mktmpdir("cfg"), "runner.yml")

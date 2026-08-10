@@ -14,12 +14,20 @@ module SpecrelayRunner
     # The ORDER is the contract, and every step before `GitPublisher` is reversible by doing
     # nothing:
     #
-    #   parse -> resolve checkout -> VERIFY DIGESTS -> check `gh` -> commit+push -> draft PR -> report
+    #   parse -> RESUME the isolated workspace -> VERIFY it -> check `gh` -> commit+push
+    #   -> draft PR -> report -> clean up only once Platform has accepted
     #
-    # Digest verification runs before any git command, so criterion 2's "refuses before Git
-    # mutation on mismatch" is a property of this sequence rather than of a rollback. The `gh`
-    # check runs before the commit for the same kind of reason: a host that cannot open a pull
-    # request must not first push a branch nobody will be asked to review.
+    # Verification runs before any git command, so criterion 2's "refuses before Git mutation on
+    # mismatch" is a property of this sequence rather than of a rollback. The `gh` check runs
+    # before the commit for the same kind of reason: a host that cannot open a pull request must
+    # not first push a branch nobody will be asked to review.
+    #
+    # MAPIAI-62 replaced the first step outright. It used to RE-RESOLVE the operator's
+    # specification checkout from configuration, independently of generation and with no pin
+    # between the two, so the two phases could resolve different directories — which is exactly
+    # what the live MAPIAI-53 run did. The runner now resumes the one workspace it created, by
+    # the opaque id Platform stored and handed back, under the same local lock generation held.
+    # There is no checkout resolution here any more and no fallback to one.
     #
     # It fails CLOSED at every step. Nothing here can report `published`, and therefore nothing
     # can move the run to awaiting approval, unless a draft pull request verifiably exists — a
@@ -44,7 +52,10 @@ module SpecrelayRunner
       ABORTED = :aborted
 
       ASSIGNMENT_MALFORMED = "publication_assignment_malformed"
-      REPOSITORY_UNRESOLVED = "specification_repository_unresolved"
+      # MAPIAI-62 — another process on this machine holds the workspace lock for this package.
+      # A refusal rather than a wait: the lease is finite, and blocking on a lock another
+      # publication holds would burn it and then publish the same package twice.
+      WORKSPACE_BUSY = "specification_workspace_busy"
       # Local outcome only. Platform refused the result, so by definition Platform stored no
       # failure class of its own; this one names the condition in the runner's exit and log.
       REPORT_REFUSED = "publication_report_refused"
@@ -55,7 +66,8 @@ module SpecrelayRunner
 
       def self.call(**kwargs) = new(**kwargs).call
 
-      def initialize(config:, client:, payload:, env: ENV, io: $stdout, clock: Time, settings: nil)
+      def initialize(config:, client:, payload:, env: ENV, io: $stdout, clock: Time, settings: nil,
+                     workspaces: nil)
         @config = config
         @client = client
         @payload = payload.to_h
@@ -63,6 +75,7 @@ module SpecrelayRunner
         @io = io
         @clock = clock
         @injected_settings = settings
+        @workspaces = workspaces || PackageWorkspaceStore.for(env: env)
         @heartbeater = nil
       end
 
@@ -77,7 +90,7 @@ module SpecrelayRunner
 
       private
 
-      attr_reader :config, :client, :payload, :env, :io, :clock, :assignment
+      attr_reader :config, :client, :payload, :env, :io, :clock, :assignment, :workspaces
 
       def settings = @settings ||= @injected_settings || Settings.from(config, env: env)
 
@@ -90,23 +103,37 @@ module SpecrelayRunner
         log("  Package:    #{assignment.generated_package_path}")
       end
 
-      # The whole sequence, guarded by the lease. A heartbeater runs for the duration and the
-      # liveness signal is checked before the first git mutation and again before reporting, so a
-      # run Platform has cancelled or reclaimed is never reported as published.
+      # The whole sequence, guarded by the lease AND by the local workspace lock.
+      #
+      # The lock is taken for the WHOLE publication, not just the verification: it is what makes
+      # "two processes with the same registration cannot publish the same package concurrently"
+      # true on this machine, and what stops the retention sweep from removing a workspace that
+      # is mid-publication. Platform's active-execution index remains the authoritative rule
+      # across machines; this is the local half of the same invariant.
       def publish(assignment)
         start_heartbeater(assignment)
-        checkout = resolve_checkout(assignment)
-        return checkout if checkout.is_a?(Result)
-
-        verified = verify_package(assignment, checkout)
-        return verified if verified.is_a?(Result)
-
-        checkpoint!
-        push_and_open(assignment, checkout, verified)
+        held = workspaces.with_lock(assignment.generated_package_workspace_id, blocking: false) do
+          publish_locked(assignment)
+        end
+        held || fail_closed(WORKSPACE_BUSY, busy_message)
       rescue Aborted => e
         aborted(e)
       ensure
         @heartbeater&.stop
+      end
+
+      def publish_locked(assignment)
+        checked = PackageWorkspaceCheck.call(workspaces: workspaces, assignment: assignment,
+                                             config: config, env: env, clock: clock)
+        return refuse_workspace(checked) unless checked.ok?
+
+        checkpoint!
+        push_and_open(assignment, checked.workspace, checked.files)
+      end
+
+      def busy_message
+        "another process on this machine is already working in the isolated workspace for this " \
+          "package. Wait for it to finish; this run stays publishable and will be offered again"
       end
 
       # `gh` is checked BEFORE the commit, not after the push. A host without an authenticated
@@ -118,8 +145,12 @@ module SpecrelayRunner
       # ticket that already has a `Spec PR` the answer comes from GitHub, and every way it can
       # come back unusable (closed, merged, missing, wrong base, from a fork) must refuse the
       # publication rather than fork a second branch off it.
-      def push_and_open(assignment, checkout, verified)
-        commands = GitCommands.new(checkout_root: checkout, env: env)
+      # Every git and `gh` command runs in the ISOLATED WORKTREE, never in the operator's
+      # checkout. It is a linked worktree of the same repository, so it shares the object
+      # database, the `origin` remote and the credential helper — everything publication needs —
+      # while HEAD, the index and the working tree it can reach belong to this runner alone.
+      def push_and_open(assignment, workspace, verified)
+        commands = GitCommands.new(checkout_root: workspace.worktree_root, env: env)
         return fail_closed(PullRequestPublisher::GH_UNAVAILABLE, PullRequestPublisher.unavailable_message) unless
           PullRequestPublisher.available?(commands: commands)
 
@@ -135,7 +166,16 @@ module SpecrelayRunner
         return fail_closed(opened.failure_class, opened.message, pushed: pushed) unless opened.ok?
 
         checkpoint!
-        succeed(verified, pushed, opened)
+        succeed(workspace, verified, pushed, opened)
+      end
+
+      # A workspace that could not be resumed or proved. Reported with its own failure class so
+      # the run page can say WHICH of "gone", "expired" and "not what Platform recorded" it was —
+      # the three have the same remedy but not the same cause, and an operator told the wrong one
+      # goes looking in the wrong place.
+      def refuse_workspace(checked)
+        log(checked.message)
+        fail_closed(checked.failure_class, checked.message)
       end
 
       # The branch this publication belongs on: the head of the ticket's existing specification
@@ -165,60 +205,16 @@ module SpecrelayRunner
       # the branch Platform expected rather than nothing.
       def publication_branch = @publication_branch || assignment&.publication_branch
 
-      # This machine's clone of the specification repository, resolved through the same operator
-      # configuration MECHANISM generation used.
-      #
-      # That is NOT the same as "the two phases can never disagree about where the package lives",
-      # which this comment used to claim. The live MAPIAI-53 run disproved it: generation and
-      # publication are separate invocations, `SPECRELAY_RUNNER_SPEC_REPOSITORY_ROOT` is read fresh
-      # from the environment each time, and a publication run started with a different value for it
-      # resolved a different clone and refused with `generated_package_missing` — correctly, having
-      # written nothing. The resolution is also not identical in code: {Preflight} falls back to
-      # reusing a verified source-workspace checkout, and this does not.
-      #
-      # Fail-closed behaviour is right and unchanged. What is missing is that nothing PINS the
-      # checkout across the generation → publication boundary; see the MVP-0028 follow-up. The
-      # pin belongs on the runner, not in the assignment — a local filesystem path is exactly what
-      # {Runner::Api::SpecCreationPayload} must never carry.
-      def resolve_checkout(assignment)
-        slug = assignment.publication_slug
-        slug = assignment.publication_repository_url if slug.empty?
-        root = settings.repository_root(slug, repository_url: assignment.publication_repository_url)
-        return fail_closed(REPOSITORY_UNRESOLVED, missing_checkout_message(slug)) if root.nil?
-
-        expanded = File.expand_path(root)
-        return fail_closed(REPOSITORY_UNRESOLVED,
-                           "the configured specification repository checkout does not exist on this " \
-                           "runner: #{expanded}") unless File.directory?(expanded)
-
-        expanded
-      end
-
-      def missing_checkout_message(slug)
-        "no local checkout is configured for the specification repository " \
-          "#{assignment.publication_repository_url}. Set #{settings.repository_root_env(slug)} to its " \
-          "absolute path, or add it under runner.specification.repository_roots, then retry publication."
-      end
-
-      def verify_package(assignment, checkout)
-        result = PackageVerification.call(checkout_root: checkout, package_path: assignment.generated_package_path,
-                                          files: assignment.generated_files)
-        return result.files if result.ok?
-
-        log("Refusing to publish: #{result.message}")
-        log("Nothing was committed, pushed, or opened as a pull request.")
-        fail_closed(result.failure_class, result.message)
-      end
-
       # ------------------------------------------------------------------ outcomes
 
       # `published` is claimed only once Platform has ACCEPTED the result. The pull request
       # existing is not the same fact as the run having advanced, and only Platform can say the
       # second one happened.
-      def succeed(verified, pushed, opened)
-        refusal = submit(success_payload(verified, pushed, opened))
-        return report_refused(refusal, pushed, opened) if refusal
+      def succeed(workspace, verified, pushed, opened)
+        submission = submit(success_payload(verified, pushed, opened))
+        return report_refused(submission.message, pushed, opened) if submission.refused?
 
+        submission.accepted? ? clean_up(workspace) : retain_for_replay
         log("")
         log("Published #{verified.length} files on #{publication_branch} as a draft pull request:")
         log("  #{opened.url}")
@@ -234,6 +230,32 @@ module SpecrelayRunner
         Result.new(outcome: PUBLISHED, pull_request_url: opened.url, branch: publication_branch,
                    head_commit: pushed.head_commit,
                    message: "Runner outcome: published (draft pull request #{opened.url}).")
+      end
+
+      # Local cleanup, and ONLY after Platform has accepted the result (design 4).
+      #
+      # The ordering is the whole point. The pull request exists and Platform's run has advanced;
+      # the local package is now a duplicate of committed history. Removing it before acceptance
+      # would destroy the one copy of a package a refused report still needs to retry from.
+      #
+      # A cleanup failure is a WARNING on a publication that succeeded, never a failure. Reporting
+      # it as one would tell an operator the specification was not published while a reviewer was
+      # already looking at it; the retention sweep collects the workspace later anyway.
+      #
+      # Already inside the workspace lock (see #publish), so this cannot race the sweep.
+      def clean_up(workspace)
+        return if workspace.remove!(commands_for: ->(root) { GitCommands.new(checkout_root: root, env: env) })
+
+        log("The publication succeeded; this runner could not remove its local package workspace.")
+        log("It is retained and the next generation's retention sweep will collect it.")
+      end
+
+      # Platform never answered, so it holds no record and will offer this run again. Keeping the
+      # workspace is what makes that replay converge: the same files produce the same tree, so
+      # {GitPublisher} creates no second commit and {PullRequestPublisher} reuses the pull request.
+      def retain_for_replay
+        log("This runner is keeping its local package so the next attempt republishes the same " \
+            "commit rather than regenerating.")
       end
 
       # Platform READ the result and refused it. The draft pull request genuinely exists, but
@@ -267,10 +289,10 @@ module SpecrelayRunner
         log("")
         log("Specification publication failed: #{text}")
         log("The run was NOT moved to awaiting approval and Jira was not touched.")
-        refusal = submit(failure_payload(failure_class, text, pushed))
+        submission = submit(failure_payload(failure_class, text, pushed))
         # Already a failure, so the outcome does not change — but the operator must not be left
         # believing Platform recorded a failure it in fact refused.
-        log("Platform REFUSED this failure report: #{refusal}") if refusal
+        log("Platform REFUSED this failure report: #{submission.message}") if submission.refused?
         Result.new(outcome: FAILED, branch: pushed ? publication_branch : nil,
                    head_commit: pushed&.head_commit,
                    message: "Runner outcome: publication_failed (#{failure_class}).")
@@ -330,22 +352,38 @@ module SpecrelayRunner
 
       def claim_token = payload.dig("claim", "runner_execution_id").to_s
 
-      # Returns nil when Platform recorded the result, and the redacted refusal message when
-      # Platform read it and REFUSED it. The two are not interchangeable: one leaves the local
-      # outcome standing, the other invalidates it as something to report.
+      # THREE outcomes, not two, and MAPIAI-62 is why the third had to become distinguishable.
+      #
+      #   accepted    — Platform read the result and recorded it. The only state in which the
+      #                 local package may be deleted (design 4).
+      #   refused     — Platform read it and rejected it. The local outcome is invalidated as
+      #                 something to report, and the package is kept for the operator's next move.
+      #   unreachable — Platform never answered. The pull request exists either way, but Platform
+      #                 holds no record, so this run WILL be offered again — and the retained
+      #                 workspace is the only thing that lets that replay converge on the same
+      #                 commit instead of failing closed (S16).
+      #
+      # The old implementation returned nil for both `accepted` and `unreachable`, which was
+      # harmless while nothing acted on the difference and became a data-loss bug the moment
+      # cleanup did.
+      Submission = Struct.new(:state, :message, keyword_init: true) do
+        def accepted? = state == :accepted
+        def refused? = state == :refused
+      end
+
       def submit(publication)
         claim = publication["runner_execution_id"].to_s
         if claim.empty?
           log("(no claim identity in the assignment — nothing was reported to Platform)")
-          return nil
+          return Submission.new(state: :unreachable)
         end
 
         response = client.submit_specification_publication(claim: claim, publication: publication)
         log("Platform recorded the result: run #{response['run_state']} (#{response['outcome']}).")
-        nil
+        Submission.new(state: :accepted)
       rescue PlatformClient::Error => e
         text = Redaction.redact(e.message)
-        return text if e.refused?
+        return Submission.new(state: :refused, message: text) if e.refused?
 
         # A TRANSPORT failure only. The remote outcome is already true — the branch and the pull
         # request exist or they do not. Failing to REACH Platform is a separate problem with its
@@ -353,7 +391,7 @@ module SpecrelayRunner
         # operator to look at GitHub for something that is not wrong there.
         log("Could not report the result to Platform: #{text}")
         log("The outcome above still stands. Platform will reclaim this run when the lease expires.")
-        nil
+        Submission.new(state: :unreachable, message: text)
       end
 
       # ------------------------------------------------------------------- lifecycle
