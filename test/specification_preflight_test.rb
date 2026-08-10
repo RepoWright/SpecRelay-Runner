@@ -79,9 +79,23 @@ class SpecificationPreflightTest < Minitest::Test
     FileUtils.mkdir_p(root)
     FileUtils.chmod(0o500, root)
     assert_refusal "package_workspace_unavailable"
-    assert_includes @io.string, SpecrelayRunner::Specification::PackageWorkspaceStore::ROOT_ENV
+    assert_includes @io.string, SpecrelayRunner::Specification::PackageWorkspaceStore::DEFAULT_RELATIVE_PATH
   ensure
     FileUtils.chmod(0o755, root)
+  end
+
+  # review-001 F1 — the Runner's state root must be DISJOINT from the operator's checkouts.
+  #
+  # A root inside one of them put `swp_<id>/` into a repository the operator owns, which is the
+  # exact defect this MVP exists to remove. Both checkouts are asserted on both probes: the
+  # refusal has to leave the OTHER one alone too, and only comparing both would catch a fix that
+  # merely moved the write.
+  def test_a_package_workspace_root_inside_the_specification_seed_refuses_before_writing
+    assert_disjoint_state_root_refusal(@specs)
+  end
+
+  def test_a_package_workspace_root_inside_the_source_checkout_refuses_before_writing
+    assert_disjoint_state_root_refusal(@source)
   end
 
   # S04 — a seed with no resolvable commit refuses before any workspace or provider write.
@@ -262,6 +276,28 @@ class SpecificationPreflightTest < Minitest::Test
     assert_empty @platform.requests_to("/api/runner/reports")
   end
 
+  # review-001 F1 — refuse, write nothing into EITHER checkout, and leave both byte-identical
+  # at the file level and at the git level.
+  def assert_disjoint_state_root_refusal(state_root)
+    start_platform(spec_creation_payload_for(issue_key: ISSUE))
+    files = { specs: snapshot(@specs), source: snapshot(@source) }
+    # Only the seed is a git checkout in this fixture; the source is a plain directory, so it is
+    # compared at the file level alone.
+    git = SpecificationWorkspace.git_state(@specs)
+
+    exit_code = run_cli(config: build_config, state_root: state_root)
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, exit_code, @io.string
+    generation = @platform.last_specification_generation
+    assert_equal "package_workspace_unavailable", generation["failure_class"], @io.string
+    assert generation["zero_output_files_written"]
+    assert_empty Dir.glob("#{state_root}/**/swp_*", File::FNM_DOTMATCH),
+                 "a generation must never create an isolated workspace inside an operator checkout"
+    assert_equal files[:specs], snapshot(@specs)
+    assert_equal files[:source], snapshot(@source)
+    assert_equal git, SpecificationWorkspace.git_state(@specs)
+  end
+
   def snapshot(root) = SpecificationWorkspace.checkout_snapshot(root)
 
   def read_package(name)
@@ -310,9 +346,9 @@ class SpecificationPreflightTest < Minitest::Test
     SpecrelayRunner::Config.load(path)
   end
 
-  def run_cli(config:)
+  def run_cli(config:, state_root: @temp)
     env = { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN, "PATH" => ENV["PATH"] }
-          .merge(SpecificationWorkspace.lane_env(@temp))
+          .merge(SpecificationWorkspace.lane_env(state_root))
     SpecrelayRunner::CLI.run(%W[claim-once --config #{config.source_path}], out: @io, err: @io, env: env)
   end
 end

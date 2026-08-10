@@ -157,6 +157,36 @@ class SpecificationPackageWorkspaceTest < Minitest::Test
     assert File.file?(File.join(outside, "precious.txt"))
   end
 
+  # review-001 F2 — the reviewer's exact probe. `all` skipped a symlinked entry, but lookup BY ID
+  # only checked the path lexically and `File.directory?` follows a symlink, so a workspace moved
+  # out of the store and linked back in resolved and had its metadata read. Enumeration, lookup
+  # and removal now apply one rule, which is what this asserts on all three.
+  def test_an_entry_symlinked_outside_the_state_root_is_never_resolved_by_id
+    workspace = create
+    outside = File.join(@temp, "moved-out-of-the-store")
+    FileUtils.mv(workspace.root, outside)
+    File.symlink(outside, workspace.root)
+
+    assert_nil @store.find(workspace.id), "lookup by id must not follow a symlinked entry"
+    assert_empty @store.all
+    refute @store.remove(Workspace.new(id: workspace.id, root: workspace.root))
+    # Not merely "not published" — not even READ, and certainly not deleted.
+    assert File.file?(File.join(outside, "workspace.json")), "the external directory must survive"
+  end
+
+  # The same rule one level up: the entry itself is an ordinary directory, but the STATE ROOT is
+  # reached through a symlink, so a lexical prefix test passes while the canonical path does not.
+  def test_a_workspace_reached_through_a_symlinked_state_root_is_still_contained
+    linked = File.join(@temp, "state-by-another-name")
+    File.symlink(@store.root, linked)
+    store = Store.new(root: linked, env: { "PATH" => ENV["PATH"] })
+    workspace = create
+
+    # Resolving the root through a link is legitimate — the workspace is genuinely inside it.
+    refute_nil store.find(workspace.id), "a symlinked root must still resolve its own workspaces"
+    assert_equal 1, store.all.length
+  end
+
   def test_removal_refuses_a_workspace_whose_directory_is_outside_the_state_root
     outside = File.join(@temp, "outside-workspace")
     FileUtils.mkdir_p(outside)

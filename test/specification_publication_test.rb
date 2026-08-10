@@ -585,6 +585,24 @@ class SpecificationPublicationTest < Minitest::Test
                  @platform.last_specification_publication["failure_class"]
   end
 
+  # review-001 F2 — a REAL workspace moved outside the state root and replaced by a symlink under
+  # its own id. Publication must fail closed on the lookup, before it reads the metadata it would
+  # have believed and before anything reaches git or GitHub.
+  def test_a_workspace_entry_symlinked_outside_the_state_root_fails_closed
+    outside = File.join(@temp, "moved-out-of-the-store")
+    FileUtils.mv(@workspace.root, outside)
+    File.symlink(outside, @workspace.root)
+    start_platform
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
+
+    assert_equal "specification_workspace_missing",
+                 @platform.last_specification_publication["failure_class"]
+    refute_includes FakeGithub.remote_branches(@bare).keys, BRANCH
+    assert_equal 0, FakeGithub.pr_creates(@gh_log)
+    assert File.file?(File.join(outside, "workspace.json")), "the external directory must survive"
+  end
+
   def test_a_publication_assignment_with_no_workspace_id_is_malformed
     start_platform(payload: publication_payload.tap { |p| p["generated_package"].delete("workspace_id") })
 
@@ -765,9 +783,12 @@ class SpecificationPublicationTest < Minitest::Test
     build_isolated_workspace
   end
 
+  # The same root the CLI will resolve from `HOME`, which is `@temp` for every run here. Built
+  # from the production constant rather than a fixture path so the test cannot drift from where
+  # the runner actually keeps its state.
   def store
     @store ||= SpecrelayRunner::Specification::PackageWorkspaceStore.new(
-      root: File.join(@temp, "runner-package-workspaces"), env: { "PATH" => ENV["PATH"] }
+      root: SpecificationWorkspace.package_workspace_root(@temp), env: { "PATH" => ENV["PATH"] }
     )
   end
 
@@ -852,8 +873,7 @@ class SpecificationPublicationTest < Minitest::Test
   # operator may have installed. HOME is set so nothing reads this developer's git config.
   def run_cli(env_extra: {})
     env = { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN,
-            "PATH" => "#{@gh_dir}:#{ENV['PATH']}", "HOME" => @temp,
-            SpecrelayRunner::Specification::PackageWorkspaceStore::ROOT_ENV => store.root }
+            "PATH" => "#{@gh_dir}:#{ENV['PATH']}", "HOME" => @temp }
           .merge(env_extra)
     SpecrelayRunner::CLI.run(%W[claim-once --config #{@config.source_path}], out: @io, err: @io, env: env)
   end

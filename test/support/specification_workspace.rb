@@ -39,11 +39,16 @@ module SpecificationWorkspace
   # The Runner-owned state root for isolated package workspaces, under the same temp root so it
   # is cleaned up with everything else — and, critically, NOT inside either checkout, which is
   # the property every test about "the operator's checkout is unchanged" depends on.
-  def package_workspace_root(root) = File.join(root, "runner-package-workspaces")
+  #
+  # Derived from the home directory rather than from a dedicated variable: review-001 F1 deleted
+  # the override, so the only thing that decides where runner state lives is HOME.
+  def package_workspace_root(root)
+    File.join(root, SpecrelayRunner::Specification::PackageWorkspaceStore::DEFAULT_RELATIVE_PATH)
+  end
 
   # The environment additions every specification-lane CLI test needs: the runner must not write
   # its package workspaces into the developer's real home directory while the suite runs.
-  def lane_env(root) = { SpecrelayRunner::Specification::PackageWorkspaceStore::ROOT_ENV => package_workspace_root(root) }
+  def lane_env(root) = { "HOME" => root }
 
   # Every isolated package workspace the runner created for a temp root, oldest first. Tests
   # find the package through this rather than by constructing a path: the id is opaque and

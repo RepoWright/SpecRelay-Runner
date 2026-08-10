@@ -32,14 +32,17 @@ module SpecrelayRunner
       ASSIGNMENT_MALFORMED = "assignment_malformed"
       SPECIFICATION_REPOSITORY_UNRESOLVED = "specification_repository_unresolved"
       SPECIFICATION_FOLDER_UNSAFE = "specification_folder_unsafe"
-      # MAPIAI-62 — this runner cannot hold a package workspace: its state root is unusable, the
-      # seed has no resolvable commit, or `git worktree add` refused. It REPLACES
-      # `specification_folder_unwritable` and `existing_package_present`, both of which were
-      # statements about the operator's checkout as a destination. It is not one of them renamed:
-      # the condition, the remedy and the directory are all different, and the two old classes
-      # describe a path this ticket deletes.
-      PACKAGE_WORKSPACE_UNAVAILABLE = "package_workspace_unavailable"
       SOURCE_WORKSPACE_UNRESOLVED = "source_workspace_unresolved"
+      # MAPIAI-62 — this runner cannot hold a package workspace: its state root is unusable, sits
+      # inside one of the operator's checkouts (review-001 F1), the seed has no resolvable commit,
+      # or `git worktree add` refused. It REPLACES `specification_folder_unwritable` and
+      # `existing_package_present`, both of which were statements about the operator's checkout as
+      # a destination. It is not one of them renamed: the condition, the remedy and the directory
+      # are all different, and the two old classes describe a path this ticket deletes.
+      #
+      # It is evaluated after the source workspace because judging the state root needs both
+      # checkouts in hand.
+      PACKAGE_WORKSPACE_UNAVAILABLE = "package_workspace_unavailable"
       INPUT_CONTENT_UNREADABLE = "input_content_unreadable"
       EXTERNAL_REFERENCE_ANALYSIS_UNAVAILABLE = "external_reference_analysis_unavailable"
       GRAPHIFY_UNAVAILABLE = "graphify_unavailable"
@@ -56,7 +59,7 @@ module SpecrelayRunner
 
       FAILURE_CLASSES = [
         ASSIGNMENT_MALFORMED, SPECIFICATION_REPOSITORY_UNRESOLVED, SPECIFICATION_FOLDER_UNSAFE,
-        PACKAGE_WORKSPACE_UNAVAILABLE, SOURCE_WORKSPACE_UNRESOLVED,
+        SOURCE_WORKSPACE_UNRESOLVED, PACKAGE_WORKSPACE_UNAVAILABLE,
         INPUT_CONTENT_UNREADABLE, EXTERNAL_REFERENCE_ANALYSIS_UNAVAILABLE, GRAPHIFY_UNAVAILABLE,
         CONTEXT_PLUS_UNAVAILABLE, GENERATION_PROVIDER_UNAVAILABLE, REDACTION_VALIDATION_UNAVAILABLE,
         SPECIFICATION_REVISION_PULL_REQUEST_UNUSABLE, SPECIFICATION_REVISION_UNREADABLE
@@ -114,12 +117,16 @@ module SpecrelayRunner
       # The remaining checks, after the two that can each end the run on their own. Split
       # out so the entry point stays a readable sequence rather than a nested chain of
       # early returns.
+      #
+      # The source checkout is resolved BEFORE the state root is established, because the state
+      # root cannot be judged without it: "is this directory inside a repository the operator
+      # owns" is a question about both checkouts (review-001 F1).
       def finish(seed, package)
-        root = prepare_workspace_root
-        return root if root.is_a?(Refusal)
-
         source_root = resolve_source_root
         return source_root if source_root.is_a?(Refusal)
+
+        root = prepare_workspace_root(seed, source_root)
+        return root if root.is_a?(Refusal)
 
         gather_and_verify(seed, package, source_root)
       end
@@ -309,18 +316,36 @@ module SpecrelayRunner
         refuse(SPECIFICATION_FOLDER_UNSAFE, e.message)
       end
 
-      # The Runner's own state root, established and proven writable WITHOUT writing a probe
-      # file into it. This replaces the writability check on the operator's specification
-      # folder: that folder is no longer written to, so its permissions no longer decide
-      # whether a generation can succeed.
-      def prepare_workspace_root
+      # The Runner's own state root, proven DISJOINT from both operator checkouts and then proven
+      # writable — in that order, because establishing the root is itself a write, and a root
+      # inside a checkout must not create so much as a directory there.
+      #
+      # review-001 F1: a state root inside a checkout made generation write `swp_<id>/` into a
+      # repository the operator owns, while the runner's own output told them their checkout was
+      # untouched. Criterion 1 is a statement about their disk, so it is checked against their
+      # disk rather than trusted to configuration.
+      #
+      # Writability is still proven WITHOUT a probe file. This replaces the old writability check
+      # on the operator's specification folder: that folder is no longer written to, so its
+      # permissions no longer decide whether a generation can succeed.
+      def prepare_workspace_root(seed, source_root)
+        inside = [ seed, source_root ].find { |checkout| workspaces.overlaps?(checkout) }
+        return refuse(PACKAGE_WORKSPACE_UNAVAILABLE, overlapping_root_message(inside)) if inside
+
         workspaces.prepare!
         nil
       rescue PackageWorkspace::Error, SystemCallError, IOError => e
         refuse(PACKAGE_WORKSPACE_UNAVAILABLE,
-               "this runner cannot hold a specification package workspace: #{e.message}. " \
-               "Check that #{PackageWorkspaceStore::ROOT_ENV} (or the default runner state " \
-               "directory) points at a writable location.")
+               "this runner cannot hold a specification package workspace: #{e.message}. Check that " \
+               "#{PackageWorkspaceStore::DEFAULT_RELATIVE_PATH}, under this runner's home directory, " \
+               "is a writable location.")
+      end
+
+      def overlapping_root_message(checkout)
+        "this runner keeps its specification packages in #{workspaces.root}, which is inside the " \
+          "repository checkout #{checkout}. Generating there would write into a repository you own, " \
+          "so nothing was created. Run this runner as a user whose home directory is outside your " \
+          "checkouts, or move the checkout out of the runner's home directory."
       end
 
       # The SOURCE checkout — the code a specification is being written about, which is a

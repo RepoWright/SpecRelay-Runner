@@ -333,7 +333,7 @@ a property of the control flow rather than of a cleanup routine that might fail.
 | `assignment_malformed` | Platform sent an assignment without required generation data, or with an incomplete bundle. |
 | `specification_repository_unresolved` | Point this machine at its checkout of the specification repository (below). |
 | `specification_folder_unsafe` | The configured specification root is not a safe repository-relative folder. |
-| `package_workspace_unavailable` | This machine cannot hold a package workspace: its state root is not writable, or the seed checkout has no resolvable commit. Check `SPECRELAY_RUNNER_SPEC_WORKSPACE_ROOT`, or fetch the specification repository's default branch. |
+| `package_workspace_unavailable` | This machine cannot hold a package workspace: `~/.specrelay/runner/specification-packages` is not writable or sits inside one of your checkouts, or the seed checkout has no resolvable commit. |
 | `source_workspace_unresolved` | Map the workspace to its local source checkout (`SPECRELAY_RUNNER_WORKSPACE_ROOT_<KEY>`). |
 | `input_content_unreadable` | The bundle offers an input Platform classified as unusable. Re-read the ticket. |
 | `external_reference_analysis_unavailable` | A Confluence page or screenshot was deferred to this runner. Enable the capability or record a substitute. |
@@ -399,14 +399,15 @@ being told the intended default was a stub.
 
 Environment overrides: `SPECRELAY_RUNNER_SPEC_REPOSITORY_ROOT_<OWNER>_<REPO>` (or the
 unsuffixed `SPECRELAY_RUNNER_SPEC_REPOSITORY_ROOT`), `SPECRELAY_RUNNER_SPEC_PROVIDER`,
-`SPECRELAY_RUNNER_SPEC_PROVIDER_COMMAND`, `SPECRELAY_RUNNER_SPEC_WORKSPACE_ROOT`.
+`SPECRELAY_RUNNER_SPEC_PROVIDER_COMMAND`.
 
 ### Where a generated package lives
 
 The runner creates one detached, `--no-checkout` git worktree per generation under
-`~/.specrelay/runner/specification-packages/<opaque-id>/` (override the root with
-`SPECRELAY_RUNNER_SPEC_WORKSPACE_ROOT`) and writes the package there. Your
-specification checkout is never written to.
+`~/.specrelay/runner/specification-packages/<opaque-id>/` and writes the package
+there. The location is not configurable, and generation refuses outright if that
+directory would sit inside your source or specification checkout. Your specification
+checkout is never written to.
 
 Publication resumes that exact workspace by its opaque id and verifies the metadata,
 the worktree, the base commit, the exact file set and every digest before it runs a
