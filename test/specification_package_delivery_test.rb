@@ -14,12 +14,12 @@ class SpecificationPackageDeliveryTest < Minitest::Test
   end
 
   def deliver(block)
-    SpecrelayRunner::SpecificationPackage.call(payload: { "approved_specification" => block },
+    SpecrelayRunner::SpecificationPackage.call(payload: { "specification_package" => block },
                                                staging_dir: @staging)
   end
 
   def test_writes_every_document_read_only_under_the_staging_root
-    result = deliver(approved_specification_block("DEMO-0001"))
+    result = deliver(specification_package_block("DEMO-0001"))
 
     assert result.ok?, result.failure
     assert_equal %w[spec.md analysis/input-evidence.md analysis/business.md analysis/technical.md
@@ -39,7 +39,7 @@ class SpecificationPackageDeliveryTest < Minitest::Test
   # S23 — ONE changed byte, with the length left intact so the digest is the only check that can
   # catch it. A tamper that also changed the size would prove the cheaper comparison instead.
   def test_refuses_a_document_whose_bytes_do_not_reproduce_the_pinned_digest
-    block = approved_specification_block("DEMO-0001")
+    block = specification_package_block("DEMO-0001")
     block["documents"][2]["content"] = "# Business analysix\n"
 
     result = deliver(block)
@@ -52,7 +52,7 @@ class SpecificationPackageDeliveryTest < Minitest::Test
   end
 
   def test_refuses_a_document_whose_byte_size_does_not_match
-    block = approved_specification_block("DEMO-0001")
+    block = specification_package_block("DEMO-0001")
     block["documents"][0]["byte_size"] = 99_999
 
     result = deliver(block)
@@ -62,7 +62,7 @@ class SpecificationPackageDeliveryTest < Minitest::Test
   end
 
   def test_refuses_a_duplicated_document
-    block = approved_specification_block("DEMO-0001")
+    block = specification_package_block("DEMO-0001")
     block["documents"] << block["documents"].first.dup
 
     result = deliver(block)
@@ -74,7 +74,7 @@ class SpecificationPackageDeliveryTest < Minitest::Test
   # S11 — a path that escapes the package folder never becomes a filesystem write.
   def test_refuses_a_traversing_or_absolute_path
     [ "../escape.md", "/etc/passwd", "analysis/../../escape.md" ].each do |path|
-      block = approved_specification_block("DEMO-0001")
+      block = specification_package_block("DEMO-0001")
       block["documents"][0]["path"] = path
 
       result = deliver(block)
@@ -87,7 +87,7 @@ class SpecificationPackageDeliveryTest < Minitest::Test
 
   def test_refuses_a_document_larger_than_the_bound
     oversized = "x" * (SpecrelayRunner::SpecificationPackage::MAX_FILE_BYTES + 1)
-    block = approved_specification_block("DEMO-0001",
+    block = specification_package_block("DEMO-0001",
                                          documents: [ [ "specification", "spec.md", oversized ] ])
 
     result = deliver(block)
@@ -99,7 +99,7 @@ class SpecificationPackageDeliveryTest < Minitest::Test
   # An assignment with no documents is a contract violation, not an empty package: Platform
   # authorizes execution only after pinning one.
   def test_refuses_an_assignment_that_carries_no_documents
-    result = deliver(approved_specification_block("DEMO-0001").merge("documents" => []))
+    result = deliver(specification_package_block("DEMO-0001").merge("documents" => []))
 
     refute result.ok?
     assert_includes result.failure, "no specification documents"
@@ -159,7 +159,7 @@ class SpecificationPackageDeliveryFlowTest < Minitest::Test
   # S23 — one altered document, and the provider is never started. The alteration keeps the
   # document's length, so only the digest comparison can catch it.
   def test_an_altered_document_refuses_before_the_executor_runs
-    @payload["approved_specification"]["documents"][0]["content"] =
+    @payload["specification_package"]["documents"][0]["content"] =
       "# Approved spec for #{TASK}\nImplement it!\n"
 
     exit_code = start

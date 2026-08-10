@@ -34,6 +34,17 @@ module SpecrelayRunner
     end
 
     def create
+      if (existing = locate(required: false))
+        status = git(existing, %w[status --porcelain])
+        raise Error, "existing worktree for #{canonical_branch} could not be inspected" unless status.success?
+        unless status.stdout.to_s.strip.empty?
+          raise Error, "existing worktree for #{canonical_branch} has uncommitted changes; " \
+                       "preserve or release it before retrying"
+        end
+
+        return Info.new(path: existing, base_commit: rev_parse(existing, "HEAD"))
+      end
+
       result = run(Shellwords.split(create_command))
       unless result.success?
         raise Error, "worktree create failed (exit #{result.exit_code}): #{first_line(result.stderr, result.stdout)}"
@@ -79,12 +90,14 @@ module SpecrelayRunner
       Changes.new(changed_files: [], diff: "", head_commit: nil, measurement_error: reason)
     end
 
-    def locate
+    def locate(required: true)
       listing = git(root, %w[worktree list --porcelain])
       raise Error, "could not list git worktrees in #{root}" unless listing.success?
 
       path = parse_worktree_for_branch(listing.stdout)
-      raise Error, "no worktree found for branch #{canonical_branch} after create" if path.to_s.empty?
+      if required && path.to_s.empty?
+        raise Error, "no worktree found for branch #{canonical_branch} after create"
+      end
 
       path
     end

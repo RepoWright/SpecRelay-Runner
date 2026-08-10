@@ -167,7 +167,7 @@ end
 # contract 4): identity, then every document with the role, path, digest, byte size and content
 # Platform recomputed itself. `digest` is real, so a test that alters one byte without restating
 # it is testing the refusal rather than the fixture.
-def approved_specification_block(task_id, documents: nil)
+def specification_package_block(task_id, documents: nil)
   documents ||= [
     [ "specification", "spec.md", "# Approved spec for #{task_id}\nImplement it.\n" ],
     [ "input_evidence", "analysis/input-evidence.md", "# Input evidence\n" ],
@@ -207,7 +207,7 @@ def base_claim_payload(task_id:, executor_command:)
       "prompt_delivery" => "file_argument", "mode" => "", "semantic_events" => "auto",
       "timeout_seconds" => 120, "env" => {}
     },
-    "approved_specification" => approved_specification_block(task_id),
+    "specification_package" => specification_package_block(task_id),
     "report_contract" => { "round_label" => "001-initial",
                           "release_instructions" => "./bin/worktree release #{task_id}",
                           "report_path" => "specs/#{task_id}/execution-reports/001-initial" }

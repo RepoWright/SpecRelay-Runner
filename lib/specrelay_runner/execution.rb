@@ -461,7 +461,7 @@ module SpecrelayRunner
         - Do NOT edit any `spec.md`/`spec_persian.md`, push, open a PR, or write to Platform.
         - Make the change idempotently.
       MD
-      "#{preamble}\n\n---\n\n#{payload.dig('approved_specification', 'handoff_prompt')}"
+      "#{preamble}\n\n---\n\n#{payload.dig('specification_package', 'handoff_prompt')}"
     end
 
     # Where the verified package actually IS on this machine. The handoff prompt tells the

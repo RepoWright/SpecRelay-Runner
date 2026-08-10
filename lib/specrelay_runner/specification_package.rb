@@ -49,7 +49,7 @@ module SpecrelayRunner
     def self.call(**kwargs) = new(**kwargs).call
 
     def initialize(payload:, staging_dir:)
-      @package = payload.to_h.fetch("approved_specification", {}).to_h
+      @package = payload.to_h.fetch("specification_package", {}).to_h
       @staging_dir = staging_dir.to_s
     end
 
