@@ -156,6 +156,33 @@ class ReviewFlowTest < Minitest::Test
     assert_includes prompt, "Which bound?"
   end
 
+  # MAPIAI-71. A carried `human_browser_pass` note is the Product Owner's own browser pass,
+  # performed because no reviewer could run one. Attempt 2 must assess it, must keep its own
+  # `browser_review` false, and must not report the pass as work it did — so the attribution
+  # travels in the fixed instructions and in the continuation label, never in a new packet
+  # field. Removing either one fails here.
+  def test_a_carried_human_browser_pass_is_attributed_to_the_human
+    build_repo
+    capture = File.join(@root, "prompt.txt")
+    packet = review_payload.merge(
+      "continuation" => {
+        "previous_attempt_ordinal" => 1, "previous_outcome" => "NEEDS_INPUT", "previous_findings" => [],
+        "question" => { "prompt" => "Who runs the browser pass?" },
+        "answer" => { "option" => "human_browser_pass",
+                      "text" => "1440x900 and 390x844 at /runs/abc: pass. Screenshots 01.png, 02.png." }
+      }
+    )
+
+    run_review(command: reviewer_script(%({"outcome":"ACCEPT","summary":"ok"}), capture: capture), payload: packet)
+
+    prompt = File.read(capture)
+    assert_includes prompt, "human_browser_pass"
+    assert_includes prompt, "Screenshots 01.png, 02.png."
+    assert_includes prompt, "the Product Owner's own words"
+    assert_includes prompt, "not as work you did"
+    assert_includes prompt, "Platform validates the human evidence separately"
+  end
+
   # --- untrusted provider output -------------------------------------------
 
   def test_malformed_json_fails_without_a_verdict
