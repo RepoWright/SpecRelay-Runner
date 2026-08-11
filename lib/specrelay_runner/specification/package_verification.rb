@@ -4,8 +4,8 @@ require "digest"
 
 module SpecrelayRunner
   module Specification
-    # Proves that the files on this machine ARE the package Platform recorded, before anything
-    # touches git (MVP-0027 criterion 2).
+    # Proves that the files in the resumed isolated worktree ARE the package Platform recorded,
+    # before anything touches git (MVP-0027 criterion 2; MAPIAI-62 design 3).
     #
     # This class is the load-bearing safety property of the publication step, and it holds it
     # the same way {Preflight} holds generation's: by running FIRST and performing no mutation
@@ -13,15 +13,22 @@ module SpecrelayRunner
     # verification failure to a git command, so "refuses before Git mutation on mismatch" is a
     # property of the control flow rather than of a rollback that might itself fail.
     #
-    # Why it verifies at all. The package was written by an earlier run, minutes or days ago,
-    # into a checkout the operator owns and can edit. Publishing whatever is on the disk now
-    # would mean Platform's recorded generation evidence — the digests it shows on the run page
-    # and validates the publication against — described a different document set from the one a
-    # developer is asked to review. Digest equality is what makes those two the same thing.
+    # It answers three questions, and all three are required:
+    #
+    #   1. is every recorded file present, and are its bytes the recorded bytes? (digest)
+    #   2. is the package EXACTLY those files, with nothing else in it? (file set)
+    #   3. is every path a real file this runner wrote, reached without following a link?
+    #
+    # Question 2 is MAPIAI-62's addition and it is not pedantry. The worktree is created
+    # `--no-checkout`, so the package directory starts empty and everything in it was put there
+    # by one generation. A file that is present but unrecorded is therefore something that
+    # arrived afterwards, and committing it would put a document on GitHub that Platform's
+    # evidence does not describe — the same failure a changed digest represents, arriving from
+    # the other direction.
     #
     # Every path is treated as hostile even though Platform validated its shape on ingest: this
     # class composes a filesystem path from it, and "the control plane probably checked" is not
-    # a boundary when the failure mode is reading or committing a file outside the checkout.
+    # a boundary when the failure mode is reading or committing a file outside the workspace.
     class PackageVerification
       # An allowlist, not a denylist — the same rule and the same vocabulary Platform's ingest
       # validator applies. A generated package path is a few slash-separated segments of word
@@ -31,6 +38,8 @@ module SpecrelayRunner
 
       MISSING = "generated_package_missing"
       MISMATCH = "generated_package_digest_mismatch"
+      # Present but not what was recorded: an extra file, or a path reached through a symlink.
+      ALTERED = "generated_package_altered"
 
       # `files` is the verified set, each entry carrying the package-relative `path`, the
       # repository-relative `repository_path` the commit uses, and the absolute local path the
@@ -43,8 +52,8 @@ module SpecrelayRunner
 
       def self.call(**kwargs) = new(**kwargs).call
 
-      def initialize(checkout_root:, package_path:, files:)
-        @checkout_root = File.expand_path(checkout_root.to_s)
+      def initialize(worktree_root:, package_path:, files:)
+        @worktree_root = File.expand_path(worktree_root.to_s)
         @package_path = package_path.to_s
         @files = Array(files)
       end
@@ -61,12 +70,12 @@ module SpecrelayRunner
 
           verified << outcome
         end
-        Result.new(files: verified)
+        check_file_set || Result.new(files: verified)
       end
 
       private
 
-      attr_reader :checkout_root, :package_path
+      attr_reader :worktree_root, :package_path
 
       # The package path and every file path, checked as a set before any of them is opened.
       # Reported together so an operator sees the whole problem rather than fixing one path and
@@ -82,8 +91,8 @@ module SpecrelayRunner
         entry = file.to_h
         relative = "#{package_path}/#{entry['path']}"
         absolute = contained(relative)
-        return failure(MISSING, "the generated package escapes the specification repository checkout") if
-          absolute.nil?
+        return failure(MISSING, "the generated package escapes its isolated worktree") if absolute.nil?
+        return failure(ALTERED, symlink_message(relative)) if linked?(relative)
         return failure(MISSING, missing_message(relative)) unless File.file?(absolute)
 
         digest = Digest::SHA256.hexdigest(File.binread(absolute))
@@ -96,28 +105,65 @@ module SpecrelayRunner
         failure(MISSING, "the generated file #{relative} could not be read: #{e.class}")
       end
 
-      # Re-checked against the checkout root after expansion, not only before it: this is the
-      # value that is actually opened, and a symlinked or otherwise surprising path is caught
-      # here rather than trusted from the shape check above.
+      # EXACTLY the recorded files, and nothing else. Enumerated with `File::FNM_DOTMATCH` so a
+      # dotfile added beside the package is caught rather than skipped by a glob that quietly
+      # ignores it.
+      def check_file_set
+        root = contained(package_path)
+        return failure(MISSING, "the recorded package folder is not in this workspace") if root.nil?
+
+        recorded = @files.map { |file| file.to_h["path"].to_s }
+        extra = Dir.glob("**/*", File::FNM_DOTMATCH, base: root)
+                   .reject { |name| name.end_with?(".", "..") || File.directory?(File.join(root, name)) }
+                   .reject { |name| recorded.include?(name) }
+        return nil if extra.empty?
+
+        failure(ALTERED, extra_message(extra))
+      end
+
+      # Re-checked against the worktree root after expansion, not only before it: this is the
+      # value that is actually opened, and a surprising path is caught here rather than trusted
+      # from the shape check above.
       def contained(relative)
-        resolved = File.expand_path(File.join(checkout_root, relative))
-        resolved.start_with?("#{checkout_root}/") ? resolved : nil
+        resolved = File.expand_path(File.join(worktree_root, relative))
+        resolved.start_with?("#{worktree_root}/") ? resolved : nil
+      end
+
+      # Every segment from the worktree root down, `lstat`-ed. `File.expand_path` does not
+      # resolve symlinks, so containment alone would accept `<package>/spec.md` when `spec.md`
+      # — or any directory above it — is a link to somewhere else entirely.
+      def linked?(relative)
+        path = worktree_root
+        relative.split("/").any? do |segment|
+          path = File.join(path, segment)
+          File.symlink?(path)
+        end
       end
 
       # Names the repository-relative path and the remedy, never the absolute local path: this
       # message is reported to Platform, stored, and rendered on the run page, and the
       # operator's home directory has no business in any of those.
       def missing_message(relative)
-        "the generated file #{relative} is not in the specification repository checkout on this " \
-          "runner. Regenerate the package (`bin/platform runner requeue-specification <run>`) or " \
-          "restore the checkout, then publish again"
+        "the generated file #{relative} is not in this runner's retained package workspace. " \
+          "Generate the package again from the run page, then publish"
       end
 
       def mismatch_message(relative, expected, actual)
         "#{relative} does not match the generated package SpecRelay recorded " \
           "(expected sha256 #{expected[0, 16]}…, found #{actual[0, 16]}…). The file was changed after " \
           "generation, so publishing it would put a document on GitHub that Platform's evidence does " \
-          "not describe. Regenerate the package, then publish again"
+          "not describe. Generate the package again, then publish"
+      end
+
+      def extra_message(extra)
+        "the retained package holds #{extra.length} file(s) SpecRelay did not record " \
+          "(#{extra.sort.first(5).join(', ')}). Publishing would commit content Platform's evidence " \
+          "does not describe. Generate the package again, then publish"
+      end
+
+      def symlink_message(relative)
+        "#{relative} is reached through a symbolic link inside the package workspace, so its bytes " \
+          "are not provably the ones this runner generated. Generate the package again, then publish"
       end
 
       def failure(failure_class, message)

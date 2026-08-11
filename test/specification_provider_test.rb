@@ -141,7 +141,7 @@ class SpecificationProviderTest < Minitest::Test
                                                      files: {}, exit_code: 1, stdout: "boom")
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_with(provider), @io.string
-    assert_empty Dir.children(File.join(@specs, "specs")), "no package, and no staging leftovers"
+    assert_no_package "no package, and no staging leftovers"
     assert_equal "generation_provider_failed", @platform.last_specification_generation["failure_class"]
     assert_equal "failed", @platform.last_specification_generation["outcome"]
   end
@@ -152,7 +152,7 @@ class SpecificationProviderTest < Minitest::Test
     provider = SpecificationWorkspace.write_provider(File.join(@temp, "provider"), files: documents)
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_with(provider), @io.string
-    assert_empty Dir.children(File.join(@specs, "specs"))
+    assert_no_package
     assert_equal "generated_output_invalid", @platform.last_specification_generation["failure_class"]
     assert_includes @io.string, "## Acceptance criteria"
   end
@@ -163,7 +163,7 @@ class SpecificationProviderTest < Minitest::Test
     provider = SpecificationWorkspace.write_provider(File.join(@temp, "provider"), files: documents)
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_with(provider), @io.string
-    assert_empty Dir.children(File.join(@specs, "specs"))
+    assert_no_package
     assert_includes @io.string, "analysis/technical.md"
   end
 
@@ -180,7 +180,7 @@ class SpecificationProviderTest < Minitest::Test
     provider = SpecificationWorkspace.write_provider(File.join(@temp, "provider"), files: documents)
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_with(provider), @io.string
-    assert_empty Dir.children(File.join(@specs, "specs")), "no package, and no staging leftovers"
+    assert_no_package "no package, and no staging leftovers"
     assert_equal "generated_output_invalid", @platform.last_specification_generation["failure_class"]
     assert_includes @io.string, "analysis/technical.md"
   end
@@ -208,7 +208,7 @@ class SpecificationProviderTest < Minitest::Test
     provider = SpecificationWorkspace.write_provider(File.join(@temp, "provider"), files: documents)
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_with(provider), @io.string
-    assert_empty Dir.children(File.join(@specs, "specs"))
+    assert_no_package
     assert_includes @io.string, "scaffolding"
   end
 
@@ -220,7 +220,7 @@ class SpecificationProviderTest < Minitest::Test
     provider = SpecificationWorkspace.write_provider(File.join(@temp, "provider"), files: documents)
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_with(provider), @io.string
-    assert_empty Dir.children(File.join(@specs, "specs"))
+    assert_no_package
     assert_includes @io.string, "analysis/input-evidence.md"
   end
 
@@ -235,7 +235,7 @@ class SpecificationProviderTest < Minitest::Test
     provider = SpecificationWorkspace.write_provider(File.join(@temp, "provider"), files: documents)
 
     assert_equal SpecrelayRunner::CLI::SUCCESS, run_with(provider), @io.string
-    assert File.exist?(File.join(@specs, "specs", PACKAGE_DIR, "analysis", "open-questions.md"))
+    assert File.exist?(File.join(package_root, "analysis", "open-questions.md"))
     generation = @platform.last_specification_generation
     assert generation.dig("package", "files").any? { |file| file["path"] == "analysis/open-questions.md" },
           generation.inspect
@@ -252,7 +252,7 @@ class SpecificationProviderTest < Minitest::Test
     provider = SpecificationWorkspace.write_provider(File.join(@temp, "provider"), files: documents)
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_with(provider), @io.string
-    assert_empty Dir.children(File.join(@specs, "specs"))
+    assert_no_package
     assert_includes @io.string, "names no open question"
   end
 
@@ -268,7 +268,7 @@ class SpecificationProviderTest < Minitest::Test
     provider = SpecificationWorkspace.write_provider(File.join(@temp, "provider"), files: documents)
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_with(provider), @io.string
-    assert_empty Dir.children(File.join(@specs, "specs"))
+    assert_no_package
     assert_includes @io.string, "missing required field(s): decision required"
   end
 
@@ -283,7 +283,7 @@ class SpecificationProviderTest < Minitest::Test
     provider = SpecificationWorkspace.write_provider(File.join(@temp, "provider"), files: documents)
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_with(provider), @io.string
-    assert_empty Dir.children(File.join(@specs, "specs"))
+    assert_no_package
     assert_includes @io.string, "unexpected field: owner"
   end
 
@@ -294,7 +294,7 @@ class SpecificationProviderTest < Minitest::Test
     provider = SpecificationWorkspace.write_provider(File.join(@temp, "provider"), files: documents)
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_with(provider), @io.string
-    assert_empty Dir.children(File.join(@specs, "specs"))
+    assert_no_package
     refute File.exist?(File.join(@temp, "escaped.md"))
     assert_includes @io.string, "unexpected files"
   end
@@ -317,7 +317,7 @@ class SpecificationProviderTest < Minitest::Test
     provider = SpecificationWorkspace.write_provider(File.join(@temp, "provider"), files: documents)
 
     assert_equal SpecrelayRunner::CLI::SUCCESS, run_with(provider), @io.string
-    written = File.read(File.join(@specs, "specs", PACKAGE_DIR, "spec.md"))
+    written = File.read(File.join(package_root, "spec.md"))
     refute_includes written, "ghp_abcdefghijklmnop1234"
     assert_includes written, "[REDACTED]"
     warnings = @platform.last_specification_generation["warnings"]
@@ -333,7 +333,7 @@ class SpecificationProviderTest < Minitest::Test
     provider = SpecificationWorkspace.write_provider(File.join(@temp, "provider"), files: documents)
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_with(provider), @io.string
-    assert_empty Dir.children(File.join(@specs, "specs"))
+    assert_no_package
     generation = @platform.last_specification_generation
     assert_equal "package_write_failed", generation["failure_class"]
     # CR-001 must-fix 3 AC 2: a failure BEFORE the rename still reports zero output files, and
@@ -377,7 +377,23 @@ class SpecificationProviderTest < Minitest::Test
   def run_with(provider_command)
     config = build_config(provider_command)
     SpecrelayRunner::CLI.run(%W[claim-once --config #{config.source_path}], out: @io, err: @io,
-                             env: { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN, "PATH" => ENV["PATH"] })
+                             env: { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN, "PATH" => ENV["PATH"] }
+                                    .merge(SpecificationWorkspace.lane_env(@temp)))
+  end
+
+  # The package path inside the Runner-owned worktree this run created.
+  def package_root
+    File.join(SpecificationWorkspace.isolated_worktree(@temp), "specs", PACKAGE_DIR)
+  end
+
+  # A provider failure or a rejected document set leaves NO package: the isolated worktree holds
+  # no `specs/` tree at all (the writer stages and renames once, so there are no leftovers), and
+  # the operator's checkout never had one to begin with.
+  def assert_no_package(message = "no package was written")
+    worktree = SpecificationWorkspace.isolated_worktree(@temp)
+    assert_empty Dir.glob(File.join(worktree, "specs", "*"), File::FNM_DOTMATCH)
+                    .reject { |path| path.end_with?("/.", "/..") }, message
+    refute File.exist?(File.join(@specs, "specs", PACKAGE_DIR)), "the operator checkout must stay empty"
   end
 
   def build_config(provider_command)

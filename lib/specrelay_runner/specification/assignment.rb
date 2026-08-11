@@ -80,6 +80,11 @@ module SpecrelayRunner
       def run_id = section("run")["id"].to_s
       def run_state = section("run")["state"].to_s
       def runner_execution_id = section("claim")["runner_execution_id"].to_s
+      # The runner identity Platform recorded for this claim — this runner's own configured id,
+      # echoed back. MAPIAI-62 records it in an isolated workspace's metadata and re-checks it at
+      # publication, so a workspace another runner identity created on a shared machine is
+      # foreign state rather than resumable state.
+      def runner_id = section("claim")["runner_id"].to_s
       def runner_display_name = section("claim")["runner_display_name"].to_s
       def issue_key = section("work_item")["issue_key"].to_s
       def issue_url = section("work_item")["issue_url"].to_s
@@ -188,10 +193,17 @@ module SpecrelayRunner
       def existing_pull_request_url = publication["existing_pull_request_url"].to_s
 
       # The package Platform RECORDED at generation, with a digest per file. This is the
-      # evidence the runner verifies its local checkout against before it is allowed to touch
-      # git — the whole point of publishing from Platform's record rather than from whatever
-      # happens to be on the disk now.
+      # evidence the runner verifies its retained workspace against before it is allowed to
+      # touch git — the whole point of publishing from Platform's record rather than from
+      # whatever happens to be on the disk now.
       def generated_package_path = generated_package["path"].to_s
+
+      # MAPIAI-62 — the OPAQUE identity of the Runner-owned workspace that generated this
+      # package. It is the only address publication resolves: there is no path in the
+      # assignment, no directory to search, and no checkout to fall back to. Platform stores it
+      # beside the owning registered runner, so a runner that receives one has already been
+      # proved by Platform to be the machine that created it.
+      def generated_package_workspace_id = generated_package["workspace_id"].to_s
 
       def generated_files
         Array(generated_package["files"]).map do |file|
@@ -208,7 +220,11 @@ module SpecrelayRunner
         [ %w[publication repository_url], "publication.repository_url" ],
         [ %w[publication branch], "publication.branch" ],
         [ %w[publication base_branch], "publication.base_branch" ],
-        [ %w[generated_package path], "generated_package.path" ]
+        [ %w[generated_package path], "generated_package.path" ],
+        # MAPIAI-62 — required, because there is no other way to find the package. A publication
+        # assignment without it names work no runner can safely do, and discovering that after a
+        # claim was burned is exactly what validating the set up front prevents.
+        [ %w[generated_package workspace_id], "generated_package.workspace_id" ]
       ].freeze
 
       SHA256 = /\A[0-9a-f]{64}\z/

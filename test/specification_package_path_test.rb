@@ -62,10 +62,26 @@ class SpecificationPackagePathTest < Minitest::Test
     assert_equal "SR-700-add-an-export-button", build(root: "").relative_package_path
   end
 
-  def test_the_absolute_path_stays_inside_the_checkout
-    path = build.absolute_package_path
+  def test_the_absolute_path_stays_inside_the_root_it_is_resolved_in
+    path = build.absolute_in(@checkout)
 
     assert path.start_with?("#{File.expand_path(@checkout)}/")
+  end
+
+  # MAPIAI-62 — the same identity resolves in whichever root the caller names, and each
+  # resolution is contained in THAT root. This is the property that lets one validated package
+  # identity serve a seed-validation read and a Runner-owned worktree write without either
+  # being able to reach the other.
+  def test_the_same_identity_resolves_independently_in_two_roots
+    other = Dir.mktmpdir("specrelay-worktree-")
+    package = build
+
+    assert_equal File.join(File.expand_path(@checkout), "specs/SR-700-add-an-export-button"),
+                 package.absolute_in(@checkout)
+    assert_equal File.join(File.expand_path(other), "specs/SR-700-add-an-export-button"),
+                 package.absolute_in(other)
+  ensure
+    FileUtils.remove_entry(other) if other && File.directory?(other)
   end
 
   # Each of these is refused rather than sanitized: a silently rewritten destination is one
@@ -109,7 +125,6 @@ class SpecificationPackagePathTest < Minitest::Test
   end
 
   def build(root: "specs", issue_key: "SR-700", summary: "Add an export button")
-    PackagePath.build(checkout_root: @checkout, specification_root: root, issue_key: issue_key,
-                      summary: summary)
+    PackagePath.build(specification_root: root, issue_key: issue_key, summary: summary)
   end
 end

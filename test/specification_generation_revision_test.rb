@@ -72,7 +72,9 @@ class SpecificationGenerationRevisionTest < Minitest::Test
   MD
 
   def setup
-    @source, @specs, @temp = SpecificationWorkspace.build
+    # No `origin` on the fixture: this test supplies its own REAL bare remote, which is the
+    # whole point of it, and a fixture remote pointing at github.com would be fetched from.
+    @source, @specs, @temp = SpecificationWorkspace.build(specs_remote: nil)
     @io = StringIO.new
   end
 
@@ -164,6 +166,8 @@ class SpecificationGenerationRevisionTest < Minitest::Test
     refute_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
     assert_includes @io.string, "specification_revision_pull_request_unusable"
     assert_empty Dir.glob(File.join(@specs, PACKAGE, "*"))
+    assert_empty SpecificationWorkspace.isolated_workspaces(@temp),
+                 "a revision refusal must happen before any isolated workspace is created"
   end
 
   def test_a_spec_pr_against_the_wrong_base_refuses
@@ -185,6 +189,8 @@ class SpecificationGenerationRevisionTest < Minitest::Test
     refute_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
     assert_includes @io.string, "specification_revision_unreadable"
     assert_empty Dir.glob(File.join(@specs, PACKAGE, "*"))
+    assert_empty SpecificationWorkspace.isolated_workspaces(@temp),
+                 "a revision refusal must happen before any isolated workspace is created"
   end
 
   def test_a_branch_that_exists_but_never_carried_a_package_at_this_path_refuses_as_unreadable
@@ -216,13 +222,13 @@ class SpecificationGenerationRevisionTest < Minitest::Test
     }
   end
 
+  # The fixture is already a git repository with one commit on `main`; this adds the real bare
+  # remote and publishes that commit to it.
   def ensure_remote_checkout
     return if @bare
 
-    git_init(@specs)
-    File.write(File.join(@specs, "README.md"), "# SpecRelay specifications\n")
-    git(@specs, "add", "README.md")
-    commit(@specs, "initial")
+    git(@specs, "config", "user.email", "test@specrelay.local")
+    git(@specs, "config", "user.name", "SpecRelay Test")
     @bare = FakeGithub.add_remote(@specs, name: "SpecRelay-Specs")
     git(@specs, "push", "-q", "origin", "HEAD:refs/heads/main")
   end
@@ -284,15 +290,9 @@ class SpecificationGenerationRevisionTest < Minitest::Test
 
   def run_cli(env_extra: {})
     env = { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN,
-            "PATH" => "#{@gh_dir}:#{ENV['PATH']}", "HOME" => @temp }.merge(env_extra)
+            "PATH" => "#{@gh_dir}:#{ENV['PATH']}", "HOME" => @temp }
+          .merge(SpecificationWorkspace.lane_env(@temp)).merge(env_extra)
     SpecrelayRunner::CLI.run(%W[claim-once --config #{@config.source_path}], out: @io, err: @io, env: env)
-  end
-
-  def git_init(root)
-    system("git", "init", "-q", root, exception: true)
-    git(root, "config", "user.email", "test@specrelay.local")
-    git(root, "config", "user.name", "SpecRelay Test")
-    git(root, "symbolic-ref", "HEAD", "refs/heads/main")
   end
 
   def commit(root, message)

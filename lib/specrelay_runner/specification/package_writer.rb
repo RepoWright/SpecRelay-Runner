@@ -8,45 +8,43 @@ require "time"
 
 module SpecrelayRunner
   module Specification
-    # Writes the generated package ATOMICALLY, at package level (MVP-0026 scope 10).
+    # Writes the generated package ATOMICALLY, at package level, into the Runner-owned isolated
+    # worktree (MVP-0026 scope 10; MAPIAI-62 design 1).
     #
-    # "Atomic at package level" is a stronger property than writing each file safely, and it
-    # is the one the spec asks for: at no point may the final path hold three documents where
-    # one of them is from a previous generation, or two documents where a third failed to
-    # write. So the sequence is:
+    # "Atomic at package level" is a stronger property than writing each file safely, and it is
+    # the one the spec asks for: at no point may the final path hold three documents where one
+    # of them is from a previous generation, or two documents where a third failed to write. So
+    # the sequence is:
     #
     #   stage -> redact -> verify -> digest -> manifest -> ONE rename into place
     #
     # Everything before the rename happens in a staging directory, and the rename is the only
     # operation that touches the final path. A failure at any earlier step removes the staging
-    # directory and leaves the destination exactly as it was — which is also what makes the
-    # "provider failure leaves no partial final package" test provable rather than hopeful.
+    # directory and leaves the destination exactly as it was.
     #
-    # The staging directory is a SIBLING of the destination rather than a `Dir.mktmpdir`
-    # temp. `File.rename` is only atomic within one filesystem, and /tmp is frequently a
-    # different one from the operator's checkout; staging next door guarantees the rename is
-    # a metadata operation that either happens or does not.
+    # The staging directory is a SIBLING of the destination rather than a `Dir.mktmpdir` temp.
+    # `File.rename` is only atomic within one filesystem, and /tmp is frequently a different one
+    # from the runner's state root; staging next door guarantees the rename is a metadata
+    # operation that either happens or does not.
     #
-    # Replacement (the configured default) is also atomic and reversible: the existing package
-    # is renamed aside FIRST, the new one is moved in, and only then is the old one deleted.
-    # If the second rename fails the old package is put back, so a failed replacement leaves
-    # the previous package intact rather than nothing at all.
+    # MAPIAI-62 removed the REPLACEMENT half of this class rather than repointing it. It existed
+    # to protect a package an operator might have hand-edited in their own checkout, and to make
+    # a re-run overwrite its own previous output there. Neither is a thing any more: every
+    # generation gets a fresh isolated workspace with a fresh opaque id, so the destination is
+    # always absent, and an existing one would be an id collision rather than a policy question.
+    # Keeping the branch would have meant keeping `on_existing_package`, a replaced-package flag
+    # on the wire, and a rollback path — all of them dead code describing a path this ticket
+    # deletes.
     #
-    # The rename is the boundary between "nothing happened" and "it happened". Before it, a
+    # The rename is still the boundary between "nothing happened" and "it happened". Before it, a
     # failure means the destination is untouched. After it, the generation has SUCCEEDED, and
-    # anything that goes wrong afterwards — deleting the set-aside copy, rewriting one
-    # manifest field — is a warning on a good package, never a teardown. Every failure this
-    # class raises carries which side of that boundary it is on, because the caller cannot
-    # know and an operator's next move depends on it.
+    # anything that goes wrong afterwards is a warning on a good package, never a teardown. Every
+    # failure this class raises carries which side of that boundary it is on, because the caller
+    # cannot know and an operator's next move depends on it.
     class PackageWriter
-      # The failure carries WHETHER THE RENAME HAPPENED, because that is the one fact an
-      # operator needs before deciding whether to go and look in the specification repository
-      # — and it is a fact only this class knows.
-      #
-      # It used to be a literal `true` in the caller ("both leave the destination untouched"),
-      # which was accurate for every path but one and therefore wrong exactly when it
-      # mattered: a post-rename cleanup failure reported "no output files written" over a
-      # destination that had already been completely replaced.
+      # The failure carries WHETHER THE RENAME HAPPENED, because that is the one fact an operator
+      # needs before deciding whether the retained workspace holds a package worth inspecting —
+      # and it is a fact only this class knows.
       class Error < StandardError
         attr_reader :package_path
 
@@ -61,62 +59,55 @@ module SpecrelayRunner
 
       MANIFEST_CONTRACT_VERSION = "mvp-0026"
       STAGING_PREFIX = ".specrelay-generating-"
-      REPLACED_PREFIX = ".specrelay-replaced-"
 
-      # One written file, as the manifest and Platform record it. `path` is
-      # package-relative; the repository-relative form is composed by the caller from the
-      # package path, so no absolute path is ever constructed here.
+      # One written file, as the manifest and Platform record it. `path` is package-relative;
+      # the repository-relative form is composed by the caller from the package path, so no
+      # absolute path is ever constructed here.
       WrittenFile = Struct.new(:path, :sha256, :bytes, keyword_init: true) do
         def to_h = { "path" => path, "sha256" => sha256, "bytes" => bytes }
       end
 
-      Result = Struct.new(:relative_package_path, :files, :manifest, :replaced_existing, :warnings,
-                          keyword_init: true) do
-        def replaced_existing? = replaced_existing ? true : false
+      Result = Struct.new(:relative_package_path, :files, :manifest, :warnings, keyword_init: true) do
         def file_paths = files.map(&:path)
       end
 
       def self.call(**kwargs) = new(**kwargs).call
 
-      def initialize(package_path:, documents:, assignment:, provider:, source:, inputs:, settings:,
-                     clock: Time)
+      # `destination_root` is the Runner-owned isolated worktree. It is passed rather than held
+      # by {PackagePath} so this class cannot be handed an operator checkout by accident: the
+      # only caller that can supply it is the one that created the workspace.
+      def initialize(package_path:, destination_root:, documents:, assignment:, provider:, source:,
+                     inputs:, clock: Time)
         @package_path = package_path
+        @destination_root = destination_root.to_s
         @documents = documents
         @assignment = assignment
         @provider = provider
         @source = source
         @inputs = inputs
-        @settings = settings
         @clock = clock
         @warnings = []
         @moved = false
       end
 
       def call
-        parent = ::File.dirname(package_path.absolute_package_path)
-        FileUtils.mkdir_p(parent)
-        staging = ::File.join(parent, "#{STAGING_PREFIX}#{SecureRandom.hex(8)}")
+        destination = package_path.absolute_in(destination_root)
+        FileUtils.mkdir_p(::File.dirname(destination))
+        staging = ::File.join(::File.dirname(destination), "#{STAGING_PREFIX}#{SecureRandom.hex(8)}")
         begin
           files = stage(staging)
           manifest = write_manifest(staging, files)
-          replaced = move_into_place(staging)
-          # The manifest is written BEFORE the move, because writing it after would put a
-          # file write back inside the window the atomic rename protects. Whether a package
-          # was replaced is only knowable after the move, so the flag is corrected in both
-          # copies here — the one on disk (rewrite_manifest_replacement) and the one
-          # returned to Platform. Leaving the returned copy stale would make the run page
-          # and the package on disk disagree about the same generation.
-          manifest = manifest.merge("replaced_existing_package" => replaced)
+          move_into_place(staging, destination)
           Result.new(relative_package_path: package_path.relative_package_path,
-                     files: files + [ manifest_digest ], manifest: manifest,
-                     replaced_existing: replaced, warnings: warnings)
+                     files: files + [ manifest_digest(destination) ], manifest: manifest,
+                     warnings: warnings)
         rescue Error
           raise
         rescue StandardError => e
           # Anything unexpected — most plausibly an I/O error while digesting the manifest at
-          # its final location — becomes an Error that still reports whether the package
-          # landed. Letting a bare Errno escape would crash past Generation's rescue list and
-          # leave the claim held with no recorded reason.
+          # its final location — becomes an Error that still reports whether the package landed.
+          # Letting a bare Errno escape would crash past Generation's rescue list and leave the
+          # claim held with no recorded reason.
           raise write_error("the generated package could not be completed: #{e.class}")
         ensure
           FileUtils.remove_entry(staging) if ::File.directory?(staging)
@@ -125,13 +116,13 @@ module SpecrelayRunner
 
       private
 
-      attr_reader :package_path, :documents, :assignment, :provider, :source, :inputs, :settings,
-                  :clock, :warnings
+      attr_reader :package_path, :destination_root, :documents, :assignment, :provider, :source,
+                  :inputs, :clock, :warnings
 
-      # Write every document into staging, redacted, and verify the written bytes. The
-      # redaction happens BEFORE the write and the verification reads what is actually on
-      # disk — checking the in-memory string would prove a property of a value that is no
-      # longer the one that matters.
+      # Write every document into staging, redacted, and verify the written bytes. The redaction
+      # happens BEFORE the write and the verification reads what is actually on disk — checking
+      # the in-memory string would prove a property of a value that is no longer the one that
+      # matters.
       def stage(staging)
         FileUtils.mkdir_p(staging)
         documents.each_file.map do |name|
@@ -147,13 +138,13 @@ module SpecrelayRunner
       # Two different guards, and they fail differently on purpose.
       #
       # Secret shapes are REDACTED, because a bundle can legitimately quote a line that looks
-      # like a token and the correct outcome is a safe document plus a warning — not a run
-      # that refuses to produce anything.
+      # like a token and the correct outcome is a safe document plus a warning — not a run that
+      # refuses to produce anything.
       #
-      # Host paths are a HARD failure, because there is no legitimate reason for the
-      # operator's absolute checkout path to appear in a generated document; every path in a
-      # package is repository-relative by construction, so one appearing means a provider
-      # composed it from something it should not have had.
+      # Host paths are a HARD failure, because there is no legitimate reason for an absolute
+      # local path to appear in a generated document; every path in a package is
+      # repository-relative by construction, so one appearing means a provider composed it from
+      # something it should not have had.
       def redact(name, content)
         redacted = Redaction.redact(content.to_s)
         warnings << "#{name}: a secret-shaped value in the generated text was redacted before writing." if
@@ -170,11 +161,12 @@ module SpecrelayRunner
         raise Error, "#{name} contains a private host filesystem path" if host_path
       end
 
-      # The absolute roots that must never appear in generated output. Both checkouts, plus
-      # the operator's home directory, which is the one a provider is most likely to echo.
+      # The absolute roots that must never appear in generated output: the Runner-owned
+      # workspace this package is being written into, the source checkout it was written about,
+      # and the operator's home directory, which is the one a provider is most likely to echo.
       def host_paths
-        @host_paths ||= [ ::File.dirname(package_path.absolute_package_path), source.root,
-                          Dir.home ].compact.map(&:to_s).reject(&:empty?).uniq
+        @host_paths ||= [ destination_root, source.root, Dir.home ]
+                        .compact.map(&:to_s).reject(&:empty?).uniq
       rescue StandardError
         [ source.root.to_s ]
       end
@@ -184,37 +176,24 @@ module SpecrelayRunner
         WrittenFile.new(path: name, sha256: Digest::SHA256.hexdigest(bytes), bytes: bytes.bytesize)
       end
 
-      # The manifest's digest, taken from the FINAL location after the move and after the
-      # replacement flag was rewritten — so it describes the bytes an operator will actually
-      # find on disk. Criterion 7 asks for a digest per generated file and the manifest is
-      # one; it is simply the only file whose digest cannot be computed during staging,
-      # because its own content is not final until the move has happened.
-      #
-      # It is deliberately absent from the manifest's OWN `files` list (see #write_manifest):
-      # a file cannot contain its own hash, and a digest that never verifies is worse than
-      # an acknowledged omission.
-      def manifest_digest
-        digest_of(PackagePath::MANIFEST_JSON,
-                  ::File.join(package_path.absolute_package_path, PackagePath::MANIFEST_JSON))
+      # The manifest's digest, taken from the FINAL location after the move — so it describes
+      # the bytes an operator will actually find on disk. Criterion 7 asks for a digest per
+      # generated file and the manifest is one; it is simply the only file whose digest cannot
+      # be computed during staging, because a file cannot contain its own hash and it is
+      # therefore deliberately absent from the manifest's own `files` list.
+      def manifest_digest(destination)
+        digest_of(PackagePath::MANIFEST_JSON, ::File.join(destination, PackagePath::MANIFEST_JSON))
       end
 
-      # The machine-readable record of this generation, written INTO the package so the
-      # package is self-describing on disk, and returned so Platform can persist the same
-      # facts. One source, two destinations — a manifest that disagreed with the run page
-      # would make both unusable as evidence.
+      # The machine-readable record of this generation, written INTO the package so the package
+      # is self-describing on disk, and returned so Platform can persist the same facts. One
+      # source, two destinations — a manifest that disagreed with the run page would make both
+      # unusable as evidence.
       #
-      # The manifest's own digest is deliberately absent from the file list: a file cannot
-      # contain its own hash, and pretending otherwise would produce a digest that never
-      # verifies.
-      #
-      # It also carries no `publication` block (MVP-0028 remediation, defect 4 — durable
-      # document truth). A prior version wrote `{branch: nil, commit: nil, note: "...no branch,
-      # commit, push, pull request, or Jira write-back was performed"}` here — a claim that is
-      # true at the instant this file is staged and false the moment MVP-0027 commits this exact
-      # file into a pushed branch and opens a pull request with it. Publication state belongs to
+      # It carries no `publication` block and no local path. Publication state belongs to
       # Platform's run record and the runner's own console log, which are read AT the time they
-      # describe; this manifest is read for as long as the package exists, including long after
-      # publication.
+      # describe; this manifest is read for as long as the package exists, including after the
+      # package has been committed to a shared repository.
       def write_manifest(staging, files)
         manifest = manifest_document(files)
         ::File.write(::File.join(staging, PackagePath::MANIFEST_JSON), "#{JSON.pretty_generate(manifest)}\n")
@@ -236,8 +215,6 @@ module SpecrelayRunner
           "provider" => { "kind" => provider.kind, "description" => provider.describe },
           "source_evidence" => source_evidence_block,
           "input_bundle" => input_bundle_block,
-          "on_existing_package" => settings.on_existing_package,
-          "replaced_existing_package" => @replaced_existing ? true : false,
           # Source-inspection warnings belong in the package on disk too. A reader who opens
           # only the manifest must be able to see that nothing was read from the checkout.
           "warnings" => (warnings + Array(source.warnings)).uniq
@@ -268,74 +245,23 @@ module SpecrelayRunner
         }
       end
 
-      # The single operation that touches the destination. Returns whether an existing
-      # package was replaced.
-      def move_into_place(staging)
-        destination = package_path.absolute_package_path
-        return finish_move(staging, destination, nil) unless ::File.exist?(destination)
-        raise write_error("a package already exists at #{package_path.relative_package_path}") unless
-          settings.replace_existing?
+      # The single operation that touches the destination. The workspace is fresh and
+      # `--no-checkout`, so the destination cannot already exist; if it does, something has
+      # written into a Runner-owned workspace and refusing is the only safe answer.
+      def move_into_place(staging, destination)
+        raise write_error("the isolated workspace already holds a package at " \
+                          "#{package_path.relative_package_path}") if ::File.exist?(destination)
 
-        aside = "#{::File.dirname(destination)}/#{REPLACED_PREFIX}#{SecureRandom.hex(8)}"
-        ::File.rename(destination, aside)
-        finish_move(staging, destination, aside)
-      end
-
-      # The rename, with the previous package restored if it fails. `aside` is nil for a
-      # first generation, in which case there is nothing to restore and a failure simply
-      # propagates with the destination still absent.
-      #
-      # ONLY the rename is inside the rescue window, and that is the fix for a real defect.
-      # The window used to extend over the post-move bookkeeping too, so a failure to delete
-      # the set-aside copy — pure housekeeping, after a completed replacement — tore down a
-      # good generation and reported it as a failure that wrote nothing. Everything after the
-      # rename is now treated the way `rewrite_manifest_replacement` on the line below always
-      # was: a warning on a generation that succeeded.
-      def finish_move(staging, destination, aside)
         begin
           ::File.rename(staging, destination)
         rescue SystemCallError => e
-          ::File.rename(aside, destination) if aside && !::File.exist?(destination)
           raise write_error("could not move the generated package into place: #{e.class}")
         end
         @moved = true
-        @replaced_existing = !aside.nil?
-        return false if aside.nil?
-
-        rewrite_manifest_replacement(destination)
-        discard_replaced(aside)
-        true
-      end
-
-      # The set-aside previous package, removed only after the new one is safely in place. Its
-      # removal cannot fail the generation; the operator is told where it is instead, by
-      # BASENAME — the containing directory is the operator's own checkout path and has no
-      # business in a message Platform stores and renders.
-      def discard_replaced(aside)
-        FileUtils.remove_entry(aside) if ::File.directory?(aside)
-      rescue StandardError
-        warnings << "the package this generation replaced could not be removed; it is still beside the " \
-                    "new package as `#{::File.basename(aside)}` and can be deleted by hand."
       end
 
       def write_error(message)
         Error.new(message, package_path: package_path.relative_package_path, wrote_package: @moved)
-      end
-
-      # `replaced_existing_package` is only knowable after the move, and scope 10 requires the
-      # replacement to be recorded in the manifest. Rewriting the one field in place is
-      # cheaper and less error-prone than deferring the whole manifest until after the rename,
-      # which would put a write back into the window the atomicity guarantee protects.
-      def rewrite_manifest_replacement(destination)
-        path = ::File.join(destination, PackagePath::MANIFEST_JSON)
-        document = JSON.parse(::File.read(path))
-        document["replaced_existing_package"] = true
-        ::File.write(path, "#{JSON.pretty_generate(document)}\n")
-      rescue StandardError
-        # The package is already in place and correct; a manifest field that could not be
-        # updated is a reporting gap, not a reason to tear down a good generation. The
-        # authoritative replacement flag also travels to Platform in the result payload.
-        warnings << "the manifest's replacement flag could not be updated after the move."
       end
     end
   end

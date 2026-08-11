@@ -7,11 +7,17 @@ module SpecrelayRunner
     # This class is the load-bearing safety property of the whole MVP. Criterion 5 does not
     # ask for a generation that cleans up after itself when a capability turns out to be
     # missing — it asks for one that never starts. So every check lives here, ahead of the
-    # writer, and this class performs NO write of any kind: it stats paths, reads
-    # configuration, probes read-only tools, and returns a verdict. The proof that zero
-    # output files were written after a refusal is therefore structural — there is no code
-    # path from a refusal to a file handle — rather than a promise backed by a cleanup
-    # routine that might itself fail.
+    # writer: it stats paths, reads configuration, probes read-only tools, and returns a
+    # verdict. The proof that zero output files were written after a refusal is therefore
+    # structural — there is no code path from a refusal to a file handle — rather than a
+    # promise backed by a cleanup routine that might itself fail.
+    #
+    # MAPIAI-62 gave it ONE creation, and placed it deliberately: the Runner-owned isolated
+    # worktree the package will be written into is created as the LAST step, after every check
+    # that can refuse has passed. So the class still writes nothing an operator owns, still
+    # writes nothing on any refusal path, and satisfies design 1's "create and validate the
+    # isolated workspace before launching the provider" as an ordering the code cannot get
+    # wrong rather than a rule the orchestrator has to remember.
     #
     # The ORDER is deliberate and is part of the contract. Checks run cheapest-and-most-
     # fundamental first, so the operator is told the one thing they must fix first rather
@@ -26,9 +32,17 @@ module SpecrelayRunner
       ASSIGNMENT_MALFORMED = "assignment_malformed"
       SPECIFICATION_REPOSITORY_UNRESOLVED = "specification_repository_unresolved"
       SPECIFICATION_FOLDER_UNSAFE = "specification_folder_unsafe"
-      SPECIFICATION_FOLDER_UNWRITABLE = "specification_folder_unwritable"
-      EXISTING_PACKAGE_PRESENT = "existing_package_present"
       SOURCE_WORKSPACE_UNRESOLVED = "source_workspace_unresolved"
+      # MAPIAI-62 — this runner cannot hold a package workspace: its state root is unusable, sits
+      # inside one of the operator's checkouts (review-001 F1), the seed has no resolvable commit,
+      # or `git worktree add` refused. It REPLACES `specification_folder_unwritable` and
+      # `existing_package_present`, both of which were statements about the operator's checkout as
+      # a destination. It is not one of them renamed: the condition, the remedy and the directory
+      # are all different, and the two old classes describe a path this ticket deletes.
+      #
+      # It is evaluated after the source workspace because judging the state root needs both
+      # checkouts in hand.
+      PACKAGE_WORKSPACE_UNAVAILABLE = "package_workspace_unavailable"
       INPUT_CONTENT_UNREADABLE = "input_content_unreadable"
       EXTERNAL_REFERENCE_ANALYSIS_UNAVAILABLE = "external_reference_analysis_unavailable"
       GRAPHIFY_UNAVAILABLE = "graphify_unavailable"
@@ -45,7 +59,7 @@ module SpecrelayRunner
 
       FAILURE_CLASSES = [
         ASSIGNMENT_MALFORMED, SPECIFICATION_REPOSITORY_UNRESOLVED, SPECIFICATION_FOLDER_UNSAFE,
-        SPECIFICATION_FOLDER_UNWRITABLE, EXISTING_PACKAGE_PRESENT, SOURCE_WORKSPACE_UNRESOLVED,
+        SOURCE_WORKSPACE_UNRESOLVED, PACKAGE_WORKSPACE_UNAVAILABLE,
         INPUT_CONTENT_UNREADABLE, EXTERNAL_REFERENCE_ANALYSIS_UNAVAILABLE, GRAPHIFY_UNAVAILABLE,
         CONTEXT_PLUS_UNAVAILABLE, GENERATION_PROVIDER_UNAVAILABLE, REDACTION_VALIDATION_UNAVAILABLE,
         SPECIFICATION_REVISION_PULL_REQUEST_UNUSABLE, SPECIFICATION_REVISION_UNREADABLE
@@ -58,58 +72,66 @@ module SpecrelayRunner
       end
 
       # Everything the later stages need, gathered once. Passing this forward rather than
-      # re-deriving is what guarantees the writer targets the very path preflight validated.
+      # re-deriving is what guarantees the writer targets the very workspace preflight created.
       # `revision` is nil for a first specification and a {PreviousSpecificationPackage::Result}
       # for a same-ticket revision (MVP-0028 decision D6).
-      Ready = Struct.new(:package_path, :checkout_root, :source, :inputs, :provider, :revision,
+      #
+      # `seed_root` is the operator's checkout, and it is named that way on purpose: it is a
+      # validated git seed and credential source, never a destination. `workspace` is the
+      # Runner-owned isolated worktree the package is written into (MAPIAI-62 design 1).
+      Ready = Struct.new(:package_path, :seed_root, :workspace, :source, :inputs, :provider, :revision,
                         keyword_init: true) do
         def refused? = false
       end
 
       def self.call(**kwargs) = new(**kwargs).call
 
-      def initialize(assignment:, settings:, config:, env: ENV, provider: nil, source_gatherer: SourceEvidence)
+      def initialize(assignment:, settings:, config:, env: ENV, provider: nil,
+                     source_gatherer: SourceEvidence, workspaces: nil, clock: Time)
         @assignment = assignment
         @settings = settings
         @config = config
         @env = env
         @injected_provider = provider
         @source_gatherer = source_gatherer
+        @workspaces = workspaces || PackageWorkspaceStore.for(env: env)
+        @clock = clock
       end
 
       def call
-        checkout = resolve_specification_checkout
-        return checkout if checkout.is_a?(Refusal)
+        seed = resolve_seed_checkout
+        return seed if seed.is_a?(Refusal)
 
-        package = resolve_package_path(checkout)
+        package = resolve_package_path
         return package if package.is_a?(Refusal)
 
-        finish(checkout, package)
+        finish(seed, package)
       rescue Assignment::Malformed => e
         refuse(ASSIGNMENT_MALFORMED, e.message)
       end
 
       private
 
-      attr_reader :assignment, :settings, :config, :env, :source_gatherer
+      attr_reader :assignment, :settings, :config, :env, :source_gatherer, :workspaces, :clock
 
       # The remaining checks, after the two that can each end the run on their own. Split
       # out so the entry point stays a readable sequence rather than a nested chain of
       # early returns.
-      def finish(checkout, package)
-        writable = check_writable(checkout, package)
-        return writable if writable
-
-        existing = check_existing_package(package)
-        return existing if existing
-
+      #
+      # The source checkout is resolved BEFORE the state root is established, because the state
+      # root cannot be judged without it: "is this directory inside a repository the operator
+      # owns" is a question about both checkouts (review-001 F1).
+      def finish(seed, package)
         source_root = resolve_source_root
         return source_root if source_root.is_a?(Refusal)
 
-        gather_and_verify(checkout, package, source_root)
+        root = prepare_workspace_root(seed, source_root)
+        return root if root.is_a?(Refusal)
+
+        gather_and_verify(seed, package, source_root)
       end
 
-      def gather_and_verify(checkout, package, source_root)
+      def gather_and_verify(seed, package, source_root)
         # Resolved ONCE, before anything reads it, because it can refuse: a profile Platform
         # named but this runner will not launch has to become a refusal here rather than an
         # exception raised from inside evidence gathering.
@@ -133,11 +155,54 @@ module SpecrelayRunner
         redaction = check_redaction
         return redaction if redaction
 
-        revision = resolve_revision(checkout, package)
+        revision = resolve_revision(seed, package)
         return revision if revision.is_a?(Refusal)
 
-        Ready.new(package_path: package, checkout_root: checkout, source: source, inputs: inputs,
-                  provider: provider, revision: revision)
+        # LAST, and only once every read-only check has passed. The isolated workspace is the
+        # first and only thing this class creates, so "a refusal wrote nothing" stays a property
+        # of the control flow: there is no path from any `refuse` above to this line.
+        workspace = create_workspace(seed, package)
+        return workspace if workspace.is_a?(Refusal)
+
+        Ready.new(package_path: package, seed_root: seed, workspace: workspace, source: source,
+                  inputs: inputs, provider: provider, revision: revision)
+      end
+
+      # The workspace, created from the seed at the seed's own resolved HEAD. A sweep runs first
+      # so a machine that has accumulated retained workspaces reclaims space before adding one,
+      # and `keep` is not needed here because the new id does not exist yet.
+      def create_workspace(seed, package)
+        workspaces.sweep(clock: clock)
+        commands = GitCommands.new(checkout_root: seed, env: env)
+        base = commands.git_value(%w[rev-parse HEAD])
+        return refuse(PACKAGE_WORKSPACE_UNAVAILABLE, no_base_commit_message(seed)) unless
+          GitPublisher::COMMIT_PATTERN.match?(base.to_s)
+
+        workspaces.create(commands: commands, base_commit: base, clock: clock,
+                          identity: workspace_identity(package.relative_package_path))
+      rescue PackageWorkspace::Error => e
+        refuse(PACKAGE_WORKSPACE_UNAVAILABLE, e.message)
+      end
+
+      def no_base_commit_message(seed)
+        "the specification repository seed on this runner has no resolvable commit, so an " \
+          "isolated package worktree cannot be created from it: #{seed}. Fetch or check out the " \
+          "repository's default branch there, then retry generation."
+      end
+
+      # What this workspace belongs to. Every field is a Platform-supplied identity or a
+      # repository-relative path — no credential, no Jira payload, and no local path — because
+      # this document is what publication checks a resumed workspace against.
+      def workspace_identity(package_path)
+        {
+          "run_id" => assignment.run_id,
+          "runner_execution_id" => assignment.runner_execution_id,
+          "runner_id" => assignment.runner_id,
+          "runner_public_id" => config.connection&.runner_public_id.to_s,
+          "repository_slug" => assignment.target_slug.to_s,
+          "repository_url" => assignment.repository_url,
+          "package_path" => package_path
+        }
       end
 
       # MVP-0028 decision D6 — nil for a first specification. For a same-ticket revision, this
@@ -145,11 +210,15 @@ module SpecrelayRunner
       # request must exist, be open, target the configured base, and belong to this repository)
       # against `specification_target`'s facts rather than `publication`'s — the only section
       # available this early — then reads the previous package off its branch.
-      def resolve_revision(checkout, package)
+      def resolve_revision(seed, package)
         url = assignment.revision_pull_request_url
         return nil if url.empty?
 
-        commands = GitCommands.new(checkout_root: checkout, env: env)
+        # Read through the SEED, and only with commands that write nothing but FETCH_HEAD and
+        # the object database — the same non-mutating pattern {GitPublisher#fetch_base}
+        # established. The isolated worktree does not exist yet at this point, and creating it
+        # before a check that can still refuse would be the one write a refusal must not make.
+        commands = GitCommands.new(checkout_root: seed, env: env)
         existing = ExistingPullRequest.call(commands: commands, slug: assignment.target_slug,
                                            base_branch: assignment.default_branch, url: url)
         return refuse(SPECIFICATION_REVISION_PULL_REQUEST_UNUSABLE, existing.message) unless existing.ok?
@@ -161,17 +230,24 @@ module SpecrelayRunner
         previous
       end
 
-      # The operator's local clone of the specification repository. Platform knows the
-      # repository URL; only this machine knows where it is checked out, and it is never
-      # cloned automatically — a runner that silently cloned a repository would be doing
-      # network work nobody asked for, into a directory nobody chose.
+      # The operator's local clone of the specification repository, resolved as a SEED
+      # (MAPIAI-62 design 1). Platform knows the repository URL; only this machine knows where
+      # it is checked out, and it is never cloned automatically — a runner that silently cloned
+      # a repository would be doing network work nobody asked for, into a directory nobody chose.
+      #
+      # What this checkout is FOR changed with MAPIAI-62 and the resolution did not: it supplies
+      # the git object database, the `origin` remote and the credential helper that the isolated
+      # worktree inherits. It is never written to, and nothing downstream is handed it as a
+      # destination.
       #
       # An EXPLICIT mapping always wins when one is configured — the same "an operator who
       # named one has decided" precedence {Provider.resolve} uses for the generation provider.
       # Only when none exists is reuse of the source workspace checkout even considered
       # (MVP-0028 remediation, defect 5), and only when it can be VERIFIED, never assumed from
-      # workspace naming alone.
-      def resolve_specification_checkout
+      # workspace naming alone. That reuse stays useful for exactly the reason it was added —
+      # locating the seed with no second mapping — and is no longer a way for a package to land
+      # in the operator's source checkout.
+      def resolve_seed_checkout
         slug = assignment.target_slug || assignment.repository_url
         configured = settings.repository_root(slug, repository_url: assignment.repository_url)
         return resolve_configured_checkout(configured) unless configured.nil?
@@ -229,45 +305,47 @@ module SpecrelayRunner
                "matches — no separate mapping is needed in that case.")
       end
 
-      def resolve_package_path(checkout)
-        PackagePath.build(checkout_root: checkout, specification_root: assignment.specification_root,
+      # The package's repository-relative identity. It is validated here, before any root is
+      # bound to it, because everything that can be wrong with it — an absolute or traversing
+      # configured folder, an issue key that is not a usable path component — is wrong
+      # independently of where the package is written.
+      def resolve_package_path
+        PackagePath.build(specification_root: assignment.specification_root,
                           issue_key: assignment.issue_key, summary: assignment.issue_title)
       rescue PackagePath::Unsafe => e
         refuse(SPECIFICATION_FOLDER_UNSAFE, e.message)
       end
 
-      # Writability, established WITHOUT writing. The nearest existing ancestor of the
-      # target is stat-ed, because the package folder itself usually does not exist yet and
-      # `File.writable?` on a missing path is always false. Creating a probe file to find
-      # out would be the one thing this class must not do.
-      def check_writable(checkout, package)
-        target = package.absolute_package_path
-        ancestor = existing_ancestor(target)
-        return nil if ancestor && File.writable?(ancestor)
+      # The Runner's own state root, proven DISJOINT from both operator checkouts and then proven
+      # writable — in that order, because establishing the root is itself a write, and a root
+      # inside a checkout must not create so much as a directory there.
+      #
+      # review-001 F1: a state root inside a checkout made generation write `swp_<id>/` into a
+      # repository the operator owns, while the runner's own output told them their checkout was
+      # untouched. Criterion 1 is a statement about their disk, so it is checked against their
+      # disk rather than trusted to configuration.
+      #
+      # Writability is still proven WITHOUT a probe file. This replaces the old writability check
+      # on the operator's specification folder: that folder is no longer written to, so its
+      # permissions no longer decide whether a generation can succeed.
+      def prepare_workspace_root(seed, source_root)
+        inside = [ seed, source_root ].find { |checkout| workspaces.overlaps?(checkout) }
+        return refuse(PACKAGE_WORKSPACE_UNAVAILABLE, overlapping_root_message(inside)) if inside
 
-        refuse(SPECIFICATION_FOLDER_UNWRITABLE,
-               "the configured specification folder is not writable: " \
-               "#{package.relative_package_path} under #{checkout}")
-      rescue PackagePath::Unsafe => e
-        refuse(SPECIFICATION_FOLDER_UNSAFE, e.message)
+        workspaces.prepare!
+        nil
+      rescue PackageWorkspace::Error, SystemCallError, IOError => e
+        refuse(PACKAGE_WORKSPACE_UNAVAILABLE,
+               "this runner cannot hold a specification package workspace: #{e.message}. Check that " \
+               "#{PackageWorkspaceStore::DEFAULT_RELATIVE_PATH}, under this runner's home directory, " \
+               "is a writable location.")
       end
 
-      def existing_ancestor(path)
-        current = path
-        current = File.dirname(current) until File.directory?(current) || File.dirname(current) == current
-        File.directory?(current) ? current : nil
-      end
-
-      # Scope 10's replace-or-refuse choice, evaluated here rather than in the writer so the
-      # `refuse` half never reaches a staging directory at all. The default is `replace`;
-      # this is only reached when an operator configured otherwise.
-      def check_existing_package(package)
-        return nil if settings.replace_existing? || !package.exists?
-
-        refuse(EXISTING_PACKAGE_PRESENT,
-               "a generated package already exists at #{package.relative_package_path} and this runner is " \
-               "configured with on_existing_package: refuse. Remove or move it, or set " \
-               "#{Settings::EXISTING_POLICY_ENV}=replace.")
+      def overlapping_root_message(checkout)
+        "this runner keeps its specification packages in #{workspaces.root}, which is inside the " \
+          "repository checkout #{checkout}. Generating there would write into a repository you own, " \
+          "so nothing was created. Run this runner as a user whose home directory is outside your " \
+          "checkouts, or move the checkout out of the runner's home directory."
       end
 
       # The SOURCE checkout — the code a specification is being written about, which is a

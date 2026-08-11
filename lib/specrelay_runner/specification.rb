@@ -57,6 +57,10 @@ require_relative "specification/composer"
 require_relative "specification/document_set"
 require_relative "specification/package_writer"
 require_relative "specification/previous_specification_package"
+# MAPIAI-62 — the Runner-owned isolated workspace a package is generated into and published
+# from. Required before Preflight, which creates one, and before Publication, which resumes one.
+require_relative "specification/package_workspace"
+require_relative "specification/package_workspace_store"
 require_relative "specification/preflight"
 require_relative "specification/generation"
 # MVP-0027 — the lane's third phase: publish the generated package as a draft pull request.
@@ -76,6 +80,7 @@ require_relative "specification/generation"
 # ticket updates that pull request instead of opening another. It still reaches no Jira — the
 # URL arrives in the assignment, Platform having read it from the ticket.
 require_relative "specification/package_verification"
+require_relative "specification/package_workspace_check"
 require_relative "specification/git_commands"
 require_relative "specification/existing_pull_request"
 require_relative "specification/git_publisher"

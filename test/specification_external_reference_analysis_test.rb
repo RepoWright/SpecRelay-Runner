@@ -36,7 +36,8 @@ class SpecificationExternalReferenceAnalysisTest < Minitest::Test
   # The per-input table — kind, name, recorded read status, used?, and the note this
   # remediation makes truthful — is `spec.md`'s "Input summary" section, not business.md's.
   def spec_document
-    File.read(File.join(@specs, "specs", "SR-700-add-an-export-button", "spec.md"))
+    File.read(File.join(SpecificationWorkspace.isolated_worktree(@temp),
+                        "specs/SR-700-add-an-export-button", "spec.md"))
   end
 
   # ------------------------------------------------------------------ successful analysis
@@ -318,7 +319,8 @@ class SpecificationExternalReferenceAnalysisTest < Minitest::Test
   end
 
   def run_cli(config:)
-    SpecrelayRunner::CLI.run(%W[claim-once --config #{config.source_path}], out: @io, err: @io,
-                             env: { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN, "PATH" => ENV["PATH"] })
+    env = { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN, "PATH" => ENV["PATH"] }
+          .merge(SpecificationWorkspace.lane_env(@temp))
+    SpecrelayRunner::CLI.run(%W[claim-once --config #{config.source_path}], out: @io, err: @io, env: env)
   end
 end

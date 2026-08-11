@@ -69,7 +69,8 @@ class SpecificationProviderPropagationTest < Minitest::Test
 
     assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
 
-    manifest = JSON.parse(File.read(File.join(@specs, "specs/SR-700-add-an-export-button",
+    manifest = JSON.parse(File.read(File.join(SpecificationWorkspace.isolated_worktree(@temp),
+                                              "specs/SR-700-add-an-export-button",
                                               "generation-manifest.json")))
     assert_equal "claude", manifest.dig("provider", "kind"), @io.string
     assert_includes manifest.dig("provider", "description"), "claude"
@@ -215,6 +216,6 @@ class SpecificationProviderPropagationTest < Minitest::Test
     path = [ @stub_dir, ENV["PATH"] ].compact.join(File::PATH_SEPARATOR)
     SpecrelayRunner::CLI.run(%W[claim-once --config #{config.source_path}], out: @io, err: @io,
                              env: { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN, "PATH" => path,
-                                    "HOME" => @temp })
+                                    "HOME" => @temp }.merge(SpecificationWorkspace.lane_env(@temp)))
   end
 end

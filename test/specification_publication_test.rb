@@ -3,6 +3,8 @@
 require_relative "test_helper"
 require "digest"
 require "open3"
+require "rbconfig"
+require "time"
 
 # MVP-0027 — the runner turns a claimed PUBLICATION assignment into a real commit, a real push
 # to a real remote, and a draft pull request.
@@ -78,6 +80,8 @@ class SpecificationPublicationTest < Minitest::Test
     File.write(File.join(@specs, "unrelated.txt"), "an operator's uncommitted work\n")
     before_head = git(@specs, "rev-parse", "HEAD").strip
     before_branch = git(@specs, "rev-parse", "--abbrev-ref", "HEAD").strip
+    before_files = SpecificationWorkspace.checkout_snapshot(@specs)
+    before_git = SpecificationWorkspace.git_state(@specs)
 
     run_cli
 
@@ -85,6 +89,8 @@ class SpecificationPublicationTest < Minitest::Test
     assert_equal before_branch, git(@specs, "rev-parse", "--abbrev-ref", "HEAD").strip
     assert_equal "an operator's uncommitted work\n", File.read(File.join(@specs, "unrelated.txt"))
     assert_includes git(@specs, "status", "--porcelain"), "unrelated.txt"
+    assert_equal before_files, SpecificationWorkspace.checkout_snapshot(@specs)
+    assert_equal before_git, SpecificationWorkspace.git_state(@specs)
   end
 
   def test_the_commit_message_names_the_issue_and_carries_role_trailers
@@ -99,35 +105,73 @@ class SpecificationPublicationTest < Minitest::Test
 
   # ---------------------------------------------------------------- criterion 5
 
-  def test_retrying_reuses_the_same_branch_commit_and_pull_request
+  # S16 — the response is LOST. The pull request exists, Platform holds no record, and the run is
+  # offered again. The replay must converge on the same commit and the same pull request, which is
+  # only possible because a publication that was never accepted keeps its local workspace.
+  def test_a_lost_response_replays_onto_the_same_commit_and_pull_request
     start_platform
-    run_cli
-    first = @platform.last_specification_publication
+    @platform.publication_response = [ 500, { error: "internal server error" } ]
+    assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
+    first = FakeGithub.remote_branches(@bare)[BRANCH]
+    assert File.directory?(@worktree), "an unaccepted publication must keep its package"
 
-    # The operator's recovery, modelled honestly: Platform offers the same run again — which is
-    # what `bin/platform runner retry-publication` produces — and the runner claims it afresh.
+    @platform.publication_response = nil
     @platform.offer_again!
     @io = StringIO.new
     assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
-    second = @platform.last_specification_publication
 
+    second = @platform.last_specification_publication
     assert_equal "published", second["outcome"]
-    assert_equal first["head_commit"], second["head_commit"], "a retry must not create a second commit"
-    assert_equal first["pull_request_url"], second["pull_request_url"]
+    assert_equal first, second["head_commit"], "a replay must not create a second commit"
+    assert_equal first, FakeGithub.remote_branches(@bare)[BRANCH]
     assert_equal true, second["reused_pull_request"]
     assert_equal true, second["reused_branch"]
-    assert_equal 1, FakeGithub.pr_creates(@gh_log), "a retry must not open a second pull request"
+    assert_equal 1, FakeGithub.pr_creates(@gh_log), "a replay must not open a second pull request"
   end
 
-  def test_a_retry_leaves_the_remote_branch_pointing_at_the_same_commit
+  # S17/S20 — Platform REFUSED the result. The package is retained, and the operator's
+  # `retry-publication` republishes THAT package: same workspace, same files, no regeneration.
+  def test_a_refused_result_retains_the_package_so_a_retry_reuses_it
     start_platform
-    run_cli
-    before = FakeGithub.remote_branches(@bare)[BRANCH]
+    @platform.publication_response = [ 422, { error: "not acceptable right now" } ]
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
+    assert File.directory?(@worktree), "a refused publication must keep its package for the retry"
 
+    @platform.publication_response = nil
     @platform.offer_again!
-    run_cli
+    @io = StringIO.new
+    assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
 
-    assert_equal before, FakeGithub.remote_branches(@bare)[BRANCH]
+    assert_equal "published", @platform.last_specification_publication["outcome"]
+    assert_equal 1, FakeGithub.pr_creates(@gh_log)
+    assert_empty @platform.requests_to("/api/runner/specification_generations"),
+                 "a retry must publish the same package, never regenerate one"
+  end
+
+  # S18 — cleanup happens ONLY after Platform accepts, and then it really happens.
+  def test_an_accepted_publication_removes_only_the_runner_owned_local_state
+    start_platform
+    before = SpecificationWorkspace.checkout_snapshot(@specs)
+    before_git = SpecificationWorkspace.git_state(@specs)
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
+
+    refute File.exist?(@workspace.root), "an accepted publication cleans up its own workspace"
+    assert_equal before, SpecificationWorkspace.checkout_snapshot(@specs)
+    assert_equal before_git, SpecificationWorkspace.git_state(@specs)
+    # And the seed's worktree registration goes with it, so a completed cycle leaves the
+    # operator's `.git` exactly as it found it.
+    refute_includes git(@specs, "worktree", "list"), @workspace.id
+  end
+
+  # S19 — cleanup failing after acceptance cannot turn a real publication into a failure.
+  def test_a_cleanup_failure_after_acceptance_is_a_warning_not_a_failure
+    start_platform
+    exit_code = with_unremovable_workspace { run_cli }
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, exit_code, @io.string
+    assert_equal "published", @platform.last_specification_publication["outcome"]
+    assert_includes @io.string, "could not remove its local package workspace"
   end
 
   # ------------------------------------------------- MVP-0028 criteria 3 and 4: the ticket's PR
@@ -157,7 +201,7 @@ class SpecificationPublicationTest < Minitest::Test
     start_platform(gh_mode: gh_mode, gh_seed: [ existing_pr(**overrides) ],
                    payload: spec_publication_payload_for(
                      issue_key: ISSUE, files: @package_files, package_path: PACKAGE, branch: BRANCH,
-                     existing_pull_request_url: EXISTING_PR_URL
+                     workspace_id: @workspace.id, existing_pull_request_url: EXISTING_PR_URL
                    ))
   end
 
@@ -256,7 +300,7 @@ class SpecificationPublicationTest < Minitest::Test
 
   def test_a_digest_mismatch_refuses_before_any_git_mutation
     start_platform
-    File.write(File.join(@specs, PACKAGE, "spec.md"), "# edited by hand after generation\n")
+    File.write(File.join(@worktree, PACKAGE, "spec.md"), "# edited by hand after generation\n")
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
 
@@ -270,7 +314,7 @@ class SpecificationPublicationTest < Minitest::Test
 
   def test_a_missing_generated_file_refuses_before_any_git_mutation
     start_platform
-    FileUtils.rm(File.join(@specs, PACKAGE, "analysis/business.md"))
+    FileUtils.rm(File.join(@worktree, PACKAGE, "analysis/business.md"))
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
 
@@ -283,13 +327,13 @@ class SpecificationPublicationTest < Minitest::Test
   # looks like. The remedy names regeneration rather than a retry.
   def test_a_stale_package_refuses_and_names_regeneration
     start_platform
-    FileUtils.rm_rf(File.join(@specs, PACKAGE))
+    FileUtils.rm_rf(File.join(@worktree, PACKAGE))
 
     run_cli
 
     result = @platform.last_specification_publication
     assert_equal "generated_package_missing", result["failure_class"]
-    assert_includes result["message"], "requeue-specification"
+    assert_includes result["message"], "Generate the package again"
     refute_includes FakeGithub.remote_branches(@bare).keys, BRANCH
   end
 
@@ -297,7 +341,7 @@ class SpecificationPublicationTest < Minitest::Test
   # the repository-relative path and nothing about this machine.
   def test_a_refusal_message_carries_no_absolute_host_path
     start_platform
-    File.write(File.join(@specs, PACKAGE, "spec.md"), "# edited\n")
+    File.write(File.join(@worktree, PACKAGE, "spec.md"), "# edited\n")
 
     run_cli
 
@@ -384,17 +428,6 @@ class SpecificationPublicationTest < Minitest::Test
 
     assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
     assert_equal "published", @platform.last_specification_publication["outcome"]
-  end
-
-  def test_an_unresolved_specification_checkout_is_refused_with_the_variable_to_set
-    start_platform
-    @config = build_config(repository_root: nil)
-
-    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
-
-    result = @platform.last_specification_publication
-    assert_equal "specification_repository_unresolved", result["failure_class"]
-    assert_includes result["message"], "SPECRELAY_RUNNER_SPEC_REPOSITORY_ROOT_SPECRELAY_SPECRELAY_SPECS"
   end
 
   def test_a_publication_assignment_missing_its_branch_is_refused
@@ -517,6 +550,206 @@ class SpecificationPublicationTest < Minitest::Test
     assert_includes @io.string, "The outcome above still stands"
   end
 
+
+  # ------------------------------------------- MAPIAI-62 design 3: resuming the workspace
+
+  # S10 — a fresh process resolves the SAME workspace from the opaque id alone. Nothing about
+  # this run reads a configured checkout: the mapping is removed entirely and it still publishes.
+  def test_the_owner_resumes_the_workspace_from_the_opaque_id_with_no_repository_mapping
+    start_platform
+    @config = build_config(repository_root: nil)
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
+    assert_equal "published", @platform.last_specification_publication["outcome"]
+  end
+
+  # S06/S30 — an id this machine does not hold fails closed and never touches git.
+  def test_an_unknown_workspace_id_fails_closed_and_names_generate_again
+    start_platform(payload: publication_payload(workspace_id: "swp_#{'0' * 32}"))
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
+
+    result = @platform.last_specification_publication
+    assert_equal "specification_workspace_missing", result["failure_class"]
+    assert_includes result["message"], "Generate again"
+    refute_includes FakeGithub.remote_branches(@bare).keys, BRANCH
+    assert_equal 0, FakeGithub.pr_creates(@gh_log)
+  end
+
+  # A malformed id can never become a path component: it is refused on shape, before any lookup.
+  def test_a_traversing_workspace_id_is_refused_without_reading_anything
+    start_platform(payload: publication_payload(workspace_id: "../../etc"))
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
+    assert_equal "specification_workspace_missing",
+                 @platform.last_specification_publication["failure_class"]
+  end
+
+  # review-001 F2 — a REAL workspace moved outside the state root and replaced by a symlink under
+  # its own id. Publication must fail closed on the lookup, before it reads the metadata it would
+  # have believed and before anything reaches git or GitHub.
+  def test_a_workspace_entry_symlinked_outside_the_state_root_fails_closed
+    outside = File.join(@temp, "moved-out-of-the-store")
+    FileUtils.mv(@workspace.root, outside)
+    File.symlink(outside, @workspace.root)
+    start_platform
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
+
+    assert_equal "specification_workspace_missing",
+                 @platform.last_specification_publication["failure_class"]
+    refute_includes FakeGithub.remote_branches(@bare).keys, BRANCH
+    assert_equal 0, FakeGithub.pr_creates(@gh_log)
+    assert File.file?(File.join(outside, "workspace.json")), "the external directory must survive"
+  end
+
+  def test_a_publication_assignment_with_no_workspace_id_is_malformed
+    start_platform(payload: publication_payload.tap { |p| p["generated_package"].delete("workspace_id") })
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
+
+    result = @platform.last_specification_publication
+    assert_equal "publication_assignment_malformed", result["failure_class"]
+    assert_includes result["message"], "generated_package.workspace_id"
+  end
+
+  # S23 — the retention window has passed. Publishable state expires; the remedy is regeneration.
+  def test_an_expired_workspace_refuses_and_offers_generate_again
+    start_platform
+    expire_workspace!
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
+
+    result = @platform.last_specification_publication
+    assert_equal "specification_workspace_expired", result["failure_class"]
+    assert_includes result["message"], "7-day retention window"
+    refute_includes FakeGithub.remote_branches(@bare).keys, BRANCH
+  end
+
+  # S12 — the metadata names a different run. Fail closed BEFORE any git mutation.
+  def test_a_workspace_recorded_for_another_run_is_refused
+    rewrite_metadata("run_id" => "run_somebody_else")
+    start_platform
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
+
+    result = @platform.last_specification_publication
+    assert_equal "specification_workspace_invalid", result["failure_class"]
+    assert_includes result["message"], "different run"
+    refute_includes FakeGithub.remote_branches(@bare).keys, BRANCH
+  end
+
+  # S11/S12 — a workspace created under a different runner identity on this same machine.
+  def test_a_workspace_created_by_another_runner_identity_is_refused
+    rewrite_metadata("runner_id" => "someone-elses-runner")
+    start_platform
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
+    assert_includes @platform.last_specification_publication["message"], "different runner identity"
+  end
+
+  def test_a_workspace_recorded_for_another_repository_is_refused
+    rewrite_metadata("repository_slug" => "SpecRelay/Somewhere-Else",
+                     "repository_url" => "https://github.com/SpecRelay/Somewhere-Else")
+    start_platform
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
+    assert_includes @platform.last_specification_publication["message"], "different specification repository"
+  end
+
+  def test_a_workspace_recorded_for_another_package_folder_is_refused
+    rewrite_metadata("package_path" => "specs/SR-999-something-else")
+    start_platform
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
+    assert_includes @platform.last_specification_publication["message"], "different package folder"
+  end
+
+  # S12 — the worktree is no longer at the base it recorded, so its content is not provably the
+  # content that was generated.
+  def test_a_worktree_moved_off_its_recorded_base_is_refused
+    rewrite_metadata("base_commit" => "0" * 40)
+    start_platform
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
+    assert_includes @platform.last_specification_publication["message"], "no longer at the commit"
+  end
+
+  def test_a_directory_that_is_no_longer_a_git_worktree_is_refused
+    start_platform
+    FileUtils.rm_rf(File.join(@worktree, ".git"))
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
+    assert_includes @platform.last_specification_publication["message"], "no longer a git worktree"
+  end
+
+  # A generation that never finished cannot be published from, even though its directory exists.
+  def test_a_workspace_whose_generation_never_finished_is_refused
+    rewrite_metadata("state" => "generating")
+    start_platform
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
+    assert_equal "specification_workspace_missing",
+                 @platform.last_specification_publication["failure_class"]
+    assert_includes @platform.last_specification_publication["message"], "no complete package"
+  end
+
+  # S13 — an EXTRA file in the package is a refusal, not a silent inclusion. Digest checks alone
+  # never see this: every recorded file matches, and the commit would carry one more.
+  def test_an_extra_file_in_the_package_is_refused
+    start_platform
+    File.write(File.join(@worktree, PACKAGE, "sneaked-in.md"), "not in the recorded package\n")
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
+
+    result = @platform.last_specification_publication
+    assert_equal "generated_package_altered", result["failure_class"]
+    assert_includes result["message"], "sneaked-in.md"
+    refute_includes FakeGithub.remote_branches(@bare).keys, BRANCH
+  end
+
+  # S14 — a recorded file replaced by a symlink. The bytes would still digest correctly, so only
+  # an explicit link check catches it.
+  def test_a_symlinked_package_file_is_refused_and_nothing_outside_the_workspace_is_read
+    start_platform
+    outside = File.join(@temp, "outside.md")
+    File.write(outside, PACKAGE_CONTENTS.fetch("spec.md"))
+    target = File.join(@worktree, PACKAGE, "spec.md")
+    FileUtils.rm(target)
+    File.symlink(outside, target)
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
+
+    result = @platform.last_specification_publication
+    assert_equal "generated_package_altered", result["failure_class"]
+    assert_includes result["message"], "symbolic link"
+    refute_includes FakeGithub.remote_branches(@bare).keys, BRANCH
+  end
+
+  def test_a_symlinked_package_directory_is_refused
+    start_platform
+    real = File.join(@worktree, PACKAGE)
+    moved = File.join(@temp, "moved-package")
+    FileUtils.mv(real, moved)
+    File.symlink(moved, real)
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
+    assert_equal "generated_package_altered",
+                 @platform.last_specification_publication["failure_class"]
+  end
+
+  # S25/S26 — another process on this machine holds the workspace lock. The claim refuses rather
+  # than blocking on it, so a finite lease is never burned waiting.
+  def test_a_workspace_locked_by_another_process_refuses_instead_of_publishing_twice
+    start_platform
+    held = with_workspace_lock_held { run_cli }
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, held, @io.string
+    assert_equal "specification_workspace_busy",
+                 @platform.last_specification_publication["failure_class"]
+    refute_includes FakeGithub.remote_branches(@bare).keys, BRANCH
+  end
+
   # ---------------------------------------------------------------- the dispatch
 
   # An assignment naming an action this build does not implement must STOP rather than fall
@@ -536,17 +769,46 @@ class SpecificationPublicationTest < Minitest::Test
 
   private
 
-  # A real git repository with a real bare remote and the generated package already committed
-  # nowhere — the package files are UNTRACKED on disk, exactly as MVP-0026 leaves them.
+  # A real git repository with a real bare remote — the SEED — plus a real Runner-owned isolated
+  # worktree created from it, holding the package exactly as MVP-0026 (as MAPIAI-62 changed it)
+  # leaves one. Built through the production store rather than by hand, so what publication
+  # resumes here is the same shape generation produces.
   def build_specification_checkout
-    FileUtils.mkdir_p(File.join(@specs, PACKAGE, "analysis"))
     git_init(@specs)
     File.write(File.join(@specs, "README.md"), "# SpecRelay specifications\n")
     git(@specs, "add", "README.md")
     commit(@specs, "initial")
     @bare = FakeGithub.add_remote(@specs, name: "SpecRelay-Specs")
     git(@specs, "push", "-q", "origin", "HEAD:refs/heads/main")
+    build_isolated_workspace
+  end
+
+  # The same root the CLI will resolve from `HOME`, which is `@temp` for every run here. Built
+  # from the production constant rather than a fixture path so the test cannot drift from where
+  # the runner actually keeps its state.
+  def store
+    @store ||= SpecrelayRunner::Specification::PackageWorkspaceStore.new(
+      root: SpecificationWorkspace.package_workspace_root(@temp), env: { "PATH" => ENV["PATH"] }
+    )
+  end
+
+  def build_isolated_workspace(identity_overrides: {})
+    store.prepare!
+    commands = SpecrelayRunner::Specification::GitCommands.new(checkout_root: @specs,
+                                                              env: { "PATH" => ENV["PATH"] })
+    @workspace = store.create(
+      commands: commands, clock: Time, base_commit: git(@specs, "rev-parse", "HEAD").strip,
+      identity: {
+        "run_id" => "run_spec123", "runner_execution_id" => "rex_spec123",
+        "runner_id" => "test-runner", "runner_public_id" => "",
+        "repository_slug" => "SpecRelay/SpecRelay-Specs",
+        "repository_url" => "https://github.com/SpecRelay/SpecRelay-Specs",
+        "package_path" => PACKAGE
+      }.merge(identity_overrides)
+    )
+    @worktree = @workspace.worktree_root
     write_package
+    @workspace.finalize!(files: @written_files)
   end
 
   PACKAGE_CONTENTS = {
@@ -556,18 +818,23 @@ class SpecificationPublicationTest < Minitest::Test
     "generation-manifest.json" => "{\n  \"contract_version\": \"mvp-0026\"\n}\n"
   }.freeze
 
+  WrittenFile = SpecrelayRunner::Specification::PackageWriter::WrittenFile
+
   def write_package
     @package_files = PACKAGE_CONTENTS.map do |name, body|
-      path = File.join(@specs, PACKAGE, name)
+      path = File.join(@worktree, PACKAGE, name)
       FileUtils.mkdir_p(File.dirname(path))
       File.write(path, body)
       { "path" => name, "sha256" => Digest::SHA256.hexdigest(body), "bytes" => body.bytesize }
     end
+    @written_files = @package_files.map do |file|
+      WrittenFile.new(path: file["path"], sha256: file["sha256"], bytes: file["bytes"])
+    end
   end
 
-  def publication_payload
+  def publication_payload(workspace_id: nil)
     spec_publication_payload_for(issue_key: ISSUE, files: @package_files, package_path: PACKAGE,
-                                 branch: BRANCH)
+                                 branch: BRANCH, workspace_id: workspace_id || @workspace.id)
   end
 
   def start_platform(gh_mode: "ok", payload: nil, gh_seed: [])
@@ -606,7 +873,8 @@ class SpecificationPublicationTest < Minitest::Test
   # operator may have installed. HOME is set so nothing reads this developer's git config.
   def run_cli(env_extra: {})
     env = { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN,
-            "PATH" => "#{@gh_dir}:#{ENV['PATH']}", "HOME" => @temp }.merge(env_extra)
+            "PATH" => "#{@gh_dir}:#{ENV['PATH']}", "HOME" => @temp }
+          .merge(env_extra)
     SpecrelayRunner::CLI.run(%W[claim-once --config #{@config.source_path}], out: @io, err: @io, env: env)
   end
 
@@ -618,6 +886,51 @@ class SpecificationPublicationTest < Minitest::Test
     raise "no `gh pr create` was recorded" unless raw.include?("pr create")
 
     raw.split("--body ", 2).last.to_s.split("\n--draft").first.to_s.sub(/ --draft\s*\z/, "")
+  end
+
+  # Rewrite one or more metadata fields in place, modelling foreign or altered local state.
+  def rewrite_metadata(fields)
+    path = File.join(@workspace.root, "workspace.json")
+    document = JSON.parse(File.read(path)).merge(fields)
+    File.write(path, "#{JSON.pretty_generate(document)}\n")
+  end
+
+  def expire_workspace! = rewrite_metadata("expires_at" => (Time.now.utc - 60).iso8601)
+
+  # Hold the real lock from a SECOND process, which is the only way to prove the lock is a
+  # cross-process one rather than an in-process flag.
+  def with_workspace_lock_held
+    lock = File.join(store.root, "#{@workspace.id}.lock")
+    ready = File.join(@temp, "lock-held")
+    holder = spawn(RbConfig.ruby, "-e", <<~RUBY)
+      File.open(#{lock.dump}, File::RDWR | File::CREAT, 0o600) do |file|
+        file.flock(File::LOCK_EX)
+        File.write(#{ready.dump}, "held")
+        sleep 30
+      end
+    RUBY
+    sleep 0.02 until File.exist?(ready)
+    yield
+  ensure
+    if holder
+      Process.kill("TERM", holder)
+      Process.wait(holder)
+    end
+  end
+
+  # Make the workspace removal fail, and only that, so the warning branch is exercised rather
+  # than a broken FileUtils.
+  def with_unremovable_workspace
+    root = @workspace.root
+    original = FileUtils.method(:remove_entry)
+    FileUtils.define_singleton_method(:remove_entry) do |path, *rest|
+      raise Errno::EACCES, path.to_s if path.to_s == root
+
+      original.call(path, *rest)
+    end
+    yield
+  ensure
+    FileUtils.define_singleton_method(:remove_entry, original)
   end
 
   def git_init(root)

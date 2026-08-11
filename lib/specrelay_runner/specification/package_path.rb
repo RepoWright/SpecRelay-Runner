@@ -60,11 +60,16 @@ module SpecrelayRunner
 
       def self.build(**kwargs) = new(**kwargs)
 
-      # `checkout_root` is the operator's local clone of the specification repository;
       # `specification_root` is the repository-relative folder Platform resolved from the
       # project's specification-lane configuration.
-      def initialize(checkout_root:, specification_root:, issue_key:, summary:)
-        @checkout_root = File.expand_path(checkout_root.to_s)
+      #
+      # There is deliberately no root here. MAPIAI-62 gave this identity two roots in one run —
+      # the operator's checkout is validated as a SEED, and the package is written into a
+      # Runner-owned isolated worktree — so "which absolute path is this?" became a question
+      # with two answers and had to move to the caller that knows which one it means. Binding a
+      # root at construction is what made it possible, in the path this ticket replaces, for
+      # generation and publication to resolve different ones without either noticing.
+      def initialize(specification_root:, issue_key:, summary:)
         @specification_root = validate_root!(specification_root.to_s)
         @folder_name = "#{validate_issue_key!(issue_key.to_s)}-#{slugify(summary)}"
       end
@@ -77,15 +82,14 @@ module SpecrelayRunner
         specification_root.empty? ? folder_name : "#{specification_root}/#{folder_name}"
       end
 
-      # The absolute local destination, re-validated for containment. Recomputed rather
-      # than memoized so a caller cannot hold a stale path across a changed root, and
-      # checked here (not only at construction) because this is the value that is actually
-      # written to.
-      def absolute_package_path
-        resolved = File.expand_path(File.join(checkout_root, relative_package_path))
-        unless resolved.start_with?("#{checkout_root}/")
-          raise Unsafe, "the resolved specification package path escapes the repository checkout"
-        end
+      # The absolute destination inside ONE root, re-validated for containment. Recomputed
+      # rather than memoized because this is the value that is actually written to, and the
+      # containment check has to run against the root the caller is using now.
+      def absolute_in(root)
+        base = File.expand_path(root.to_s)
+        resolved = File.expand_path(File.join(base, relative_package_path))
+        raise Unsafe, "the resolved specification package path escapes its root" unless
+          resolved.start_with?("#{base}/")
 
         resolved
       end
@@ -94,11 +98,7 @@ module SpecrelayRunner
       # generated cross-references.
       def relative_file_paths = ALL_FILES.map { |name| "#{relative_package_path}/#{name}" }
 
-      def exists? = File.directory?(absolute_package_path)
-
       private
-
-      attr_reader :checkout_root
 
       def validate_issue_key!(key)
         raise Unsafe, "the assignment's Jira issue key is not a usable path component: #{key.inspect}" unless

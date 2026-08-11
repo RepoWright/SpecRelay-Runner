@@ -71,11 +71,41 @@ class SpecificationPreflightTest < Minitest::Test
                    payload: spec_creation_payload_for(issue_key: ISSUE, specification_root: "/etc/specs")
   end
 
-  def test_an_unwritable_specification_folder_refuses
-    FileUtils.chmod(0o500, File.join(@specs, "specs"))
-    assert_refusal "specification_folder_unwritable"
+  # MAPIAI-62 — the operator's specification folder is no longer a destination, so its
+  # permissions no longer decide anything. What CAN stop a generation is this runner's own
+  # state root, and that is a different refusal with a different remedy.
+  def test_an_unwritable_runner_package_workspace_root_refuses
+    root = SpecificationWorkspace.package_workspace_root(@temp)
+    FileUtils.mkdir_p(root)
+    FileUtils.chmod(0o500, root)
+    assert_refusal "package_workspace_unavailable"
+    assert_includes @io.string, SpecrelayRunner::Specification::PackageWorkspaceStore::DEFAULT_RELATIVE_PATH
   ensure
-    FileUtils.chmod(0o755, File.join(@specs, "specs"))
+    FileUtils.chmod(0o755, root)
+  end
+
+  # review-001 F1 — the Runner's state root must be DISJOINT from the operator's checkouts.
+  #
+  # A root inside one of them put `swp_<id>/` into a repository the operator owns, which is the
+  # exact defect this MVP exists to remove. Both checkouts are asserted on both probes: the
+  # refusal has to leave the OTHER one alone too, and only comparing both would catch a fix that
+  # merely moved the write.
+  def test_a_package_workspace_root_inside_the_specification_seed_refuses_before_writing
+    assert_disjoint_state_root_refusal(@specs)
+  end
+
+  def test_a_package_workspace_root_inside_the_source_checkout_refuses_before_writing
+    assert_disjoint_state_root_refusal(@source)
+  end
+
+  # S04 — a seed with no resolvable commit refuses before any workspace or provider write.
+  def test_a_seed_checkout_with_no_commit_refuses_before_creating_a_workspace
+    FileUtils.remove_entry(@specs)
+    FileUtils.mkdir_p(@specs)
+    SpecificationWorkspace.git!(@specs, "init", "-q", "-b", "main")
+
+    assert_refusal "package_workspace_unavailable"
+    assert_empty SpecificationWorkspace.isolated_workspaces(@temp)
   end
 
   def test_an_unresolvable_source_workspace_refuses
@@ -128,7 +158,7 @@ class SpecificationPreflightTest < Minitest::Test
     exit_code = run_cli(config: build_config)
 
     assert_equal SpecrelayRunner::CLI::SUCCESS, exit_code, @io.string
-    technical = File.read(File.join(@specs, "specs", "SR-700-add-an-export-button", "analysis", "technical.md"))
+    technical = read_package("analysis/technical.md")
     assert_includes technical, "Graphify is not installed for this checkout"
     assert_includes technical, "Result: did NOT contribute evidence"
     warnings = @platform.last_specification_generation["warnings"]
@@ -197,7 +227,7 @@ class SpecificationPreflightTest < Minitest::Test
     exit_code = run_cli(config: build_config(graphify_substitute: "read the changed area directly"))
 
     assert_equal SpecrelayRunner::CLI::SUCCESS, exit_code, @io.string
-    technical = File.read(File.join(@specs, "specs", "SR-700-add-an-export-button", "analysis", "technical.md"))
+    technical = read_package("analysis/technical.md")
     assert_includes technical, "read the changed area directly"
     # See the note in specification_generation_test.rb: the verdict vocabulary changed under
     # CR-001 must-fix 2; the property this line protects — a substituted tool is recorded as
@@ -213,7 +243,7 @@ class SpecificationPreflightTest < Minitest::Test
     exit_code = run_cli(config: build_config(external_references_substitute: "the reporter pasted the page inline"))
 
     assert_equal SpecrelayRunner::CLI::SUCCESS, exit_code, @io.string
-    business = File.read(File.join(@specs, "specs", "SR-700-add-an-export-button", "analysis", "business.md"))
+    business = read_package("analysis/business.md")
     assert_includes business, "Needs product clarification"
     assert_includes business, "Reporting requirements"
     warnings = @platform.last_specification_generation["warnings"]
@@ -232,6 +262,10 @@ class SpecificationPreflightTest < Minitest::Test
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, exit_code, @io.string
     assert_equal before, snapshot(@specs), "preflight must not create or modify any output file"
+    # MAPIAI-62 — and it must not leave a Runner-owned workspace behind either. The workspace is
+    # created as preflight's LAST step, so every refusal above happens before one exists.
+    assert_empty SpecificationWorkspace.isolated_workspaces(@temp),
+                 "a refusal must not create an isolated package workspace"
     generation = @platform.last_specification_generation
     refute_nil generation, "the refusal must be reported to Platform\n#{@io.string}"
     assert_equal "refused", generation["outcome"]
@@ -242,10 +276,33 @@ class SpecificationPreflightTest < Minitest::Test
     assert_empty @platform.requests_to("/api/runner/reports")
   end
 
-  def snapshot(root)
-    Dir.glob("#{root}/**/*", File::FNM_DOTMATCH).select { |path| File.file?(path) }.sort.to_h do |path|
-      [ path.delete_prefix("#{root}/"), Digest::SHA256.hexdigest(File.binread(path)) ]
-    end
+  # review-001 F1 — refuse, write nothing into EITHER checkout, and leave both byte-identical
+  # at the file level and at the git level.
+  def assert_disjoint_state_root_refusal(state_root)
+    start_platform(spec_creation_payload_for(issue_key: ISSUE))
+    files = { specs: snapshot(@specs), source: snapshot(@source) }
+    # Only the seed is a git checkout in this fixture; the source is a plain directory, so it is
+    # compared at the file level alone.
+    git = SpecificationWorkspace.git_state(@specs)
+
+    exit_code = run_cli(config: build_config, state_root: state_root)
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, exit_code, @io.string
+    generation = @platform.last_specification_generation
+    assert_equal "package_workspace_unavailable", generation["failure_class"], @io.string
+    assert generation["zero_output_files_written"]
+    assert_empty Dir.glob("#{state_root}/**/swp_*", File::FNM_DOTMATCH),
+                 "a generation must never create an isolated workspace inside an operator checkout"
+    assert_equal files[:specs], snapshot(@specs)
+    assert_equal files[:source], snapshot(@source)
+    assert_equal git, SpecificationWorkspace.git_state(@specs)
+  end
+
+  def snapshot(root) = SpecificationWorkspace.checkout_snapshot(root)
+
+  def read_package(name)
+    File.read(File.join(SpecificationWorkspace.isolated_worktree(@temp),
+                        "specs/SR-700-add-an-export-button", name))
   end
 
   def rebuild_source(graph:)
@@ -289,8 +346,9 @@ class SpecificationPreflightTest < Minitest::Test
     SpecrelayRunner::Config.load(path)
   end
 
-  def run_cli(config:)
-    SpecrelayRunner::CLI.run(%W[claim-once --config #{config.source_path}], out: @io, err: @io,
-                             env: { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN, "PATH" => ENV["PATH"] })
+  def run_cli(config:, state_root: @temp)
+    env = { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN, "PATH" => ENV["PATH"] }
+          .merge(SpecificationWorkspace.lane_env(state_root))
+    SpecrelayRunner::CLI.run(%W[claim-once --config #{config.source_path}], out: @io, err: @io, env: env)
   end
 end

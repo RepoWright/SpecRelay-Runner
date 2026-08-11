@@ -31,14 +31,80 @@ class SpecificationGenerationTest < Minitest::Test
     assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
 
     %w[spec.md analysis/business.md analysis/technical.md generation-manifest.json].each do |name|
-      assert File.file?(File.join(@specs, PACKAGE, name)), "expected #{PACKAGE}/#{name}\n#{@io.string}"
+      assert File.file?(File.join(worktree, PACKAGE, name)), "expected #{PACKAGE}/#{name}\n#{@io.string}"
     end
   end
 
   def test_the_folder_name_is_derived_from_the_issue_key_and_a_sanitized_summary
     run_cli
 
-    assert_equal [ "SR-700-add-an-export-button" ], Dir.children(File.join(@specs, "specs"))
+    assert_equal [ "SR-700-add-an-export-button" ], Dir.children(File.join(worktree, "specs"))
+  end
+
+  # ------------------------------------------------------- MAPIAI-62 criterion 1 (S01)
+
+  # The load-bearing assertion of this ticket. The package exists, and it exists ONLY in the
+  # Runner-owned worktree; the operator's specification checkout is byte-identical to what it
+  # was before the run.
+  def test_the_package_is_written_only_into_the_runner_owned_isolated_worktree
+    before = SpecificationWorkspace.checkout_snapshot(@specs)
+    assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
+
+    assert File.file?(File.join(worktree, PACKAGE, "spec.md")), @io.string
+    refute File.exist?(File.join(@specs, PACKAGE)), "nothing may be written into the operator checkout"
+    assert_equal before, SpecificationWorkspace.checkout_snapshot(@specs)
+    refute_includes worktree, @specs
+  end
+
+  # S03 — the operator's dirty working tree is invisible to generation and survives it.
+  def test_staged_modified_and_untracked_operator_files_are_untouched
+    File.write(File.join(@specs, "README.md"), "# edited by the operator\n")
+    File.write(File.join(@specs, "untracked.md"), "operator scratch\n")
+    File.write(File.join(@specs, "staged.md"), "staged work\n")
+    SpecificationWorkspace.git!(@specs, "add", "staged.md")
+    before = SpecificationWorkspace.checkout_snapshot(@specs)
+    status_before = SpecificationWorkspace.git!(@specs, "status", "--porcelain")
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
+
+    assert_equal before, SpecificationWorkspace.checkout_snapshot(@specs)
+    assert_equal status_before, SpecificationWorkspace.git!(@specs, "status", "--porcelain")
+  end
+
+  # The one thing this design does write near the seed, asserted directly rather than hidden
+  # behind the snapshot's exclusion: git's own linked-worktree bookkeeping, and nothing else.
+  def test_the_seed_git_directory_gains_only_worktree_bookkeeping
+    before = Dir.children(File.join(@specs, ".git")).sort
+    head_before = SpecificationWorkspace.git!(@specs, "rev-parse", "HEAD")
+    run_cli
+
+    assert_equal (before + [ "worktrees" ]).uniq.sort, Dir.children(File.join(@specs, ".git")).sort
+    assert_equal head_before, SpecificationWorkspace.git!(@specs, "rev-parse", "HEAD")
+  end
+
+  # The worktree really is one, detached, and starts from the seed's own commit — so publication
+  # can prove identity against a recorded base rather than trusting a directory.
+  def test_the_isolated_workspace_is_a_detached_worktree_at_the_recorded_base
+    run_cli
+    metadata = SpecificationWorkspace.isolated_metadata(SpecificationWorkspace.latest_isolated_workspace(@temp))
+
+    assert_equal SpecificationWorkspace.git!(@specs, "rev-parse", "HEAD").strip, metadata["base_commit"]
+    assert_equal SpecificationWorkspace.git!(worktree, "rev-parse", "HEAD").strip, metadata["base_commit"]
+    assert_equal "true", SpecificationWorkspace.git!(worktree, "rev-parse", "--is-inside-work-tree").strip
+    assert_equal "ready", metadata["state"]
+    assert_equal "run_spec123", metadata["run_id"]
+  end
+
+  # The opaque id, and only the opaque id, crosses to Platform (design 2 / S32).
+  def test_the_reported_workspace_identity_is_opaque_and_carries_no_local_path
+    run_cli
+    reported = @platform.last_specification_generation.fetch("package_workspace")
+
+    assert_match(/\Aswp_[0-9a-f]{32}\z/, reported["id"])
+    assert_equal 7, reported["retention_days"]
+    refute_empty reported["expires_at"]
+    refute_includes @platform.last_specification_generation.to_json, @temp
+    refute_includes @platform.last_specification_generation.to_json, Dir.home
   end
 
   # ------------------------------------------------------------------ criterion 2
@@ -237,7 +303,7 @@ class SpecificationGenerationTest < Minitest::Test
     reported.each do |file|
       next if file["path"] == "generation-manifest.json"
 
-      on_disk = Digest::SHA256.hexdigest(File.binread(File.join(@specs, PACKAGE, file["path"])))
+      on_disk = Digest::SHA256.hexdigest(File.binread(File.join(worktree, PACKAGE, file["path"])))
       assert_equal on_disk, file["sha256"], file["path"]
     end
     assert generation["tool_evidence"].any? { |tool| tool["name"] == "graphify" }
@@ -282,10 +348,16 @@ class SpecificationGenerationTest < Minitest::Test
     assert_empty @platform.requests_to("/api/runner/reports")
     assert_empty @platform.requests_to("/api/runner/events")
 
-    # The disk: the specification checkout gained a package and nothing else. No git
-    # repository was initialized, no branch created, no commit made.
-    refute File.exist?(File.join(@specs, ".git")), "the runner must not create a git repository"
-    assert_equal %w[README.md specs].sort, Dir.children(@specs).sort
+    # The disk: the isolated worktree gained a package and nothing else. No branch was created
+    # and no commit was made anywhere.
+    assert_equal %w[specs], Dir.children(worktree).reject { |name| name == ".git" }
+    # The worktree is DETACHED and the repository's branch list is exactly the seed's own. A new
+    # branch here would be a branch in the operator's repository, which generation never creates.
+    assert_equal [ "main" ],
+                 SpecificationWorkspace.git!(worktree, "for-each-ref", "--format=%(refname:short)",
+                                             "refs/heads").split
+    refute SpecificationWorkspace.git(worktree, "symbolic-ref", "-q", "HEAD").last.success?,
+           "the isolated worktree must be detached, so HEAD names no branch"
     # MVP-0028 remediation, defect 4 — the manifest carries no publication claim at all. It is a
     # durable package file, committed into the specification repository by a later publication
     # run, so a snapshot claim written here ("no branch, commit, pull request...") would read as
@@ -295,74 +367,38 @@ class SpecificationGenerationTest < Minitest::Test
   end
 
   def test_the_source_checkout_is_not_modified
-    before = checkout_snapshot(@source)
+    before = SpecificationWorkspace.checkout_snapshot(@source)
     run_cli
 
-    assert_equal before, checkout_snapshot(@source)
+    assert_equal before, SpecificationWorkspace.checkout_snapshot(@source)
   end
 
-  # ------------------------------------------------------------------ criterion 12
+  # ------------------------------------------------- MAPIAI-62 criterion 12 / S21
 
-  def test_a_second_generation_atomically_replaces_the_package_and_records_the_replacement
+  # Generating again does not replace anything: it creates a SECOND isolated workspace with its
+  # own opaque id, and the first one is left exactly as it was. That is what makes Platform's
+  # single stored id — rather than a directory the runner overwrites — the thing that decides
+  # which package is current.
+  def test_a_second_generation_creates_a_new_workspace_and_leaves_the_first_intact
     run_cli
-    marker = File.join(@specs, PACKAGE, "stale-leftover.md")
-    File.write(marker, "left by a previous generation")
-
-    @platform.stop
-    @platform = FakePlatform.new(claim_payload: spec_creation_payload_for(issue_key: ISSUE)).start
-    @config = build_config
-    @io = StringIO.new
-    assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
-
-    refute File.exist?(marker), "replacement must not merge with the previous package"
-    manifest = JSON.parse(read_package("generation-manifest.json"))
-    assert manifest["replaced_existing_package"], "the manifest must record the replacement"
-    assert @platform.last_specification_generation.dig("package", "replaced_existing_package")
-    # No staging or set-aside directory survives.
-    assert_equal [ "SR-700-add-an-export-button" ], Dir.children(File.join(@specs, "specs"))
-  end
-
-  def test_the_refuse_policy_refuses_instead_of_replacing
-    run_cli
-    original = read_package("spec.md")
-
-    @platform.stop
-    @platform = FakePlatform.new(claim_payload: spec_creation_payload_for(issue_key: ISSUE)).start
-    @config = build_config
-    @io = StringIO.new
-    exit_code = run_cli(env_extra: { "SPECRELAY_RUNNER_SPEC_ON_EXISTING_PACKAGE" => "refuse" })
-
-    assert_equal SpecrelayRunner::CLI::RUN_FAILED, exit_code, @io.string
-    assert_equal "existing_package_present", @platform.last_specification_generation["failure_class"]
-    assert_equal original, read_package("spec.md"), "the existing package must be untouched"
-  end
-
-  # CR-001 must-fix 3 AC 1. Deleting the set-aside copy is housekeeping AFTER a completed
-  # replacement. Round 001 ran it inside the rename's rescue window, so a failure there tore
-  # down a generation that had already succeeded and reported it as a failure that wrote
-  # nothing — with the destination fully replaced.
-  def test_a_failure_to_delete_the_replaced_package_is_a_warning_on_a_successful_generation
-    run_cli
+    first = SpecificationWorkspace.sole_isolated_workspace(@temp)
+    first_spec = File.read(File.join(first, "worktree", PACKAGE, "spec.md"))
     restart_platform
 
-    exit_code = with_unremovable_replaced_package { run_cli }
+    assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
 
-    assert_equal SpecrelayRunner::CLI::SUCCESS, exit_code, @io.string
-    generation = @platform.last_specification_generation
-    assert_equal "generated", generation["outcome"]
-    assert generation["warnings"].any? { |warning| warning.include?("could not be removed") },
-           generation["warnings"].inspect
-    assert generation.dig("package", "replaced_existing_package")
-    # The new package really is at the final path, which is what makes "generated" the honest
-    # outcome rather than a downgrade of a failure.
-    assert_includes read_package("spec.md"), ISSUE
-    assert Dir.children(File.join(@specs, "specs")).any? { |name| name.start_with?(".specrelay-replaced-") },
-           "the leftover the warning names must actually be there"
+    workspaces = SpecificationWorkspace.isolated_workspaces(@temp)
+    assert_equal 2, workspaces.length, workspaces.inspect
+    assert_equal 1, (workspaces - [ first ]).length
+    assert_equal first_spec, File.read(File.join(first, "worktree", PACKAGE, "spec.md")),
+                 "the previous workspace must be left intact, merely stale"
   end
 
-  # AC 3: a failure AFTER the rename reports zero_output_files_written FALSE and names the
-  # package, because the operator's next move is to go and look at it.
-  def test_a_failure_after_the_rename_reports_that_a_package_was_written
+  # S07 — a failure AFTER the rename reports zero_output_files_written FALSE, names the package,
+  # and RETAINS the workspace so the partial work is inspectable. The operator checkout is
+  # unchanged on this path too.
+  def test_a_failure_after_the_rename_retains_an_inspectable_workspace
+    before = SpecificationWorkspace.checkout_snapshot(@specs)
     exit_code = with_unreadable_final_manifest { run_cli }
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, exit_code, @io.string
@@ -370,7 +406,10 @@ class SpecificationGenerationTest < Minitest::Test
     assert_equal "failed", generation["outcome"]
     refute generation["zero_output_files_written"], "the package IS on disk; the report must say so"
     assert_includes generation["message"], PACKAGE
-    assert File.file?(File.join(@specs, PACKAGE, "spec.md")), "the package landed before the failure"
+    assert File.file?(File.join(worktree, PACKAGE, "spec.md")), "the package landed before the failure"
+    # The workspace is reported so the run page can say which machine holds it and until when.
+    assert_match(/\Aswp_/, generation.dig("package_workspace", "id").to_s)
+    assert_equal before, SpecificationWorkspace.checkout_snapshot(@specs)
   end
 
   # ------------------------------------------------------------------ criterion 10
@@ -387,7 +426,10 @@ class SpecificationGenerationTest < Minitest::Test
 
   # ------------------------------------------------------------------ helpers
 
-  def read_package(name) = File.read(File.join(@specs, PACKAGE, name))
+  # The package lives in the Runner-owned worktree, found through the store rather than at a
+  # path a test could predict — the workspace id is opaque and random by design.
+  def worktree = SpecificationWorkspace.isolated_worktree(@temp)
+  def read_package(name) = File.read(File.join(worktree, PACKAGE, name))
 
   # Leaves the directory itself in place — the point is a checkout that RESOLVES and contains
   # nothing readable, which is a different condition from a missing workspace root.
@@ -396,14 +438,6 @@ class SpecificationGenerationTest < Minitest::Test
       next if path.end_with?("/.", "/..")
 
       FileUtils.remove_entry(path)
-    end
-  end
-
-  # Every file under a checkout with its digest, so "nothing was modified" is asserted over
-  # content rather than over mtimes, which a copy would also preserve.
-  def checkout_snapshot(root)
-    Dir.glob("#{root}/**/*", File::FNM_DOTMATCH).select { |path| File.file?(path) }.sort.to_h do |path|
-      [ path.delete_prefix("#{root}/"), Digest::SHA256.hexdigest(File.binread(path)) ]
     end
   end
 
@@ -421,33 +455,20 @@ class SpecificationGenerationTest < Minitest::Test
     @io = StringIO.new
   end
 
-  # Fail the post-move deletion of the set-aside package, and ONLY that. Scoped by the
-  # writer's own prefix so the staging cleanup in the same `ensure` still runs — otherwise the
-  # test would prove something about a broken FileUtils rather than about this branch.
+  # Fail the manifest digest, which is taken from the FINAL location after the rename. The only
+  # production failure that genuinely lands after the atomic move, and the reason `call`
+  # converts a stray Errno into a write error that reports the package as present.
+  #
+  # Matched on the package-relative suffix rather than an absolute path: the workspace id is
+  # random, so the final location does not exist until the run under test creates it.
   #
   # `define_singleton_method` + restore rather than a mocking library: this suite has no gems,
   # which is the same reason with_broken_redaction in the preflight test is written this way.
-  def with_unremovable_replaced_package
-    original = FileUtils.method(:remove_entry)
-    FileUtils.define_singleton_method(:remove_entry) do |path, *rest|
-      raise Errno::EACCES, path.to_s if
-        File.basename(path.to_s).start_with?(SpecrelayRunner::Specification::PackageWriter::REPLACED_PREFIX)
-
-      original.call(path, *rest)
-    end
-    yield
-  ensure
-    FileUtils.define_singleton_method(:remove_entry, original)
-  end
-
-  # Fail the manifest digest, which is taken from the FINAL location after the rename. The
-  # only production failure that genuinely lands after the atomic move, and the reason `call`
-  # converts a stray Errno into a write error that reports the package as present.
   def with_unreadable_final_manifest
-    final = File.join(@specs, PACKAGE, "generation-manifest.json")
+    suffix = "#{PACKAGE}/generation-manifest.json"
     original = File.method(:binread)
     File.define_singleton_method(:binread) do |path, *rest|
-      raise Errno::EIO, path.to_s if path.to_s == final
+      raise Errno::EIO, path.to_s if path.to_s.end_with?(suffix)
 
       original.call(path, *rest)
     end
@@ -485,7 +506,8 @@ class SpecificationGenerationTest < Minitest::Test
   end
 
   def run_cli(env_extra: {})
-    env = { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN, "PATH" => ENV["PATH"] }.merge(env_extra)
+    env = { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN, "PATH" => ENV["PATH"] }
+          .merge(SpecificationWorkspace.lane_env(@temp)).merge(env_extra)
     SpecrelayRunner::CLI.run(%W[claim-once --config #{@config.source_path}], out: @io, err: @io, env: env)
   end
 end
