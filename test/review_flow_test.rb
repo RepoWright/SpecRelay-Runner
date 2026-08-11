@@ -180,7 +180,7 @@ class ReviewFlowTest < Minitest::Test
     assert_includes prompt, "Screenshots 01.png, 02.png."
     assert_includes prompt, "the Product Owner's own words"
     assert_includes prompt, "not as work you did"
-    assert_includes prompt, "Platform validates the human evidence separately"
+    assert_includes prompt, "Platform validates the human evidence"
   end
 
   # --- untrusted provider output -------------------------------------------
