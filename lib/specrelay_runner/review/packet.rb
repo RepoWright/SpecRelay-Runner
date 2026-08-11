@@ -75,6 +75,17 @@ module SpecrelayRunner
         - Every field is LENGTH-BOUNDED and an over-long one loses the whole review. Stay
           inside the limits under "Length limits" below: be specific and short, and put the
           detail in the location rather than in prose.
+
+        If a carried answer's option is `human_browser_pass`, the Product Owner ran the browser
+        pass themselves because no reviewer could. Treat their note as evidence to assess, not as
+        work you did:
+        - check that it names the tested URL, the viewports, the result and the screenshot
+          references, and return a finding when it does not;
+        - report `browser_review` false, because you did not run the pass, and do not describe it
+          as your own anywhere in your summary or findings;
+        - you may still ACCEPT a UI change on that basis — Platform validates the human evidence
+          separately, and records it as a fact distinct from yours;
+        - never invent a URL, viewport, result or screenshot the note does not state.
       TEXT
 
       def initialize(assignment)
@@ -167,6 +178,10 @@ module SpecrelayRunner
 
       # Only on a follow-up attempt. It carries the prior FINDINGS and the Product Owner's
       # ANSWER — never the previous reviewer's reasoning (S38).
+      #
+      # The answer is labelled as theirs unconditionally. A reviewer reading an unattributed line
+      # can mistake any carried answer for its own conclusion, and for `human_browser_pass` that
+      # mistake would have it report a human's browser pass as work it did (MAPIAI-71).
       def continuation_section
         continuation = assignment.continuation
         return nil if continuation.nil?
@@ -177,7 +192,7 @@ module SpecrelayRunner
           ## Continuing after a Product Owner answer
           Previous outcome: #{continuation['previous_outcome']}
           Question asked: #{continuation.dig('question', 'prompt')}
-          Answer: #{answer_text(continuation['answer'])}
+          Answer (the Product Owner's own words, not as work you did): #{answer_text(continuation['answer'])}
           Previous findings:
           #{findings.empty? ? '(none)' : findings.join("\n")}
         TEXT
