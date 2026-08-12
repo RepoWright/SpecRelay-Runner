@@ -211,7 +211,8 @@ class RealExecutorFlowTest < Minitest::Test
     assert_equal %w[auth status], JSON.parse(File.read(argv_log))
     assert_match(/preflight_failed/, @io.string)
     assert_match(/Refusing to execute/, @io.string)
-    assert_match(%r{bin/platform runner release #{TASK}}, @io.string)
+    # MVP-0035 replaced the manual-release instruction with the release itself.
+    assert_equal 1, @platform.requests_to("/api/runner/claim_releases").size
   end
 
   # review-001 finding F1, at the flow level. The guard used to compare only

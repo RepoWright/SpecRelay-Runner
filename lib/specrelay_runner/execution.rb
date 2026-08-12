@@ -50,6 +50,9 @@ module SpecrelayRunner
       @log_stream = nil
       @lease_stop_reason = nil
       @package = nil
+      # MVP-0035 — nil for an ordinary first execution, which is every claim that does not
+      # follow a CHANGES_REQUESTED review.
+      @rework = Rework.for(payload)
       @controls = ProtocolControls.new(env: env)
       @emitter = EventEmitter.new(client: client, run_id: @run.fetch("id"), attempt_id: @claim)
     end
@@ -116,15 +119,42 @@ module SpecrelayRunner
     def preflight_failure(error)
       key = workspace.fetch("workspace_key")
       env_var = "SPECRELAY_RUNNER_WORKSPACE_ROOT_#{key.to_s.upcase.gsub(/[^A-Z0-9]+/, '_')}"
-      log("Pre-execution failure for #{run['task_id']}: #{Redaction.redact(error.message)}")
-      log("The run is still CLAIMED on Platform. To recover:")
-      log("  1) Map this workspace to its local checkout, e.g.:")
-      log("       export #{env_var}=/absolute/path/to/#{key}")
-      log("  2) Release the stuck claim on the Platform host so the run is claimable again:")
-      log("       bin/platform runner release #{run['task_id']}")
-      log("  3) Re-run: specrelay-runner claim-once --config <path>")
+      reason = Redaction.redact(error.message)
+      log("Pre-execution failure for #{run['task_id']}: #{reason}")
+      release_claim(reason)
+      log("To recover, map this workspace to its local checkout, e.g.:")
+      log("  export #{env_var}=/absolute/path/to/#{key}")
+      log("then re-run: specrelay-runner claim-once --config <path>")
       Result.new(outcome: :preflight_failed,
                  message: "Runner outcome: preflight_failed (local workspace not ready; claim not executed).")
+    end
+
+    # MVP-0035 — the reviewed head could not be established, so this machine must not implement
+    # anything. No report and no publication: nothing about the outcome is known, and a failed
+    # report would mark the run terminal when the correct answer is "another attempt can still
+    # run this once the input is readable".
+    def rework_refused(reason)
+      safe = Redaction.redact(reason.to_s)
+      log("Refusing the change-request round for #{run['task_id']}: #{safe}")
+      log("Nothing ran: the executor was not started, nothing was pushed, and Jira was not touched.")
+      release_claim(safe)
+      Result.new(outcome: :preflight_failed,
+                 message: "Runner outcome: preflight_failed (#{safe}); nothing executed.")
+    end
+
+    # Give the machine's capacity back and leave the run claimable, on EVERY pre-provider
+    # refusal. Before MVP-0035 each of these told the operator to run `bin/platform runner
+    # release` by hand, which is the stuck-claim class QUALITY-0002 already paid for once —
+    # Platform owns the transition either way, so the runner asks for it rather than printing
+    # an instruction and leaving the claim held.
+    #
+    # Best effort by design: a Platform that cannot be reached will expire the lease on its own,
+    # and raising here would replace a precise local reason with a transport error.
+    def release_claim(reason)
+      client.release_claim(claim: claim, reason: reason)
+      log("Released this claim on Platform; the run is claimable again.")
+    rescue PlatformClient::Error => e
+      log("Could not release the claim (#{Redaction.redact(e.message)}); its lease will expire on Platform.")
     end
 
     # Fail closed before anything happens: no worktree, no executor launch, no
@@ -142,14 +172,13 @@ module SpecrelayRunner
     end
 
     def executor_mismatch_failure(error)
-      log("Refusing to execute #{run['task_id']}: #{Redaction.redact(error.message)}")
+      reason = Redaction.redact(error.message)
+      log("Refusing to execute #{run['task_id']}: #{reason}")
       log("Nothing ran: no worktree was created, no report was uploaded, and Jira was not advanced.")
-      log("The run is still CLAIMED on Platform. To recover:")
-      log("  1) Align the executor policy — this runner's `executor:` override, or the")
-      log("     workspace definition's executor_config on the Platform host.")
-      log("  2) Release the claim on the Platform host so the run is claimable again:")
-      log("       bin/platform runner release #{run['task_id']}")
-      log("  3) Re-run: specrelay-runner claim-once --config <path>")
+      release_claim(reason)
+      log("To recover, align the executor policy — this runner's `executor:` override, or the")
+      log("workspace definition's executor_config on the Platform host — then re-run:")
+      log("  specrelay-runner claim-once --config <path>")
       Result.new(outcome: :preflight_failed,
                  message: "Runner outcome: preflight_failed (claimed executor is not the selected profile; nothing executed).")
     end
@@ -159,6 +188,16 @@ module SpecrelayRunner
 
       emit("workspace.preparing", "Preparing worktree for #{run['task_id']}", phase: "workspace")
       worktree = create_worktree(root)
+
+      # MVP-0035 — a rework round continues the reviewed pull request, so the worktree must hold
+      # that exact commit before anything else looks at it. A refusal here stops before the
+      # provider, before the package, and before any external write.
+      if @rework
+        continuation = @rework.materialize(worktree_path: worktree.path)
+        return rework_refused(continuation.reason) unless continuation.ok?
+
+        worktree = Workspace::Info.new(path: worktree.path, base_commit: continuation.head_commit || worktree.base_commit)
+      end
 
       # MVP-0034 contract 4 — the pinned package is verified and written read-only BEFORE the
       # provider starts. A document whose bytes do not reproduce the digest Platform pinned ends
@@ -461,7 +500,16 @@ module SpecrelayRunner
         - Do NOT edit any `spec.md`/`spec_persian.md`, push, open a PR, or write to Platform.
         - Make the change idempotently.
       MD
-      "#{preamble}\n\n---\n\n#{payload.dig('specification_package', 'handoff_prompt')}"
+      "#{preamble}\n\n---\n\n#{payload.dig('specification_package', 'handoff_prompt')}#{rework_prompt}"
+    end
+
+    # MVP-0035 — the change request, appended ONCE after the unchanged approved package. The
+    # package leads because it is still the authority; the findings follow because they are what
+    # this round is for.
+    def rework_prompt
+      return "" if @rework.nil?
+
+      @rework.prompt_section(payload.dig("report_contract", "round_label").to_s)
     end
 
     # Where the verified package actually IS on this machine. The handoff prompt tells the
