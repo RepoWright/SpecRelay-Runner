@@ -11,8 +11,9 @@ module SpecrelayRunner
   #   2. the executor must be told which head it is on and which findings it is correcting.
   #
   # It fails CLOSED. A remote that cannot be read, a branch that moved or is gone, an origin that
-  # is a different repository, or a worktree with uncommitted work all refuse — and refusing is
-  # the right answer, because SpecRelay must never guess which version of the code to fix.
+  # is a different repository, a claim that would publish somewhere other than the reviewed
+  # branch, or a worktree with uncommitted work all refuse — and refusing is the right answer,
+  # because SpecRelay must never guess which version of the code to fix, or where to put the fix.
   #
   # The read-only git queries are {Review::Checkout::Git}, the seam the REVIEWER already proves
   # its checkout with. "What does the remote say this branch points at?" is one question with one
@@ -22,7 +23,8 @@ module SpecrelayRunner
   # It holds no publication logic. The commit, the no-force push to the assigned branch and the
   # pull-request reuse decision are {Publication}'s and are unchanged by this MVP: putting the
   # worktree on the reviewed head is what makes the new commit a descendant, which is what makes
-  # that existing path do the right thing.
+  # that existing path do the right thing. What this DOES check is that the branch Publication
+  # was assigned is the reviewed one, because those two facts reach the runner separately.
   class Rework
     Result = Struct.new(:ok, :reason, :head_commit, keyword_init: true) do
       def ok? = ok
@@ -113,31 +115,50 @@ module SpecrelayRunner
       return refuse("no git repository at the worktree for '#{key}'") unless git.repository?(worktree_path)
       return refuse("the worktree for '#{key}' has uncommitted changes; preserve or release it before retrying") unless clean?(worktree_path)
 
-      identity_refusal(repository, worktree_path, git) ||
+      target_refusal(repository, worktree_path, git) ||
         remote_refusal(repository, worktree_path, head, git) ||
         fetch_head(repository, worktree_path, head, git)
     end
 
-    # WHICH repository, before which commit. A commit id is portable — a fork or a mirror can
-    # carry the reviewed branch at the byte-identical reviewed sha — so the head check below
-    # cannot tell a repointed origin from the real one, and resetting onto it would publish the
-    # correction into somebody else's repository (CR-001 F2).
+    # WHICH repository and WHICH branch, before which commit.
     #
-    # The authority is the `clone_url` the assignment already carries for this repository, and
-    # the comparison is {Review::Checkout.identity}, the normalizer the reviewer's own checkout
-    # proof uses — so an https remote and its scp-like ssh spelling are one repository here too.
-    # An assignment that names no url for this key leaves nothing to prove identity against, and
-    # that is a refusal rather than a pass.
-    def identity_refusal(repository, worktree_path, git)
+    # Two facts have to agree before anything is checked out. The assignment entry this claim
+    # will PUBLISH to must be the repository and branch the change request pinned — Platform
+    # serializes both from the review's own pin, and a claim where they still differ is one
+    # whose correction would land on a branch nobody reviewed (CR-002). And the worktree's
+    # `origin` must be that repository: a commit id is portable, so a fork or mirror can carry
+    # the reviewed branch at the byte-identical reviewed sha, and the head check below cannot
+    # tell a repointed origin from the real one (CR-001 F2).
+    #
+    # The comparison is {Review::Checkout.identity}, the normalizer the reviewer's own checkout
+    # proof uses, so an https remote and its scp-like ssh spelling are one repository here too.
+    # An assignment that names no entry for this key leaves nothing to prove identity against,
+    # and that is a refusal rather than a pass.
+    def target_refusal(repository, worktree_path, git)
       key = repository["repository_key"].to_s
-      expected = Review::Checkout.identity(assignment_clone_url(key))
-      return nil if !expected.empty? && expected == Review::Checkout.identity(git.remote_url(worktree_path))
+      published = assignment_repository(key)
+      expected = Review::Checkout.identity(published&.fetch("clone_url", nil))
+      return refuse("this claim publishes no repository named '#{key}', which is the reviewed one") if expected.empty?
+
+      branch_refusal(key, published, repository) ||
+        remote_identity_refusal(key, expected, worktree_path, git)
+    end
+
+    def branch_refusal(key, published, repository)
+      return nil if published["branch"].to_s == repository["branch"].to_s
+
+      refuse("this claim publishes '#{key}' to '#{published['branch']}', " \
+             "not to the reviewed branch '#{repository['branch']}'")
+    end
+
+    def remote_identity_refusal(key, expected, worktree_path, git)
+      return nil if expected == Review::Checkout.identity(git.remote_url(worktree_path))
 
       refuse("the worktree for '#{key}' points at a different remote than the reviewed repository")
     end
 
-    def assignment_clone_url(key)
-      assignment_repositories.find { |repository| repository["id"].to_s == key }&.fetch("clone_url", nil)
+    def assignment_repository(key)
+      assignment_repositories.find { |repository| repository["id"].to_s == key }
     end
 
     # FRESHNESS, once identity is settled: the pinned commit must still BE the head of the

@@ -49,9 +49,9 @@ class ReworkFlowTest < Minitest::Test
     git(clone, "rev-parse", "HEAD").strip
   end
 
-  def start(rework:, executor_command: nil, seed: nil, gh_mode: "ok")
+  def start(rework:, executor_command: nil, seed: nil, gh_mode: "ok", publication_branch: BRANCH)
     payload = claim_payload_for(task_id: TASK, executor_command: executor_command || recording_executor,
-                                publication: { branch: BRANCH }, rework: rework)
+                                publication: { branch: publication_branch }, rework: rework)
     @platform = FakePlatform.new(claim_payload: payload).start
     @gh_dir, @gh_log, = FakeGithub.gh_bin(mode: gh_mode, pull_request_url: PR_URL, bare: @bare,
                                           seed: seed || [ { "url" => PR_URL, "state" => "OPEN",
@@ -200,6 +200,21 @@ class ReworkFlowTest < Minitest::Test
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, code, output
     assert_refused(output, "different remote")
     assert_equal @reviewed_head, git(mirror, "rev-parse", "refs/heads/#{BRANCH}").strip
+    assert_equal 0, FakeGithub.pr_creates(@gh_log)
+  end
+
+  # CR-002. The change request pins the branch the reviewed pull request is on; the top-level
+  # assignment names the branch publication will actually push to. Verifying one and pushing the
+  # other would put the correction on a branch nobody reviewed, on a pull request nobody is
+  # waiting for — and the reviewed branch would keep showing the code that was rejected.
+  def test_a_publication_branch_other_than_the_reviewed_branch_refuses_before_the_executor
+    start(rework: { "repositories" => [ reviewed_repository ] }, publication_branch: "specrelay/redirected")
+    code, output = run_cli
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, code, output
+    assert_refused(output, "not to the reviewed branch")
+    assert_equal @reviewed_head, remote_head, "the reviewed branch must be exactly as the review left it"
+    refute_includes FakeGithub.remote_branches(@bare).keys, "specrelay/redirected"
     assert_equal 0, FakeGithub.pr_creates(@gh_log)
   end
 
