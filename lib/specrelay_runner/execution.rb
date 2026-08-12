@@ -119,12 +119,13 @@ module SpecrelayRunner
     def preflight_failure(error)
       key = workspace.fetch("workspace_key")
       env_var = "SPECRELAY_RUNNER_WORKSPACE_ROOT_#{key.to_s.upcase.gsub(/[^A-Z0-9]+/, '_')}"
-      reason = Redaction.redact(error.message)
-      log("Pre-execution failure for #{run['task_id']}: #{reason}")
-      release_claim(reason)
-      log("To recover, map this workspace to its local checkout, e.g.:")
-      log("  export #{env_var}=/absolute/path/to/#{key}")
-      log("then re-run: specrelay-runner claim-once --config <path>")
+      log("Pre-execution failure for #{run['task_id']}: #{Redaction.redact(error.message)}")
+      log("The run is still CLAIMED on Platform. To recover:")
+      log("  1) Map this workspace to its local checkout, e.g.:")
+      log("       export #{env_var}=/absolute/path/to/#{key}")
+      log("  2) Release the stuck claim on the Platform host so the run is claimable again:")
+      log("       bin/platform runner release #{run['task_id']}")
+      log("  3) Re-run: specrelay-runner claim-once --config <path>")
       Result.new(outcome: :preflight_failed,
                  message: "Runner outcome: preflight_failed (local workspace not ready; claim not executed).")
     end
@@ -142,11 +143,11 @@ module SpecrelayRunner
                  message: "Runner outcome: preflight_failed (#{safe}); nothing executed.")
     end
 
-    # Give the machine's capacity back and leave the run claimable, on EVERY pre-provider
-    # refusal. Before MVP-0035 each of these told the operator to run `bin/platform runner
-    # release` by hand, which is the stuck-claim class QUALITY-0002 already paid for once —
-    # Platform owns the transition either way, so the runner asks for it rather than printing
-    # an instruction and leaving the claim held.
+    # Give the machine's capacity back and leave the run claimable. ONLY a refused change-request
+    # target does this. The other pre-provider refusals keep their manual recovery step: each is
+    # a misconfiguration of this machine that the operator has to correct anyway, and releasing
+    # under the default `continue` loop policy would let the same runner reclaim and re-refuse
+    # the same run in a loop instead of holding one actionable failure (CR-001 F3).
     #
     # Best effort by design: a Platform that cannot be reached will expire the lease on its own,
     # and raising here would replace a precise local reason with a transport error.
@@ -172,13 +173,14 @@ module SpecrelayRunner
     end
 
     def executor_mismatch_failure(error)
-      reason = Redaction.redact(error.message)
-      log("Refusing to execute #{run['task_id']}: #{reason}")
+      log("Refusing to execute #{run['task_id']}: #{Redaction.redact(error.message)}")
       log("Nothing ran: no worktree was created, no report was uploaded, and Jira was not advanced.")
-      release_claim(reason)
-      log("To recover, align the executor policy — this runner's `executor:` override, or the")
-      log("workspace definition's executor_config on the Platform host — then re-run:")
-      log("  specrelay-runner claim-once --config <path>")
+      log("The run is still CLAIMED on Platform. To recover:")
+      log("  1) Align the executor policy — this runner's `executor:` override, or the")
+      log("     workspace definition's executor_config on the Platform host.")
+      log("  2) Release the claim on the Platform host so the run is claimable again:")
+      log("       bin/platform runner release #{run['task_id']}")
+      log("  3) Re-run: specrelay-runner claim-once --config <path>")
       Result.new(outcome: :preflight_failed,
                  message: "Runner outcome: preflight_failed (claimed executor is not the selected profile; nothing executed).")
     end

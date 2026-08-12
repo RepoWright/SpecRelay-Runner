@@ -13,10 +13,15 @@ class ReworkFlowTest < Minitest::Test
   TASK = "MAPIAI-902"
   BRANCH = "specrelay/#{TASK}"
   PR_URL = "https://github.com/SpecRelay/tiny-demo-workspace/pull/9"
+  # The ssh form of the https `clone_url` the assignment carries, so the identity check is
+  # proven against the two remote spellings of one repository rather than one literal string.
+  ORIGIN_URL = "git@github.com:SpecRelay/tiny-demo-workspace.git"
 
   def setup
     @root, = DemoWorkspace.build
-    @bare = FakeGithub.add_remote(@root)
+    # Addressed by the url the assignment carries, so the reviewed-repository identity these
+    # tests turn on is the real one rather than a local path no `clone_url` could name.
+    @bare = FakeGithub.add_remote(@root, url: ORIGIN_URL)
     git(@root, "push", "-q", "origin", "HEAD:refs/heads/main")
     @reviewed_head = publish_reviewed_round
   end
@@ -181,46 +186,50 @@ class ReworkFlowTest < Minitest::Test
     assert_refused(output, "could not read the remote")
   end
 
-  # A repointed origin is refused by the head check rather than by a url comparison, and that is
-  # the stronger guarantee: this foreign remote carries the reviewed BRANCH NAME at a different
-  # commit, which a url check would have to be written to catch and a sha check cannot miss.
-  def test_a_foreign_origin_carrying_the_same_branch_name_refuses_rather_than_resetting_onto_it
-    foreign = foreign_remote_with_branch
-    git(@root, "remote", "set-url", "origin", foreign)
-    start(rework: { "repositories" => [ reviewed_repository ] }, executor_command: recording_executor)
+  # CR-001 F2. A commit id is portable, so branch-plus-sha is not repository identity: this
+  # mirror is a real clone, and its reviewed branch is at the byte-identical reviewed commit.
+  # Only the remote it points at differs, and the assignment already states which remote that
+  # must be. Resetting onto it would publish the correction into someone else's repository.
+  def test_a_foreign_mirror_at_the_exact_reviewed_commit_refuses_rather_than_publishing_into_it
+    mirror = File.join(@scratch, "mirror.git")
+    system("git", "clone", "-q", "--bare", @bare, mirror, exception: true)
+    git(@root, "remote", "set-url", "origin", mirror)
+    start(rework: { "repositories" => [ reviewed_repository ] })
     code, output = run_cli
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, code, output
-    assert_refused(output, "moved")
-    refute_equal git(foreign, "rev-parse", "refs/heads/#{BRANCH}").strip,
-                 git(worktree_path, "rev-parse", "HEAD").strip
+    assert_refused(output, "different remote")
+    assert_equal @reviewed_head, git(mirror, "rev-parse", "refs/heads/#{BRANCH}").strip
+    assert_equal 0, FakeGithub.pr_creates(@gh_log)
   end
 
-  # Another real repository that happens to use the same publication branch name.
-  def foreign_remote_with_branch
-    bare = File.join(@scratch, "foreign.git")
-    clone = File.join(@scratch, "foreign-clone")
-    system("git", "init", "-q", "--bare", bare, exception: true)
-    system("git", "init", "-q", clone, exception: true)
-    git(clone, "remote", "add", "origin", bare)
-    git(clone, "config", "user.email", "other@example.test")
-    git(clone, "config", "user.name", "Other Project")
-    git(clone, "config", "commit.gpgsign", "false")
-    File.write(File.join(clone, "README.md"), "someone else's repository\n")
-    git(clone, "add", "-A")
-    git(clone, "commit", "-qm", "unrelated")
-    git(clone, "push", "-q", "origin", "HEAD:refs/heads/#{BRANCH}")
-    bare
+  # CR-001 F2. Publication commits and pushes from ONE worktree, so a second reviewed target
+  # names something this runner cannot act on. Reading only the first entry would silently
+  # implement half a change request; the complete set is either usable or refused.
+  def test_more_than_one_reviewed_repository_refuses_before_the_executor
+    start(rework: { "repositories" => [ reviewed_repository,
+                                        reviewed_repository(repository_key: "other-workspace") ] })
+    code, output = run_cli
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, code, output
+    assert_refused(output, "names 2 reviewed repositories")
   end
 
-  def test_a_dirty_worktree_refuses_rather_than_discarding_uncommitted_local_work
+  # Uncommitted local work is never discarded to make room for the reviewed head. The refusal
+  # comes from the shared workspace guard, which inspects a reused worktree before any round
+  # begins — so this is a preflight failure with its manual recovery step, not a rework refusal,
+  # and no claim is released (CR-001 F3). `Rework` repeats the check immediately before its own
+  # `reset --hard`, which is the only destructive git operation in the runner.
+  def test_a_dirty_worktree_refuses_before_the_change_request_round_and_keeps_the_local_edit
     git(@root, "worktree", "add", "-q", "-b", TASK, worktree_path, "HEAD")
     File.write(File.join(worktree_path, "demo-app", "index.html"), "<h1>local edit in progress</h1>\n")
-    start(rework: { "repositories" => [ reviewed_repository ] }, executor_command: recording_executor)
+    start(rework: { "repositories" => [ reviewed_repository ] })
     code, output = run_cli
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, code, output
-    assert_refused(output, "uncommitted changes")
+    assert_includes output, "uncommitted changes"
+    assert_empty @platform.requests_to("/api/runner/reports"), "no report may be uploaded"
+    refute File.exist?(observed_path), "the executor must never have started"
     assert_includes File.read(File.join(worktree_path, "demo-app", "index.html")), "local edit in progress"
   end
 

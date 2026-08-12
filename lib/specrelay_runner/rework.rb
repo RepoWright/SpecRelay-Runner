@@ -28,14 +28,17 @@ module SpecrelayRunner
       def ok? = ok
     end
 
-    # The reviewed target, or nil when this claim is an ordinary first execution.
+    # The reviewed target, or nil when this claim is an ordinary first execution. The
+    # assignment's own repository list comes along because it holds the authoritative
+    # `clone_url`, which the rework block deliberately does not repeat.
     def self.for(payload)
       block = payload["rework"]
-      block.is_a?(Hash) ? new(block) : nil
+      block.is_a?(Hash) ? new(block, Array(payload["repositories"])) : nil
     end
 
-    def initialize(block)
+    def initialize(block, assignment_repositories = [])
       @block = block
+      @assignment_repositories = assignment_repositories
     end
 
     # Put the worktree on the reviewed head, or refuse.
@@ -43,7 +46,10 @@ module SpecrelayRunner
     # With no reviewed repository there is nothing to continue from and the ordinary initial
     # checkout IS the base, so this succeeds without touching git (S06).
     def materialize(worktree_path:, git: Review::Checkout::Git)
-      repository = reviewed_repository
+      targets = Array(block["repositories"])
+      return too_many(targets) if targets.length > 1
+
+      repository = targets.first
       return Result.new(ok: true) if repository.nil?
 
       head = repository["head_commit"].to_s
@@ -67,12 +73,18 @@ module SpecrelayRunner
 
     private
 
-    attr_reader :block
+    attr_reader :block, :assignment_repositories
 
-    # The one repository the implementation lane publishes, as the review pinned it, or nil when
-    # the reviewed execution legitimately changed no files. Platform sends a list because the
-    # shape is per-repository, but publication commits and pushes from ONE worktree, so a second
-    # entry would describe a target this runner has no way to act on.
+    # Publication commits and pushes from ONE worktree, so a second reviewed target names
+    # something this runner cannot act on. Implementing the first and dropping the rest would
+    # answer half a change request and report it as done, so the whole claim is refused instead
+    # (CR-001 F2). Widening this belongs to a specification that adds multi-repository
+    # publication, not to a target reader.
+    def too_many(targets)
+      refuse("this change request names #{targets.length} reviewed repositories; " \
+             "this runner publishes from one worktree and will not implement part of it")
+    end
+
     def reviewed_repository = Array(block["repositories"]).first
 
     def findings = Array(block["findings"])
@@ -101,19 +113,37 @@ module SpecrelayRunner
       return refuse("no git repository at the worktree for '#{key}'") unless git.repository?(worktree_path)
       return refuse("the worktree for '#{key}' has uncommitted changes; preserve or release it before retrying") unless clean?(worktree_path)
 
-      remote_refusal(repository, worktree_path, head, git) || fetch_head(repository, worktree_path, head, git)
+      identity_refusal(repository, worktree_path, git) ||
+        remote_refusal(repository, worktree_path, head, git) ||
+        fetch_head(repository, worktree_path, head, git)
     end
 
-    # The pinned commit must still BE the head of the reviewed branch on the remote. Holding the
-    # object locally would only prove it once existed here; a push moves the branch and leaves
-    # the old object behind forever, so a purely local check would let this round build on code
-    # the pull request no longer shows.
+    # WHICH repository, before which commit. A commit id is portable — a fork or a mirror can
+    # carry the reviewed branch at the byte-identical reviewed sha — so the head check below
+    # cannot tell a repointed origin from the real one, and resetting onto it would publish the
+    # correction into somebody else's repository (CR-001 F2).
     #
-    # This is also the FOREIGN-remote guard, and it is a stronger one than comparing urls: a
-    # repository that is not the reviewed one cannot have the reviewed branch pointing at the
-    # reviewed 40-hex commit. A worktree whose origin was repointed therefore refuses here, with
-    # the branch state it actually observed rather than a url comparison the operator would then
-    # have to interpret.
+    # The authority is the `clone_url` the assignment already carries for this repository, and
+    # the comparison is {Review::Checkout.identity}, the normalizer the reviewer's own checkout
+    # proof uses — so an https remote and its scp-like ssh spelling are one repository here too.
+    # An assignment that names no url for this key leaves nothing to prove identity against, and
+    # that is a refusal rather than a pass.
+    def identity_refusal(repository, worktree_path, git)
+      key = repository["repository_key"].to_s
+      expected = Review::Checkout.identity(assignment_clone_url(key))
+      return nil if !expected.empty? && expected == Review::Checkout.identity(git.remote_url(worktree_path))
+
+      refuse("the worktree for '#{key}' points at a different remote than the reviewed repository")
+    end
+
+    def assignment_clone_url(key)
+      assignment_repositories.find { |repository| repository["id"].to_s == key }&.fetch("clone_url", nil)
+    end
+
+    # FRESHNESS, once identity is settled: the pinned commit must still BE the head of the
+    # reviewed branch on that remote. Holding the object locally would only prove it once existed
+    # here; a push moves the branch and leaves the old object behind forever, so a purely local
+    # check would let this round build on code the pull request no longer shows.
     def remote_refusal(repository, worktree_path, head, git)
       key = repository["repository_key"]
       observed = git.remote_head(worktree_path, repository["branch"].to_s)
