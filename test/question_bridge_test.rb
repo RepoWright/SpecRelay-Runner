@@ -62,16 +62,16 @@ class QuestionBridgeTest < Minitest::Test
     SpecrelayRunner::Config.load(path)
   end
 
-  # One real claim-once against a provider that abandons its own question.
-  def run_abandoning_provider(provider_exit:)
+  # Replace the running fake with one whose provider ASKS and then abandons its own question.
+  # `ask_seconds` places the provider's exit before or after the parent's next answer poll.
+  def use_abandoning_provider(provider_exit:, ask_seconds: nil)
     @platform.stop
     executor = DemoWorkspace.write_abandoning_executor(@root)
     @platform = FakePlatform.new(claim_payload: payload(executor: executor).tap do |built|
       built["executor"]["env"]["FAKE_QUESTION_EXIT_CODE"] = provider_exit
+      built["executor"]["env"]["FAKE_QUESTION_ASK_SECONDS"] = ask_seconds if ask_seconds
     end).start
     @config = build_config
-    @io = StringIO.new
-    run_cli(@io)
   end
 
   # The loop, driven over REAL claim-once executions: each iteration runs the whole CLI path, so
@@ -115,6 +115,95 @@ class QuestionBridgeTest < Minitest::Test
     assert_includes io.string, "[question-executor] answered #{ANSWERS.to_json}"
     assert_includes io.string, "[question-executor] applied edit"
     assert_equal 1, @platform.requests_to("/api/runner/reports").size
+    # CR-002 F1 — Platform learns that the answers ARRIVED only from the runner that wrote them
+    # into the live session's bridge, and learns it exactly once.
+    assert_equal 1, @platform.delivery_acknowledgements.size
+    assert_equal "ANSWERED", @platform.question_state
+  end
+
+  # CR-002 F1 — the Product Owner's answer is durable, but the provider exits before the next
+  # poll can hand it over. Nothing may report that the session received it.
+  def test_an_answer_the_lost_provider_never_received_is_never_acknowledged
+    use_abandoning_provider(provider_exit: "0", ask_seconds: "0.5")
+    @platform.answer_question!(ANSWERS)
+    io = StringIO.new
+
+    exit_code = run_cli(io)
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, exit_code, io.string
+    assert_empty @platform.delivery_acknowledgements, "an undelivered answer is never acknowledged"
+    assert_equal "ANSWER_READY", @platform.question_state
+    assert_equal 1, @platform.capture_failures.size
+    assert_includes io.string, SpecrelayRunner::QuestionBridge::PROVIDER_EXITED
+    assert_empty @platform.requests_to("/api/runner/reports"), "no report follows an undelivered answer"
+    assert_path_exists File.join(@root, ".runs", "worktrees", TASK), "the dirty worktree is preserved"
+  end
+
+  # CR-002 F1 — the same race one step later: the provider goes while the answer poll is still in
+  # flight, so the answers are written into a bridge whose session has already ended.
+  def test_a_provider_lost_while_the_answer_poll_is_in_flight_is_never_reported_as_delivered
+    use_abandoning_provider(provider_exit: "0", ask_seconds: "3")
+    @platform.answer_question!(ANSWERS)
+    @platform.question_poll_delay = 2.0
+    io = StringIO.new
+
+    exit_code = run_cli(io)
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, exit_code, io.string
+    assert_empty @platform.delivery_acknowledgements
+    assert_equal "ANSWER_READY", @platform.question_state
+    assert_equal 1, @platform.capture_failures.size
+    # The answers were written locally and then found to have nowhere to go: this is the
+    # in-flight race, not the earlier one the test above covers.
+    assert_includes io.string, SpecrelayRunner::QuestionBridge::ANSWER_UNDELIVERED
+    assert_empty @platform.requests_to("/api/runner/reports")
+  end
+
+  # CR-002 F1 — Platform never confirmed the delivery, so the attempt must not continue as if it
+  # had. Fail closed: the answers stay durable and no report is uploaded.
+  def test_a_delivery_platform_never_confirms_ends_the_session_without_a_report
+    @platform.answer_question!(ANSWERS)
+    @platform.delivery_response = [ 500, { error: "platform is unwell" } ]
+    io = StringIO.new
+
+    exit_code = run_cli(io)
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, exit_code, io.string
+    assert_equal 1, @platform.capture_failures.size
+    assert_equal "ANSWER_READY", @platform.question_state
+    # The provider genuinely received the answers locally; it is the DURABLE claim that could
+    # not be made, and that alone ends the attempt.
+    assert_includes io.string, "[question-executor] answered"
+    assert_empty @platform.requests_to("/api/runner/reports")
+    assert_path_exists File.join(@root, ".runs", "worktrees", TASK), "the dirty worktree is preserved"
+  end
+
+  # CR-002 F2 — Platform released the session before the provider exited. The runner reports the
+  # capture failure it saw, then classifies the attempt from the state Platform returns, not from
+  # the provider's exit code.
+  def test_a_release_that_won_before_the_provider_exited_is_handled_rather_than_failed
+    use_abandoning_provider(provider_exit: "3", ask_seconds: "0.5")
+    @platform.release_question!
+    io = StringIO.new
+
+    exit_code = run_cli(io)
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, exit_code, io.string
+    assert_equal 1, @platform.capture_failures.size, "the runner still reports what it observed"
+    assert_empty @platform.requests_to("/api/runner/reports"), "no report follows a released session"
+    assert_match(/awaiting_input/, io.string)
+    refute_match(/input_capture_failed/, io.string)
+    assert_path_exists File.join(@root, ".runs", "worktrees", TASK), "the dirty worktree is preserved"
+  end
+
+  def test_a_release_that_won_before_the_provider_exited_keeps_a_stop_policy_loop_watching
+    use_abandoning_provider(provider_exit: "3", ask_seconds: "0.5")
+    @platform.release_question!
+
+    status, runs = loop_over_real_runs(iterations: 2)
+
+    assert_equal SpecrelayRunner::LoopRunner::OK, status
+    assert_equal 2, runs, "an ordinary release must not end the session under --on-failure stop"
   end
 
   # CR-001 F4 — a released answer window is an approved PAUSE, so `claim-once` reports it as
@@ -191,20 +280,26 @@ class QuestionBridgeTest < Minitest::Test
   # exit code, this is a lost question, not a failed task: no test runs, no report is uploaded,
   # and the attempt ends as a capture failure with the dirty worktree left in place.
   def test_a_provider_that_exits_while_its_question_is_live_ends_as_a_capture_failure
-    exit_code = run_abandoning_provider(provider_exit: "0")
+    use_abandoning_provider(provider_exit: "0")
+    io = StringIO.new
 
-    assert_equal SpecrelayRunner::CLI::RUN_FAILED, exit_code, @io.string
+    exit_code = run_cli(io)
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, exit_code, io.string
     assert_equal 1, @platform.executor_questions.reject { |r| r[:body].to_h.key?("capture_failure") }.size
     assert_equal 1, @platform.capture_failures.size, "the lost question is reported, not left to a lapsing lease"
     assert_empty @platform.requests_to("/api/runner/reports"), "no report follows a lost question"
-    assert_match(/input_capture_failed/, @io.string)
+    assert_match(/input_capture_failed/, io.string)
     assert_path_exists File.join(@root, ".runs", "worktrees", TASK), "the dirty worktree is preserved"
   end
 
   def test_a_provider_that_crashes_while_its_question_is_live_still_ends_as_a_capture_failure
-    exit_code = run_abandoning_provider(provider_exit: "3")
+    use_abandoning_provider(provider_exit: "3")
+    io = StringIO.new
 
-    assert_equal SpecrelayRunner::CLI::RUN_FAILED, exit_code, @io.string
+    exit_code = run_cli(io)
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, exit_code, io.string
     assert_equal 1, @platform.capture_failures.size
     assert_empty @platform.requests_to("/api/runner/reports")
   end

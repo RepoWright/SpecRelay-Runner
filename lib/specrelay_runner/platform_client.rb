@@ -307,6 +307,19 @@ module SpecrelayRunner
       status == 201 ? body : raise_for(status, body)
     end
 
+    # PATCH /api/runner/executor_questions/<id> (MVP-0036 CR-002). The runner reporting that it
+    # wrote the accepted answers into the live session's bridge.
+    #
+    # Platform cannot observe a provider process, so this is the only honest source for "the
+    # same session received the answers" — and it is what makes the batch durably ANSWERED.
+    # Idempotent on Platform, so a replay is harmless; a refusal or fault is raised, because a
+    # delivery Platform did not confirm must not be treated as one it did.
+    def confirm_executor_question_delivery(claim:, public_id:)
+      path = "/api/runner/executor_questions/#{URI.encode_www_form_component(public_id.to_s)}"
+      status, body = request_json(Net::HTTP::Patch, path, payload: { claim: claim })
+      status == 200 ? body : raise_for(status, body)
+    end
+
     # GET /api/runner/executor_questions/<id> (MVP-0036). What Platform durably believes about
     # one batch: whether the window is still open, and the answers once they exist.
     #

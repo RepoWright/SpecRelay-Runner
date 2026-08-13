@@ -37,10 +37,13 @@ module SpecrelayRunner
     ANSWER_POLL_SECONDS = 2.0
 
     LIVE_WAIT = "LIVE_WAIT"
-    ANSWERED = "ANSWERED"
+    # The Product Owner answered and Platform is holding the batch for THIS session. It becomes
+    # ANSWERED only when the acknowledgement below reports that the answers were handed over.
+    ANSWER_READY = "ANSWER_READY"
     OFFLINE_WAIT = "OFFLINE_WAIT"
 
     PROVIDER_EXITED = "the provider exited while its question was still waiting for an answer"
+    ANSWER_UNDELIVERED = "the provider exited before its answers could be handed back to it"
 
     def initialize(client:, claim:, staging_dir:, io: $stdout)
       @client = client
@@ -85,8 +88,11 @@ module SpecrelayRunner
     # Platform closed the answer window. The question and its context are durable.
     def released? = outcome == :released
 
-    # No question ever became durable and the bridge cannot recover. The attempt ends as
-    # INPUT_CAPTURE_FAILED with the dirty worktree preserved.
+    # This session could not carry the question through: nothing became durable, the provider
+    # exited while its batch was unsettled, or an accepted answer could not be handed back. A
+    # durable question — and, since CR-002, possibly a durable ANSWER — may well exist; what
+    # failed is this session's part in it. The runner reports that; PLATFORM decides what the
+    # attempt becomes, and the dirty worktree is preserved either way.
     def failed? = outcome == :failed
 
     def outcome = @mutex.synchronize { @outcome }
@@ -163,7 +169,7 @@ module SpecrelayRunner
       state = question["state"].to_s
       @mutex.synchronize { @awaiting_verdict = true }
       until stopping?
-        return deliver(question) if state == ANSWERED
+        return deliver(question) if state == ANSWER_READY
         return record(:released, nil) if state == OFFLINE_WAIT
 
         sleep ANSWER_POLL_SECONDS
@@ -178,10 +184,23 @@ module SpecrelayRunner
 
     # The answers reach the SAME session, exactly once: written to a temporary name and renamed
     # into place, so a provider polling for the file never reads a half-written document.
+    #
+    # Platform is told only AFTER that write, and only while the session that asked is still
+    # running (CR-002 F1). "The Product Owner answered" and "the provider received it" are two
+    # different facts separated by a process boundary, and this parent is the only thing that
+    # can report the second one.
     def deliver(question)
-      @mutex.synchronize { @awaiting_verdict = false }
       write(ANSWER, { "answers" => question["answers"] })
+      return record(:failed, ANSWER_UNDELIVERED) if stopping?
+
+      client.confirm_executor_question_delivery(claim: claim, public_id: question["id"])
+      @mutex.synchronize { @awaiting_verdict = false }
       log("[question] answers delivered to the waiting provider session")
+    rescue PlatformClient::Error => e
+      # Fail closed, exactly as an unknown submission outcome does. An unacknowledged delivery
+      # would leave Platform holding an answer it cannot say was handed over, on a run that
+      # carried on and finished; ending the session here keeps that answer durable for Stage 2.
+      record(:failed, Redaction.redact(e.message))
     end
 
     def refuse(message)

@@ -30,6 +30,10 @@ module SpecrelayRunner
     # executor — would produce evidence that lies about what ran.
     ExecutorMismatch = Class.new(StandardError)
 
+    # The one Platform execution state this runner reads back rather than assumes: the answer
+    # window closed and the attempt paused (MVP-0036 CR-002 F2).
+    PLATFORM_AWAITING_INPUT = "AWAITING_INPUT"
+
     Result = Struct.new(:outcome, :message, keyword_init: true) do
       def success? = outcome == :completed
 
@@ -363,6 +367,10 @@ module SpecrelayRunner
     def question_outcome
       return input_capture_failure if @bridge.failed?
 
+      released_session
+    end
+
+    def released_session
       log("The provider session for #{run['task_id']} was released; the question and its context " \
           "are durable on Platform and this machine's changes were left in place.")
       Result.new(outcome: :awaiting_input,
@@ -370,18 +378,31 @@ module SpecrelayRunner
     end
 
     # Reported to Platform rather than left to a lapsing lease, so the attempt ends as a
-    # distinct recoverable failure and the machine is freed now. A failure to REPORT the
-    # failure is still an honest non-zero exit: Platform reclaims the lapsed lease.
+    # distinct recoverable failure and the machine is freed now.
+    #
+    # PLATFORM classifies the ending, not this runner (CR-002 F2). There is a real interval in
+    # which the Product Owner's release has already won and the provider exits before the next
+    # poll can observe it: what this runner saw is a lost question, but what happened is an
+    # ordinary pause, and calling it a failure would stop a `--on-failure stop` session over a
+    # normal decision. Anything else — a transport fault, a refusal, a state this runner does
+    # not recognise — stays a failure, because an ending it cannot confirm must not be reported
+    # as handled. A failure to REPORT the failure is still an honest non-zero exit: Platform
+    # reclaims the lapsed lease.
     def input_capture_failure
       reason = @bridge.failure_reason.to_s
+      response = client.report_input_capture_failure(claim: claim, reason: reason)
+      return released_session if response.to_h.dig("execution", "state") == PLATFORM_AWAITING_INPUT
+
+      capture_failed(reason)
+    rescue PlatformClient::Error => e
+      capture_failed(e.message)
+    end
+
+    def capture_failed(reason)
       log("Could not capture the provider's question for #{run['task_id']}: #{Redaction.redact(reason)}")
       log("Nothing was tested, reported, published, or written to Jira. Your changes are still in the worktree.")
-      client.report_input_capture_failure(claim: claim, reason: reason)
       Result.new(outcome: :input_capture_failed,
                  message: "Runner outcome: input_capture_failed (#{Redaction.redact(reason)}).")
-    rescue PlatformClient::Error => e
-      Result.new(outcome: :input_capture_failed,
-                 message: "Runner outcome: input_capture_failed (#{Redaction.redact(e.message)}).")
     end
 
     def start_log_stream
