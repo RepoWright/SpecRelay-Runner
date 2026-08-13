@@ -40,10 +40,14 @@ module SpecrelayRunner
     # The Product Owner answered and Platform is holding the batch for THIS session. It becomes
     # ANSWERED only when the acknowledgement below reports that the answers were handed over.
     ANSWER_READY = "ANSWER_READY"
+    # The one state that means this session's delivery is what Platform recorded. Anything else
+    # coming back from the acknowledgement is some OTHER ending that won (CR-003 F1).
+    ANSWERED = "ANSWERED"
     OFFLINE_WAIT = "OFFLINE_WAIT"
 
     PROVIDER_EXITED = "the provider exited while its question was still waiting for an answer"
     ANSWER_UNDELIVERED = "the provider exited before its answers could be handed back to it"
+    DELIVERY_UNCONFIRMED = "Platform did not confirm that the answers reached this session"
 
     def initialize(client:, claim:, staging_dir:, io: $stdout)
       @client = client
@@ -193,7 +197,10 @@ module SpecrelayRunner
       write(ANSWER, { "answers" => question["answers"] })
       return record(:failed, ANSWER_UNDELIVERED) if stopping?
 
-      client.confirm_executor_question_delivery(claim: claim, public_id: question["id"])
+      settled = client.confirm_executor_question_delivery(claim: claim, public_id: question["id"])
+                      .to_h["question"].to_h
+      return unconfirmed(settled) unless delivered?(question, settled)
+
       @mutex.synchronize { @awaiting_verdict = false }
       log("[question] answers delivered to the waiting provider session")
     rescue PlatformClient::Error => e
@@ -201,6 +208,19 @@ module SpecrelayRunner
       # would leave Platform holding an answer it cannot say was handed over, on a run that
       # carried on and finished; ending the session here keeps that answer durable for Stage 2.
       record(:failed, Redaction.redact(e.message))
+    end
+
+    # Platform ANSWERING is not Platform agreeing (CR-003 F1). A cancellation, a release or the
+    # deadline may have won this batch while the answers were being written, and the response
+    # says which — so only THIS batch, reported ANSWERED, is a delivery this session may act on.
+    def delivered?(asked, settled)
+      settled["id"].to_s == asked["id"].to_s && settled["state"].to_s == ANSWERED
+    end
+
+    # Something else ended the batch. The provider is stopped and the attempt fails closed: it
+    # must not carry on working from answers Platform does not record as delivered.
+    def unconfirmed(settled)
+      record(:failed, "#{DELIVERY_UNCONFIRMED} (#{settled['id']} is #{settled['state']})")
     end
 
     def refuse(message)

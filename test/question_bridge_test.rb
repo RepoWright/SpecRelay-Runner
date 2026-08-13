@@ -171,11 +171,53 @@ class QuestionBridgeTest < Minitest::Test
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, exit_code, io.string
     assert_equal 1, @platform.capture_failures.size
     assert_equal "ANSWER_READY", @platform.question_state
-    # The provider genuinely received the answers locally; it is the DURABLE claim that could
-    # not be made, and that alone ends the attempt.
-    assert_includes io.string, "[question-executor] answered"
+    # The answers reached the live bridge first: the acknowledgement is only ever attempted
+    # after that write, so it is the DURABLE claim that could not be made. (Whether the provider
+    # wins the race to read the file before it is stopped is timing, not behaviour, so it is not
+    # asserted here.)
+    assert_equal 1, @platform.delivery_acknowledgements.size
     assert_empty @platform.requests_to("/api/runner/reports")
     assert_path_exists File.join(@root, ".runs", "worktrees", TASK), "the dirty worktree is preserved"
+  end
+
+  # CR-003 F1 — Platform answered 200, but the state that won is not this session's delivery:
+  # an operator cancelled the run while the answers were in flight. A successful response is not
+  # a successful delivery, so the session must not continue on the strength of it.
+  def test_a_delivery_answered_with_another_winning_state_is_not_success
+    @platform.answer_question!(ANSWERS)
+    @platform.delivery_response = [ 200, settled_question_body("exq_fake", "OFFLINE_WAIT") ]
+    io = StringIO.new
+
+    exit_code = run_cli(io)
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, exit_code, io.string
+    assert_equal 1, @platform.delivery_acknowledgements.size
+    refute_includes io.string, "answers delivered to the waiting provider session"
+    assert_includes io.string, SpecrelayRunner::QuestionBridge::DELIVERY_UNCONFIRMED
+    assert_empty @platform.requests_to("/api/runner/reports"), "no report follows an unconfirmed delivery"
+    assert_equal 1, @platform.capture_failures.size
+    assert_path_exists File.join(@root, ".runs", "worktrees", TASK), "the dirty worktree is preserved"
+  end
+
+  # The acknowledgement must confirm THIS batch. A verdict about another one proves nothing
+  # about the answers this session just wrote.
+  def test_a_delivery_answered_about_another_question_is_not_success
+    @platform.answer_question!(ANSWERS)
+    @platform.delivery_response = [ 200, settled_question_body("exq_someone_else", "ANSWERED") ]
+    io = StringIO.new
+
+    exit_code = run_cli(io)
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, exit_code, io.string
+    refute_includes io.string, "answers delivered to the waiting provider session"
+    assert_includes io.string, SpecrelayRunner::QuestionBridge::DELIVERY_UNCONFIRMED
+    assert_empty @platform.requests_to("/api/runner/reports")
+  end
+
+  def settled_question_body(id, state)
+    { contract_version: "mvp-0036",
+      question: { id: id, state: state, deadline_at: "2026-08-13T12:00:00Z",
+                  remaining_seconds: 0, answers: ANSWERS } }
   end
 
   # CR-002 F2 — Platform released the session before the provider exited. The runner reports the
