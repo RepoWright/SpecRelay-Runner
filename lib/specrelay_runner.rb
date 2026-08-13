@@ -57,8 +57,10 @@ require_relative "specrelay_runner/specification_package"
 # MVP-0033: the REVIEWER role. Loaded before `rework` and `execution`, which reuse its read-only
 # git seam to prove a reviewed head is still the one the remote shows.
 require_relative "specrelay_runner/review"
-# MVP-0035: the change-request round — continuing an implementation from the exact reviewed
-# pull-request head, with the reviewer's findings.
+# MVP-0035 / MVP-0036 Stage 2b: proving a worktree holds the exact recorded head, and the change
+# request that is one of the two reasons to require it. `continued_target` first — `rework` is
+# built on it.
+require_relative "specrelay_runner/continued_target"
 require_relative "specrelay_runner/rework"
 # MVP-0036 Stage 2a: the offline resume round — continuing from this machine's own uncommitted
 # work, proven unchanged. Loaded after `review` for the same reason `rework` is: both prove a

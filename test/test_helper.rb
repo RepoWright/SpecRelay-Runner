@@ -148,9 +148,12 @@ end
 # rework: when given, adds the MVP-0035 change-request block and advances the assigned report
 # round, exactly as Platform does for a claim that follows a CHANGES_REQUESTED review. Omit it
 # to model a first execution, which carries no rework block at all.
-def claim_payload_for(task_id:, executor_command:, publication: nil, rework: nil)
+def claim_payload_for(task_id:, executor_command:, publication: nil, rework: nil, restart: nil)
   payload = base_claim_payload(task_id: task_id, executor_command: executor_command)
   payload = payload.merge("rework" => rework_block(rework), "report_contract" => rework_round(task_id)) if rework
+  # MVP-0036 Stage 2b — a REPLACEMENT run's recorded target. Its report round stays the first
+  # one, because the replacement is a new run rather than another round of the old one.
+  payload = payload.merge("restart" => restart) if restart
   return payload if publication.nil?
 
   payload.merge(

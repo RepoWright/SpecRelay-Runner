@@ -68,6 +68,10 @@ module SpecrelayRunner
       # MVP-0035 — nil for an ordinary first execution, which is every claim that does not
       # follow a CHANGES_REQUESTED review.
       @rework = Rework.for(payload)
+      # MVP-0036 Stage 2b — nil unless this claim is a REPLACEMENT run continuing the pull
+      # request an abandoned run had already published. A run is never both this and a rework:
+      # a replacement is new, so nothing has reviewed it.
+      @restart = ContinuedTarget.for(payload, "restart")
       # MVP-0036 Stage 2a — nil unless this claim continues an answered offline question on the
       # machine that still holds its uncommitted work.
       @resume = Resume.for(payload)
@@ -154,8 +158,8 @@ module SpecrelayRunner
     # would mark the run terminal when the correct answer is "another attempt can still run this
     # once the input is readable" (MVP-0035) or "the owner can retry once the machine is right"
     # (MVP-0036 Stage 2a design 9).
-    def rework_refused(reason)
-      refuse_before_provider(reason, "Refusing the change-request round for #{run['task_id']}")
+    def continuation_refused(reason)
+      refuse_before_provider(reason, "Refusing to continue the recorded work for #{run['task_id']}")
     end
 
     # Stage 2a — the recorded checkpoint is not what this machine holds. The question, its
@@ -229,12 +233,14 @@ module SpecrelayRunner
       end
       worktree = prepared&.worktree || create_worktree(root)
 
-      # MVP-0035 — a rework round continues the reviewed pull request, so the worktree must hold
-      # that exact commit before anything else looks at it. A refusal here stops before the
+      # MVP-0035 rework and MVP-0036 Stage 2b restart both continue an exact recorded head, so the
+      # worktree must hold that commit before anything else looks at it. One branch, because it is
+      # one proof ({ContinuedTarget}) and a claim is never both. A refusal here stops before the
       # provider, before the package, and before any external write.
-      if @rework
-        continuation = @rework.materialize(worktree_path: worktree.path)
-        return rework_refused(continuation.reason) unless continuation.ok?
+      continued = @rework || @restart
+      if continued
+        continuation = continued.materialize(worktree_path: worktree.path)
+        return continuation_refused(continuation.reason) unless continuation.ok?
 
         worktree = Workspace::Info.new(path: worktree.path, base_commit: continuation.head_commit || worktree.base_commit)
       end

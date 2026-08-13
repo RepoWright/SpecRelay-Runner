@@ -49,9 +49,9 @@ class ReworkFlowTest < Minitest::Test
     git(clone, "rev-parse", "HEAD").strip
   end
 
-  def start(rework:, executor_command: nil, seed: nil, gh_mode: "ok", publication_branch: BRANCH)
+  def start(rework: nil, restart: nil, executor_command: nil, seed: nil, gh_mode: "ok", publication_branch: BRANCH)
     payload = claim_payload_for(task_id: TASK, executor_command: executor_command || recording_executor,
-                                publication: { branch: publication_branch }, rework: rework)
+                                publication: { branch: publication_branch }, rework: rework, restart: restart)
     @platform = FakePlatform.new(claim_payload: payload).start
     @gh_dir, @gh_log, = FakeGithub.gh_bin(mode: gh_mode, pull_request_url: PR_URL, bare: @bare,
                                           seed: seed || [ { "url" => PR_URL, "state" => "OPEN",
@@ -228,6 +228,51 @@ class ReworkFlowTest < Minitest::Test
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, code, output
     assert_refused(output, "names 2 reviewed repositories")
+  end
+
+  # --- MVP-0036 Stage 2b B02/B04: the same proof, for a REPLACEMENT run -----
+  #
+  # A restart continues a published pull request that no reviewer ever looked at, so it carries
+  # no findings and no change request — but the question it asks of this worktree is identical:
+  # is this the exact repository, branch and head Platform recorded. These run against the same
+  # real remote as the rework cases above, because the point is that one implementation answers
+  # it for both callers.
+
+  def test_a_replacement_run_is_materialized_at_the_exact_recorded_head_before_the_executor_runs
+    start(restart: { "repositories" => [ reviewed_repository ] })
+    code, output = run_cli
+    assert_equal SpecrelayRunner::CLI::SUCCESS, code, output
+
+    assert_includes File.read(observed_path), "round one"
+    assert_equal @reviewed_head, File.read(observed_head_path).strip
+    # A replacement has not been reviewed, so nothing about a change request reaches the provider.
+    refute_includes File.read(prompt_path), "Change request"
+  end
+
+  def test_a_replacement_whose_recorded_head_moved_refuses_before_the_executor_and_releases_the_claim
+    start(restart: { "repositories" => [ reviewed_repository(head_commit: "a" * 40) ] })
+    code, output = run_cli
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, code, output
+    assert_refused(output, "moved")
+    assert_equal @reviewed_head, remote_head, "the recorded branch must be exactly as it was left"
+    assert_equal 0, FakeGithub.pr_creates(@gh_log)
+  end
+
+  # The abandoned checkpoint belongs to the machine that made it. A replacement claimed on that
+  # same machine finds the dirty worktree and refuses; it never resets over the work the operator
+  # was told to release themselves.
+  def test_a_replacement_never_discards_the_abandoned_uncommitted_work
+    git(@root, "worktree", "add", "-q", "-b", TASK, worktree_path, "HEAD")
+    File.write(File.join(worktree_path, "demo-app", "index.html"), "<h1>abandoned checkpoint</h1>\n")
+    start(restart: { "repositories" => [ reviewed_repository ] })
+    code, output = run_cli
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, code, output
+    assert_includes output, "uncommitted changes"
+    assert_empty @platform.requests_to("/api/runner/reports"), "no report may be uploaded"
+    refute File.exist?(observed_path), "the executor must never have started"
+    assert_includes File.read(File.join(worktree_path, "demo-app", "index.html")), "abandoned checkpoint"
   end
 
   # Uncommitted local work is never discarded to make room for the reviewed head. The refusal
