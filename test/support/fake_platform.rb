@@ -239,6 +239,10 @@ class FakePlatform
     when "/api/runner/events" then events(request)
     when "/api/runner/heartbeat" then [ 200, { acknowledged: true, state: "EXECUTING", lease: lease_signal } ]
     when "/api/runner/reports" then report(request)
+    # MVP-0035 — a runner abandoning its own claim before it executed anything. The fake answers
+    # what Platform answers, because the runner PRINTS the run state back and a constant would
+    # let a released claim and an unreleased one look identical in the operator's output.
+    when "/api/runner/claim_releases" then [ 201, { outcome: "released", run_state: "AWAITING_EXECUTION_REPORT" } ]
     when "/api/runner/specification_generations" then specification_generation(request)
     when "/api/runner/specification_publications" then specification_publication(request)
     when "/api/runner/review_results" then review_result(request)

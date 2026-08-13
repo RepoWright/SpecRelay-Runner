@@ -21,7 +21,6 @@ module SpecrelayRunner
     # The report-relative path of the bounded live executor log (MVP-0018).
     LIVE_LOG_PATH = "evidence/live-executor-log.txt"
 
-    ROUND_NUMBER = 1
     MANIFEST_VERSION = 1
     STATUS_SUCCEEDED = "succeeded"
     STATUS_FAILED = "failed"
@@ -56,6 +55,10 @@ module SpecrelayRunner
     def workspace = payload.fetch("workspace")
     def report_contract = payload.fetch("report_contract")
     def round_label = report_contract.fetch("round_label")
+    # MVP-0035 — the round is Platform's, not a constant here. Rounds are append-only across a
+    # change-request cycle, and a runner that hard-coded 1 would file every corrected round under
+    # the ordering of the first.
+    def round_number = report_contract.fetch("round_number")
     def failed? = status == STATUS_FAILED
 
     def files
@@ -84,7 +87,7 @@ module SpecrelayRunner
 
     def manifest
       {
-        "round_number" => ROUND_NUMBER, "round_label" => round_label, "run_id" => run.fetch("id"),
+        "round_number" => round_number, "round_label" => round_label, "run_id" => run.fetch("id"),
         "project_key" => workspace.fetch("project_key"), "workspace_key" => workspace.fetch("workspace_key"),
         "task_id" => run.fetch("task_id"), "canonical_branch" => run.fetch("canonical_branch"),
         "executor_summary" => executor_summary, "files_changed_summary" => files_changed_summary,

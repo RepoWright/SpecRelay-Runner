@@ -15,12 +15,32 @@ module FakeGithub
   module_function
 
   # Create a bare remote and register it as `origin` on the workspace root.
-  def add_remote(root, name: "tiny-demo-workspace")
+  #
+  # `url:` addresses that same bare repository by the GitHub url the assignment carries, for a
+  # test whose subject is repository identity rather than the remote's contents. Without it the
+  # remote is a local path, which no assignment `clone_url` can honestly name.
+  def add_remote(root, name: "tiny-demo-workspace", url: nil)
     remote = Dir.mktmpdir("specrelay-runner-remote-")
     bare = File.join(remote, "#{name}.git")
     system("git", "init", "-q", "--bare", bare, exception: true)
-    git(root, "remote", "add", "origin", bare)
+    git(root, "remote", "add", "origin", url || bare)
+    serve_locally(root, bare) if url
     bare
+  end
+
+  # Git runs `ssh <host> '<service> <path>'` for an ssh remote. Replacing ssh with a shim that
+  # ignores both and serves the local bare repository keeps the transport, the protocol and every
+  # object real while the url stays the one the assignment names — and reaches no network. It is
+  # `core.sshCommand` rather than an env var because the runner spawns git itself.
+  def serve_locally(root, bare)
+    shim = File.join(File.dirname(bare), "ssh")
+    File.write(shim, <<~RUBY)
+      #!/usr/bin/env ruby
+      service = ARGV.last.to_s.split(" ").first.to_s.sub(/\\Agit-/, "")
+      exec("git", service, #{bare.inspect})
+    RUBY
+    FileUtils.chmod(0o755, shim)
+    git(root, "config", "core.sshCommand", shim)
   end
 
   # Write a fake `gh` into its own bin dir and return [bin_dir, log_path, state_path].

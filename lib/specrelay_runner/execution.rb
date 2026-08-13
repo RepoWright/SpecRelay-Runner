@@ -50,6 +50,9 @@ module SpecrelayRunner
       @log_stream = nil
       @lease_stop_reason = nil
       @package = nil
+      # MVP-0035 — nil for an ordinary first execution, which is every claim that does not
+      # follow a CHANGES_REQUESTED review.
+      @rework = Rework.for(payload)
       @controls = ProtocolControls.new(env: env)
       @emitter = EventEmitter.new(client: client, run_id: @run.fetch("id"), attempt_id: @claim)
     end
@@ -127,6 +130,34 @@ module SpecrelayRunner
                  message: "Runner outcome: preflight_failed (local workspace not ready; claim not executed).")
     end
 
+    # MVP-0035 — the reviewed head could not be established, so this machine must not implement
+    # anything. No report and no publication: nothing about the outcome is known, and a failed
+    # report would mark the run terminal when the correct answer is "another attempt can still
+    # run this once the input is readable".
+    def rework_refused(reason)
+      safe = Redaction.redact(reason.to_s)
+      log("Refusing the change-request round for #{run['task_id']}: #{safe}")
+      log("Nothing ran: the executor was not started, nothing was pushed, and Jira was not touched.")
+      release_claim(safe)
+      Result.new(outcome: :preflight_failed,
+                 message: "Runner outcome: preflight_failed (#{safe}); nothing executed.")
+    end
+
+    # Give the machine's capacity back and leave the run claimable. ONLY a refused change-request
+    # target does this. The other pre-provider refusals keep their manual recovery step: each is
+    # a misconfiguration of this machine that the operator has to correct anyway, and releasing
+    # under the default `continue` loop policy would let the same runner reclaim and re-refuse
+    # the same run in a loop instead of holding one actionable failure (CR-001 F3).
+    #
+    # Best effort by design: a Platform that cannot be reached will expire the lease on its own,
+    # and raising here would replace a precise local reason with a transport error.
+    def release_claim(reason)
+      client.release_claim(claim: claim, reason: reason)
+      log("Released this claim on Platform; the run is claimable again.")
+    rescue PlatformClient::Error => e
+      log("Could not release the claim (#{Redaction.redact(e.message)}); its lease will expire on Platform.")
+    end
+
     # Fail closed before anything happens: no worktree, no executor launch, no
     # report, no publication, no Jira transition. Only checked when this runner
     # selected a real provider profile — the fake-executor regression path is
@@ -159,6 +190,16 @@ module SpecrelayRunner
 
       emit("workspace.preparing", "Preparing worktree for #{run['task_id']}", phase: "workspace")
       worktree = create_worktree(root)
+
+      # MVP-0035 — a rework round continues the reviewed pull request, so the worktree must hold
+      # that exact commit before anything else looks at it. A refusal here stops before the
+      # provider, before the package, and before any external write.
+      if @rework
+        continuation = @rework.materialize(worktree_path: worktree.path)
+        return rework_refused(continuation.reason) unless continuation.ok?
+
+        worktree = Workspace::Info.new(path: worktree.path, base_commit: continuation.head_commit || worktree.base_commit)
+      end
 
       # MVP-0034 contract 4 — the pinned package is verified and written read-only BEFORE the
       # provider starts. A document whose bytes do not reproduce the digest Platform pinned ends
@@ -461,7 +502,16 @@ module SpecrelayRunner
         - Do NOT edit any `spec.md`/`spec_persian.md`, push, open a PR, or write to Platform.
         - Make the change idempotently.
       MD
-      "#{preamble}\n\n---\n\n#{payload.dig('specification_package', 'handoff_prompt')}"
+      "#{preamble}\n\n---\n\n#{payload.dig('specification_package', 'handoff_prompt')}#{rework_prompt}"
+    end
+
+    # MVP-0035 — the change request, appended ONCE after the unchanged approved package. The
+    # package leads because it is still the authority; the findings follow because they are what
+    # this round is for.
+    def rework_prompt
+      return "" if @rework.nil?
+
+      @rework.prompt_section(payload.dig("report_contract", "round_label").to_s)
     end
 
     # Where the verified package actually IS on this machine. The handoff prompt tells the

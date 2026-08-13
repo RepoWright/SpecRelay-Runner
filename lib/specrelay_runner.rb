@@ -53,13 +53,16 @@ require_relative "specrelay_runner/terminal_result"
 # MVP-0034: the pinned package the executor implements, verified and written read-only before
 # `execution` launches a provider on it.
 require_relative "specrelay_runner/specification_package"
+# MVP-0033: the REVIEWER role. Loaded before `rework` and `execution`, which reuse its read-only
+# git seam to prove a reviewed head is still the one the remote shows.
+require_relative "specrelay_runner/review"
+# MVP-0035: the change-request round — continuing an implementation from the exact reviewed
+# pull-request head, with the reviewer's findings.
+require_relative "specrelay_runner/rework"
 require_relative "specrelay_runner/execution"
 # MVP-0026: turning that recognized assignment into a generated specification package.
 # The whole lane lives under one namespace; see specification.rb for the pipeline order.
 require_relative "specrelay_runner/specification"
-# MVP-0033: the REVIEWER role — a claimed review of a frozen implementation target, executed
-# by a fresh provider process with its own fixed instructions.
-require_relative "specrelay_runner/review"
 require_relative "specrelay_runner/package_preflight"
 require_relative "specrelay_runner/poll_interval"
 require_relative "specrelay_runner/presence"

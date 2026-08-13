@@ -144,8 +144,13 @@ end
 # publication: when given, adds the MVP-0014 assignment blocks Platform sends
 # (`repositories`, `repository_policy`, `links`). Omit it to model a pre-MVP-0014
 # Platform that asks for no publication.
-def claim_payload_for(task_id:, executor_command:, publication: nil)
+#
+# rework: when given, adds the MVP-0035 change-request block and advances the assigned report
+# round, exactly as Platform does for a claim that follows a CHANGES_REQUESTED review. Omit it
+# to model a first execution, which carries no rework block at all.
+def claim_payload_for(task_id:, executor_command:, publication: nil, rework: nil)
   payload = base_claim_payload(task_id: task_id, executor_command: executor_command)
+  payload = payload.merge("rework" => rework_block(rework), "report_contract" => rework_round(task_id)) if rework
   return payload if publication.nil?
 
   payload.merge(
@@ -192,6 +197,28 @@ def specification_package_block(task_id, documents: nil)
   }
 end
 
+# The rework block exactly as Runner::Api::RunPayload builds it (MVP-0035 design 2): the settled
+# review attempt's identity, its bounded findings, and the reviewed target the runner must
+# continue from. `repositories: []` models the legitimate no-change review, which has no pull
+# request to continue from and must fall back to the ordinary initial checkout.
+def rework_block(overrides)
+  {
+    "review_attempt_id" => "rvt_rework123",
+    "input_manifest_digest" => "e" * 64,
+    "summary" => "The heading is right, but the change is not idempotent.",
+    "findings" => [ { "severity" => "blocking", "summary" => "The edit is not idempotent.",
+                      "reason" => "A second run would append a second heading.",
+                      "location" => "demo-app/index.html:1" } ],
+    "repositories" => []
+  }.merge(overrides.transform_keys(&:to_s))
+end
+
+def rework_round(task_id)
+  { "round_number" => 2, "round_label" => "002-review-fixes",
+    "release_instructions" => "./bin/worktree release #{task_id}",
+    "report_path" => "specs/#{task_id}/execution-reports/002-review-fixes" }
+end
+
 def base_claim_payload(task_id:, executor_command:)
   {
     "contract_version" => "mvp-0010",
@@ -211,7 +238,9 @@ def base_claim_payload(task_id:, executor_command:)
       "timeout_seconds" => 120, "env" => {}
     },
     "specification_package" => specification_package_block(task_id),
-    "report_contract" => { "round_label" => "001-initial",
+    # MVP-0035: Platform assigns the round, so `round_number` travels with the label rather than
+    # being a constant the runner holds.
+    "report_contract" => { "round_number" => 1, "round_label" => "001-initial",
                           "release_instructions" => "./bin/worktree release #{task_id}",
                           "report_path" => "specs/#{task_id}/execution-reports/001-initial" }
   }

@@ -270,6 +270,16 @@ module SpecrelayRunner
       status == 201 ? body : raise_for(status, body)
     end
 
+    # POST /api/runner/claim_releases — abandon THIS claim before anything executed (MVP-0035).
+    #
+    # A sibling of `submit_report`, never a shape of it: a report is an outcome and finalizes the
+    # run, and this says there was none. Platform frees the machine's capacity slot and leaves
+    # the run claimable, so a corrected input can be picked up by this machine or another.
+    def release_claim(claim:, reason:)
+      status, body = post_json("/api/runner/claim_releases", { claim: claim, reason: reason })
+      status == 201 ? body : raise_for(status, body)
+    end
+
     # POST /api/runner/reports. bundle is { round_label:, files: [...] }.
     # terminal_result, when given, is the MVP-0013 terminal-result envelope
     # validated by Platform BEFORE import; a rejected envelope returns non-201 and

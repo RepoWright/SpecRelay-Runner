@@ -144,6 +144,10 @@ class RunnerFlowTest < Minitest::Test
     assert_match(/preflight_failed/, io.string)
     assert_match(/SPECRELAY_RUNNER_WORKSPACE_ROOT_TINY_DEMO_WORKSPACE/, io.string)
     assert_match(%r{bin/platform runner release #{TASK}}, io.string)
+    # MVP-0035 automatic release is scoped to a refused change-request target. A missing
+    # workspace root is a misconfiguration of THIS machine, and releasing it would let the
+    # default loop policy reclaim and re-refuse the same run instead of stopping (CR-001 F3).
+    assert_equal 0, @platform.requests_to("/api/runner/claim_releases").size
   end
 
   # A failing executor must still produce a durable FAILED attempt on Platform.
