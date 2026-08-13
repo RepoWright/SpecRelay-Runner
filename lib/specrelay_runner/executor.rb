@@ -56,13 +56,17 @@ module SpecrelayRunner
     # `stop_check` (MVP-0036) is passed straight through to CommandRunner, which owns the one
     # bounded shutdown grace. It is how a provider whose question window closed is ended
     # without this object learning anything about questions.
-    def run(prompt_text, on_output: nil, stop_check: nil)
+    #
+    # `on_start` (MVP-0036 CR-004) is passed through the same way: CommandRunner owns the one
+    # instant at which the child exists and has its prompt, and this object still learns nothing
+    # about what a caller does with that fact.
+    def run(prompt_text, on_output: nil, stop_check: nil, on_start: nil)
       prompt_path = write_prompt(prompt_text)
       result = CommandRunner.run(
         launch_argv(prompt_text, prompt_path),
         chdir: worktree_path, env: process_env,
         timeout_seconds: timeout_seconds, stdin_data: (prompt_text if stdin_prompt?),
-        on_output: on_output, stop_check: stop_check
+        on_output: on_output, stop_check: stop_check, on_start: on_start
       )
       Result.new(exit_code: result.exit_code, stdout: result.stdout, stderr: result.stderr,
                  duration_seconds: result.duration_seconds, timed_out: result.timed_out,

@@ -175,6 +175,37 @@ module DemoWorkspace
     path
   end
 
+  # MVP-0036 CR-004 F3 — a resumed provider that does its first REAL action before printing
+  # anything, which is what a provider given a complete handoff actually does. It never writes to
+  # stdout or stderr, so output cannot stand in for "this process received its input".
+  #
+  # With `FAKE_RESUME_NEXT_QUESTION` that first action is ordinal N+1, which Platform can only
+  # accept once the batch being continued has been acknowledged.
+  def write_silent_resume_executor(root)
+    path = File.join(root, "bin", "silent-resume-executor")
+    File.write(path, <<~'RUBY')
+      #!/usr/bin/env ruby
+      # frozen_string_literal: true
+      prompt = File.read(ARGV.last.to_s)
+      abort "the prompt carried no answers" unless prompt.include?("## Answers to your earlier questions")
+
+      if (asked = ENV["FAKE_RESUME_NEXT_QUESTION"])
+        request = prompt[%r{`([^`]*/question-request\.json)`}, 1]
+        abort "the prompt named no bridge" if request.nil?
+        File.write("#{request}.partial", asked)
+        File.rename("#{request}.partial", request)
+        sleep 30
+        exit 0
+      end
+
+      file = "demo-app/index.html"
+      File.write(file, File.read(file).sub("Hello Interrupted Demo", "Hello SpecRelay Demo"))
+      exit 0
+    RUBY
+    FileUtils.chmod(0o755, path)
+    path
+  end
+
   # MVP-0036 CR-001 F1 — a provider that asks a valid question and then DIES before any
   # verdict arrives. The exit code is scripted so the test can prove the outcome is decided by
   # the unanswered question rather than by whether the provider happened to exit cleanly.

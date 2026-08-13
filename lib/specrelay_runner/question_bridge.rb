@@ -54,13 +54,24 @@ module SpecrelayRunner
     # `measure` is asked for this machine's checkpoint at the instant the provider pauses — not
     # when the bridge starts — because the provider changes files right up to that moment, and a
     # later resume has to land on exactly the state it left (Stage 2a design 3).
-    def initialize(client:, claim:, staging_dir:, measure: -> { nil }, io: $stdout)
+    #
+    # `resume_question_id` is the earlier batch THIS session is continuing, or nil for an ordinary
+    # claim. Holding it here rather than passing it per call is what lets the two things that can
+    # trigger the acknowledgement — the provider starting, and the provider asking again — share
+    # one gate (CR-004 F3).
+    def initialize(client:, claim:, staging_dir:, measure: -> { nil }, resume_question_id: nil,
+                   io: $stdout)
       @client = client
       @claim = claim
       @path = File.join(staging_dir, DIRECTORY)
       @measure = measure
+      @resume_question_id = resume_question_id
       @io = io
       @mutex = Mutex.new
+      # A SECOND mutex, and deliberately not `@mutex`: this one is held across an HTTP call, so
+      # that the second caller WAITS for the acknowledgement rather than skipping past it. The
+      # state mutex must never be held that long, and `record` takes it.
+      @resume_gate = Mutex.new
       @outcome = nil
       @failure_reason = nil
       @should_stop = false
@@ -113,40 +124,43 @@ module SpecrelayRunner
     # submission and the answer or release that ends it.
     def awaiting_verdict? = @mutex.synchronize { @awaiting_verdict && @outcome.nil? }
 
-    # Stage 2a — the fresh session started with an earlier batch's answers in its prompt and is
-    # now running. Platform is told once, from here, because this parent is the only thing that
-    # can observe that the process it launched with them is alive; the batch then settles as
-    # RESUMED and the run is free to be asked again.
+    # Stage 2a — the fresh session was started with an earlier batch's answers in its prompt.
+    # Platform is told once, from here, and only then does that batch settle as RESUMED and the
+    # run become free to be asked again.
     #
-    # Anything other than RESUMED means something else won — a cancellation, or another machine
-    # — so the provider is stopped exactly as an unconfirmed live delivery stops it. Continuing
-    # on answers Platform does not record as delivered is the one outcome that must not happen.
+    # TWO callers, one gate (CR-004 F3). Execution calls it at the provider-start boundary, which
+    # is the only honest evidence that the process received the handoff — and covers a provider
+    # that finishes without ever printing. `submit` below calls it before putting a NEW batch on
+    # the wire, because a resumed provider's very first action may be to ask again, and Platform's
+    # one-open-batch index would refuse that valid question while this one is still open. The gate
+    # is held across the call, so the second caller waits for the answer instead of racing it.
     #
-    # Called from whichever output thread sees the provider first, so the claim to report it is
-    # taken under the same mutex every other decision here uses: Platform is idempotent, but a
-    # second acknowledgement would read the state its own predecessor wrote.
-    def confirm_resume(public_id)
-      return unless claim_resume_delivery
+    # Anything other than RESUMED means something else won — a cancellation, or another machine —
+    # so the provider is stopped exactly as an unconfirmed live delivery stops it. Continuing on
+    # answers Platform does not record as delivered is the one outcome that must not happen.
+    def confirm_resume
+      @resume_gate.synchronize do
+        next if @resume_question_id.nil? || @resume_confirmed
 
-      settled = client.confirm_executor_question_delivery(claim: claim, public_id: public_id)
-                      .to_h["question"].to_h
-      return unconfirmed(settled) unless settled["state"].to_s == RESUMED
-
-      log("[question] the earlier answers were delivered to this fresh session")
-    rescue PlatformClient::Error => e
-      record(:failed, Redaction.redact(e.message))
+        @resume_confirmed = true
+        deliver_resume
+      end
     end
 
     private
 
     attr_reader :client, :claim, :measure, :io
 
-    def claim_resume_delivery
-      @mutex.synchronize do
-        next false if @resume_confirmed
+    # Never retried: a failure here has already ended the session, and asking again would be
+    # asking Platform to contradict the decision it just reported.
+    def deliver_resume
+      settled = client.confirm_executor_question_delivery(claim: claim, public_id: @resume_question_id)
+                      .to_h["question"].to_h
+      return unconfirmed(settled) unless settled["state"].to_s == RESUMED
 
-        @resume_confirmed = true
-      end
+      log("[question] the earlier answers were delivered to this fresh session")
+    rescue PlatformClient::Error => e
+      record(:failed, Redaction.redact(e.message))
     end
 
     def request_path = File.join(path, REQUEST)
@@ -193,6 +207,12 @@ module SpecrelayRunner
     end
 
     def submit(document)
+      # The batch this session is CONTINUING must be settled before the one it is ASKING reaches
+      # Platform (CR-004 F3). If that acknowledgement failed, the session is already ending and
+      # this question must not be sent at all.
+      confirm_resume
+      return if stopping? || outcome
+
       body = client.submit_executor_question(claim: claim, question: document, checkpoint: measure.call)
       await(body.to_h["question"].to_h)
     rescue PlatformClient::Error => e

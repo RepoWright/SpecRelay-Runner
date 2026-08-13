@@ -382,9 +382,11 @@ module SpecrelayRunner
       # The bridge lives in the STAGING directory, outside the worktree, so a question request
       # can never appear in the diff the executor is measured on.
       @bridge = QuestionBridge.new(client: client, claim: claim, staging_dir: staging, io: io,
-                                   measure: -> { measure_checkpoint(root, worktree) }).start
+                                   measure: -> { measure_checkpoint(root, worktree) },
+                                   resume_question_id: @resume&.question_id).start
       Executor.new(config: payload.fetch("executor"), worktree_path: worktree.path, staging_dir: staging, env: env)
-              .run(prompt_text(worktree.path, @bridge.path), on_output: executor_output_sink,
+              .run(prompt_text(worktree.path, @bridge.path), on_output: @log_stream.sink,
+                   on_start: -> { @bridge.confirm_resume },
                    stop_check: -> { @bridge.stop_provider? })
     ensure
       @log_stream&.finish
@@ -396,23 +398,6 @@ module SpecrelayRunner
       Checkpoint.measure(repository_key: workspace.fetch("workspace_key"),
                          branch: run["canonical_branch"].to_s, worktree_path: worktree.path,
                          workspace: measuring_workspace(root))
-    end
-
-    # Stage 2a required behavior 5 — a resume is acknowledged on the provider's FIRST output,
-    # which is the earliest thing this parent can observe that proves the process it launched
-    # with the answers is really running. Sooner would record a delivery a failed launch never
-    # made; later would leave the batch open past the point the same provider may ask the next
-    # one, which the one-open-batch rule would then refuse.
-    #
-    # The bridge owns "exactly once" — this only says when.
-    def executor_output_sink
-      sink = @log_stream.sink
-      return sink if @resume.nil?
-
-      lambda do |source, line|
-        @bridge.confirm_resume(@resume.question_id)
-        sink.call(source, line)
-      end
     end
 
     # MVP-0036 — the two honest endings for a provider that paused on a question. Neither runs

@@ -51,14 +51,18 @@ module SpecrelayRunner
     # grace a timeout uses — one shutdown implementation, so a released provider session and an
     # overrunning one cannot be stopped by two different rules. Nil restores the ordinary
     # behaviour exactly: wait for the child, or kill it at the timeout.
+    #
+    # `on_start` (MVP-0036 CR-004 F3) is an OPTIONAL callback fired once the child exists AND its
+    # input has been handed over. See {#notify_started}.
     def initialize(chdir:, env: {}, timeout_seconds: 1800, stdin_data: nil, on_output: nil,
-                   stop_check: nil)
+                   stop_check: nil, on_start: nil)
       @chdir = chdir.to_s
       @env = env.to_h.transform_keys(&:to_s).transform_values(&:to_s)
       @timeout_seconds = timeout_seconds
       @stdin_data = stdin_data
       @on_output = on_output
       @stop_check = stop_check
+      @on_start = on_start
     end
 
     def run(argv)
@@ -67,6 +71,7 @@ module SpecrelayRunner
 
       started = monotonic
       out_r, err_r, pid = spawn_process(argv)
+      notify_started(pid)
       timed_out, status = wait_or_kill(pid)
       Result.new(exit_code: status&.exitstatus, stdout: out_r.value, stderr: err_r.value,
                  duration_seconds: (monotonic - started).round(3), timed_out: timed_out)
@@ -74,7 +79,24 @@ module SpecrelayRunner
 
     private
 
-    attr_reader :chdir, :env, :timeout_seconds, :stdin_data, :on_output, :stop_check
+    attr_reader :chdir, :env, :timeout_seconds, :stdin_data, :on_output, :stop_check, :on_start
+
+    # THE provider-start boundary (MVP-0036 CR-004 F3): the child exists and its input has been
+    # delivered — by argv at spawn, or by the stdin write inside `spawn_process`. It is the one
+    # honest instant at which a caller may record "this process received what we gave it": before
+    # it, nothing was started; after it, the child may already have acted.
+    #
+    # Deliberately NOT swallowed the way `on_output` is. That one is a progress display and must
+    # never fail the execution it reports on; this one is a decision about whether the run may
+    # continue at all, and a caller that cannot record the handoff has to be able to stop it. The
+    # process group is ended first so a raising callback can never leave an orphaned child and a
+    # run stuck CLAIMED (the QUALITY-0002 failure class).
+    def notify_started(pid)
+      on_start&.call
+    rescue StandardError
+      terminate_group(pid)
+      raise
+    end
 
     def spawn_process(argv)
       out_r, out_w = IO.pipe

@@ -64,22 +64,31 @@ class QuestionResumeTest < Minitest::Test
   end
 
   # Phase two: the same run, claimed again by the same machine, carrying the answers.
-  def resume_payload(checkpoint, question_id: "exq_fake")
-    executor = DemoWorkspace.write_resume_executor(@root)
-    claim_payload_for(task_id: TASK, executor_command: executor).merge(
-      "resume" => { "question_id" => question_id, "checkpoint" => checkpoint,
+  def resume_payload(checkpoint, executor: nil, env: nil)
+    executor ||= DemoWorkspace.write_resume_executor(@root)
+    payload = claim_payload_for(task_id: TASK, executor_command: executor).merge(
+      "resume" => { "question_id" => "exq_fake", "checkpoint" => checkpoint,
                     "continuation_context" => BATCH["continuation_context"],
                     "questions" => BATCH["questions"], "answers" => ANSWERS }
     )
+    payload["executor"]["env"] = env if env
+    payload
   end
 
-  def restart_platform(payload)
+  def restart_platform(payload, delivery: settled_resume("RESUMED"))
     @platform.stop
     @platform = FakePlatform.new(claim_payload: payload).start
-    @platform.delivery_response = [ 200, { contract_version: "mvp-0036",
-                                           question: { id: "exq_fake", state: "RESUMED",
-                                                       deadline_at: "2026-08-13T12:00:00Z",
-                                                       remaining_seconds: 0, answers: ANSWERS } } ]
+    @platform.delivery_response = delivery
+  end
+
+  def settled_resume(state)
+    [ 200, { contract_version: "mvp-0036",
+             question: { id: "exq_fake", state: state, deadline_at: "2026-08-13T12:00:00Z",
+                         remaining_seconds: 0, answers: ANSWERS } } ]
+  end
+
+  def request_order
+    @platform.requests.map { |request| [ request[:method], request[:path] ] }
   end
 
   def run_cli(io)
@@ -155,6 +164,74 @@ class QuestionResumeTest < Minitest::Test
     refute_includes io.string, "[resume-executor]"
     assert_equal 1, @platform.requests_to("/api/runner/claim_releases").size
     assert_empty @platform.requests_to("/api/runner/reports")
+  end
+
+  # ----------------------------------------------- acknowledging before the next question
+
+  # CR-004 F3 — the provider's FIRST action is ordinal N+1, before it has printed anything. The
+  # batch it is continuing must already be settled by then, or Platform's one-open-batch index
+  # refuses a perfectly valid question and the provider is told its request was a duplicate.
+  def test_a_silent_resumed_provider_may_ask_its_next_question_as_its_first_action
+    checkpoint = released_question_with_dirty_worktree
+    restart_platform(resume_payload(checkpoint,
+                                    executor: DemoWorkspace.write_silent_resume_executor(@root),
+                                    env: { "FAKE_RESUME_NEXT_QUESTION" => BATCH.to_json }))
+    @platform.release_question!
+    io = StringIO.new
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli(io), io.string
+
+    acknowledged = request_order.index { |method, path| method == "PATCH" && path.start_with?("/api/runner/executor_questions/") }
+    asked = request_order.index { |method, path| method == "POST" && path == "/api/runner/executor_questions" }
+    refute_nil acknowledged, "the resume was never acknowledged"
+    refute_nil asked, "the next question never reached Platform"
+    assert_operator acknowledged, :<, asked, "batch N must be RESUMED before ordinal N+1 is submitted"
+    assert_equal 1, @platform.delivery_acknowledgements.size
+    assert_equal 1, @platform.executor_questions.size
+  end
+
+  # CR-004 F3.3 — no output at all, and the work simply finishes. The handoff still happened, so
+  # it is still acknowledged, exactly once.
+  def test_a_resumed_provider_that_never_prints_is_acknowledged_exactly_once
+    checkpoint = released_question_with_dirty_worktree
+    restart_platform(resume_payload(checkpoint, executor: DemoWorkspace.write_silent_resume_executor(@root)))
+    io = StringIO.new
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli(io), io.string
+    assert_equal 1, @platform.delivery_acknowledgements.size
+    assert_empty @platform.executor_questions
+    assert_equal 1, @platform.requests_to("/api/runner/reports").size
+  end
+
+  # CR-004 F3.3 — the process never started, so nothing received the answers and nothing may say
+  # it did. The offline batch stays exactly as it was, for the owner to retry.
+  def test_a_resumed_provider_that_cannot_be_launched_acknowledges_nothing
+    checkpoint = released_question_with_dirty_worktree
+    restart_platform(resume_payload(checkpoint, executor: File.join(@root, "bin", "not-installed")))
+    io = StringIO.new
+
+    refute_equal SpecrelayRunner::CLI::SUCCESS, run_cli(io), io.string
+    assert_empty @platform.delivery_acknowledgements, "a process that never started received nothing"
+    assert_empty @platform.executor_questions
+    assert_path_exists File.join(@root, ".runs", "worktrees", TASK), "the dirty worktree is preserved"
+  end
+
+  # CR-004 F3.4 — Platform answered, but the state that won is not this session's resume: an
+  # operator cancelled the run while the fresh process was starting. It is stopped through the
+  # existing bounded shutdown before any report, test or publication.
+  def test_a_resume_platform_will_not_confirm_stops_the_fresh_process_before_any_report
+    checkpoint = released_question_with_dirty_worktree
+    restart_platform(resume_payload(checkpoint, executor: DemoWorkspace.write_silent_resume_executor(@root)),
+                     delivery: settled_resume("OFFLINE_WAIT"))
+    io = StringIO.new
+
+    exit_code = run_cli(io)
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, exit_code, io.string
+    assert_includes io.string, SpecrelayRunner::QuestionBridge::DELIVERY_UNCONFIRMED
+    assert_equal 1, @platform.delivery_acknowledgements.size
+    assert_empty @platform.requests_to("/api/runner/reports"), "no report follows an unconfirmed resume"
+    assert_path_exists File.join(@root, ".runs", "worktrees", TASK), "the dirty worktree is preserved"
   end
 
   # ------------------------------------------------------------ the proof itself
