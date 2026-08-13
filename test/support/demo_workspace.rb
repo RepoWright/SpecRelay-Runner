@@ -118,6 +118,15 @@ module DemoWorkspace
       # a valid request must contain, rather than only that a bridge path was named.
       puts "[question-executor] instructions #{prompt[/^\s*- `continuation_context` requires:.*$/].to_s.strip}"
 
+      # MVP-0036 Stage 2a: the real shape of the pause this MVP exists for — the provider has
+      # already CHANGED files when it stops to ask, so the worktree a later resume must prove is
+      # genuinely dirty rather than merely present.
+      if ENV["FAKE_QUESTION_EDIT_FIRST"]
+        file = "demo-app/index.html"
+        File.write(file, File.read(file).sub("Hello Demo", "Hello Interrupted Demo"))
+        puts "[question-executor] edited before asking"
+      end
+
       File.write("#{request}.partial", ENV.fetch("FAKE_QUESTION_JSON"))
       File.rename("#{request}.partial", request)
       puts "[question-executor] asked"
@@ -139,6 +148,27 @@ module DemoWorkspace
       content = File.read(file)
       File.write(file, content.gsub("Hello Demo", "Hello SpecRelay Demo")) if content.include?("Hello Demo")
       puts "[question-executor] applied edit"
+      exit 0
+    RUBY
+    FileUtils.chmod(0o755, path)
+    path
+  end
+
+  # MVP-0036 Stage 2a — a FRESH provider resuming someone else's paused work. It proves the
+  # handoff by echoing it: a session that received no answers cannot print them.
+  def write_resume_executor(root)
+    path = File.join(root, "bin", "resume-executor")
+    File.write(path, <<~'RUBY')
+      #!/usr/bin/env ruby
+      # frozen_string_literal: true
+      prompt = File.read(ARGV.last.to_s)
+      section = prompt[/## Answers to your earlier questions.*/m].to_s
+      abort "[resume-executor] the prompt carried no answers" if section.empty?
+      puts "[resume-executor] resumed #{section.lines.map(&:strip).reject(&:empty?).join(' | ')}"
+
+      file = "demo-app/index.html"
+      File.write(file, File.read(file).sub("Hello Interrupted Demo", "Hello Resumed Demo"))
+      puts "[resume-executor] applied edit"
       exit 0
     RUBY
     FileUtils.chmod(0o755, path)

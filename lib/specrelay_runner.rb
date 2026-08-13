@@ -60,6 +60,11 @@ require_relative "specrelay_runner/review"
 # MVP-0035: the change-request round — continuing an implementation from the exact reviewed
 # pull-request head, with the reviewer's findings.
 require_relative "specrelay_runner/rework"
+# MVP-0036 Stage 2a: the offline resume round — continuing from this machine's own uncommitted
+# work, proven unchanged. Loaded after `review` for the same reason `rework` is: both prove a
+# target through its read-only git seam.
+require_relative "specrelay_runner/checkpoint"
+require_relative "specrelay_runner/resume"
 require_relative "specrelay_runner/execution"
 # MVP-0026: turning that recognized assignment into a generated specification package.
 # The whole lane lives under one namespace; see specification.rb for the pipeline order.

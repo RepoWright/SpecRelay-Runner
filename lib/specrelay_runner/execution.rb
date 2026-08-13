@@ -68,6 +68,9 @@ module SpecrelayRunner
       # MVP-0035 — nil for an ordinary first execution, which is every claim that does not
       # follow a CHANGES_REQUESTED review.
       @rework = Rework.for(payload)
+      # MVP-0036 Stage 2a — nil unless this claim continues an answered offline question on the
+      # machine that still holds its uncommitted work.
+      @resume = Resume.for(payload)
       @bridge = nil
       @controls = ProtocolControls.new(env: env)
       @emitter = EventEmitter.new(client: client, run_id: @run.fetch("id"), attempt_id: @claim)
@@ -146,13 +149,25 @@ module SpecrelayRunner
                  message: "Runner outcome: preflight_failed (local workspace not ready; claim not executed).")
     end
 
-    # MVP-0035 — the reviewed head could not be established, so this machine must not implement
-    # anything. No report and no publication: nothing about the outcome is known, and a failed
-    # report would mark the run terminal when the correct answer is "another attempt can still
-    # run this once the input is readable".
+    # The two refusals that happen BEFORE a provider and hand the claim straight back. Neither
+    # knows anything about the outcome of the work, so neither may report one: a failed report
+    # would mark the run terminal when the correct answer is "another attempt can still run this
+    # once the input is readable" (MVP-0035) or "the owner can retry once the machine is right"
+    # (MVP-0036 Stage 2a design 9).
     def rework_refused(reason)
+      refuse_before_provider(reason, "Refusing the change-request round for #{run['task_id']}")
+    end
+
+    # Stage 2a — the recorded checkpoint is not what this machine holds. The question, its
+    # answers and its checkpoint all stay durable on Platform, and the uncommitted work stays
+    # here, so the owner can correct the worktree and claim again.
+    def resume_refused(reason)
+      refuse_before_provider(reason, "Refusing to resume #{run['task_id']}")
+    end
+
+    def refuse_before_provider(reason, headline)
       safe = Redaction.redact(reason.to_s)
-      log("Refusing the change-request round for #{run['task_id']}: #{safe}")
+      log("#{headline}: #{safe}")
       log("Nothing ran: the executor was not started, nothing was pushed, and Jira was not touched.")
       release_claim(safe)
       Result.new(outcome: :preflight_failed,
@@ -205,7 +220,14 @@ module SpecrelayRunner
       emit("attempt.started", "Runner #{runner_name} started an attempt for #{run['task_id']}", phase: "attempt")
 
       emit("workspace.preparing", "Preparing worktree for #{run['task_id']}", phase: "workspace")
-      worktree = create_worktree(root)
+      # MVP-0036 Stage 2a — a resume continues the DIRTY worktree its question was asked from, so
+      # it reads and proves that worktree where an ordinary claim creates a clean one. A refusal
+      # here stops before the provider, before the package, and before any external write.
+      if @resume
+        prepared = @resume.prepare(workspace: measuring_workspace(root))
+        return resume_refused(prepared.reason) unless prepared.ok?
+      end
+      worktree = prepared&.worktree || create_worktree(root)
 
       # MVP-0035 — a rework round continues the reviewed pull request, so the worktree must hold
       # that exact commit before anything else looks at it. A refusal here stops before the
@@ -226,7 +248,7 @@ module SpecrelayRunner
       end
 
       emit("core.started", "Running #{provider} executor for #{run['task_id']}", phase: "core")
-      executor_result = run_executor(worktree, staging)
+      executor_result = run_executor(root, worktree, staging)
       # MVP-0036 — the provider stopped on a QUESTION, not on work. Checked before the lease
       # and before the exit code, because both would misreport it: a released session ends the
       # attempt on Platform (so the lease reads "terminal"), and a terminated provider exits
@@ -240,7 +262,7 @@ module SpecrelayRunner
                              classification: executor_classification(executor_result))
       end
 
-      changes = Workspace.new(root: root, canonical_branch: run["canonical_branch"], create_command: "").capture_changes(worktree.path)
+      changes = measuring_workspace(root).capture_changes(worktree.path)
       # An unmeasurable worktree is NOT an unchanged one. Reporting `changed: false`
       # here would advance Jira announcing "no code changes" while the executor's diff
       # sits on disk, so this fails closed instead (review-002 finding N1).
@@ -341,6 +363,13 @@ module SpecrelayRunner
                     create_command: workspace.fetch("worktree_create_command")).create
     end
 
+    # The same workspace, for READING only: the change capture, the Stage 2a checkpoint and the
+    # resume's worktree lookup all ask about a worktree rather than create one, so none of them
+    # carries a create command.
+    def measuring_workspace(root)
+      Workspace.new(root: root, canonical_branch: run["canonical_branch"], create_command: "")
+    end
+
     # MVP-0018 — the executor runs with a live output sink attached, so safe,
     # redacted, bounded progress reaches the terminal and Platform BETWEEN
     # `core.started` and `verification.started` instead of only at process exit.
@@ -348,17 +377,42 @@ module SpecrelayRunner
     # The stream is stopped here rather than only in the outer `ensure`, so its
     # final flush and truncation notice land before `verification.started` — the
     # live executor log is a record of the CORE phase, not of everything after it.
-    def run_executor(worktree, staging)
+    def run_executor(root, worktree, staging)
       @log_stream = start_log_stream
       # The bridge lives in the STAGING directory, outside the worktree, so a question request
       # can never appear in the diff the executor is measured on.
-      @bridge = QuestionBridge.new(client: client, claim: claim, staging_dir: staging, io: io).start
+      @bridge = QuestionBridge.new(client: client, claim: claim, staging_dir: staging, io: io,
+                                   measure: -> { measure_checkpoint(root, worktree) }).start
       Executor.new(config: payload.fetch("executor"), worktree_path: worktree.path, staging_dir: staging, env: env)
-              .run(prompt_text(worktree.path, @bridge.path), on_output: @log_stream.sink,
+              .run(prompt_text(worktree.path, @bridge.path), on_output: executor_output_sink,
                    stop_check: -> { @bridge.stop_provider? })
     ensure
       @log_stream&.finish
       @bridge&.stop
+    end
+
+    # MVP-0036 Stage 2a — what this machine looked like at the instant the provider paused.
+    def measure_checkpoint(root, worktree)
+      Checkpoint.measure(repository_key: workspace.fetch("workspace_key"),
+                         branch: run["canonical_branch"].to_s, worktree_path: worktree.path,
+                         workspace: measuring_workspace(root))
+    end
+
+    # Stage 2a required behavior 5 — a resume is acknowledged on the provider's FIRST output,
+    # which is the earliest thing this parent can observe that proves the process it launched
+    # with the answers is really running. Sooner would record a delivery a failed launch never
+    # made; later would leave the batch open past the point the same provider may ask the next
+    # one, which the one-open-batch rule would then refuse.
+    #
+    # The bridge owns "exactly once" — this only says when.
+    def executor_output_sink
+      sink = @log_stream.sink
+      return sink if @resume.nil?
+
+      lambda do |source, line|
+        @bridge.confirm_resume(@resume.question_id)
+        sink.call(source, line)
+      end
     end
 
     # MVP-0036 — the two honest endings for a provider that paused on a question. Neither runs
@@ -470,7 +524,7 @@ module SpecrelayRunner
     # Jira is not advanced).
     def failed_report(root, worktree, executor_result, message, classification: ClaudeProfile::EXECUTOR_FAILED)
       log(message)
-      changes = Workspace.new(root: root, canonical_branch: run["canonical_branch"], create_command: "").capture_changes(worktree.path)
+      changes = measuring_workspace(root).capture_changes(worktree.path)
       test = { command: workspace.fetch("test_command"), exit_code: nil, output: "" }
       emit("attempt.completed", "Uploading failed execution report for #{run['task_id']}", phase: "completed")
       bundle = ReportBundle.build(payload: payload, status: ReportBundle::STATUS_FAILED, executor: executor_result,
@@ -574,8 +628,14 @@ module SpecrelayRunner
 
         #{question_lines(bridge_path)}
       MD
-      "#{preamble}\n\n---\n\n#{payload.dig('specification_package', 'handoff_prompt')}#{rework_prompt}"
+      "#{preamble}\n\n---\n\n#{payload.dig('specification_package', 'handoff_prompt')}#{rework_prompt}#{resume_prompt}"
     end
+
+    # MVP-0036 Stage 2a — the answered batch, appended once after the unchanged approved package.
+    # It is the ONLY thing a fresh session receives from the one that asked: the questions, the
+    # decisions, and the bounded public continuation context. No transcript, no earlier reasoning
+    # and no local path, because none of those was ever stored.
+    def resume_prompt = @resume&.prompt_section.to_s
 
     # MVP-0035 — the change request, appended ONCE after the unchanged approved package. The
     # package leads because it is still the authority; the findings follow because they are what

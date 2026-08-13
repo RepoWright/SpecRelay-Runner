@@ -292,8 +292,14 @@ module SpecrelayRunner
     # A 4xx is a REFUSAL the provider may correct (an invalid document) or must obey (a stale
     # claim). It raises like any other refusal so the bridge fails closed rather than retrying
     # a body Platform will never accept.
-    def submit_executor_question(claim:, question:)
-      status, body = post_json("/api/runner/executor_questions", { claim: claim, question: question })
+    # `checkpoint` is this parent's OWN assertion about the worktree the provider asked from
+    # (MVP-0036 Stage 2a), sent beside the provider's document rather than inside it: the
+    # provider writes the question, and only the parent can measure the machine. Omitted when
+    # this machine could not measure itself, which leaves the question askable and the run
+    # simply not resumable.
+    def submit_executor_question(claim:, question:, checkpoint: nil)
+      body = { claim: claim, question: question, checkpoint: checkpoint }.compact
+      status, body = post_json("/api/runner/executor_questions", body)
       status == 201 ? body : raise_for(status, body)
     end
 

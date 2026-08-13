@@ -44,15 +44,21 @@ module SpecrelayRunner
     # coming back from the acknowledgement is some OTHER ending that won (CR-003 F1).
     ANSWERED = "ANSWERED"
     OFFLINE_WAIT = "OFFLINE_WAIT"
+    # The one state that means a FRESH session received an offline batch's answers (Stage 2a).
+    RESUMED = "RESUMED"
 
     PROVIDER_EXITED = "the provider exited while its question was still waiting for an answer"
     ANSWER_UNDELIVERED = "the provider exited before its answers could be handed back to it"
     DELIVERY_UNCONFIRMED = "Platform did not confirm that the answers reached this session"
 
-    def initialize(client:, claim:, staging_dir:, io: $stdout)
+    # `measure` is asked for this machine's checkpoint at the instant the provider pauses — not
+    # when the bridge starts — because the provider changes files right up to that moment, and a
+    # later resume has to land on exactly the state it left (Stage 2a design 3).
+    def initialize(client:, claim:, staging_dir:, measure: -> { nil }, io: $stdout)
       @client = client
       @claim = claim
       @path = File.join(staging_dir, DIRECTORY)
+      @measure = measure
       @io = io
       @mutex = Mutex.new
       @outcome = nil
@@ -60,6 +66,7 @@ module SpecrelayRunner
       @should_stop = false
       @thread = nil
       @awaiting_verdict = false
+      @resume_confirmed = false
     end
 
     attr_reader :path
@@ -106,9 +113,41 @@ module SpecrelayRunner
     # submission and the answer or release that ends it.
     def awaiting_verdict? = @mutex.synchronize { @awaiting_verdict && @outcome.nil? }
 
+    # Stage 2a — the fresh session started with an earlier batch's answers in its prompt and is
+    # now running. Platform is told once, from here, because this parent is the only thing that
+    # can observe that the process it launched with them is alive; the batch then settles as
+    # RESUMED and the run is free to be asked again.
+    #
+    # Anything other than RESUMED means something else won — a cancellation, or another machine
+    # — so the provider is stopped exactly as an unconfirmed live delivery stops it. Continuing
+    # on answers Platform does not record as delivered is the one outcome that must not happen.
+    #
+    # Called from whichever output thread sees the provider first, so the claim to report it is
+    # taken under the same mutex every other decision here uses: Platform is idempotent, but a
+    # second acknowledgement would read the state its own predecessor wrote.
+    def confirm_resume(public_id)
+      return unless claim_resume_delivery
+
+      settled = client.confirm_executor_question_delivery(claim: claim, public_id: public_id)
+                      .to_h["question"].to_h
+      return unconfirmed(settled) unless settled["state"].to_s == RESUMED
+
+      log("[question] the earlier answers were delivered to this fresh session")
+    rescue PlatformClient::Error => e
+      record(:failed, Redaction.redact(e.message))
+    end
+
     private
 
-    attr_reader :client, :claim, :io
+    attr_reader :client, :claim, :measure, :io
+
+    def claim_resume_delivery
+      @mutex.synchronize do
+        next false if @resume_confirmed
+
+        @resume_confirmed = true
+      end
+    end
 
     def request_path = File.join(path, REQUEST)
     def stopping? = @mutex.synchronize { @should_stop }
@@ -154,7 +193,7 @@ module SpecrelayRunner
     end
 
     def submit(document)
-      body = client.submit_executor_question(claim: claim, question: document)
+      body = client.submit_executor_question(claim: claim, question: document, checkpoint: measure.call)
       await(body.to_h["question"].to_h)
     rescue PlatformClient::Error => e
       # A refusal is Platform having READ the request and declined it, so the same session may
