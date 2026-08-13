@@ -32,6 +32,17 @@ module SpecrelayRunner
 
     Result = Struct.new(:outcome, :message, keyword_init: true) do
       def success? = outcome == :completed
+
+      # An attempt that ended WELL, whether or not it finished the work (MVP-0036 CR-001 F4).
+      #
+      # A released answer window is an approved pause, not a failure: the question is durable,
+      # the machine is free, and the operator has simply not decided yet. Reported as a failed
+      # run it would make a `--on-failure stop` loop shut the machine down every time the AI
+      # asked something — the opposite of the outcome this MVP exists to deliver.
+      #
+      # `:input_capture_failed` is deliberately NOT here. That one is a real failure and must
+      # still stop such a loop.
+      def handled? = success? || outcome == :awaiting_input
     end
 
     STOP_HEARTBEAT_ENV = "SPECRELAY_RUNNER_STOP_HEARTBEAT_AFTER_SECONDS"

@@ -145,6 +145,29 @@ module DemoWorkspace
     path
   end
 
+  # MVP-0036 CR-001 F1 — a provider that asks a valid question and then DIES before any
+  # verdict arrives. The exit code is scripted so the test can prove the outcome is decided by
+  # the unanswered question rather than by whether the provider happened to exit cleanly.
+  def write_abandoning_executor(root)
+    path = File.join(root, "bin", "abandoning-executor")
+    File.write(path, <<~'RUBY')
+      #!/usr/bin/env ruby
+      # frozen_string_literal: true
+      prompt = File.read(ARGV.last.to_s)
+      request = prompt[%r{`([^`]*/question-request\.json)`}, 1]
+      abort "[abandoning-executor] the prompt named no bridge" if request.nil?
+      File.write("#{request}.partial", ENV.fetch("FAKE_QUESTION_JSON"))
+      File.rename("#{request}.partial", request)
+      puts "[abandoning-executor] asked, then leaving"
+      # Long enough for the parent to submit the batch to Platform, so the question really is
+      # durable when this process disappears.
+      sleep ENV.fetch("FAKE_QUESTION_ASK_SECONDS", "3").to_f
+      exit ENV.fetch("FAKE_QUESTION_EXIT_CODE", "0").to_i
+    RUBY
+    FileUtils.chmod(0o755, path)
+    path
+  end
+
   def git_init(root)
     %w[init\ -q].each { |a| git(root, *a.split) }
     git(root, "config", "user.email", "runner@example.test")

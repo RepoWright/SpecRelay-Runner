@@ -40,6 +40,8 @@ module SpecrelayRunner
     ANSWERED = "ANSWERED"
     OFFLINE_WAIT = "OFFLINE_WAIT"
 
+    PROVIDER_EXITED = "the provider exited while its question was still waiting for an answer"
+
     def initialize(client:, claim:, staging_dir:, io: $stdout)
       @client = client
       @claim = claim
@@ -50,6 +52,7 @@ module SpecrelayRunner
       @failure_reason = nil
       @should_stop = false
       @thread = nil
+      @awaiting_verdict = false
     end
 
     attr_reader :path
@@ -60,10 +63,18 @@ module SpecrelayRunner
       self
     end
 
+    # Called once the provider process has ended, on every path.
+    #
+    # A batch Platform ACCEPTED and nobody settled is the provider exiting mid-question
+    # (CR-001 F1). Recording it here — the moment the child is known to be gone — is what keeps
+    # that ending on the question lifecycle instead of falling through to the ordinary
+    # failed-report path, where a non-zero exit would be blamed on the task and a zero exit
+    # would run tests and upload a report for work that stopped on an unanswered decision.
     def stop
       @mutex.synchronize { @should_stop = true }
       @thread&.join
       @thread = nil
+      record(:failed, PROVIDER_EXITED) if awaiting_verdict?
     end
 
     # The provider must be ended. True for BOTH endings, because both leave a process blocked
@@ -80,6 +91,10 @@ module SpecrelayRunner
 
     def outcome = @mutex.synchronize { @outcome }
     def failure_reason = @mutex.synchronize { @failure_reason }
+
+    # A batch Platform accepted that nobody has settled yet. True only between the accepted
+    # submission and the answer or release that ends it.
+    def awaiting_verdict? = @mutex.synchronize { @awaiting_verdict && @outcome.nil? }
 
     private
 
@@ -146,11 +161,14 @@ module SpecrelayRunner
     def await(question)
       public_id = question["id"].to_s
       state = question["state"].to_s
+      @mutex.synchronize { @awaiting_verdict = true }
       until stopping?
         return deliver(question) if state == ANSWERED
         return record(:released, nil) if state == OFFLINE_WAIT
 
         sleep ANSWER_POLL_SECONDS
+        break if stopping?
+
         question = client.executor_question(claim: claim, public_id: public_id).to_h["question"].to_h
         state = question["state"].to_s
       end
@@ -161,6 +179,7 @@ module SpecrelayRunner
     # The answers reach the SAME session, exactly once: written to a temporary name and renamed
     # into place, so a provider polling for the file never reads a half-written document.
     def deliver(question)
+      @mutex.synchronize { @awaiting_verdict = false }
       write(ANSWER, { "answers" => question["answers"] })
       log("[question] answers delivered to the waiting provider session")
     end
@@ -181,6 +200,7 @@ module SpecrelayRunner
       @mutex.synchronize do
         @outcome ||= outcome
         @failure_reason ||= reason
+        @awaiting_verdict = false
       end
       log("[question] the provider session is ending: #{reason || 'Platform released it'}")
     end
