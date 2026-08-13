@@ -71,8 +71,7 @@ module SpecrelayRunner
 
       started = monotonic
       out_r, err_r, pid = spawn_process(argv)
-      notify_started(pid)
-      timed_out, status = wait_or_kill(pid)
+      timed_out, status = deliver_and_wait(pid)
       Result.new(exit_code: status&.exitstatus, stdout: out_r.value, stderr: err_r.value,
                  duration_seconds: (monotonic - started).round(3), timed_out: timed_out)
     end
@@ -81,11 +80,29 @@ module SpecrelayRunner
 
     attr_reader :chdir, :env, :timeout_seconds, :stdin_data, :on_output, :stop_check, :on_start
 
-    # THE provider-start boundary (MVP-0036 CR-004 F3): the child exists and its input has been
-    # delivered — by argv at spawn, or by the stdin write inside `spawn_process`. It is the one
-    # honest instant at which a caller may record "this process received what we gave it": before
-    # it, nothing was started; after it, the child may already have acted.
+    # THE provider-start boundary (MVP-0036 CR-004 F3, corrected by CR-005 F2): the child exists
+    # and its input REALLY reached it — by argv at spawn, or by a stdin write that completed. It
+    # is the one honest instant at which a caller may record "this process received what we gave
+    # it": before it, nothing was started; after it, the child may already have acted.
     #
+    # A child that was gone before it read a byte received nothing, so nothing may be told it
+    # did. That case is an ordinary early exit when no callback was requested — which is what it
+    # has always been, and F2.4 keeps it that way — but a caller that asked to be told the input
+    # arrived needs the LAUNCH to fail, not an exit code that looks like the task's own. Raising
+    # here reaches `Executor#run`'s existing SystemCallError rescue, so it becomes the same
+    # `launch_error` every other "no provider ran this" already produces.
+    def deliver_and_wait(pid)
+      return wait_or_kill(pid) if on_start.nil?
+
+      unless @input_delivered
+        terminate_group(pid)
+        raise Errno::EPIPE, "the child closed its input before the prompt was delivered"
+      end
+
+      notify_started(pid)
+      wait_or_kill(pid)
+    end
+
     # Deliberately NOT swallowed the way `on_output` is. That one is a progress display and must
     # never fail the execution it reports on; this one is a decision about whether the run may
     # continue at all, and a caller that cannot record the handoff has to be able to stop it. The
@@ -104,14 +121,18 @@ module SpecrelayRunner
       in_r, in_w = IO.pipe
       pid = Process.spawn(env, *argv, chdir: chdir, out: out_w, err: err_w, in: in_r, pgroup: true)
       [ out_w, err_w, in_r ].each(&:close)
-      write_stdin(in_w)
+      @input_delivered = write_stdin(in_w)
       [ reader_thread(out_r, STDOUT), reader_thread(err_r, STDERR), pid ]
     end
 
+    # True when the child really has its input: there was none to give, or all of it was written.
     def write_stdin(io)
       io.write(stdin_data) if stdin_data
+      true
     rescue Errno::EPIPE
-      # child exited before reading stdin; not an error
+      # The child exited before reading stdin. Not an error in itself — see {#deliver_and_wait}
+      # for why it stops mattering only when nobody asked to be told the input arrived.
+      false
     ensure
       io.close
     end

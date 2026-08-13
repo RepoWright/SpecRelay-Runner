@@ -216,6 +216,32 @@ class QuestionResumeTest < Minitest::Test
     assert_path_exists File.join(@root, ".runs", "worktrees", TASK), "the dirty worktree is preserved"
   end
 
+  # CR-005 F2 — the provider process started but never read the prompt carrying the answers. No
+  # session received them, so nothing may say one did, and the run must stay retryable: no tests,
+  # no report, no publication, and the claim handed straight back.
+  #
+  # `/usr/bin/true` is a real child that exits without ever reading its input, and the prompt is
+  # larger than the pipe buffer, so the failed handoff is deterministic rather than timing.
+  def test_a_resume_whose_prompt_never_reaches_the_provider_acknowledges_nothing
+    checkpoint = released_question_with_dirty_worktree
+    payload = resume_payload(checkpoint, executor: "/usr/bin/true")
+    payload["executor"]["prompt_delivery"] = "stdin"
+    payload["specification_package"]["handoff_prompt"] = "x" * 200_000
+    restart_platform(payload)
+    io = StringIO.new
+
+    exit_code = run_cli(io)
+
+    refute_equal SpecrelayRunner::CLI::SUCCESS, exit_code, io.string
+    assert_empty @platform.delivery_acknowledgements,
+                 "a process that never received the answers is never acknowledged"
+    assert_empty @platform.requests_to("/api/runner/reports"),
+                 "no report follows a resume no provider ever read"
+    assert_equal 1, @platform.requests_to("/api/runner/claim_releases").size
+    assert_empty @platform.executor_questions
+    assert_path_exists File.join(@root, ".runs", "worktrees", TASK), "the dirty worktree is preserved"
+  end
+
   # CR-004 F3.4 — Platform answered, but the state that won is not this session's resume: an
   # operator cancelled the run while the fresh process was starting. It is stopped through the
   # existing bounded shutdown before any report, test or publication.

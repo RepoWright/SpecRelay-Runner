@@ -168,7 +168,7 @@ module SpecrelayRunner
     def refuse_before_provider(reason, headline)
       safe = Redaction.redact(reason.to_s)
       log("#{headline}: #{safe}")
-      log("Nothing ran: the executor was not started, nothing was pushed, and Jira was not touched.")
+      log("Nothing ran: no provider received this task, nothing was pushed, and Jira was not touched.")
       release_claim(safe)
       Result.new(outcome: :preflight_failed,
                  message: "Runner outcome: preflight_failed (#{safe}); nothing executed.")
@@ -254,6 +254,11 @@ module SpecrelayRunner
       # attempt on Platform (so the lease reads "terminal"), and a terminated provider exits
       # non-zero. Neither is a failure of the task, and neither may upload a report.
       return question_outcome if @bridge&.outcome
+      # MVP-0036 CR-005 F2 — no provider ever received the answers, so there is nothing to
+      # report. A failed report would mark the run TERMINAL and take the offline batch with it;
+      # handing the claim back leaves the answers, the checkpoint and the changed files exactly
+      # as they were, for the owner to try again.
+      return resume_refused(executor_result.launch_error) if @resume && executor_result.launch_error
       # If Platform expired or cancelled the claim while the executor held it, stop
       # BEFORE running tests or uploading anything (MVP-0012).
       check_stop!

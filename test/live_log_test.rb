@@ -54,6 +54,68 @@ class LiveLogTest < Minitest::Test
     assert_equal [ "stdout", "second line" ], seen[1][1..2]
   end
 
+  # ---- CommandRunner: the provider-start boundary (MVP-0036 CR-005 F2) ----
+  #
+  # `on_start` means "this child has what we gave it". A caller records an irreversible fact on
+  # the strength of it, so it must fire once for a real handoff and never for a failed one.
+
+  def test_the_start_callback_fires_once_when_the_prompt_travels_as_an_argument
+    started = 0
+
+    result = SpecrelayRunner::CommandRunner.run(
+      [ RbConfig.ruby, write_script("exit 0\n") ], chdir: @tmp, env: { "PATH" => ENV["PATH"] },
+      timeout_seconds: 20, on_start: -> { started += 1 }
+    )
+
+    assert_equal 0, result.exit_code
+    assert_equal 1, started
+  end
+
+  def test_the_start_callback_fires_once_when_the_prompt_is_delivered_on_stdin
+    script = write_script(<<~RUBY)
+      read = $stdin.read
+      $stdout.write(read.bytesize.to_s)
+    RUBY
+    started = 0
+    prompt = "x" * 200_000
+
+    result = SpecrelayRunner::CommandRunner.run(
+      [ RbConfig.ruby, script ], chdir: @tmp, env: { "PATH" => ENV["PATH"] }, timeout_seconds: 20,
+      stdin_data: prompt, on_start: -> { started += 1 }
+    )
+
+    assert_equal 0, result.exit_code
+    assert_equal prompt.bytesize.to_s, result.stdout, "the child received the whole prompt"
+    assert_equal 1, started
+  end
+
+  # The child is gone before it reads a byte, and the prompt is larger than the pipe buffer so
+  # the write cannot quietly complete into it. Nothing was handed off, so nothing may be told it
+  # was — and the caller has to learn the launch failed rather than see an ordinary exit code.
+  def test_the_start_callback_never_fires_when_the_child_closed_its_input_first
+    started = 0
+
+    assert_raises(Errno::EPIPE) do
+      SpecrelayRunner::CommandRunner.run(
+        [ RbConfig.ruby, write_script("exit 0\n") ], chdir: @tmp, env: { "PATH" => ENV["PATH"] },
+        timeout_seconds: 20, stdin_data: "x" * 1_000_000, on_start: -> { started += 1 }
+      )
+    end
+
+    assert_equal 0, started
+  end
+
+  # F2.4 — with no lifecycle callback the ordinary behaviour is untouched: a child that exits
+  # before reading its input has always been an ordinary early exit, and its result still decides.
+  def test_a_child_that_never_reads_its_input_is_unchanged_without_a_start_callback
+    result = SpecrelayRunner::CommandRunner.run(
+      [ RbConfig.ruby, write_script("exit 7\n") ], chdir: @tmp, env: { "PATH" => ENV["PATH"] },
+      timeout_seconds: 20, stdin_data: "x" * 1_000_000
+    )
+
+    assert_equal 7, result.exit_code
+  end
+
   def test_stdout_and_stderr_are_delivered_with_distinct_stream_names
     script = write_script(<<~RUBY)
       $stdout.sync = true
