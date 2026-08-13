@@ -53,6 +53,7 @@ module SpecrelayRunner
       # MVP-0035 — nil for an ordinary first execution, which is every claim that does not
       # follow a CHANGES_REQUESTED review.
       @rework = Rework.for(payload)
+      @bridge = nil
       @controls = ProtocolControls.new(env: env)
       @emitter = EventEmitter.new(client: client, run_id: @run.fetch("id"), attempt_id: @claim)
     end
@@ -211,6 +212,11 @@ module SpecrelayRunner
 
       emit("core.started", "Running #{provider} executor for #{run['task_id']}", phase: "core")
       executor_result = run_executor(worktree, staging)
+      # MVP-0036 — the provider stopped on a QUESTION, not on work. Checked before the lease
+      # and before the exit code, because both would misreport it: a released session ends the
+      # attempt on Platform (so the lease reads "terminal"), and a terminated provider exits
+      # non-zero. Neither is a failure of the task, and neither may upload a report.
+      return question_outcome if @bridge&.outcome
       # If Platform expired or cancelled the claim while the executor held it, stop
       # BEFORE running tests or uploading anything (MVP-0012).
       check_stop!
@@ -329,10 +335,42 @@ module SpecrelayRunner
     # live executor log is a record of the CORE phase, not of everything after it.
     def run_executor(worktree, staging)
       @log_stream = start_log_stream
+      # The bridge lives in the STAGING directory, outside the worktree, so a question request
+      # can never appear in the diff the executor is measured on.
+      @bridge = QuestionBridge.new(client: client, claim: claim, staging_dir: staging, io: io).start
       Executor.new(config: payload.fetch("executor"), worktree_path: worktree.path, staging_dir: staging, env: env)
-              .run(prompt_text(worktree.path), on_output: @log_stream.sink)
+              .run(prompt_text(worktree.path, @bridge.path), on_output: @log_stream.sink,
+                   stop_check: -> { @bridge.stop_provider? })
     ensure
       @log_stream&.finish
+      @bridge&.stop
+    end
+
+    # MVP-0036 — the two honest endings for a provider that paused on a question. Neither runs
+    # tests, uploads a report, publishes, or touches Jira: there is no result to report, only a
+    # decision a human has not made yet. The dirty worktree stays exactly where it is.
+    def question_outcome
+      return input_capture_failure if @bridge.failed?
+
+      log("The provider session for #{run['task_id']} was released; the question and its context " \
+          "are durable on Platform and this machine's changes were left in place.")
+      Result.new(outcome: :awaiting_input,
+                 message: "Runner outcome: awaiting_input (question durable; no report uploaded).")
+    end
+
+    # Reported to Platform rather than left to a lapsing lease, so the attempt ends as a
+    # distinct recoverable failure and the machine is freed now. A failure to REPORT the
+    # failure is still an honest non-zero exit: Platform reclaims the lapsed lease.
+    def input_capture_failure
+      reason = @bridge.failure_reason.to_s
+      log("Could not capture the provider's question for #{run['task_id']}: #{Redaction.redact(reason)}")
+      log("Nothing was tested, reported, published, or written to Jira. Your changes are still in the worktree.")
+      client.report_input_capture_failure(claim: claim, reason: reason)
+      Result.new(outcome: :input_capture_failed,
+                 message: "Runner outcome: input_capture_failed (#{Redaction.redact(reason)}).")
+    rescue PlatformClient::Error => e
+      Result.new(outcome: :input_capture_failed,
+                 message: "Runner outcome: input_capture_failed (#{Redaction.redact(e.message)}).")
     end
 
     def start_log_stream
@@ -485,7 +523,7 @@ module SpecrelayRunner
       check_stop!
     end
 
-    def prompt_text(worktree_path)
+    def prompt_text(worktree_path, bridge_path)
       preamble = <<~MD.strip
         # Automated execution task — #{run['task_id']}
 
@@ -501,6 +539,8 @@ module SpecrelayRunner
         - Change ONLY files inside the worktree above, per the approved specification.
         - Do NOT edit any `spec.md`/`spec_persian.md`, push, open a PR, or write to Platform.
         - Make the change idempotently.
+
+        #{question_lines(bridge_path)}
       MD
       "#{preamble}\n\n---\n\n#{payload.dig('specification_package', 'handoff_prompt')}#{rework_prompt}"
     end
@@ -512,6 +552,31 @@ module SpecrelayRunner
       return "" if @rework.nil?
 
       @rework.prompt_section(payload.dig("report_contract", "round_label").to_s)
+    end
+
+    # MVP-0036 — the ONE way to reach the Product Owner. Named explicitly because a provider's
+    # own question UI is private: SpecRelay never reads it, never interprets stdout as a
+    # question, and cannot answer either.
+    #
+    # The required context fields and the size bound come from the assignment's
+    # `question_contract`, which Platform builds from the very validator that enforces them, so
+    # these instructions cannot describe a document Platform would refuse.
+    def question_lines(bridge_path)
+      contract = payload["question_contract"].to_h
+      fields = contract["continuation_context_fields"].to_h
+      <<~MD.strip
+        If you need a Product Owner decision, do not guess and do not ask on stdout:
+
+        - Write `#{File.join(bridge_path, QuestionBridge::REQUEST)}` as one JSON object with
+          `questions` (each `prompt`, and optional `options` of `key`/`label`/`trade_off`/`recommended`)
+          and `continuation_context`. `#{contract['reserved_option_key']}` is always offered for you
+          and is a reserved key. The whole document must fit within #{contract['max_document_bytes']} bytes.
+        - `continuation_context` requires: #{fields.map { |name, description| "`#{name}` (#{description})" }.join(', ')}.
+          It is PUBLIC: no local paths, credentials, or your own reasoning.
+        - Then wait for `#{File.join(bridge_path, QuestionBridge::ANSWER)}` and continue with its
+          `answers`, or for `#{File.join(bridge_path, QuestionBridge::ERROR)}`, which you may correct
+          and re-submit. If neither appears, your session was released; stop.
+      MD
     end
 
     # Where the verified package actually IS on this machine. The handoff prompt tells the

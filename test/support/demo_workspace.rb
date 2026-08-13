@@ -95,6 +95,56 @@ module DemoWorkspace
     path
   end
 
+  # MVP-0036 — a fake executor that uses the QUESTION BRIDGE. It reads the bridge path out of
+  # the prompt exactly as a real provider must (the prompt is the only place it is named),
+  # writes one request, then blocks on the answer — so the test exercises the real
+  # same-session wait rather than a stubbed one.
+  #
+  # `FAKE_QUESTION_JSON` is the raw request bytes, so a test can send a malformed or oversized
+  # document without this script sanitizing it first.
+  def write_question_executor(root)
+    path = File.join(root, "bin", "question-executor")
+    File.write(path, <<~'RUBY')
+      #!/usr/bin/env ruby
+      # frozen_string_literal: true
+      require "json"
+      prompt = File.read(ARGV.last.to_s)
+      request = prompt[%r{`([^`]*/question-request\.json)`}, 1]
+      abort "[question-executor] the prompt named no bridge" if request.nil?
+      answer = File.join(File.dirname(request), "question-answer.json")
+      error = File.join(File.dirname(request), "question-error.json")
+
+      # Echo the instructions back so a test can prove the prompt really told the provider what
+      # a valid request must contain, rather than only that a bridge path was named.
+      puts "[question-executor] instructions #{prompt[/^\s*- `continuation_context` requires:.*$/].to_s.strip}"
+
+      File.write("#{request}.partial", ENV.fetch("FAKE_QUESTION_JSON"))
+      File.rename("#{request}.partial", request)
+      puts "[question-executor] asked"
+
+      deadline = Time.now + ENV.fetch("FAKE_QUESTION_TIMEOUT_SECONDS", "20").to_f
+      until Time.now > deadline
+        if File.file?(answer)
+          puts "[question-executor] answered #{JSON.parse(File.read(answer))['answers'].to_json}"
+          break
+        end
+        if File.file?(error)
+          puts "[question-executor] refused #{JSON.parse(File.read(error))['error']}"
+          break
+        end
+        sleep 0.05
+      end
+
+      file = "demo-app/index.html"
+      content = File.read(file)
+      File.write(file, content.gsub("Hello Demo", "Hello SpecRelay Demo")) if content.include?("Hello Demo")
+      puts "[question-executor] applied edit"
+      exit 0
+    RUBY
+    FileUtils.chmod(0o755, path)
+    path
+  end
+
   def git_init(root)
     %w[init\ -q].each { |a| git(root, *a.split) }
     git(root, "config", "user.email", "runner@example.test")

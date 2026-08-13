@@ -1,7 +1,6 @@
 # frozen_string_literal: true
 
 require "open3"
-require "timeout"
 
 module SpecrelayRunner
   # Launches one child process from an explicit argv array under a hard timeout,
@@ -25,6 +24,10 @@ module SpecrelayRunner
     MAX_CAPTURE_BYTES = 1_000_000
     TERM_GRACE_SECONDS = 5
     READ_CHUNK_BYTES = 64 * 1024
+    # How often the parent notices that the child exited, the timeout passed, or a stop was
+    # requested. Short enough that a released provider session ends promptly, long enough that
+    # waiting on a half-hour executor costs nothing measurable.
+    WAIT_POLL_SECONDS = 0.05
 
     # A provider that emits a very long line with no newline must not be able to
     # grow the pending-line buffer without bound; at this size the partial line is
@@ -43,12 +46,19 @@ module SpecrelayRunner
 
     def self.run(argv, **kwargs) = new(**kwargs).run(argv)
 
-    def initialize(chdir:, env: {}, timeout_seconds: 1800, stdin_data: nil, on_output: nil)
+    # `stop_check` (MVP-0036) is an OPTIONAL predicate polled while the child runs. When it
+    # answers truthfully, the process group is ended through the same bounded TERM-then-KILL
+    # grace a timeout uses — one shutdown implementation, so a released provider session and an
+    # overrunning one cannot be stopped by two different rules. Nil restores the ordinary
+    # behaviour exactly: wait for the child, or kill it at the timeout.
+    def initialize(chdir:, env: {}, timeout_seconds: 1800, stdin_data: nil, on_output: nil,
+                   stop_check: nil)
       @chdir = chdir.to_s
       @env = env.to_h.transform_keys(&:to_s).transform_values(&:to_s)
       @timeout_seconds = timeout_seconds
       @stdin_data = stdin_data
       @on_output = on_output
+      @stop_check = stop_check
     end
 
     def run(argv)
@@ -64,7 +74,7 @@ module SpecrelayRunner
 
     private
 
-    attr_reader :chdir, :env, :timeout_seconds, :stdin_data, :on_output
+    attr_reader :chdir, :env, :timeout_seconds, :stdin_data, :on_output, :stop_check
 
     def spawn_process(argv)
       out_r, out_w = IO.pipe
@@ -150,13 +160,29 @@ module SpecrelayRunner
         "[output truncated at #{MAX_CAPTURE_BYTES} bytes]\n"
     end
 
+    # One wait loop for both reasons a child stops early. It replaces the old
+    # `Timeout.timeout(...) { waitpid }` because a blocking wait cannot also observe a stop
+    # signal, and giving the two reasons separate implementations would mean two shutdown
+    # graces that could drift apart.
     def wait_or_kill(pid)
-      Timeout.timeout(timeout_seconds) { Process.waitpid(pid, 0) }
-      [ false, $? ]
-    rescue Timeout::Error
-      [ true, terminate_group(pid) ]
+      deadline = monotonic + timeout_seconds
+      loop do
+        return [ false, $? ] if reaped?(pid)
+        return [ true, terminate_group(pid) ] if monotonic >= deadline
+        return [ false, terminate_group(pid) ] if stop_requested?
+
+        sleep WAIT_POLL_SECONDS
+      end
     rescue Errno::ECHILD
       [ false, nil ]
+    end
+
+    # A stop predicate must never be able to fail the execution it is watching, for the same
+    # reason the live-output consumer cannot: it is an observer, not a decision.
+    def stop_requested?
+      stop_check&.call ? true : false
+    rescue StandardError
+      false
     end
 
     def terminate_group(pid)

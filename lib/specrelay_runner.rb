@@ -46,6 +46,7 @@ require_relative "specrelay_runner/heartbeater"
 require_relative "specrelay_runner/protocol_controls"
 require_relative "specrelay_runner/event_emitter"
 require_relative "specrelay_runner/executor_log_stream"
+require_relative "specrelay_runner/question_bridge"
 # MVP-0027: the pull-request reuse decision, shared by both publication lanes.
 require_relative "specrelay_runner/pull_request_reuse"
 require_relative "specrelay_runner/publication"

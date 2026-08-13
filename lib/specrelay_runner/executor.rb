@@ -52,13 +52,17 @@ module SpecrelayRunner
     # executor writes, while it is still running. It is passed straight through to
     # CommandRunner, which guarantees it can neither change nor fail the captured
     # result — this method's contract is unchanged when it is nil.
-    def run(prompt_text, on_output: nil)
+    #
+    # `stop_check` (MVP-0036) is passed straight through to CommandRunner, which owns the one
+    # bounded shutdown grace. It is how a provider whose question window closed is ended
+    # without this object learning anything about questions.
+    def run(prompt_text, on_output: nil, stop_check: nil)
       prompt_path = write_prompt(prompt_text)
       result = CommandRunner.run(
         launch_argv(prompt_text, prompt_path),
         chdir: worktree_path, env: process_env,
         timeout_seconds: timeout_seconds, stdin_data: (prompt_text if stdin_prompt?),
-        on_output: on_output
+        on_output: on_output, stop_check: stop_check
       )
       Result.new(exit_code: result.exit_code, stdout: result.stdout, stderr: result.stderr,
                  duration_seconds: result.duration_seconds, timed_out: result.timed_out,

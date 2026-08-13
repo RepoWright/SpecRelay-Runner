@@ -91,6 +91,13 @@ class FakePlatform
     @claimed = false
     @lease_signal = lease_signal
     @seen_sequences = []
+    # MVP-0036: the answer window starts OPEN and stays open until a test plays the Product
+    # Owner, so a test that scripts nothing models a provider that is still waiting.
+    @question = nil
+    @question_answers = []
+    @question_settle_state = nil
+    @question_settle_after = 1
+    @question_polls = 0
     @mutex = Mutex.new
   end
 
@@ -140,6 +147,29 @@ class FakePlatform
   def review_results = review_submissions.reject { |request| request[:body].to_h.key?("stale") }
   def stale_reports = review_submissions.filter_map { |request| request[:body].to_h if request[:body].to_h.key?("stale") }
   def last_review = review_results.last&.dig(:body, "review")
+
+  # MVP-0036 — what the provider actually asked through the bridge. An EMPTY list is as
+  # load-bearing as its contents: a locally refused request must never reach Platform.
+  def executor_questions = requests_to("/api/runner/executor_questions")
+  def asked_question = @mutex.synchronize { @question }
+  def capture_failures = executor_questions.select { |r| r[:body].to_h.key?("capture_failure") }
+
+  # Play the Product Owner. The settlement lands on the Nth POLL rather than immediately, so the
+  # runner's waiting loop is exercised rather than short-circuited by the submission response.
+  def answer_question!(answers, after_polls: 1) = settle_question("ANSWERED", answers, after_polls)
+  def release_question!(after_polls: 1) = settle_question("OFFLINE_WAIT", [], after_polls)
+
+  def settle_question(state, answers, after_polls)
+    @mutex.synchronize do
+      @question_settle_state = state
+      @question_answers = answers
+      @question_settle_after = after_polls
+    end
+  end
+
+  # Script a refusal (a 4xx the provider may correct) or a fault (5xx / a body Platform never
+  # sends), so a test can prove the runner tells the two apart.
+  attr_accessor :question_response
   def last_registration = requests_to("/api/runner/registration").last
   def last_enrollment = requests_to("/api/runner/enrollment").last
   def last_enrollment_preview = requests_to("/api/runner/enrollment_preview").last
@@ -246,9 +276,46 @@ class FakePlatform
     when "/api/runner/specification_generations" then specification_generation(request)
     when "/api/runner/specification_publications" then specification_publication(request)
     when "/api/runner/review_results" then review_result(request)
+    when "/api/runner/executor_questions" then executor_question(request)
+    when %r{\A/api/runner/executor_questions/(?<id>.+)\z} then executor_question_state
     else [ 404, { error: "not found" } ]
     end
   end
+
+  # MVP-0036: the question bridge's endpoint. Deliberately dumb about the document schema
+  # (Platform's own specs cover that) but NOT dumb about the state it reports back: the runner
+  # branches on it to decide whether to keep the provider alive, hand it the answers, or end
+  # it, so a fake that always said LIVE_WAIT would let every one of those branches pass
+  # vacuously.
+  def executor_question(request)
+    # The capture-failure body is answered BEFORE any scripted response: a test scripts a fault
+    # to provoke the failure, and having that same script also reject the report of it would
+    # make "the runner told Platform" unprovable.
+    return [ 201, { contract_version: "mvp-0036", execution: { state: "INPUT_CAPTURE_FAILED" } } ] if
+      request[:body].to_h.key?("capture_failure")
+    return @question_response if @question_response
+
+    @mutex.synchronize { @question = request.dig(:body, "question").to_h }
+    question_body(201, "LIVE_WAIT", [])
+  end
+
+  # The POLL. Every read moves the counter, so a settlement scheduled for the Nth poll happens
+  # while the runner is genuinely waiting.
+  def executor_question_state
+    state, answers = @mutex.synchronize do
+      @question_polls += 1
+      settled = @question_settle_state && @question_polls >= @question_settle_after
+      [ settled ? @question_settle_state : "LIVE_WAIT", settled ? @question_answers : [] ]
+    end
+    question_body(200, state, answers)
+  end
+
+  def question_body(status, state, answers)
+    [ status, { contract_version: "mvp-0036",
+                question: { id: "exq_fake", state: state, deadline_at: "2026-08-13T12:00:00Z",
+                            remaining_seconds: state == "LIVE_WAIT" ? 600 : 0, answers: answers } } ]
+  end
+
 
   # MVP-0026: the specification-generation result endpoint. Deliberately dumb about domain
   # rules (Platform's own request specs cover the real state transitions) but NOT dumb about
