@@ -78,7 +78,6 @@ module SpecrelayRunner
       @evidence = []
       @total_bytes = 0
       @emitted_lines = 0
-      @upload_failures = 0
       @truncated = false
       @finished = false
       @running = false
@@ -121,7 +120,10 @@ module SpecrelayRunner
       @timer = nil
       flush_all
       announce_truncation
-      report_upload_failures
+      # MAPIAI-60 — the last delivery opportunity of the attempt. A gap that closed here still
+      # closed during the attempt, which is why the report below runs after it, not before.
+      emitter.retry_undelivered
+      report_delivery_gap
       # A quiet-provider status row is only true while the provider is running.
       io.clear_status
       self
@@ -229,24 +231,29 @@ module SpecrelayRunner
       submit(TRUNCATED_EVENT, TRUNCATION_NOTICE, log_source: "status", phase: "core", note: "budget_exhausted")
     end
 
-    # Every upload failure is counted rather than raised, then reported once so a
-    # silent gap in the Platform-side log is never invisible to the operator.
-    def report_upload_failures
-      failures = @mutex.synchronize { @upload_failures }
-      return if failures.zero?
+    # What Platform never accepted, reported once at the end so a silent gap in the Platform-side
+    # log is never invisible to the operator. It is the emitter's count, not a local one: after
+    # MAPIAI-60 a failed delivery may still be retried, so "how many attempts failed" would
+    # overstate the gap and claim missing output that in fact arrived.
+    def report_delivery_gap
+      owed = emitter.undelivered_count
+      return if owed.zero?
 
-      write "[core.progress] #{failures} live log update(s) could not be delivered to Platform; " \
+      write "[core.progress] #{owed} live log update(s) could not be delivered to Platform; " \
             "the terminal output above and the report evidence are unaffected"
     end
 
-    # The one place a live log event is sent. A transport failure is counted, never
-    # raised: the live view is progress evidence, and losing a chunk of it must not
-    # change the outcome of the run.
+    # The one place a live log event is sent. A transport failure is swallowed, never raised: the
+    # live view is progress evidence, and losing a chunk of it must not change the outcome of the
+    # run.
+    #
+    # MAPIAI-60 — every submission is also a delivery opportunity for whatever an earlier outage
+    # left undelivered, which is what makes reconnection a property of the ordinary path instead
+    # of a reconnect daemon, a disk queue, or a second retention policy.
     def submit(event_type, summary, log_chunk: nil, **attributes)
-      response = emitter.emit(event_type, summary, log_chunk: log_chunk, **attributes)
-      observe(response)
+      emitter.retry_undelivered
+      observe(emitter.emit(event_type, summary, log_chunk: log_chunk, **attributes))
     rescue PlatformClient::Error
-      @mutex.synchronize { @upload_failures += 1 }
       nil
     end
 

@@ -63,6 +63,7 @@ module SpecrelayRunner
       @claim = payload.fetch("claim").fetch("runner_execution_id")
       @heartbeater = nil
       @log_stream = nil
+      @claude_stream = nil
       @lease_stop_reason = nil
       @package = nil
       # MVP-0035 — nil for an ordinary first execution, which is every claim that does not
@@ -272,6 +273,13 @@ module SpecrelayRunner
         return failed_report(root, worktree, executor_result, executor_failure(executor_result),
                              classification: executor_classification(executor_result))
       end
+      # MAPIAI-60 — the provider exited cleanly but its structured output could not be read, so
+      # there is no result this runner can prove. Fails closed as a failed attempt rather than
+      # reporting an empty success: an unreadable stream is not an unchanged repository.
+      if (unreadable = @claude_stream&.close&.failure)
+        return failed_report(root, worktree, executor_result,
+                             "the #{provider} executor produced unusable output: #{unreadable}")
+      end
 
       changes = measuring_workspace(root).capture_changes(worktree.path)
       # An unmeasurable worktree is NOT an unchanged one. Reporting `changed: false`
@@ -390,18 +398,40 @@ module SpecrelayRunner
     # live executor log is a record of the CORE phase, not of everything after it.
     def run_executor(root, worktree, staging)
       @log_stream = start_log_stream
+      @claude_stream = claude_stream(worktree)
       # The bridge lives in the STAGING directory, outside the worktree, so a question request
       # can never appear in the diff the executor is measured on.
       @bridge = QuestionBridge.new(client: client, claim: claim, staging_dir: staging, io: io,
                                    measure: -> { measure_checkpoint(root, worktree) },
                                    resume_question_id: @resume&.question_id).start
-      Executor.new(config: payload.fetch("executor"), worktree_path: worktree.path, staging_dir: staging, env: env)
-              .run(prompt_text(worktree.path, @bridge.path), on_output: @log_stream.sink,
-                   on_start: -> { @bridge.confirm_resume },
-                   stop_check: -> { @bridge.stop_provider? })
+      result = Executor.new(config: payload.fetch("executor"), worktree_path: worktree.path,
+                            staging_dir: staging, env: env)
+                       .run(prompt_text(worktree.path, @bridge.path),
+                            on_output: (@claude_stream || @log_stream).sink,
+                            on_start: -> { @bridge.confirm_resume },
+                            stop_check: -> { @bridge.stop_provider? })
+      decoded(result)
     ensure
       @log_stream&.finish
       @bridge&.stop
+    end
+
+    # MAPIAI-60 — the supported Claude profile is structured-output-only, so its stdout is a
+    # JSONL transport rather than operator text and is decoded before anything sees it. Any other
+    # configured executor (the deterministic fixture, an operator's own command) keeps the
+    # line-oriented contract it has always had; nothing pretends it emits Claude semantics.
+    def claude_stream(worktree)
+      return nil unless ClaudeProfile.selected?(payload["executor"])
+
+      ClaudeStream.new(sink: @log_stream.sink, repository_path: worktree.path)
+    end
+
+    # The report is built from the DECODED terminal result, never from the raw frames: raw JSONL
+    # is transport, so it may not become this attempt's stdout evidence.
+    def decoded(result)
+      return result unless @claude_stream
+
+      Executor::Result.new(**result.to_h, stdout: @claude_stream.final_text)
     end
 
     # MVP-0036 Stage 2a — what this machine looked like at the instant the provider paused.

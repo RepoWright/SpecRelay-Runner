@@ -109,23 +109,49 @@ module FakeClaudeCli
     end
   end
 
-  # The success path: behave like `claude --print "<prompt>"` — take the prompt as
-  # the final argv element, edit the assigned worktree idempotently, print a text
-  # transcript, and exit 0.
+  # The success path: behave like the supported profile — take the prompt as the final argv
+  # element, edit the assigned worktree idempotently, and report progress the way
+  # `--output-format stream-json --verbose` does (MAPIAI-60): a `system/init` message, typed
+  # assistant/user messages as work happens, then ONE terminal `result` carrying the answer.
+  #
+  # It emits INCREMENTALLY, with a real pause before the result, so a test can prove progress
+  # reached a surface while the process was still running rather than at exit.
+  #
+  # The planted token travels in an assistant TEXT block — private prose that must never be
+  # displayed — so a test can assert both that it is not shown and that nothing else leaked.
   def edit_branch(from_heading, to_heading)
     <<~RUBY.strip
       prompt = ARGV.last.to_s
       abort "refusing to run without a prompt" if prompt.strip.empty?
-      puts "reading the approved specification (\#{prompt.bytesize} bytes)"
-      puts "incidentally echoing #{LEAKED_TOKEN} into the transcript"
+      $stdout.sync = true
+      def say(message) = puts(JSON.generate(message))
+      def tool(name, input) = say("type" => "assistant", "message" => { "content" => [
+        { "type" => "tool_use", "name" => name, "input" => input } ] })
+      def tool_done = say("type" => "user", "message" => { "content" => [
+        { "type" => "tool_result", "is_error" => false, "content" => "raw tool output" } ] })
+
       file = "demo-app/index.html"
+      say("type" => "system", "subtype" => "init", "cwd" => Dir.pwd, "model" => "fake-claude")
+      say("type" => "assistant", "message" => { "content" => [
+        { "type" => "text", "text" => "considering the task; #{LEAKED_TOKEN}" } ] })
+      tool("Read", "file_path" => File.expand_path(file))
+      tool_done
       content = File.read(file)
-      if content.include?(#{from_heading.inspect})
+      applied = content.include?(#{from_heading.inspect})
+      if applied
+        tool("Edit", "file_path" => File.expand_path(file))
         File.write(file, content.gsub(#{from_heading.inspect}, #{to_heading.inspect}))
-        puts "applied the heading change"
-      else
-        puts "the heading change is already applied; nothing to do"
+        tool_done
       end
+      tool("Bash", "command" => "npm test")
+      tool_done
+      sleep 0.4
+      # The token also travels in the TERMINAL RESULT, which does reach the report's stdout
+      # evidence — so the existing redaction of that evidence stays under test even though the
+      # assistant prose above never reaches a surface at all.
+      say("type" => "result", "subtype" => "success", "is_error" => false,
+          "result" => (applied ? "applied the heading change" : "the heading change is already applied; nothing to do") +
+                      " (transcript echoed #{LEAKED_TOKEN})")
       exit 0
     RUBY
   end

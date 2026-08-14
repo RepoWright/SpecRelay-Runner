@@ -113,7 +113,37 @@ module SpecrelayRunner
       def produce(ready)
         packet = Packet.build(assignment: assignment, source: ready.source, inputs: ready.inputs,
                               package_path: ready.package_path, revision: ready.revision)
-        DocumentSet.validate!(ready.provider.generate(packet), issue_key: assignment.issue_key)
+        DocumentSet.validate!(generated(ready, packet), issue_key: assignment.issue_key)
+      end
+
+      # MAPIAI-60 — the real Claude provider reports safe progress through the SAME live-log
+      # stream the implementation lane uses, so this lane stops being silent while a model works
+      # and the operator watches one panel rather than two. The stream is started and finished
+      # around the provider call only: it is a record of the generation, not of the whole claim.
+      #
+      # A stop signal Platform returns on one of those events is treated exactly as the
+      # heartbeater's is — the next {#checkpoint!} raises on it — so live delivery cannot become
+      # a second way to decide whether this claim is still live.
+      #
+      # Only the Claude provider gets a stream. The composer finishes in milliseconds and has no
+      # provider semantics to report, so giving it one would emit heartbeats about nothing.
+      def generated(ready, packet)
+        return ready.provider.generate(packet) unless ready.provider.kind == Provider::Claude::KIND
+
+        stream = start_log_stream
+        begin
+          ready.provider.generate(packet, on_output: stream.sink)
+        ensure
+          stream.finish
+          @lease_stop_reason ||= stream.stop_reason
+        end
+      end
+
+      def start_log_stream
+        emitter = EventEmitter.new(client: client, run_id: assignment.run_id,
+                                   attempt_id: assignment.runner_execution_id)
+        ExecutorLogStream.start(emitter: emitter, io: io, provider: Provider::Claude::KIND,
+                                task_id: assignment.issue_key)
       end
 
       # The write, and the promotion of the workspace to `ready` in the same step. The digests

@@ -237,7 +237,7 @@ def base_claim_payload(task_id:, executor_command:)
     },
     "executor" => {
       "provider" => "fake", "command" => executor_command, "args" => [],
-      "prompt_delivery" => "file_argument", "mode" => "", "semantic_events" => "auto",
+      "prompt_delivery" => "file_argument", "mode" => "",
       "timeout_seconds" => 120, "env" => {}
     },
     "specification_package" => specification_package_block(task_id),

@@ -25,8 +25,8 @@ class SpecificationProviderPropagationTest < Minitest::Test
   # The exact configuration ProjectSetup::ExecutorProfiles stores for each selectable profile.
   CLAUDE_PROFILE = {
     "provider" => "claude", "command" => "claude", "mode" => "print",
-    "args" => [ "--print", "--dangerously-skip-permissions" ],
-    "prompt_delivery" => "argument", "semantic_events" => "auto",
+    "args" => [ "--print", "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions" ],
+    "prompt_delivery" => "argument",
     "timeout_seconds" => 1800, "env" => {}
   }.freeze
 
@@ -76,6 +76,32 @@ class SpecificationProviderPropagationTest < Minitest::Test
     assert_includes manifest.dig("provider", "description"), "claude"
   end
 
+  # ------------------------------------------------------------------ MAPIAI-60: live progress
+
+  # The second workflow, on the SAME path as the first: this lane used to attach no live stream
+  # at all, so an operator watching a specification run saw one "Generating" line and then
+  # silence until the package appeared.
+  def test_specification_generation_shows_live_provider_progress_on_both_surfaces
+    stub_claude
+    start_platform(profile: "claude", executor: CLAUDE_PROFILE)
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
+
+    # The lane is assigned no repository, so containment cannot be proven and no path is shown.
+    expected = [ "Provider started", "Inspecting a file", "Provider completed" ]
+    expected.each { |status| assert_includes @io.string, "[claude:status] #{status}" }
+
+    chunks = @platform.protocol_events.select { |event| event["event_type"] == "log.chunk" }
+    refute_empty chunks, "the specification lane must reach the run page's existing panel"
+    assert_equal [ "status" ], chunks.map { |event| event.dig("attributes", "log_source") }.uniq
+    delivered = chunks.map { |event| event["sanitized_log_chunk"].to_s }.join("\n")
+    assert_equal expected, delivered.split("\n").select { |line| expected.include?(line) }
+
+    # And the package still came only from the terminal result.
+    assert_equal "generated", @platform.last_specification_generation["outcome"]
+    refute_includes @io.string, %("type":"result"), "a raw frame reached the terminal"
+  end
+
   # ------------------------------------------------------------------ what must still refuse
 
   # The fixture is a real selection with no specification provider behind it. It must refuse —
@@ -102,7 +128,7 @@ class SpecificationProviderPropagationTest < Minitest::Test
   def test_a_platform_profile_carrying_a_forbidden_flag_is_refused_not_launched
     stub_claude
     start_platform(profile: "claude",
-                   executor: CLAUDE_PROFILE.merge("args" => [ "--print", "--mcp-config", "/tmp/x.json" ]))
+                   executor: CLAUDE_PROFILE.merge("args" => CLAUDE_PROFILE.fetch("args") + [ "--mcp-config", "/tmp/x.json" ]))
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
 
@@ -141,8 +167,21 @@ class SpecificationProviderPropagationTest < Minitest::Test
   private
 
   # A `claude` that satisfies the profile: named `claude`, taking the prompt as its LAST argv
-  # element (`prompt_delivery: argument`), answering with the JSON file map every provider answers
-  # with. Placed first on PATH so `Executor.resolve_command` resolves to this one.
+  # element (`prompt_delivery: argument`), answering in the supported structured format
+  # (MAPIAI-60) — activity while it works, then ONE terminal result carrying the JSON file map
+  # every provider answers with. Placed first on PATH so `Executor.resolve_command` resolves to
+  # this one.
+  #
+  # The tool it reports names a path OUTSIDE any repository, because this lane is assigned none:
+  # containment can never be proven here, so no path may ever be shown.
+  STUB_MESSAGES = lambda do |files|
+    [ { "type" => "system", "subtype" => "init" },
+      { "type" => "assistant", "message" => { "content" => [
+        { "type" => "tool_use", "name" => "Read", "input" => { "file_path" => "/elsewhere/notes.md" } } ] } },
+      { "type" => "result", "subtype" => "success", "is_error" => false, "result" => JSON.generate(files) } ]
+      .map { |message| JSON.generate(message) }.join("\n")
+  end
+
   def stub_claude
     @stub_dir = Dir.mktmpdir("claude-stub", @temp)
     path = File.join(@stub_dir, "claude")
@@ -151,7 +190,7 @@ class SpecificationProviderPropagationTest < Minitest::Test
       eval "prompt=\\${$#}"
       printf '%s' "$prompt" > "#{@prompt}"
       cat <<'SPECRELAY_PROVIDER_EOF'
-      #{JSON.generate(valid_generated_files)}
+      #{STUB_MESSAGES.call(valid_generated_files)}
       SPECRELAY_PROVIDER_EOF
     SH
     File.chmod(0o755, path)

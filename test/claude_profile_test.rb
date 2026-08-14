@@ -13,7 +13,7 @@ require "fileutils"
 class ClaudeProfileTest < Minitest::Test
   PROFILE = {
     "provider" => "claude", "command" => "claude",
-    "args" => %w[--print --dangerously-skip-permissions],
+    "args" => %w[--print --output-format stream-json --verbose --dangerously-skip-permissions],
     "prompt_delivery" => "argument", "timeout_seconds" => 900, "env" => {}
   }.freeze
 
@@ -62,16 +62,20 @@ class ClaudeProfileTest < Minitest::Test
   # --- the exact supported argv (acceptance criterion 1) ---------------------
 
   def test_accepts_the_documented_profile
-    assert_equal %w[--print --dangerously-skip-permissions], profile.args
+    assert_equal PROFILE.fetch("args"), profile.args
     assert_equal "argument", profile.prompt_delivery
   end
 
   def test_accepts_the_short_print_flag
-    assert_equal %w[-p], profile("args" => %w[-p]).args
+    args = %w[-p --output-format stream-json --verbose]
+
+    assert_equal args, profile("args" => args).args
   end
 
   def test_requires_non_interactive_output
-    error = assert_raises(SpecrelayRunner::ClaudeProfile::Error) { profile("args" => %w[--dangerously-skip-permissions]) }
+    error = assert_raises(SpecrelayRunner::ClaudeProfile::Error) do
+      profile("args" => %w[--output-format stream-json --verbose])
+    end
     assert_match(/non-interactive/, error.message)
   end
 
@@ -92,21 +96,42 @@ class ClaudeProfileTest < Minitest::Test
   end
 
   # Each forbidden flag breaks a boundary this MVP proves; refusing them is what
-  # makes "non-interactive, text output, no session reuse, no MCP, no remote
-  # control" an enforced property rather than a documented hope.
+  # makes "non-interactive, no session reuse, no MCP, no remote control" an enforced
+  # property rather than a documented hope.
   def test_refuses_every_flag_that_breaks_the_bounded_profile
-    %w[--output-format --input-format --mcp-config --strict-mcp-config --bg --background
+    %w[--input-format --mcp-config --strict-mcp-config --bg --background
        --chrome --remote-control --tmux -c --continue -r --resume --fork-session --session-id].each do |flag|
       error = assert_raises(SpecrelayRunner::ClaudeProfile::Error, "#{flag} must be refused") do
-        profile("args" => [ "--print", flag ])
+        profile("args" => PROFILE.fetch("args") + [ flag ])
       end
       assert_match(/must not pass #{Regexp.escape(flag)}/, error.message)
     end
   end
 
   def test_refuses_a_forbidden_flag_written_with_an_equals_sign
-    error = assert_raises(SpecrelayRunner::ClaudeProfile::Error) { profile("args" => %w[--print --output-format=stream-json]) }
-    assert_match(/--output-format/, error.message)
+    error = assert_raises(SpecrelayRunner::ClaudeProfile::Error) do
+      profile("args" => PROFILE.fetch("args") + %w[--input-format=stream-json])
+    end
+    assert_match(/--input-format/, error.message)
+  end
+
+  # MAPIAI-60 — the profile is structured-output-only. Text output is not a supported shape it
+  # tolerates, it is a shape it refuses: with two accepted output formats there would be two
+  # result parsers and no way to prove which one produced a package.
+  def test_refuses_a_profile_that_would_not_produce_structured_output
+    [ %w[--print --dangerously-skip-permissions],
+      %w[--print --output-format text --verbose],
+      %w[--print --output-format stream-json],
+      %w[--print --verbose] ].each do |args|
+      error = assert_raises(SpecrelayRunner::ClaudeProfile::Error, "#{args.inspect} must be refused") do
+        profile("args" => args)
+      end
+      assert_match(/must request structured output/, error.message)
+    end
+  end
+
+  def test_accepts_the_required_structured_output_flags_written_with_an_equals_sign
+    profile("args" => %w[--print --output-format=stream-json --verbose])
   end
 
   # `executor.env` travels to Platform in the claim request, so a credential
@@ -123,11 +148,12 @@ class ClaudeProfileTest < Minitest::Test
   def test_allows_a_non_secret_env_entry
     built = profile("env" => { "CLAUDE_CODE_MAX_OUTPUT_TOKENS" => "8000" })
 
-    assert_equal %w[--print --dangerously-skip-permissions], built.args
+    assert_equal PROFILE.fetch("args"), built.args
   end
 
   def test_describe_is_a_single_safe_line
-    assert_equal "claude claude --print --dangerously-skip-permissions (prompt via argument)", profile.describe
+    assert_equal "claude claude --print --output-format stream-json --verbose " \
+                 "--dangerously-skip-permissions (prompt via argument)", profile.describe
   end
 
   # --- readiness (acceptance criterion 2) ------------------------------------
@@ -221,7 +247,7 @@ class ClaudeProfileTest < Minitest::Test
   # --- fail-closed payload comparison (acceptance criterion 4) ---------------
 
   def test_no_mismatch_for_an_identical_claimed_payload
-    payload = PROFILE.merge("mode" => "print", "semantic_events" => "auto")
+    payload = PROFILE.merge("mode" => "print")
 
     assert_nil profile.mismatch_reason(payload, env: NO_PATH)
   end
@@ -240,15 +266,22 @@ class ClaudeProfileTest < Minitest::Test
   end
 
   def test_mismatch_when_the_claimed_args_differ
-    reason = profile.mismatch_reason(PROFILE.merge("args" => %w[--print]), env: NO_PATH)
+    reason = profile.mismatch_reason(
+      PROFILE.merge("args" => %w[--print --output-format stream-json --verbose]), env: NO_PATH
+    )
 
     assert_match(/differs from the selected profile in args/, reason)
   end
 
-  def test_mismatch_when_the_claimed_payload_would_stream_json
-    reason = profile.mismatch_reason(PROFILE.merge("args" => %w[--print --output-format stream-json]), env: NO_PATH)
+  # MAPIAI-60 — the flags that decide the output shape are ORDINARY args, so they are inside the
+  # identity this guard compares. A payload that would run the provider in text mode is refused
+  # here rather than launched and then read by a decoder that cannot parse it.
+  def test_mismatch_when_the_claimed_payload_would_run_in_text_mode
+    reason = profile.mismatch_reason(
+      PROFILE.merge("args" => %w[--print --output-format text --dangerously-skip-permissions]), env: NO_PATH
+    )
 
-    assert_match(/--output-format/, reason)
+    assert_match(/not a usable Claude Code profile/, reason)
   end
 
   # review-001 finding F1. The guard used to compare only File.basename(command), so
@@ -312,7 +345,7 @@ class ClaudeProfileTest < Minitest::Test
     identity = profile.identity(env: NO_PATH)
 
     assert_equal SpecrelayRunner::ClaudeProfile::IDENTITY_FIELDS.length, identity.length
-    assert_equal [ "claude", "claude", %w[--print --dangerously-skip-permissions], "argument", 900, {} ], identity
+    assert_equal [ "claude", "claude", PROFILE.fetch("args"), "argument", 900, {} ], identity
   end
 
   # --- failure classification (acceptance criterion 5) -----------------------

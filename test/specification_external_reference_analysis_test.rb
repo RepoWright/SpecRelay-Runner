@@ -258,11 +258,17 @@ class SpecificationExternalReferenceAnalysisTest < Minitest::Test
   # {SpecrelayRunner::ClaudeProfile} validation, and it ignores its prompt argument entirely —
   # this test's only Claude invocation is the reference analysis, since generation is configured
   # to use the deterministic `fake` provider explicitly.
+  #
+  # MAPIAI-60 — it answers in the supported structured format, because the profile is now
+  # structured-output-only: the analyzer's verdict travels in the ONE terminal result.
   def write_fake_claude(path, response:)
+    messages = [ { "type" => "system", "subtype" => "init" },
+                 { "type" => "result", "subtype" => "success", "is_error" => false,
+                   "result" => JSON.generate(response) } ].map { |message| JSON.generate(message) }.join("\n")
     File.write(path, <<~SH)
       #!/bin/sh
       cat <<'SPECRELAY_FAKE_CLAUDE_EOF'
-      #{JSON.generate(response)}
+      #{messages}
       SPECRELAY_FAKE_CLAUDE_EOF
       exit 0
     SH
@@ -314,7 +320,7 @@ class SpecificationExternalReferenceAnalysisTest < Minitest::Test
       executor:
           provider: claude
           command: #{claude_command}
-          args: ["--print", "--dangerously-skip-permissions"]
+          args: ["--print", "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions"]
     YAML
   end
 

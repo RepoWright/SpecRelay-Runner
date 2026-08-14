@@ -22,7 +22,7 @@ class SpecificationProviderSelectionTest < Minitest::Test
     Settings.new(specification, env: env)
   end
 
-  def claude_profile(command: "claude", args: [ "--print", "--dangerously-skip-permissions" ])
+  def claude_profile(command: "claude", args: [ "--print", "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions" ])
     SpecrelayRunner::ClaudeProfile.new("provider" => "claude", "command" => command, "args" => args)
   end
 

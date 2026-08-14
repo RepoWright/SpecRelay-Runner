@@ -375,6 +375,60 @@ class LiveLogTest < Minitest::Test
     assert_includes stream.evidence_text, "a line that cannot be delivered", "and the report still records it"
   end
 
+  # ---- MAPIAI-60 S10/S11: delivery gaps close without changing identity ----
+  #
+  # A live view must never apply back-pressure to a provider, so an undelivered envelope waits
+  # in the attempt's existing in-memory state instead of blocking or failing the work. When
+  # delivery becomes possible again the ORIGINAL bytes go out — same sequence, same payload —
+  # because a retry that renumbered or rebuilt an event would make Platform's idempotency rules
+  # meaningless and could render the same progress twice.
+
+  def test_an_envelope_lost_to_a_transport_outage_is_retried_verbatim_when_delivery_returns
+    client = RecordingClient.new
+    stream, io = live_stream(client)
+
+    client.offline = true
+    flush_batch(stream, "Provider started")
+    client.offline = false
+    flush_batch(stream, "Editing app/index.html")
+    stream.finish
+
+    assert_equal [ 1, 2 ], client.accepted_sequences,
+                 "the lost sequence must be delivered once, before the newer one"
+    assert_equal client.first_attempt_for(1), client.accepted_for(1),
+                 "the retry must be the ORIGINAL envelope, byte for byte"
+    assert_includes io.string, "Provider started", "local display never waited for Platform"
+    refute_includes io.string, "could not be delivered to Platform",
+                    "the gap closed during the attempt, so there is nothing to warn about"
+  end
+
+  def test_a_permanent_refusal_is_not_retried_as_a_transport_outage
+    client = RecordingClient.new
+    stream, _io = live_stream(client)
+
+    client.refuse = true
+    flush_batch(stream, "Provider started")
+    client.refuse = false
+    flush_batch(stream, "Editing app/index.html")
+    stream.finish
+
+    assert_equal [ 2 ], client.accepted_sequences
+    assert_equal 1, client.attempts_for(1).size, "Platform read and refused it; the same bytes cannot become acceptable"
+  end
+
+  def test_a_gap_that_never_closes_is_named_locally_and_never_claimed_as_delivered
+    client = RecordingClient.new
+    stream, io = live_stream(client)
+
+    client.offline = true
+    flush_batch(stream, "Provider started")
+    stream.finish
+
+    assert_empty client.accepted_sequences
+    assert_includes io.string, "could not be delivered to Platform"
+    assert_includes stream.evidence_text, "Provider started", "the local record is unaffected"
+  end
+
   def test_a_stop_signal_on_a_log_event_response_is_observed
     stream, _io, emitter = build_stream
     emitter.lease = { "state" => "cancelled", "cancel_requested" => true }
@@ -462,6 +516,23 @@ class LiveLogTest < Minitest::Test
     [ stream, io, emitter ]
   end
 
+  # One marker line plus enough clipped-length lines to cross FLUSH_BYTES, so each batch is
+  # exactly ONE delivery attempt: the outage and the recovery become deterministic events
+  # rather than a race with the flush timer.
+  def flush_batch(stream, marker)
+    stream.accept("status", marker)
+    5.times { stream.accept("status", "x" * (SpecrelayRunner::ExecutorLogStream::MAX_LINE_BYTES - 100)) }
+  end
+
+  # A stream wired to the REAL EventEmitter, because exact-envelope retry is a claim about the
+  # sequence and payload an emitter builds — a double could only restate the assertion.
+  def live_stream(client, io: StringIO.new)
+    emitter = SpecrelayRunner::EventEmitter.new(client: client, run_id: "run_60", attempt_id: "rex_60")
+    stream = SpecrelayRunner::ExecutorLogStream.new(emitter: emitter, io: io, provider: "claude",
+                                                    task_id: "DEMO-0060", clock: FakeClock.new)
+    [ stream, io ]
+  end
+
   def with_execution
     root, executor = DemoWorkspace.build
     platform = FakePlatform.new(claim_payload: claim_payload_for(task_id: "DEMO-0018", executor_command: executor)).start
@@ -505,6 +576,7 @@ class LiveLogTest < Minitest::Test
     def initialize
       @sent = []
       @fail_next = false
+      @failures = 0
       @lease = { "state" => "active", "cancel_requested" => false }
     end
 
@@ -514,6 +586,7 @@ class LiveLogTest < Minitest::Test
       @sent << { type: event_type, summary: summary, log_chunk: log_chunk, attributes: attributes }
       if @fail_next
         @fail_next = false
+        @failures += 1
         raise SpecrelayRunner::PlatformClient::Error, "simulated transport failure"
       end
       { "lease" => lease }
@@ -521,5 +594,38 @@ class LiveLogTest < Minitest::Test
 
     def chunks = @sent.select { |e| e[:type] == "log.chunk" }
     def events_of(type) = @sent.select { |e| e[:type] == type }
+
+    # EventEmitter's delivery-gap interface, which the stream drives on every submit.
+    def retry_undelivered = undelivered_count
+    def undelivered_count = @failures
+  end
+
+  # A PlatformClient stand-in that can be taken OFFLINE (a transport fault, whose outcome is
+  # unknown and may succeed later) or made to REFUSE (Platform read the payload and rejected
+  # it). Every attempted body is kept, so a retry can be compared with the original.
+  class RecordingClient
+    attr_accessor :offline, :refuse
+
+    def initialize
+      @attempts = []
+      @accepted = []
+      @offline = false
+      @refuse = false
+    end
+
+    def submit_protocol_event(claim:, event:, **)
+      _ = claim
+      @attempts << event
+      raise SpecrelayRunner::PlatformClient::RequestFailed.new("refused", status: 422) if refuse
+      raise SpecrelayRunner::PlatformClient::Error, "unreachable" if offline
+
+      @accepted << event
+      { "lease" => { "state" => "active", "cancel_requested" => false } }
+    end
+
+    def accepted_sequences = @accepted.map { |e| e["sequence"] }
+    def accepted_for(sequence) = @accepted.find { |e| e["sequence"] == sequence }
+    def attempts_for(sequence) = @attempts.select { |e| e["sequence"] == sequence }
+    def first_attempt_for(sequence) = attempts_for(sequence).first
   end
 end

@@ -8,8 +8,13 @@ module SpecrelayRunner
     #
     # Everything that turns evidence into prose goes through one interface with two methods:
     #
-    #   describe -> String          # what an operator sees in the log and in the manifest
-    #   generate(packet) -> Hash    # { "spec.md" => "...", "analysis/business.md" => "...", ... }
+    #   describe -> String                       # what an operator sees in the log and the manifest
+    #   generate(packet, on_output:) -> Hash      # { "spec.md" => "...", "analysis/business.md" => ... }
+    #
+    # `on_output` (MAPIAI-60) is an OPTIONAL consumer of live progress, the same `(stream, line)`
+    # shape CommandRunner uses. Only the Claude provider has provider semantics to report through
+    # it; the composer and a configured command ignore it rather than manufacture events they do
+    # not have, so their existing lifecycle output stays truthful.
     #
     # Two implementations ship. `Composed` is the default and is deterministic: same packet,
     # same bytes, no network, no model — which is what lets the digests, the atomic replace,
@@ -91,7 +96,8 @@ module SpecrelayRunner
         def describe = "built-in deterministic composer (no model, no network)"
         def kind = KIND
 
-        def generate(packet)
+        def generate(packet, on_output: nil)
+          _ = on_output
           Composer.call(packet)
         rescue StandardError => e
           # A composer bug must surface as a generation failure the run records, not as an
@@ -145,12 +151,22 @@ module SpecrelayRunner
         # reviewable source rather than "deep inside command glue" (MVP-0026 scope 9), and the
         # output contract is the provider boundary's, not this class's, so {DocumentSet} validates
         # a Claude package exactly as it validates any other.
-        def generate(packet)
-          result = run(prompt_for(packet))
+        # MAPIAI-60 — the profile is structured-output-only, so the process is read through the
+        # SAME {ClaudeStream} the implementation lane uses. Progress reaches `on_output` while the
+        # model works; the document map still comes only from the terminal result, and still goes
+        # only to {DocumentSet}. One decoder, two lanes, no second normalization rule.
+        def generate(packet, on_output: nil)
+          # No repository is assigned to this lane, so containment can never be proven and the
+          # decoder shows no path at all — the same projection rule, applied to a lane with no root.
+          stream = ClaudeStream.new(sink: on_output)
+          result = run(prompt_for(packet), stream)
           raise Failed, "the Claude specification provider timed out" if result.timed_out?
           raise Failed, "the Claude specification provider exited #{result.exit_code}" unless result.success?
 
-          parse(result.stdout)
+          failure = stream.close.failure
+          raise Failed, "the Claude specification provider's output could not be read: #{failure}" if failure
+
+          parse(stream.final_text)
         end
 
         private
@@ -163,11 +179,12 @@ module SpecrelayRunner
         # of the profile identity the readiness check already validated.
         FORWARDED_ENV = %w[PATH HOME].freeze
 
-        def run(prompt)
+        def run(prompt, stream)
           Dir.mktmpdir("specrelay-spec-claude-") do |workdir|
             command_runner.run([ profile.command, *profile.args, prompt ], chdir: workdir,
                                                                           env: child_env,
-                                                                          timeout_seconds: profile.timeout_seconds)
+                                                                          timeout_seconds: profile.timeout_seconds,
+                                                                          on_output: stream.sink)
           end
         end
 
@@ -328,11 +345,9 @@ module SpecrelayRunner
         # A model may wrap JSON in a fence or add a sentence despite being asked not to, so the
         # first balanced object is extracted rather than the whole stdout parsed. Anything else is
         # a failure the run records — never a partial package.
-        def parse(stdout)
-          text = stdout.to_s
-          raise Failed, "the Claude specification provider produced more output than the runner will accept" if
-            text.bytesize > MAX_OUTPUT_BYTES
-
+        # The size bound belongs to {ClaudeStream}, which is where the bytes now arrive; a second
+        # check here would be a second owner of the same rule, and an unreachable one.
+        def parse(text)
           document = JSON.parse(json_object(text))
           raise Failed, "the Claude specification provider did not return a JSON object of file paths" unless
             document.is_a?(Hash)
@@ -387,7 +402,8 @@ module SpecrelayRunner
         def kind = KIND
         def describe = "configured provider command `#{File.basename(command)}`"
 
-        def generate(packet)
+        def generate(packet, on_output: nil)
+          _ = on_output
           result = run(JSON.generate(packet))
           raise Failed, "the generation provider timed out after #{timeout_seconds}s" if result.timed_out?
           raise Failed, "the generation provider exited #{result.exit_code}: #{first_line(result)}" unless
