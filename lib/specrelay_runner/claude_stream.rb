@@ -51,21 +51,28 @@ module SpecrelayRunner
     STEP_FAILED = "Step failed"
     COMPLETED = "Provider completed"
     FAILED = "Provider failed"
+    DIAGNOSTIC = "Provider wrote diagnostic output"
 
     # Tool categories, matched case-insensitively so a renamed-casing tool still projects safely.
     READ_TOOLS = %w[read glob grep notebookread].freeze
     EDIT_TOOLS = %w[edit write multiedit notebookedit].freeze
     COMMAND_TOOLS = %w[bash bashoutput].freeze
 
-    # A command may be PREVIEWED only when it passes both gates: a leading executable that is
-    # known to be an ordinary build/test entry point, and a character set with no way to carry a
-    # credential, an environment assignment, a substitution, a redirect, or a second command.
-    # Anything else collapses to the generic status — the preview is a convenience, and no
-    # convenience justifies guessing about a string the provider chose.
+    # A command may be PREVIEWED only when EVERY token is a fact this class already recognises:
+    # an approved executable, one of a closed set of subcommands, or a path the existing
+    # repository-containment projection proves. What is shown is then REBUILT from those facts —
+    # provider text is never echoed.
+    #
+    # CR-001 F2: the previous rule was a permissive character pattern over the whole line, which
+    # passed `python3 /Users/alice/private.py` and `bundle exec rspec --seed <secret>` intact. A
+    # pattern says what a string looks like; only an allowlist says what it is.
     PREVIEWABLE_COMMANDS = %w[bundle rake rails rspec ruby rubocop npm npx yarn pnpm node
                               pytest python python3 go cargo make bin/rails bin/rspec
                               bin/rake bin/dev].freeze
-    PREVIEWABLE_TEXT = %r{\A[a-zA-Z0-9 _\-/.:,]+\z}
+    PREVIEWABLE_WORDS = %w[exec run test check lint build install ci].freeze
+    # A path-shaped token: no shell metacharacter, no whitespace, and an actual separator or
+    # extension, so a bare word can never be mistaken for a repository-relative path.
+    PATH_TOKEN = %r{\A[A-Za-z0-9_./-]+\z}
     TEST_HINT = /\b(test|tests|spec|specs|rspec|minitest|pytest|jest)\b/i
 
     FAILURE_UNREADABLE = "the provider's structured output could not be read"
@@ -85,18 +92,31 @@ module SpecrelayRunner
       @result = nil
       @result_seen = false
       @failure = nil
+      @diagnostic_reported = false
     end
 
     # The consumer handed to CommandRunner. Every line the provider writes comes through here.
     def sink = ->(source, line) { accept(source, line) }
 
     def accept(source, line)
-      return forward(source, line) unless source == CommandRunner::STDOUT
+      return diagnostic unless source == CommandRunner::STDOUT
       # After a fatal decode failure nothing later in the stream can be trusted, so nothing
       # later in the stream is shown.
       return if @failure
 
       decode(line.to_s)
+    end
+
+    # stderr is provider bytes, not structured output, and it never passed this allowlist:
+    # review 001 sent an account-like email and an absolute home path there and both reached the
+    # public sink. Its bytes are therefore not forwarded at all. ONE bounded notice records that
+    # the provider wrote diagnostics; the COMPLETE stderr still reaches the report through the
+    # buffered capture, which this class does not touch (CR-001 F2).
+    def diagnostic
+      return if @diagnostic_reported
+
+      @diagnostic_reported = true
+      forward(CommandRunner::STDERR, DIAGNOSTIC)
     end
 
     # Ends the stream and applies the two rules that cannot be checked one message at a time.
@@ -218,10 +238,22 @@ module SpecrelayRunner
     def previewable_command(value)
       text = value.to_s.strip
       return nil if text.empty? || text.length > MAX_COMMAND_CHARS
-      return nil unless PREVIEWABLE_TEXT.match?(text)
-      return nil unless PREVIEWABLE_COMMANDS.include?(text.split(/\s+/).first.to_s)
 
-      text
+      tokens = text.split(/\s+/)
+      return nil unless PREVIEWABLE_COMMANDS.include?(tokens.first)
+
+      projected = tokens.map { |token| approved_token(token) }
+      projected.all? ? projected.join(" ") : nil
+    end
+
+    # The token as it may be SHOWN, or nil when it is not an approved fact. A path is returned as
+    # its repository-relative projection — the same rule a tool path passes — so an absolute or
+    # escaping path is refused here rather than displayed.
+    def approved_token(token)
+      return token if PREVIEWABLE_COMMANDS.include?(token) || PREVIEWABLE_WORDS.include?(token)
+      return nil unless PATH_TOKEN.match?(token) && token.match?(%r{[/.]})
+
+      contained_path(token)
     end
 
     def terminal_status(message)

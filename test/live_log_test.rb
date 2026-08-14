@@ -383,14 +383,66 @@ class LiveLogTest < Minitest::Test
   # because a retry that renumbered or rebuilt an event would make Platform's idempotency rules
   # meaningless and could render the same progress twice.
 
+  # ---- CR-001 F3: Platform I/O never happens on the child output reader ----
+  #
+  # `accept` is called FROM CommandRunner's reader thread. A Platform request made there stops
+  # the reader, fills the child's pipe and freezes the very provider whose progress is being
+  # reported — review 001 measured one `accept` blocked for 0.503 seconds. Delivery therefore
+  # belongs to the stream's own existing timer, and to `finish`; never to the reader.
+
+  # How long a deliberately slow Platform holds each request. Long enough that a reader-path
+  # request cannot hide inside scheduling noise.
+  SLOW_CALL_SECONDS = 0.5
+
+  def test_the_output_callback_never_waits_for_a_platform_request
+    client = RecordingClient.new(delay: SLOW_CALL_SECONDS)
+    stream, _io = live_stream(client)
+
+    started = monotonic
+    flush_batch(stream, "Provider started")
+    elapsed = monotonic - started
+
+    assert_operator elapsed, :<, SLOW_CALL_SECONDS / 2,
+                    "the reader path waited #{elapsed.round(3)}s for Platform; it must only " \
+                    "normalize, bound, print and buffer"
+    stream.finish
+    assert_equal [ 1 ], client.accepted_sequences, "and the delivery still happened, off that path"
+  end
+
+  # The same boundary through the REAL seam it exists for: a live child writing JSONL, decoded
+  # and streamed while a Platform client holds every request. The provider must run at its own
+  # speed and its terminal result must still be captured.
+  def test_a_blocked_platform_client_never_delays_the_child_or_its_terminal_result
+    client = RecordingClient.new(delay: SLOW_CALL_SECONDS)
+    emitter = SpecrelayRunner::EventEmitter.new(client: client, run_id: "run_60", attempt_id: "rex_60")
+    stream = SpecrelayRunner::ExecutorLogStream.start(emitter: emitter, io: StringIO.new,
+                                                      provider: "claude", task_id: "DEMO-0060")
+    decoder = SpecrelayRunner::ClaudeStream.new(sink: stream.sink, repository_path: @tmp)
+
+    started = monotonic
+    result = SpecrelayRunner::CommandRunner.run([ RbConfig.ruby, chatty_provider ], chdir: @tmp,
+                                                env: { "PATH" => ENV["PATH"] }, timeout_seconds: 20,
+                                                on_output: decoder.sink)
+    elapsed = monotonic - started
+    stream.finish
+
+    assert_equal 0, result.exit_code
+    assert_operator elapsed, :<, SLOW_CALL_SECONDS,
+                    "the child waited #{elapsed.round(3)}s on a slow Platform"
+    assert_nil decoder.close.failure
+    assert_equal "the provider's own answer", decoder.final_text
+  end
+
   def test_an_envelope_lost_to_a_transport_outage_is_retried_verbatim_when_delivery_returns
     client = RecordingClient.new
     stream, io = live_stream(client)
 
     client.offline = true
     flush_batch(stream, "Provider started")
+    stream.deliver_pending
     client.offline = false
     flush_batch(stream, "Editing app/index.html")
+    stream.deliver_pending
     stream.finish
 
     assert_equal [ 1, 2 ], client.accepted_sequences,
@@ -408,8 +460,10 @@ class LiveLogTest < Minitest::Test
 
     client.refuse = true
     flush_batch(stream, "Provider started")
+    stream.deliver_pending
     client.refuse = false
     flush_batch(stream, "Editing app/index.html")
+    stream.deliver_pending
     stream.finish
 
     assert_equal [ 2 ], client.accepted_sequences
@@ -516,9 +570,27 @@ class LiveLogTest < Minitest::Test
     [ stream, io, emitter ]
   end
 
-  # One marker line plus enough clipped-length lines to cross FLUSH_BYTES, so each batch is
-  # exactly ONE delivery attempt: the outage and the recovery become deterministic events
-  # rather than a race with the flush timer.
+  # A real provider that reports enough long-path activity to cross the flush threshold several
+  # times, then answers. Every status line is long, so a reader that delivered its own batches
+  # would stop for the slow client more than once.
+  def chatty_provider
+    deep = File.join(@tmp, "app", "a" * 600, "b" * 600, "index.html.erb")
+    write_script(<<~RUBY)
+      require "json"
+      $stdout.sync = true
+      puts JSON.generate({ "type" => "system", "subtype" => "init" })
+      20.times do
+        puts JSON.generate({ "type" => "assistant", "message" => { "content" => [
+          { "type" => "tool_use", "name" => "Read", "input" => { "file_path" => #{deep.inspect} } } ] } })
+      end
+      puts JSON.generate({ "type" => "result", "subtype" => "success", "is_error" => false,
+                           "result" => "the provider's own answer" })
+    RUBY
+  end
+
+  # One marker line plus enough clipped-length lines to cross FLUSH_BYTES, so the following
+  # `deliver_pending` is exactly ONE delivery attempt: the outage and the recovery become
+  # deterministic events rather than a race with the flush timer.
   def flush_batch(stream, marker)
     stream.accept("status", marker)
     5.times { stream.accept("status", "x" * (SpecrelayRunner::ExecutorLogStream::MAX_LINE_BYTES - 100)) }
@@ -606,15 +678,19 @@ class LiveLogTest < Minitest::Test
   class RecordingClient
     attr_accessor :offline, :refuse
 
-    def initialize
+    # `delay` holds every request open, the way a slow or hanging Platform does. It is what makes
+    # "the reader never waits for delivery" a measurement rather than a reading of the source.
+    def initialize(delay: 0)
       @attempts = []
       @accepted = []
       @offline = false
       @refuse = false
+      @delay = delay
     end
 
     def submit_protocol_event(claim:, event:, **)
       _ = claim
+      sleep @delay if @delay.positive?
       @attempts << event
       raise SpecrelayRunner::PlatformClient::RequestFailed.new("refused", status: 422) if refuse
       raise SpecrelayRunner::PlatformClient::Error, "unreachable" if offline

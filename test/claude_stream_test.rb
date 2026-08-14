@@ -187,6 +187,39 @@ class ClaudeStreamTest < Minitest::Test
     refute_includes texts.join("\n"), "netrc"
   end
 
+  # CR-001 F2 — an ALLOWLISTED executable is not a licence to echo the rest of the line. Review
+  # 001 sent `python3 /Users/alice/private.py` and the full absolute path reached the sink,
+  # because the preview matched a permissive character pattern rather than a closed grammar.
+  def test_an_argument_path_outside_the_repository_collapses_to_the_generic_status
+    feed(tool_use("Bash", "command" => "python3 /Users/alice/private.py"),
+         tool_use("Bash", "command" => "ruby ../../../etc/shadow"))
+
+    assert_equal [ "Running a command" ] * 2, texts
+    refute_includes texts.join("\n"), "alice"
+    refute_includes texts.join("\n"), "shadow"
+  end
+
+  def test_arbitrary_bare_argument_text_is_never_echoed
+    feed(tool_use("Bash", "command" => "bundle exec rspec --seed sk-live-DO-NOT-LEAK"),
+         tool_use("Bash", "command" => "npm run publish-as operator@example.test"))
+
+    assert_equal [ "Running a command" ] * 2, texts
+    refute_includes texts.join("\n"), "sk-live-DO-NOT-LEAK"
+    refute_includes texts.join("\n"), "operator@example.test"
+  end
+
+  # The positive control: every token is an approved fact, and the one path is projected through
+  # the SAME containment rule a tool path uses — so what is shown is the projection, not the
+  # provider's own string.
+  def test_a_command_of_wholly_approved_facts_is_previewed_with_projected_paths
+    feed(tool_use("Bash", "command" => "bundle exec rspec #{File.join(@tmp, 'spec/models')}"),
+         tool_use("Bash", "command" => "npm install"))
+
+    assert_equal [ "Running test command: bundle exec rspec spec/models",
+                   "Running command: npm install" ], texts
+    refute_includes texts.join("\n"), @tmp
+  end
+
   # ---- S06 / terminal result classification -----------------------------
 
   def test_completion_and_failure_are_distinct_terminal_statuses
@@ -237,17 +270,23 @@ class ClaudeStreamTest < Minitest::Test
     refute_nil stream.close.failure
   end
 
-  # ---- stderr keeps its own stream identity ------------------------------
+  # ---- stderr is provider bytes, so it is never forwarded ----------------
 
-  # stderr is not structured output and is not decoded. It stays on its own stream so the
-  # existing redaction/bounding path still shows it, and it can never be mistaken for a frame.
-  def test_stderr_passes_through_unchanged_on_its_own_stream
+  # CR-001 F2. stderr is not structured output and never passed the allowlist: review 001 sent an
+  # account-like email and an absolute home path on stderr and both reached the public sink. The
+  # complete stderr still reaches the report through the buffered capture, which is untouched.
+  def test_stderr_bytes_are_never_forwarded_and_become_one_bounded_notice
     stream = build_stream
-    stream.accept("stderr", "claude: a diagnostic line")
+    stream.accept("stderr", "operator@example.test could not read /Users/alice/private.py")
+    stream.accept("stderr", "arbitrary provider chatter nobody vetted")
     stream.accept("stdout", JSON.generate(result_message))
 
-    assert_includes @seen, [ "stderr", "claude: a diagnostic line" ]
     assert_nil stream.close.failure
+    notices = @seen.select { |source, _text| source == "stderr" }
+    assert_equal 1, notices.size, "one bounded notice, not one per line: #{notices.inspect}"
+    [ "operator@example.test", "/Users/alice/private.py", "arbitrary provider chatter" ].each do |raw|
+      refute_includes @seen.flatten.join(" "), raw
+    end
   end
 
   private
