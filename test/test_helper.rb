@@ -148,9 +148,12 @@ end
 # rework: when given, adds the MVP-0035 change-request block and advances the assigned report
 # round, exactly as Platform does for a claim that follows a CHANGES_REQUESTED review. Omit it
 # to model a first execution, which carries no rework block at all.
-def claim_payload_for(task_id:, executor_command:, publication: nil, rework: nil)
+def claim_payload_for(task_id:, executor_command:, publication: nil, rework: nil, restart: nil)
   payload = base_claim_payload(task_id: task_id, executor_command: executor_command)
   payload = payload.merge("rework" => rework_block(rework), "report_contract" => rework_round(task_id)) if rework
+  # MVP-0036 Stage 2b — a REPLACEMENT run's recorded target. Its report round stays the first
+  # one, because the replacement is a new run rather than another round of the old one.
+  payload = payload.merge("restart" => restart) if restart
   return payload if publication.nil?
 
   payload.merge(
@@ -238,6 +241,24 @@ def base_claim_payload(task_id:, executor_command:)
       "timeout_seconds" => 120, "env" => {}
     },
     "specification_package" => specification_package_block(task_id),
+    # MVP-0036 — the question contract exactly as Runner::Api::RunPayload builds it. Captured
+    # rather than approximated, because the runner RENDERS these values into the provider's
+    # fixed bridge instructions: a fixture that omitted the block would let the runner ship
+    # instructions naming no required field and no size bound, and every test would still pass.
+    "question_contract" => {
+      "submit_path" => "/api/runner/executor_questions",
+      "max_document_bytes" => 65_536,
+      "continuation_context_fields" => {
+        "progress" => "what has been done so far",
+        "changed_areas" => "which areas of the code changed",
+        "why_it_matters" => "why these decisions matter",
+        "next_step" => "the next step once the answers arrive",
+        "remaining_work" => "the work still remaining",
+        "do_not_repeat" => "the work that must not be repeated"
+      },
+      "reserved_option_key" => "other",
+      "wait_seconds" => 600
+    },
     # MVP-0035: Platform assigns the round, so `round_number` travels with the label rather than
     # being a constant the runner holds.
     "report_contract" => { "round_number" => 1, "round_label" => "001-initial",

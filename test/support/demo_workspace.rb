@@ -95,6 +95,140 @@ module DemoWorkspace
     path
   end
 
+  # MVP-0036 — a fake executor that uses the QUESTION BRIDGE. It reads the bridge path out of
+  # the prompt exactly as a real provider must (the prompt is the only place it is named),
+  # writes one request, then blocks on the answer — so the test exercises the real
+  # same-session wait rather than a stubbed one.
+  #
+  # `FAKE_QUESTION_JSON` is the raw request bytes, so a test can send a malformed or oversized
+  # document without this script sanitizing it first.
+  def write_question_executor(root)
+    path = File.join(root, "bin", "question-executor")
+    File.write(path, <<~'RUBY')
+      #!/usr/bin/env ruby
+      # frozen_string_literal: true
+      require "json"
+      prompt = File.read(ARGV.last.to_s)
+      request = prompt[%r{`([^`]*/question-request\.json)`}, 1]
+      abort "[question-executor] the prompt named no bridge" if request.nil?
+      answer = File.join(File.dirname(request), "question-answer.json")
+      error = File.join(File.dirname(request), "question-error.json")
+
+      # Echo the instructions back so a test can prove the prompt really told the provider what
+      # a valid request must contain, rather than only that a bridge path was named.
+      puts "[question-executor] instructions #{prompt[/^\s*- `continuation_context` requires:.*$/].to_s.strip}"
+
+      # MVP-0036 Stage 2a: the real shape of the pause this MVP exists for — the provider has
+      # already CHANGED files when it stops to ask, so the worktree a later resume must prove is
+      # genuinely dirty rather than merely present.
+      if ENV["FAKE_QUESTION_EDIT_FIRST"]
+        file = "demo-app/index.html"
+        File.write(file, File.read(file).sub("Hello Demo", "Hello Interrupted Demo"))
+        puts "[question-executor] edited before asking"
+      end
+
+      File.write("#{request}.partial", ENV.fetch("FAKE_QUESTION_JSON"))
+      File.rename("#{request}.partial", request)
+      puts "[question-executor] asked"
+
+      deadline = Time.now + ENV.fetch("FAKE_QUESTION_TIMEOUT_SECONDS", "20").to_f
+      until Time.now > deadline
+        if File.file?(answer)
+          puts "[question-executor] answered #{JSON.parse(File.read(answer))['answers'].to_json}"
+          break
+        end
+        if File.file?(error)
+          puts "[question-executor] refused #{JSON.parse(File.read(error))['error']}"
+          break
+        end
+        sleep 0.05
+      end
+
+      file = "demo-app/index.html"
+      content = File.read(file)
+      File.write(file, content.gsub("Hello Demo", "Hello SpecRelay Demo")) if content.include?("Hello Demo")
+      puts "[question-executor] applied edit"
+      exit 0
+    RUBY
+    FileUtils.chmod(0o755, path)
+    path
+  end
+
+  # MVP-0036 Stage 2a — a FRESH provider resuming someone else's paused work. It proves the
+  # handoff by echoing it: a session that received no answers cannot print them.
+  def write_resume_executor(root)
+    path = File.join(root, "bin", "resume-executor")
+    File.write(path, <<~'RUBY')
+      #!/usr/bin/env ruby
+      # frozen_string_literal: true
+      prompt = File.read(ARGV.last.to_s)
+      section = prompt[/## Answers to your earlier questions.*/m].to_s
+      abort "[resume-executor] the prompt carried no answers" if section.empty?
+      puts "[resume-executor] resumed #{section.lines.map(&:strip).reject(&:empty?).join(' | ')}"
+
+      file = "demo-app/index.html"
+      File.write(file, File.read(file).sub("Hello Interrupted Demo", "Hello Resumed Demo"))
+      puts "[resume-executor] applied edit"
+      exit 0
+    RUBY
+    FileUtils.chmod(0o755, path)
+    path
+  end
+
+  # MVP-0036 CR-004 F3 — a resumed provider that does its first REAL action before printing
+  # anything, which is what a provider given a complete handoff actually does. It never writes to
+  # stdout or stderr, so output cannot stand in for "this process received its input".
+  #
+  # With `FAKE_RESUME_NEXT_QUESTION` that first action is ordinal N+1, which Platform can only
+  # accept once the batch being continued has been acknowledged.
+  def write_silent_resume_executor(root)
+    path = File.join(root, "bin", "silent-resume-executor")
+    File.write(path, <<~'RUBY')
+      #!/usr/bin/env ruby
+      # frozen_string_literal: true
+      prompt = File.read(ARGV.last.to_s)
+      abort "the prompt carried no answers" unless prompt.include?("## Answers to your earlier questions")
+
+      if (asked = ENV["FAKE_RESUME_NEXT_QUESTION"])
+        request = prompt[%r{`([^`]*/question-request\.json)`}, 1]
+        abort "the prompt named no bridge" if request.nil?
+        File.write("#{request}.partial", asked)
+        File.rename("#{request}.partial", request)
+        sleep 30
+        exit 0
+      end
+
+      file = "demo-app/index.html"
+      File.write(file, File.read(file).sub("Hello Interrupted Demo", "Hello SpecRelay Demo"))
+      exit 0
+    RUBY
+    FileUtils.chmod(0o755, path)
+    path
+  end
+
+  # MVP-0036 CR-001 F1 — a provider that asks a valid question and then DIES before any
+  # verdict arrives. The exit code is scripted so the test can prove the outcome is decided by
+  # the unanswered question rather than by whether the provider happened to exit cleanly.
+  def write_abandoning_executor(root)
+    path = File.join(root, "bin", "abandoning-executor")
+    File.write(path, <<~'RUBY')
+      #!/usr/bin/env ruby
+      # frozen_string_literal: true
+      prompt = File.read(ARGV.last.to_s)
+      request = prompt[%r{`([^`]*/question-request\.json)`}, 1]
+      abort "[abandoning-executor] the prompt named no bridge" if request.nil?
+      File.write("#{request}.partial", ENV.fetch("FAKE_QUESTION_JSON"))
+      File.rename("#{request}.partial", request)
+      puts "[abandoning-executor] asked, then leaving"
+      # Long enough for the parent to submit the batch to Platform, so the question really is
+      # durable when this process disappears.
+      sleep ENV.fetch("FAKE_QUESTION_ASK_SECONDS", "3").to_f
+      exit ENV.fetch("FAKE_QUESTION_EXIT_CODE", "0").to_i
+    RUBY
+    FileUtils.chmod(0o755, path)
+    path
+  end
+
   def git_init(root)
     %w[init\ -q].each { |a| git(root, *a.split) }
     git(root, "config", "user.email", "runner@example.test")

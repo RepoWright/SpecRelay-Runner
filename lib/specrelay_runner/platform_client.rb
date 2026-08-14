@@ -280,6 +280,65 @@ module SpecrelayRunner
       status == 201 ? body : raise_for(status, body)
     end
 
+    # POST /api/runner/executor_questions (MVP-0036). Submits ONE bounded question batch from
+    # the local bridge, plus the bounded public continuation context, for a claim whose
+    # provider session is still alive.
+    #
+    # A sibling of the result endpoints rather than a shape of `submit_report`: this body
+    # finalizes nothing and touches no Jira, GitHub or report — it asks Platform to hold the
+    # session open. Platform decides the deadline and the state; the runner reads what it
+    # DECIDED rather than assuming its own policy.
+    #
+    # A 4xx is a REFUSAL the provider may correct (an invalid document) or must obey (a stale
+    # claim). It raises like any other refusal so the bridge fails closed rather than retrying
+    # a body Platform will never accept.
+    # `checkpoint` is this parent's OWN assertion about the worktree the provider asked from
+    # (MVP-0036 Stage 2a), sent beside the provider's document rather than inside it: the
+    # provider writes the question, and only the parent can measure the machine. Omitted when
+    # this machine could not measure itself, which leaves the question askable and the run
+    # simply not resumable.
+    def submit_executor_question(claim:, question:, checkpoint: nil)
+      body = { claim: claim, question: question, checkpoint: checkpoint }.compact
+      status, body = post_json("/api/runner/executor_questions", body)
+      status == 201 ? body : raise_for(status, body)
+    end
+
+    # The same endpoint, a DIFFERENT body: no question could be captured at all, because the
+    # provider exited or the bridge could not recover. Reported explicitly rather than left to
+    # a lapsing lease, so the attempt ends as a distinct recoverable failure and the machine is
+    # freed now.
+    def report_input_capture_failure(claim:, reason:)
+      status, body = post_json("/api/runner/executor_questions",
+                               { claim: claim, capture_failure: { reason: reason } })
+      status == 201 ? body : raise_for(status, body)
+    end
+
+    # PATCH /api/runner/executor_questions/<id> (MVP-0036 CR-002). The runner reporting that it
+    # wrote the accepted answers into the live session's bridge.
+    #
+    # Platform cannot observe a provider process, so this is the only honest source for "the
+    # same session received the answers" — and it is what makes the batch durably ANSWERED.
+    # Idempotent on Platform, so a replay is harmless; a refusal or fault is raised, because a
+    # delivery Platform did not confirm must not be treated as one it did.
+    def confirm_executor_question_delivery(claim:, public_id:)
+      path = "/api/runner/executor_questions/#{URI.encode_www_form_component(public_id.to_s)}"
+      status, body = request_json(Net::HTTP::Patch, path, payload: { claim: claim })
+      status == 200 ? body : raise_for(status, body)
+    end
+
+    # GET /api/runner/executor_questions/<id> (MVP-0036). What Platform durably believes about
+    # one batch: whether the window is still open, and the answers once they exist.
+    #
+    # This poll IS the answer channel. Platform pushes nothing and this MVP opens no socket, so
+    # a waiting provider is served by the runner parent re-reading durable state — which is
+    # also what makes a dropped response harmless.
+    def executor_question(claim:, public_id:)
+      path = "/api/runner/executor_questions/#{URI.encode_www_form_component(public_id.to_s)}" \
+             "?claim=#{URI.encode_www_form_component(claim.to_s)}"
+      status, body = request_json(Net::HTTP::Get, path)
+      status == 200 ? body : raise_for(status, body)
+    end
+
     # POST /api/runner/reports. bundle is { round_label:, files: [...] }.
     # terminal_result, when given, is the MVP-0013 terminal-result envelope
     # validated by Platform BEFORE import; a rejected envelope returns non-201 and

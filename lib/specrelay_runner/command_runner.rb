@@ -1,7 +1,6 @@
 # frozen_string_literal: true
 
 require "open3"
-require "timeout"
 
 module SpecrelayRunner
   # Launches one child process from an explicit argv array under a hard timeout,
@@ -25,6 +24,10 @@ module SpecrelayRunner
     MAX_CAPTURE_BYTES = 1_000_000
     TERM_GRACE_SECONDS = 5
     READ_CHUNK_BYTES = 64 * 1024
+    # How often the parent notices that the child exited, the timeout passed, or a stop was
+    # requested. Short enough that a released provider session ends promptly, long enough that
+    # waiting on a half-hour executor costs nothing measurable.
+    WAIT_POLL_SECONDS = 0.05
 
     # A provider that emits a very long line with no newline must not be able to
     # grow the pending-line buffer without bound; at this size the partial line is
@@ -43,12 +46,23 @@ module SpecrelayRunner
 
     def self.run(argv, **kwargs) = new(**kwargs).run(argv)
 
-    def initialize(chdir:, env: {}, timeout_seconds: 1800, stdin_data: nil, on_output: nil)
+    # `stop_check` (MVP-0036) is an OPTIONAL predicate polled while the child runs. When it
+    # answers truthfully, the process group is ended through the same bounded TERM-then-KILL
+    # grace a timeout uses — one shutdown implementation, so a released provider session and an
+    # overrunning one cannot be stopped by two different rules. Nil restores the ordinary
+    # behaviour exactly: wait for the child, or kill it at the timeout.
+    #
+    # `on_start` (MVP-0036 CR-004 F3) is an OPTIONAL callback fired once the child exists AND its
+    # input has been handed over. See {#notify_started}.
+    def initialize(chdir:, env: {}, timeout_seconds: 1800, stdin_data: nil, on_output: nil,
+                   stop_check: nil, on_start: nil)
       @chdir = chdir.to_s
       @env = env.to_h.transform_keys(&:to_s).transform_values(&:to_s)
       @timeout_seconds = timeout_seconds
       @stdin_data = stdin_data
       @on_output = on_output
+      @stop_check = stop_check
+      @on_start = on_start
     end
 
     def run(argv)
@@ -57,14 +71,49 @@ module SpecrelayRunner
 
       started = monotonic
       out_r, err_r, pid = spawn_process(argv)
-      timed_out, status = wait_or_kill(pid)
+      timed_out, status = deliver_and_wait(pid)
       Result.new(exit_code: status&.exitstatus, stdout: out_r.value, stderr: err_r.value,
                  duration_seconds: (monotonic - started).round(3), timed_out: timed_out)
     end
 
     private
 
-    attr_reader :chdir, :env, :timeout_seconds, :stdin_data, :on_output
+    attr_reader :chdir, :env, :timeout_seconds, :stdin_data, :on_output, :stop_check, :on_start
+
+    # THE provider-start boundary (MVP-0036 CR-004 F3, corrected by CR-005 F2): the child exists
+    # and its input REALLY reached it — by argv at spawn, or by a stdin write that completed. It
+    # is the one honest instant at which a caller may record "this process received what we gave
+    # it": before it, nothing was started; after it, the child may already have acted.
+    #
+    # A child that was gone before it read a byte received nothing, so nothing may be told it
+    # did. That case is an ordinary early exit when no callback was requested — which is what it
+    # has always been, and F2.4 keeps it that way — but a caller that asked to be told the input
+    # arrived needs the LAUNCH to fail, not an exit code that looks like the task's own. Raising
+    # here reaches `Executor#run`'s existing SystemCallError rescue, so it becomes the same
+    # `launch_error` every other "no provider ran this" already produces.
+    def deliver_and_wait(pid)
+      return wait_or_kill(pid) if on_start.nil?
+
+      unless @input_delivered
+        terminate_group(pid)
+        raise Errno::EPIPE, "the child closed its input before the prompt was delivered"
+      end
+
+      notify_started(pid)
+      wait_or_kill(pid)
+    end
+
+    # Deliberately NOT swallowed the way `on_output` is. That one is a progress display and must
+    # never fail the execution it reports on; this one is a decision about whether the run may
+    # continue at all, and a caller that cannot record the handoff has to be able to stop it. The
+    # process group is ended first so a raising callback can never leave an orphaned child and a
+    # run stuck CLAIMED (the QUALITY-0002 failure class).
+    def notify_started(pid)
+      on_start&.call
+    rescue StandardError
+      terminate_group(pid)
+      raise
+    end
 
     def spawn_process(argv)
       out_r, out_w = IO.pipe
@@ -72,14 +121,18 @@ module SpecrelayRunner
       in_r, in_w = IO.pipe
       pid = Process.spawn(env, *argv, chdir: chdir, out: out_w, err: err_w, in: in_r, pgroup: true)
       [ out_w, err_w, in_r ].each(&:close)
-      write_stdin(in_w)
+      @input_delivered = write_stdin(in_w)
       [ reader_thread(out_r, STDOUT), reader_thread(err_r, STDERR), pid ]
     end
 
+    # True when the child really has its input: there was none to give, or all of it was written.
     def write_stdin(io)
       io.write(stdin_data) if stdin_data
+      true
     rescue Errno::EPIPE
-      # child exited before reading stdin; not an error
+      # The child exited before reading stdin. Not an error in itself — see {#deliver_and_wait}
+      # for why it stops mattering only when nobody asked to be told the input arrived.
+      false
     ensure
       io.close
     end
@@ -150,13 +203,29 @@ module SpecrelayRunner
         "[output truncated at #{MAX_CAPTURE_BYTES} bytes]\n"
     end
 
+    # One wait loop for both reasons a child stops early. It replaces the old
+    # `Timeout.timeout(...) { waitpid }` because a blocking wait cannot also observe a stop
+    # signal, and giving the two reasons separate implementations would mean two shutdown
+    # graces that could drift apart.
     def wait_or_kill(pid)
-      Timeout.timeout(timeout_seconds) { Process.waitpid(pid, 0) }
-      [ false, $? ]
-    rescue Timeout::Error
-      [ true, terminate_group(pid) ]
+      deadline = monotonic + timeout_seconds
+      loop do
+        return [ false, $? ] if reaped?(pid)
+        return [ true, terminate_group(pid) ] if monotonic >= deadline
+        return [ false, terminate_group(pid) ] if stop_requested?
+
+        sleep WAIT_POLL_SECONDS
+      end
     rescue Errno::ECHILD
       [ false, nil ]
+    end
+
+    # A stop predicate must never be able to fail the execution it is watching, for the same
+    # reason the live-output consumer cannot: it is an observer, not a decision.
+    def stop_requested?
+      stop_check&.call ? true : false
+    rescue StandardError
+      false
     end
 
     def terminate_group(pid)

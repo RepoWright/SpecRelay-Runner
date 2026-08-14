@@ -91,6 +91,14 @@ class FakePlatform
     @claimed = false
     @lease_signal = lease_signal
     @seen_sequences = []
+    # MVP-0036: the answer window starts OPEN and stays open until a test plays the Product
+    # Owner, so a test that scripts nothing models a provider that is still waiting.
+    @question = nil
+    @question_answers = []
+    @question_settle_state = nil
+    @question_settle_after = 1
+    @question_polls = 0
+    @question_delivered = false
     @mutex = Mutex.new
   end
 
@@ -140,6 +148,46 @@ class FakePlatform
   def review_results = review_submissions.reject { |request| request[:body].to_h.key?("stale") }
   def stale_reports = review_submissions.filter_map { |request| request[:body].to_h if request[:body].to_h.key?("stale") }
   def last_review = review_results.last&.dig(:body, "review")
+
+  # MVP-0036 — what the provider actually asked through the bridge. An EMPTY list is as
+  # load-bearing as its contents: a locally refused request must never reach Platform.
+  def executor_questions = requests_to("/api/runner/executor_questions")
+  def asked_question = @mutex.synchronize { @question }
+  def capture_failures = executor_questions.select { |r| r[:body].to_h.key?("capture_failure") }
+
+  # CR-002 F1 — the acknowledgement the runner sends once it has written the answers into the
+  # live session's bridge.
+  def delivery_acknowledgements
+    requests.select { |r| r[:method] == "PATCH" && r[:path].start_with?("/api/runner/executor_questions/") }
+  end
+
+  # What Platform durably believes right now. ANSWERED is reachable ONLY through the
+  # acknowledgement above, so a test cannot prove same-session delivery without the runner
+  # having reported it.
+  def question_state
+    @mutex.synchronize { @question_delivered ? "ANSWERED" : (@question_settle_state || "LIVE_WAIT") }
+  end
+
+  # Play the Product Owner. The settlement lands on the Nth POLL rather than immediately, so the
+  # runner's waiting loop is exercised rather than short-circuited by the submission response.
+  def answer_question!(answers, after_polls: 1) = settle_question("ANSWER_READY", answers, after_polls)
+  def release_question!(after_polls: 1) = settle_question("OFFLINE_WAIT", [], after_polls)
+
+  def settle_question(state, answers, after_polls)
+    @mutex.synchronize do
+      @question_settle_state = state
+      @question_answers = answers
+      @question_settle_after = after_polls
+    end
+  end
+
+  # Script a refusal (a 4xx the provider may correct) or a fault (5xx / a body Platform never
+  # sends), so a test can prove the runner tells the two apart.
+  attr_accessor :question_response
+
+  # CR-002 F1: a slow answer poll, so a test can put the provider's exit INSIDE the poll the
+  # runner is waiting on, and a scripted answer for the acknowledgement itself.
+  attr_accessor :question_poll_delay, :delivery_response
   def last_registration = requests_to("/api/runner/registration").last
   def last_enrollment = requests_to("/api/runner/enrollment").last
   def last_enrollment_preview = requests_to("/api/runner/enrollment_preview").last
@@ -246,9 +294,66 @@ class FakePlatform
     when "/api/runner/specification_generations" then specification_generation(request)
     when "/api/runner/specification_publications" then specification_publication(request)
     when "/api/runner/review_results" then review_result(request)
+    when "/api/runner/executor_questions" then executor_question(request)
+    when %r{\A/api/runner/executor_questions/(?<id>.+)\z} then executor_question_member(request)
     else [ 404, { error: "not found" } ]
     end
   end
+
+  # MVP-0036: the question bridge's endpoint. Deliberately dumb about the document schema
+  # (Platform's own specs cover that) but NOT dumb about the state it reports back: the runner
+  # branches on it to decide whether to keep the provider alive, hand it the answers, or end
+  # it, so a fake that always said LIVE_WAIT would let every one of those branches pass
+  # vacuously.
+  def executor_question(request)
+    # The capture-failure body is answered BEFORE any scripted response: a test scripts a fault
+    # to provoke the failure, and having that same script also reject the report of it would
+    # make "the runner told Platform" unprovable.
+    #
+    # The execution state is the one Platform KEPT, because the runner classifies the attempt
+    # from it (CR-002 F2): a release that already won leaves the execution terminal and
+    # AWAITING_INPUT, and a genuinely lost question does not.
+    return [ 201, { contract_version: "mvp-0036", execution: { state: kept_execution_state } } ] if
+      request[:body].to_h.key?("capture_failure")
+    return @question_response if @question_response
+
+    @mutex.synchronize { @question = request.dig(:body, "question").to_h }
+    question_body(201, "LIVE_WAIT", [])
+  end
+
+  def kept_execution_state = question_state == "OFFLINE_WAIT" ? "AWAITING_INPUT" : "INPUT_CAPTURE_FAILED"
+
+  def executor_question_member(request)
+    request[:method] == "PATCH" ? confirm_delivery : executor_question_state
+  end
+
+  # The POLL. Every read moves the counter, so a settlement scheduled for the Nth poll happens
+  # while the runner is genuinely waiting.
+  def executor_question_state
+    sleep @question_poll_delay if @question_poll_delay
+    state, answers = @mutex.synchronize do
+      @question_polls += 1
+      settled = @question_settle_state && @question_polls >= @question_settle_after
+      [ settled ? @question_settle_state : "LIVE_WAIT", settled ? @question_answers : [] ]
+    end
+    question_body(200, state, answers)
+  end
+
+  # The delivery acknowledgement, with Platform's own compare-and-set: only an answer that was
+  # waiting to be delivered becomes ANSWERED, and a replay changes nothing.
+  def confirm_delivery
+    return @delivery_response if @delivery_response
+
+    @mutex.synchronize { @question_delivered = true if @question_settle_state == "ANSWER_READY" }
+    question_body(200, question_state, @question_answers)
+  end
+
+  def question_body(status, state, answers)
+    [ status, { contract_version: "mvp-0036",
+                question: { id: "exq_fake", state: state, deadline_at: "2026-08-13T12:00:00Z",
+                            remaining_seconds: state == "LIVE_WAIT" ? 600 : 0, answers: answers } } ]
+  end
+
 
   # MVP-0026: the specification-generation result endpoint. Deliberately dumb about domain
   # rules (Platform's own request specs cover the real state transitions) but NOT dumb about

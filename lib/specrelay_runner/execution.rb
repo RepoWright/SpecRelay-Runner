@@ -30,8 +30,23 @@ module SpecrelayRunner
     # executor — would produce evidence that lies about what ran.
     ExecutorMismatch = Class.new(StandardError)
 
+    # The one Platform execution state this runner reads back rather than assumes: the answer
+    # window closed and the attempt paused (MVP-0036 CR-002 F2).
+    PLATFORM_AWAITING_INPUT = "AWAITING_INPUT"
+
     Result = Struct.new(:outcome, :message, keyword_init: true) do
       def success? = outcome == :completed
+
+      # An attempt that ended WELL, whether or not it finished the work (MVP-0036 CR-001 F4).
+      #
+      # A released answer window is an approved pause, not a failure: the question is durable,
+      # the machine is free, and the operator has simply not decided yet. Reported as a failed
+      # run it would make a `--on-failure stop` loop shut the machine down every time the AI
+      # asked something — the opposite of the outcome this MVP exists to deliver.
+      #
+      # `:input_capture_failed` is deliberately NOT here. That one is a real failure and must
+      # still stop such a loop.
+      def handled? = success? || outcome == :awaiting_input
     end
 
     STOP_HEARTBEAT_ENV = "SPECRELAY_RUNNER_STOP_HEARTBEAT_AFTER_SECONDS"
@@ -53,6 +68,14 @@ module SpecrelayRunner
       # MVP-0035 — nil for an ordinary first execution, which is every claim that does not
       # follow a CHANGES_REQUESTED review.
       @rework = Rework.for(payload)
+      # MVP-0036 Stage 2b — nil unless this claim is a REPLACEMENT run continuing the pull
+      # request an abandoned run had already published. A run is never both this and a rework:
+      # a replacement is new, so nothing has reviewed it.
+      @restart = ContinuedTarget.for(payload, "restart")
+      # MVP-0036 Stage 2a — nil unless this claim continues an answered offline question on the
+      # machine that still holds its uncommitted work.
+      @resume = Resume.for(payload)
+      @bridge = nil
       @controls = ProtocolControls.new(env: env)
       @emitter = EventEmitter.new(client: client, run_id: @run.fetch("id"), attempt_id: @claim)
     end
@@ -130,14 +153,26 @@ module SpecrelayRunner
                  message: "Runner outcome: preflight_failed (local workspace not ready; claim not executed).")
     end
 
-    # MVP-0035 — the reviewed head could not be established, so this machine must not implement
-    # anything. No report and no publication: nothing about the outcome is known, and a failed
-    # report would mark the run terminal when the correct answer is "another attempt can still
-    # run this once the input is readable".
-    def rework_refused(reason)
+    # The two refusals that happen BEFORE a provider and hand the claim straight back. Neither
+    # knows anything about the outcome of the work, so neither may report one: a failed report
+    # would mark the run terminal when the correct answer is "another attempt can still run this
+    # once the input is readable" (MVP-0035) or "the owner can retry once the machine is right"
+    # (MVP-0036 Stage 2a design 9).
+    def continuation_refused(reason)
+      refuse_before_provider(reason, "Refusing to continue the recorded work for #{run['task_id']}")
+    end
+
+    # Stage 2a — the recorded checkpoint is not what this machine holds. The question, its
+    # answers and its checkpoint all stay durable on Platform, and the uncommitted work stays
+    # here, so the owner can correct the worktree and claim again.
+    def resume_refused(reason)
+      refuse_before_provider(reason, "Refusing to resume #{run['task_id']}")
+    end
+
+    def refuse_before_provider(reason, headline)
       safe = Redaction.redact(reason.to_s)
-      log("Refusing the change-request round for #{run['task_id']}: #{safe}")
-      log("Nothing ran: the executor was not started, nothing was pushed, and Jira was not touched.")
+      log("#{headline}: #{safe}")
+      log("Nothing ran: no provider received this task, nothing was pushed, and Jira was not touched.")
       release_claim(safe)
       Result.new(outcome: :preflight_failed,
                  message: "Runner outcome: preflight_failed (#{safe}); nothing executed.")
@@ -189,14 +224,23 @@ module SpecrelayRunner
       emit("attempt.started", "Runner #{runner_name} started an attempt for #{run['task_id']}", phase: "attempt")
 
       emit("workspace.preparing", "Preparing worktree for #{run['task_id']}", phase: "workspace")
-      worktree = create_worktree(root)
+      # MVP-0036 Stage 2a — a resume continues the DIRTY worktree its question was asked from, so
+      # it reads and proves that worktree where an ordinary claim creates a clean one. A refusal
+      # here stops before the provider, before the package, and before any external write.
+      if @resume
+        prepared = @resume.prepare(workspace: measuring_workspace(root))
+        return resume_refused(prepared.reason) unless prepared.ok?
+      end
+      worktree = prepared&.worktree || create_worktree(root)
 
-      # MVP-0035 — a rework round continues the reviewed pull request, so the worktree must hold
-      # that exact commit before anything else looks at it. A refusal here stops before the
+      # MVP-0035 rework and MVP-0036 Stage 2b restart both continue an exact recorded head, so the
+      # worktree must hold that commit before anything else looks at it. One branch, because it is
+      # one proof ({ContinuedTarget}) and a claim is never both. A refusal here stops before the
       # provider, before the package, and before any external write.
-      if @rework
-        continuation = @rework.materialize(worktree_path: worktree.path)
-        return rework_refused(continuation.reason) unless continuation.ok?
+      continued = @rework || @restart
+      if continued
+        continuation = continued.materialize(worktree_path: worktree.path)
+        return continuation_refused(continuation.reason) unless continuation.ok?
 
         worktree = Workspace::Info.new(path: worktree.path, base_commit: continuation.head_commit || worktree.base_commit)
       end
@@ -210,7 +254,17 @@ module SpecrelayRunner
       end
 
       emit("core.started", "Running #{provider} executor for #{run['task_id']}", phase: "core")
-      executor_result = run_executor(worktree, staging)
+      executor_result = run_executor(root, worktree, staging)
+      # MVP-0036 — the provider stopped on a QUESTION, not on work. Checked before the lease
+      # and before the exit code, because both would misreport it: a released session ends the
+      # attempt on Platform (so the lease reads "terminal"), and a terminated provider exits
+      # non-zero. Neither is a failure of the task, and neither may upload a report.
+      return question_outcome if @bridge&.outcome
+      # MVP-0036 CR-005 F2 — no provider ever received the answers, so there is nothing to
+      # report. A failed report would mark the run TERMINAL and take the offline batch with it;
+      # handing the claim back leaves the answers, the checkpoint and the changed files exactly
+      # as they were, for the owner to try again.
+      return resume_refused(executor_result.launch_error) if @resume && executor_result.launch_error
       # If Platform expired or cancelled the claim while the executor held it, stop
       # BEFORE running tests or uploading anything (MVP-0012).
       check_stop!
@@ -219,7 +273,7 @@ module SpecrelayRunner
                              classification: executor_classification(executor_result))
       end
 
-      changes = Workspace.new(root: root, canonical_branch: run["canonical_branch"], create_command: "").capture_changes(worktree.path)
+      changes = measuring_workspace(root).capture_changes(worktree.path)
       # An unmeasurable worktree is NOT an unchanged one. Reporting `changed: false`
       # here would advance Jira announcing "no code changes" while the executor's diff
       # sits on disk, so this fails closed instead (review-002 finding N1).
@@ -320,6 +374,13 @@ module SpecrelayRunner
                     create_command: workspace.fetch("worktree_create_command")).create
     end
 
+    # The same workspace, for READING only: the change capture, the Stage 2a checkpoint and the
+    # resume's worktree lookup all ask about a worktree rather than create one, so none of them
+    # carries a create command.
+    def measuring_workspace(root)
+      Workspace.new(root: root, canonical_branch: run["canonical_branch"], create_command: "")
+    end
+
     # MVP-0018 — the executor runs with a live output sink attached, so safe,
     # redacted, bounded progress reaches the terminal and Platform BETWEEN
     # `core.started` and `verification.started` instead of only at process exit.
@@ -327,12 +388,71 @@ module SpecrelayRunner
     # The stream is stopped here rather than only in the outer `ensure`, so its
     # final flush and truncation notice land before `verification.started` — the
     # live executor log is a record of the CORE phase, not of everything after it.
-    def run_executor(worktree, staging)
+    def run_executor(root, worktree, staging)
       @log_stream = start_log_stream
+      # The bridge lives in the STAGING directory, outside the worktree, so a question request
+      # can never appear in the diff the executor is measured on.
+      @bridge = QuestionBridge.new(client: client, claim: claim, staging_dir: staging, io: io,
+                                   measure: -> { measure_checkpoint(root, worktree) },
+                                   resume_question_id: @resume&.question_id).start
       Executor.new(config: payload.fetch("executor"), worktree_path: worktree.path, staging_dir: staging, env: env)
-              .run(prompt_text(worktree.path), on_output: @log_stream.sink)
+              .run(prompt_text(worktree.path, @bridge.path), on_output: @log_stream.sink,
+                   on_start: -> { @bridge.confirm_resume },
+                   stop_check: -> { @bridge.stop_provider? })
     ensure
       @log_stream&.finish
+      @bridge&.stop
+    end
+
+    # MVP-0036 Stage 2a — what this machine looked like at the instant the provider paused.
+    def measure_checkpoint(root, worktree)
+      Checkpoint.measure(repository_key: workspace.fetch("workspace_key"),
+                         branch: run["canonical_branch"].to_s, worktree_path: worktree.path,
+                         workspace: measuring_workspace(root))
+    end
+
+    # MVP-0036 — the two honest endings for a provider that paused on a question. Neither runs
+    # tests, uploads a report, publishes, or touches Jira: there is no result to report, only a
+    # decision a human has not made yet. The dirty worktree stays exactly where it is.
+    def question_outcome
+      return input_capture_failure if @bridge.failed?
+
+      released_session
+    end
+
+    def released_session
+      log("The provider session for #{run['task_id']} was released; the question and its context " \
+          "are durable on Platform and this machine's changes were left in place.")
+      Result.new(outcome: :awaiting_input,
+                 message: "Runner outcome: awaiting_input (question durable; no report uploaded).")
+    end
+
+    # Reported to Platform rather than left to a lapsing lease, so the attempt ends as a
+    # distinct recoverable failure and the machine is freed now.
+    #
+    # PLATFORM classifies the ending, not this runner (CR-002 F2). There is a real interval in
+    # which the Product Owner's release has already won and the provider exits before the next
+    # poll can observe it: what this runner saw is a lost question, but what happened is an
+    # ordinary pause, and calling it a failure would stop a `--on-failure stop` session over a
+    # normal decision. Anything else — a transport fault, a refusal, a state this runner does
+    # not recognise — stays a failure, because an ending it cannot confirm must not be reported
+    # as handled. A failure to REPORT the failure is still an honest non-zero exit: Platform
+    # reclaims the lapsed lease.
+    def input_capture_failure
+      reason = @bridge.failure_reason.to_s
+      response = client.report_input_capture_failure(claim: claim, reason: reason)
+      return released_session if response.to_h.dig("execution", "state") == PLATFORM_AWAITING_INPUT
+
+      capture_failed(reason)
+    rescue PlatformClient::Error => e
+      capture_failed(e.message)
+    end
+
+    def capture_failed(reason)
+      log("Could not capture the provider's question for #{run['task_id']}: #{Redaction.redact(reason)}")
+      log("Nothing was tested, reported, published, or written to Jira. Your changes are still in the worktree.")
+      Result.new(outcome: :input_capture_failed,
+                 message: "Runner outcome: input_capture_failed (#{Redaction.redact(reason)}).")
     end
 
     def start_log_stream
@@ -400,7 +520,7 @@ module SpecrelayRunner
     # Jira is not advanced).
     def failed_report(root, worktree, executor_result, message, classification: ClaudeProfile::EXECUTOR_FAILED)
       log(message)
-      changes = Workspace.new(root: root, canonical_branch: run["canonical_branch"], create_command: "").capture_changes(worktree.path)
+      changes = measuring_workspace(root).capture_changes(worktree.path)
       test = { command: workspace.fetch("test_command"), exit_code: nil, output: "" }
       emit("attempt.completed", "Uploading failed execution report for #{run['task_id']}", phase: "completed")
       bundle = ReportBundle.build(payload: payload, status: ReportBundle::STATUS_FAILED, executor: executor_result,
@@ -485,7 +605,7 @@ module SpecrelayRunner
       check_stop!
     end
 
-    def prompt_text(worktree_path)
+    def prompt_text(worktree_path, bridge_path)
       preamble = <<~MD.strip
         # Automated execution task — #{run['task_id']}
 
@@ -501,9 +621,17 @@ module SpecrelayRunner
         - Change ONLY files inside the worktree above, per the approved specification.
         - Do NOT edit any `spec.md`/`spec_persian.md`, push, open a PR, or write to Platform.
         - Make the change idempotently.
+
+        #{question_lines(bridge_path)}
       MD
-      "#{preamble}\n\n---\n\n#{payload.dig('specification_package', 'handoff_prompt')}#{rework_prompt}"
+      "#{preamble}\n\n---\n\n#{payload.dig('specification_package', 'handoff_prompt')}#{rework_prompt}#{resume_prompt}"
     end
+
+    # MVP-0036 Stage 2a — the answered batch, appended once after the unchanged approved package.
+    # It is the ONLY thing a fresh session receives from the one that asked: the questions, the
+    # decisions, and the bounded public continuation context. No transcript, no earlier reasoning
+    # and no local path, because none of those was ever stored.
+    def resume_prompt = @resume&.prompt_section.to_s
 
     # MVP-0035 — the change request, appended ONCE after the unchanged approved package. The
     # package leads because it is still the authority; the findings follow because they are what
@@ -512,6 +640,31 @@ module SpecrelayRunner
       return "" if @rework.nil?
 
       @rework.prompt_section(payload.dig("report_contract", "round_label").to_s)
+    end
+
+    # MVP-0036 — the ONE way to reach the Product Owner. Named explicitly because a provider's
+    # own question UI is private: SpecRelay never reads it, never interprets stdout as a
+    # question, and cannot answer either.
+    #
+    # The required context fields and the size bound come from the assignment's
+    # `question_contract`, which Platform builds from the very validator that enforces them, so
+    # these instructions cannot describe a document Platform would refuse.
+    def question_lines(bridge_path)
+      contract = payload["question_contract"].to_h
+      fields = contract["continuation_context_fields"].to_h
+      <<~MD.strip
+        If you need a Product Owner decision, do not guess and do not ask on stdout:
+
+        - Write `#{File.join(bridge_path, QuestionBridge::REQUEST)}` as one JSON object with
+          `questions` (each `prompt`, and optional `options` of `key`/`label`/`trade_off`/`recommended`)
+          and `continuation_context`. `#{contract['reserved_option_key']}` is always offered for you
+          and is a reserved key. The whole document must fit within #{contract['max_document_bytes']} bytes.
+        - `continuation_context` requires: #{fields.map { |name, description| "`#{name}` (#{description})" }.join(', ')}.
+          It is PUBLIC: no local paths, credentials, or your own reasoning.
+        - Then wait for `#{File.join(bridge_path, QuestionBridge::ANSWER)}` and continue with its
+          `answers`, or for `#{File.join(bridge_path, QuestionBridge::ERROR)}`, which you may correct
+          and re-submit. If neither appears, your session was released; stop.
+      MD
     end
 
     # Where the verified package actually IS on this machine. The handoff prompt tells the

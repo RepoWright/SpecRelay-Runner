@@ -350,10 +350,7 @@ module SpecrelayRunner
         PackagePreflight::Assignment.preflight?(payload)
 
       announce_claim(payload)
-      result = Execution.new(config: config, client: client, payload: payload, env: env,
-                             io: presenter).call
-      presenter.line result.message
-      result.success? ? SUCCESS : RUN_FAILED
+      run_execution(config, client, payload)
     end
 
     # MVP-0033 — one claimed review, executed by a fresh provider process.
@@ -439,10 +436,19 @@ module SpecrelayRunner
       return RUN_FAILED if assignment_payload.nil?
 
       announce_claim(assignment_payload)
-      result = Execution.new(config: config, client: client, payload: assignment_payload, env: env,
+      run_execution(config, client, assignment_payload)
+    end
+
+    # One implementation execution, and ONE mapping of its outcome to an exit status.
+    #
+    # `handled?` rather than `success?`: a released answer window did not complete the work, but
+    # nothing failed either, and a loop must keep watching through it (MVP-0036 CR-001 F4). Both
+    # entry points share this so the two can never classify the same outcome differently.
+    def run_execution(config, client, payload)
+      result = Execution.new(config: config, client: client, payload: payload, env: env,
                              io: presenter).call
       presenter.line result.message
-      result.success? ? SUCCESS : RUN_FAILED
+      result.handled? ? SUCCESS : RUN_FAILED
     end
 
     def generate_specification(config, client, payload)

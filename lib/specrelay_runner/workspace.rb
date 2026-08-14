@@ -54,6 +54,19 @@ module SpecrelayRunner
       Info.new(path: path, base_commit: rev_parse(path, "HEAD"))
     end
 
+    # The worktree this canonical branch is ALREADY checked out in, or nil (MVP-0036 Stage 2a).
+    #
+    # A sibling of `create`, never a mode of it. `create` refuses an existing worktree that has
+    # uncommitted changes, because an ordinary attempt must never start on top of work it did
+    # not do — and that is exactly the state a resume requires, since those changed files are
+    # the thing it is continuing. Reading is all this does: nothing is created, reset or cleaned.
+    def existing
+      path = locate(required: false)
+      return nil if path.to_s.empty?
+
+      Info.new(path: path, base_commit: rev_parse(path, "HEAD"))
+    end
+
     # Capture changed files (tracked + untracked via intent-to-add) and a unified
     # diff vs HEAD.
     #
