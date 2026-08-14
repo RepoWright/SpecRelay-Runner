@@ -21,25 +21,35 @@ class SpecificationReferenceAnalyzerTest < Minitest::Test
   class FakeCommandRunner
     Call = Struct.new(:argv, :chdir, :env, :timeout_seconds, keyword_init: true)
 
-    def initialize(result:)
+    def initialize(result:, lines: [])
       @result = result
+      @lines = lines
       @calls = []
     end
 
     attr_reader :calls
 
-    def run(argv, chdir:, env:, timeout_seconds:)
+    # MAPIAI-60 — the analyzer launches the structured-output-only profile, so this double
+    # delivers JSONL lines the way the real CommandRunner does rather than a stdout blob.
+    def run(argv, chdir:, env:, timeout_seconds:, on_output: nil)
       @calls << Call.new(argv: argv, chdir: chdir, env: env, timeout_seconds: timeout_seconds)
+      @lines.each { |line| on_output&.call("stdout", line) }
       @result
     end
   end
 
   def settings_for(document, env: {}) = Settings.new(document, env: env)
 
-  def claude_profile(command: "claude", args: [ "--print", "--dangerously-skip-permissions" ], env: {})
+  CLAUDE_ARGS = [ "--print", "--output-format", "stream-json", "--verbose",
+                 "--dangerously-skip-permissions" ].freeze
+
+  def claude_profile(command: "claude", args: CLAUDE_ARGS, env: {})
     SpecrelayRunner::ClaudeProfile.new("provider" => "claude", "command" => command, "args" => args, "env" => env)
   end
 
+  # What the provider ANSWERED. Since MAPIAI-60 that answer travels as the terminal message of a
+  # structured stream rather than as raw stdout; {#build_claude_analyzer} performs that
+  # translation once, so every test below still states only the answer it cares about.
   def success(stdout:, duration_seconds: 0.2)
     Result.new(exit_code: 0, stdout: stdout, stderr: "", duration_seconds: duration_seconds, timed_out: false)
   end
@@ -223,7 +233,10 @@ class SpecificationReferenceAnalyzerTest < Minitest::Test
   # ------------------------------------------------------------------ the Claude adapter, direct execution
 
   def build_claude_analyzer(result:, profile: claude_profile, env: {}, settings: settings_for({}))
-    runner = FakeCommandRunner.new(result: result)
+    lines = [ JSON.generate("type" => "system", "subtype" => "init"),
+              JSON.generate("type" => "result", "subtype" => "success", "is_error" => false,
+                            "result" => result.stdout) ]
+    runner = FakeCommandRunner.new(result: result, lines: result.success? ? lines : [])
     [ ReferenceAnalyzer::Claude.new(profile: profile, settings: settings, env: env, command_runner: runner),
       runner ]
   end
@@ -249,8 +262,8 @@ class SpecificationReferenceAnalyzerTest < Minitest::Test
     analyzer.analyze(kind: "jam_recording", reference: "https://jam.dev/c/abc123")
 
     call = runner.calls.fetch(0)
-    assert_equal [ "claude", "--print", "--dangerously-skip-permissions" ], call.argv[0, 3]
-    assert_equal 1, call.argv.length - 3, "the prompt is exactly one argv element"
+    assert_equal [ "claude", *CLAUDE_ARGS ], call.argv[0, CLAUDE_ARGS.length + 1]
+    assert_equal 1, call.argv.length - CLAUDE_ARGS.length - 1, "the prompt is exactly one argv element"
     assert_includes call.argv.last, "jam_recording"
     assert_includes call.argv.last, "https://jam.dev/c/abc123"
     assert_equal 45, call.timeout_seconds

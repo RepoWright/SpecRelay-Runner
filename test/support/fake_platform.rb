@@ -188,6 +188,12 @@ class FakePlatform
   # CR-002 F1: a slow answer poll, so a test can put the provider's exit INSIDE the poll the
   # runner is waiting on, and a scripted answer for the acknowledgement itself.
   attr_accessor :question_poll_delay, :delivery_response
+
+  # MAPIAI-60 CR-002 F1: how long a live-log response is withheld, so a test can put a Platform
+  # that has stopped answering UNDERNEATH an attempt that is finishing. Only `log.*` events are
+  # held, and only on their own connection thread — a delay that also stalled this fake's accept
+  # loop would postpone the result-path requests the test measures and prove nothing.
+  attr_accessor :log_event_delay
   def last_registration = requests_to("/api/runner/registration").last
   def last_enrollment = requests_to("/api/runner/enrollment").last
   def last_enrollment_preview = requests_to("/api/runner/enrollment_preview").last
@@ -233,11 +239,28 @@ class FakePlatform
 
     status, body = route(request)
     @requests << request.merge(response_status: status)
-    respond(socket, status, body)
+    held = hold(socket, request, status, body)
+    respond(socket, status, body) unless held
   rescue StandardError => e
     respond(socket, 500, { error: e.message })
   ensure
-    socket.close
+    socket.close unless held
+  end
+
+  # A live-log response withheld for `log_event_delay`, answered on its own thread so this fake
+  # keeps serving the requests the attempt's RESULT path makes while one progress request hangs.
+  def hold(socket, request, status, body)
+    return nil unless @log_event_delay && request[:path] == "/api/runner/events" &&
+                      request.dig(:body, "event", "event_type").to_s.start_with?("log.")
+
+    Thread.new do
+      sleep @log_event_delay
+      respond(socket, status, body)
+    rescue StandardError
+      nil # the runner gave up on this response, which is the point of the delay
+    ensure
+      socket.close
+    end
   end
 
   def read_request(socket)

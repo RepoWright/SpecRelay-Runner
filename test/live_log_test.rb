@@ -253,7 +253,7 @@ class LiveLogTest < Minitest::Test
 
   def test_a_heartbeat_is_emitted_only_while_the_provider_is_quiet
     clock = FakeClock.new
-    stream, io, emitter = build_stream(clock: clock, heartbeat_interval: 10)
+    stream, io, emitter = build_stream(clock: clock, heartbeat_interval: 10, delivering: false)
     clock.advance(11)
     stream.send(:heartbeat_if_quiet)
 
@@ -285,7 +285,7 @@ class LiveLogTest < Minitest::Test
     clock = FakeClock.new
     terminal = RecordingTerminal.new
     presenter = SpecrelayRunner::TerminalPresenter.new(out: terminal, transient: true, columns: 100)
-    stream, _io, emitter = build_stream(clock: clock, heartbeat_interval: 10, io: presenter)
+    stream, _io, emitter = build_stream(clock: clock, heartbeat_interval: 10, io: presenter, delivering: false)
     clock.advance(11)
     stream.send(:heartbeat_if_quiet)
     clock.advance(11)
@@ -330,7 +330,7 @@ class LiveLogTest < Minitest::Test
   # to show that a silent executor is still alive.
   def test_without_a_terminal_the_quiet_heartbeat_remains_line_oriented
     clock = FakeClock.new
-    stream, io, emitter = build_stream(clock: clock, heartbeat_interval: 10)
+    stream, io, emitter = build_stream(clock: clock, heartbeat_interval: 10, delivering: false)
     clock.advance(11)
     stream.send(:heartbeat_if_quiet)
 
@@ -346,7 +346,7 @@ class LiveLogTest < Minitest::Test
     clock = FakeClock.new
     terminal = RecordingTerminal.new
     presenter = SpecrelayRunner::TerminalPresenter.new(out: terminal, transient: true, columns: 200)
-    stream, _io, _emitter = build_stream(clock: clock, heartbeat_interval: 1, io: presenter)
+    stream, _io, _emitter = build_stream(clock: clock, heartbeat_interval: 1, io: presenter, delivering: false)
     readers = %w[stdout stderr].map do |source|
       Thread.new { 40.times { |i| stream.accept(source, "#{source} line #{i} #{'-' * 30}") } }
     end
@@ -370,9 +370,148 @@ class LiveLogTest < Minitest::Test
     stream.accept("stdout", "a line that cannot be delivered")
     stream.finish
 
-    assert_includes io.string, "could not be delivered to Platform"
+    assert_includes io.string, "were not acknowledged by Platform before this attempt ended"
     assert_includes io.string, "a line that cannot be delivered", "the terminal still showed it"
     assert_includes stream.evidence_text, "a line that cannot be delivered", "and the report still records it"
+  end
+
+  # ---- MAPIAI-60 S10/S11: delivery gaps close without changing identity ----
+  #
+  # A live view must never apply back-pressure to a provider, so an undelivered envelope waits
+  # in the attempt's existing in-memory state instead of blocking or failing the work. When
+  # delivery becomes possible again the ORIGINAL bytes go out — same sequence, same payload —
+  # because a retry that renumbered or rebuilt an event would make Platform's idempotency rules
+  # meaningless and could render the same progress twice.
+
+  # ---- CR-001 F3: Platform I/O never happens on the child output reader ----
+  #
+  # `accept` is called FROM CommandRunner's reader thread. A Platform request made there stops
+  # the reader, fills the child's pipe and freezes the very provider whose progress is being
+  # reported — review 001 measured one `accept` blocked for 0.503 seconds. Delivery therefore
+  # belongs to the stream's own existing timer, and to `finish`; never to the reader.
+
+  # How long a deliberately slow Platform holds each request. Long enough that a reader-path
+  # request cannot hide inside scheduling noise.
+  SLOW_CALL_SECONDS = 0.5
+
+  def test_the_output_callback_never_waits_for_a_platform_request
+    client = RecordingClient.new(delay: SLOW_CALL_SECONDS)
+    stream, _io = live_stream(client)
+
+    started = monotonic
+    flush_batch(stream, "Provider started")
+    elapsed = monotonic - started
+
+    assert_operator elapsed, :<, SLOW_CALL_SECONDS / 2,
+                    "the reader path waited #{elapsed.round(3)}s for Platform; it must only " \
+                    "normalize, bound, print and buffer"
+    stream.send(:deliver_pending)
+    assert_equal [ 1 ], client.accepted_sequences, "and the delivery still happened, off that path"
+  end
+
+  # The same boundary through the REAL seam it exists for: a live child writing JSONL, decoded
+  # and streamed while a Platform client holds every request. The provider must run at its own
+  # speed and its terminal result must still be captured.
+  def test_a_blocked_platform_client_never_delays_the_child_or_its_terminal_result
+    client = RecordingClient.new(delay: SLOW_CALL_SECONDS)
+    emitter = SpecrelayRunner::EventEmitter.new(client: client, run_id: "run_60", attempt_id: "rex_60")
+    stream = SpecrelayRunner::ExecutorLogStream.start(emitter: emitter, io: StringIO.new,
+                                                      provider: "claude", task_id: "DEMO-0060")
+    decoder = SpecrelayRunner::ClaudeStream.new(sink: stream.sink, repository_path: @tmp)
+
+    started = monotonic
+    result = SpecrelayRunner::CommandRunner.run([ RbConfig.ruby, chatty_provider ], chdir: @tmp,
+                                                env: { "PATH" => ENV["PATH"] }, timeout_seconds: 20,
+                                                on_output: decoder.sink)
+    elapsed = monotonic - started
+    stream.finish
+
+    assert_equal 0, result.exit_code
+    assert_operator elapsed, :<, SLOW_CALL_SECONDS,
+                    "the child waited #{elapsed.round(3)}s on a slow Platform"
+    assert_nil decoder.close.failure
+    assert_equal "the provider's own answer", decoder.final_text
+  end
+
+  # CR-005 — the transcript is not a second product. Its lines go through the SAME fan-out, so
+  # the terminal and the Platform envelope receive identical text without a new log source,
+  # event type or protocol field, and the tool output is part of what the operator reads.
+  def test_a_correlated_completion_reaches_both_surfaces_through_the_existing_fan_out
+    client = RecordingClient.new
+    stream, io = live_stream(client)
+    decoder = SpecrelayRunner::ClaudeStream.new(sink: stream.sink, repository_path: @tmp)
+
+    decoder.accept("stdout", JSON.generate(
+      "type" => "assistant", "message" => { "content" => [
+        { "type" => "tool_use", "id" => "toolu_1", "name" => "Edit",
+          "input" => { "file_path" => File.join(@tmp, "demo-app/index.html") } } ] }
+    ))
+    decoder.accept("stdout", JSON.generate(
+      "type" => "user", "message" => { "content" => [
+        { "type" => "tool_result", "tool_use_id" => "toolu_1", "is_error" => false,
+          "content" => "RAW TOOL OUTPUT" } ] }
+    ))
+    stream.send(:flush_all)
+    stream.finish
+
+    envelope = client.accepted_for(1)
+    delivered = envelope["sanitized_log_chunk"].to_s
+    [ "> Edit #{File.join(@tmp, 'demo-app/index.html')}", "RAW TOOL OUTPUT" ].each do |fragment|
+      assert_includes io.string, fragment
+      assert_includes delivered, fragment
+    end
+    assert_equal SpecrelayRunner::ClaudeStream::STATUS, envelope.dig("attributes", "log_source")
+  end
+
+  def test_an_envelope_lost_to_a_transport_outage_is_retried_verbatim_when_delivery_returns
+    client = RecordingClient.new
+    stream, io = live_stream(client)
+
+    client.offline = true
+    flush_batch(stream, "Provider started")
+    stream.send(:deliver_pending)
+    client.offline = false
+    flush_batch(stream, "Editing app/index.html")
+    stream.send(:deliver_pending)
+    stream.finish
+
+    assert_equal [ 1, 2 ], client.accepted_sequences,
+                 "the lost sequence must be delivered once, before the newer one"
+    assert_equal client.first_attempt_for(1), client.accepted_for(1),
+                 "the retry must be the ORIGINAL envelope, byte for byte"
+    assert_includes io.string, "Provider started", "local display never waited for Platform"
+    refute_includes io.string, "were not acknowledged by Platform",
+                    "the gap closed during the attempt, so there is nothing to warn about"
+  end
+
+  def test_a_permanent_refusal_is_not_retried_as_a_transport_outage
+    client = RecordingClient.new
+    stream, _io = live_stream(client)
+
+    client.refuse = true
+    flush_batch(stream, "Provider started")
+    stream.send(:deliver_pending)
+    client.refuse = false
+    flush_batch(stream, "Editing app/index.html")
+    stream.send(:deliver_pending)
+    stream.finish
+
+    assert_equal [ 2 ], client.accepted_sequences
+    assert_equal 1, client.attempts_for(1).size, "Platform read and refused it; the same bytes cannot become acceptable"
+  end
+
+  def test_a_gap_that_never_closes_is_named_locally_and_never_claimed_as_delivered
+    client = RecordingClient.new
+    stream, io = live_stream(client)
+
+    client.offline = true
+    flush_batch(stream, "Provider started")
+    stream.send(:deliver_pending)
+    stream.finish
+
+    assert_empty client.accepted_sequences
+    assert_includes io.string, "were not acknowledged by Platform before this attempt ended"
+    assert_includes stream.evidence_text, "Provider started", "the local record is unaffected"
   end
 
   def test_a_stop_signal_on_a_log_event_response_is_observed
@@ -427,6 +566,65 @@ class LiveLogTest < Minitest::Test
     end
   end
 
+  # ---- CR-002 F1: the result path never waits for the progress path ---------
+  #
+  # CR-001 took Platform I/O off the child's reader, but left it in `finish` — which both
+  # orchestrators call in an `ensure` around the provider call. A Platform that accepted the
+  # connection and then stopped answering therefore still held the FINISHED provider's result,
+  # for up to PlatformClient's 1,800-second read timeout, before the package or report could be
+  # written. Review 002 measured 1.007s against a 0.5s client; the timeout is the real bound.
+  #
+  # Held far longer than any legitimate shutdown, so "waited for Platform" and "settled its own
+  # thread" cannot be confused for one another.
+  LOG_EVENT_DELAY = 15
+
+  # The F2 boundary proof: how long `finish` itself may take when the delivery thread is inside a
+  # response that never comes. The two orchestration examples below measure a whole workflow, so
+  # their 15-second ceiling is only a coarse deadlock guard — a shutdown wait that grew from 2
+  # seconds to 10 would still pass them.
+  #
+  # A FIXED budget, deliberately not computed from SHUTDOWN_SECONDS: a ceiling derived from the
+  # constant would move with it and could never fail when it grows, which is the regression this
+  # exists to catch. It is the accepted two-second bound plus scheduling margin.
+  FINALIZATION_BUDGET_SECONDS = 3
+  # Far beyond any legitimate shutdown, so what is measured is the runner's own bound and never
+  # the request completing on its own.
+  WITHHELD_RESPONSE_SECONDS = 30
+
+  def test_finalization_gives_up_on_a_withheld_response_within_its_own_small_budget
+    client = RecordingClient.new(delay: WITHHELD_RESPONSE_SECONDS)
+    emitter = SpecrelayRunner::EventEmitter.new(client: client, run_id: "run_60", attempt_id: "rex_60")
+    io = StringIO.new
+    stream = SpecrelayRunner::ExecutorLogStream.start(emitter: emitter, io: io, provider: "claude",
+                                                      task_id: "DEMO-0060")
+    # Enough buffered output that the delivery thread has a batch to send, so finalization is
+    # always waiting on the withheld response rather than on an empty stream.
+    flush_batch(stream, "Provider started")
+
+    started = monotonic
+    stream.finish
+    elapsed = monotonic - started
+
+    assert_operator elapsed, :<, FINALIZATION_BUDGET_SECONDS,
+                    "finish took #{elapsed.round(3)}s: the attempt's result waited on the progress channel"
+    assert_empty client.accepted_sequences, "nothing was acknowledged, which is what the gap reports"
+    assert_includes io.string, "were not acknowledged by Platform before this attempt ended"
+  end
+
+  def test_a_platform_that_stops_answering_the_log_channel_never_holds_the_attempt_result
+    with_execution(log_event_delay: LOG_EVENT_DELAY) do |platform, output, elapsed|
+      assert_operator elapsed, :<, LOG_EVENT_DELAY,
+                      "the attempt took #{elapsed.round(3)}s: finalization waited for the live-log channel"
+      refute_nil platform.last_report, "the executor's authoritative result still reached Platform"
+      # CR-003 F1: this fake ROUTED and answered the event before withholding the response, so
+      # Platform has it and only the acknowledgement was lost. The runner cannot tell that case
+      # from a genuine loss, so it must claim neither.
+      assert_includes output, "were not acknowledged by Platform before this attempt ended"
+      assert_includes output, "delivery may still have succeeded"
+      assert_includes output, "[fake:stdout]", "the operator still saw the run locally"
+    end
+  end
+
   def test_the_uploaded_report_carries_the_bounded_live_log_as_its_own_evidence_file
     with_execution do |platform, _output|
       files = platform.last_report.dig(:body, "report", "files").to_h { |f| [ f["relative_path"], f ] }
@@ -451,20 +649,67 @@ class LiveLogTest < Minitest::Test
     path
   end
 
-  # A stream wired to a recording emitter, with the timer thread never started so
-  # the heartbeat/flush schedule is driven explicitly by the test.
-  def build_stream(clock: FakeClock.new, heartbeat_interval: 15, io: StringIO.new)
+  # A stream wired to a recording emitter. It RUNS its delivery thread, because since CR-002 F1
+  # that thread is what `finish` hands the attempt's last delivery to — a stream built without one
+  # has no delivery owner at all, so asserting on what `finish` uploaded would prove nothing.
+  #
+  # `delivering: false` is for the tests that drive the heartbeat schedule by hand against a
+  # frozen clock and assert an exact beat or row count: a timer racing those assertions could
+  # emit the same beat a microsecond before the test asks for it.
+  def build_stream(clock: FakeClock.new, heartbeat_interval: 15, io: StringIO.new, delivering: true)
     emitter = RecordingEmitter.new
     stream = SpecrelayRunner::ExecutorLogStream.new(
       emitter: emitter, io: io, provider: "fake", task_id: "DEMO-0018",
       clock: clock, heartbeat_interval: heartbeat_interval
     )
-    [ stream, io, emitter ]
+    [ delivering ? stream.start : stream, io, emitter ]
   end
 
-  def with_execution
+  # A real provider that reports enough long-path activity to cross the flush threshold several
+  # times, then answers. Every status line is long, so a reader that delivered its own batches
+  # would stop for the slow client more than once.
+  def chatty_provider
+    deep = File.join(@tmp, "app", "a" * 600, "b" * 600, "index.html.erb")
+    write_script(<<~RUBY)
+      require "json"
+      $stdout.sync = true
+      puts JSON.generate({ "type" => "system", "subtype" => "init" })
+      20.times do
+        puts JSON.generate({ "type" => "assistant", "message" => { "content" => [
+          { "type" => "tool_use", "name" => "Read", "input" => { "file_path" => #{deep.inspect} } } ] } })
+      end
+      puts JSON.generate({ "type" => "result", "subtype" => "success", "is_error" => false,
+                           "result" => "the provider's own answer" })
+    RUBY
+  end
+
+  # One marker line plus enough clipped-length lines to cross FLUSH_BYTES, so the following
+  # `deliver_pending` is exactly ONE delivery attempt: the outage and the recovery become
+  # deterministic events rather than a race with the flush timer.
+  def flush_batch(stream, marker)
+    stream.accept("status", marker)
+    5.times { stream.accept("status", "x" * (SpecrelayRunner::ExecutorLogStream::MAX_LINE_BYTES - 100)) }
+  end
+
+  # A stream wired to the REAL EventEmitter, because exact-envelope retry is a claim about the
+  # sequence and payload an emitter builds — a double could only restate the assertion.
+  #
+  # Its delivery thread is NOT started: ordering is the property under test, so each delivery
+  # attempt is stepped through the same private boundary the timer drives, exactly as the
+  # heartbeat tests step `heartbeat_if_quiet`. Racing a 0.25s tick against an outage a test flips
+  # by hand would decide how many attempts happened by scheduling. The started thread's own
+  # shutdown is covered where it belongs — at the two real orchestration boundaries.
+  def live_stream(client, io: StringIO.new)
+    emitter = SpecrelayRunner::EventEmitter.new(client: client, run_id: "run_60", attempt_id: "rex_60")
+    stream = SpecrelayRunner::ExecutorLogStream.new(emitter: emitter, io: io, provider: "claude",
+                                                    task_id: "DEMO-0060", clock: FakeClock.new)
+    [ stream, io ]
+  end
+
+  def with_execution(log_event_delay: nil)
     root, executor = DemoWorkspace.build
     platform = FakePlatform.new(claim_payload: claim_payload_for(task_id: "DEMO-0018", executor_command: executor)).start
+    platform.log_event_delay = log_event_delay
     path = File.join(Dir.mktmpdir("cfg"), "runner.yml")
     File.write(path, <<~YAML)
       platform:
@@ -479,10 +724,12 @@ class LiveLogTest < Minitest::Test
         tiny-demo-workspace: #{root}
     YAML
     io = StringIO.new
+    started = monotonic
     code = SpecrelayRunner::CLI.run(%W[claim-once --config #{path}], out: io, err: io,
                                                                     env: { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN, "PATH" => ENV["PATH"] })
+    elapsed = monotonic - started
     assert_equal SpecrelayRunner::CLI::SUCCESS, code, io.string
-    yield platform, io.string
+    yield platform, io.string, elapsed
   ensure
     platform&.stop
     FileUtils.remove_entry(root) if root && File.directory?(root)
@@ -505,6 +752,7 @@ class LiveLogTest < Minitest::Test
     def initialize
       @sent = []
       @fail_next = false
+      @failures = 0
       @lease = { "state" => "active", "cancel_requested" => false }
     end
 
@@ -514,6 +762,7 @@ class LiveLogTest < Minitest::Test
       @sent << { type: event_type, summary: summary, log_chunk: log_chunk, attributes: attributes }
       if @fail_next
         @fail_next = false
+        @failures += 1
         raise SpecrelayRunner::PlatformClient::Error, "simulated transport failure"
       end
       { "lease" => lease }
@@ -521,5 +770,42 @@ class LiveLogTest < Minitest::Test
 
     def chunks = @sent.select { |e| e[:type] == "log.chunk" }
     def events_of(type) = @sent.select { |e| e[:type] == type }
+
+    # EventEmitter's delivery-gap interface, which the stream drives on every submit.
+    def retry_undelivered = undelivered_count
+    def undelivered_count = @failures
+  end
+
+  # A PlatformClient stand-in that can be taken OFFLINE (a transport fault, whose outcome is
+  # unknown and may succeed later) or made to REFUSE (Platform read the payload and rejected
+  # it). Every attempted body is kept, so a retry can be compared with the original.
+  class RecordingClient
+    attr_accessor :offline, :refuse
+
+    # `delay` holds every request open, the way a slow or hanging Platform does. It is what makes
+    # "the reader never waits for delivery" a measurement rather than a reading of the source.
+    def initialize(delay: 0)
+      @attempts = []
+      @accepted = []
+      @offline = false
+      @refuse = false
+      @delay = delay
+    end
+
+    def submit_protocol_event(claim:, event:, **)
+      _ = claim
+      sleep @delay if @delay.positive?
+      @attempts << event
+      raise SpecrelayRunner::PlatformClient::RequestFailed.new("refused", status: 422) if refuse
+      raise SpecrelayRunner::PlatformClient::Error, "unreachable" if offline
+
+      @accepted << event
+      { "lease" => { "state" => "active", "cancel_requested" => false } }
+    end
+
+    def accepted_sequences = @accepted.map { |e| e["sequence"] }
+    def accepted_for(sequence) = @accepted.find { |e| e["sequence"] == sequence }
+    def attempts_for(sequence) = @attempts.select { |e| e["sequence"] == sequence }
+    def first_attempt_for(sequence) = attempts_for(sequence).first
   end
 end

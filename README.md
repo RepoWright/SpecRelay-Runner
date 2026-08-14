@@ -620,7 +620,7 @@ a machine that is not connected (or not ready) is told to run `connect` rather t
 reading a refusal as a healthy idle — on the transient row in a terminal, as a line
 where there is no row to redraw.
 
-### Live executor output (MVP-0018)
+### Live executor output (MVP-0018, real provider progress in MAPIAI-60)
 
 While the executor runs, safe output is streamed to the terminal between
 `[core.started]` and `[verification.started]` and submitted to Platform as ordered
@@ -628,15 +628,37 @@ live log events, so a working run never looks like a hung one:
 
 ```text
 [core.started] Running claude executor for MAPIAI-40
+  [claude:status] Provider started
+  [claude:status] Reading demo-app/index.html
+  [claude:status] Running test command: bundle exec rspec
   [claude:status] claude executor running for 15s on MAPIAI-40 (no new output yet)
-  [claude:stdout] MAPIAI-40 is implemented per approved spec `specs/DEMO-0012-…/spec.md`
+  [claude:status] Provider completed
 [verification.started] Running project tests for MAPIAI-40
 ```
 
-The supported Claude profile runs with `--print` and emits nothing until it
-finishes (`--output-format` is a forbidden flag), so a `core.progress` **heartbeat**
-is emitted every 15s of silence naming the elapsed time. It is a fallback, never a
-substitute: real output, when available, is what you see.
+**Structured provider output.** The supported Claude profile is structured-output
+only: `--output-format stream-json` and `--verbose` are *required* flags, and a
+profile missing either is refused before the process is launched. Claude then
+writes one JSON object per line while it works, and that stream is a transport, not
+operator text — one Runner-owned decoder reads it and produces two independent
+things: safe public progress, and the terminal result.
+
+**Nothing raw is ever shown.** Progress is an allowlist projection, not a filter:
+initialization, a read/edit, a command or test, a tool completion, and completion or
+failure each become one bounded status line. Assistant prose, user messages, raw
+tool inputs and results, and account/model/cwd identity have no projection and
+therefore no way to reach a terminal, a log file, or the wire. A file path appears
+only when it is *proven* to sit inside the assigned repository, shown relative to
+it; a command is previewed only when every token is an approved executable, one of
+a closed set of subcommands, or such a proven path — anything else collapses to a
+generic status. Malformed output, a missing terminal result, or two terminal
+results fail the attempt closed without displaying the frame. Both workflows —
+implementation and specification creation — use this one decoder and this one
+stream; there is no second, lane-specific rule.
+
+A `core.progress` **heartbeat** still names the elapsed time after 15s of genuine
+silence. It is a fallback, never a substitute: real output, when available, is what
+you see.
 
 In a terminal that heartbeat is **transient** (RUNNER-0001): the `[claude:status]`
 row replaces itself instead of appending a line every 15s, and real provider output
@@ -654,6 +676,34 @@ a delayed one.
 It cannot break the run: a consumer that raises is swallowed, an upload failure is
 counted and reported once, and the buffered capture plus the child's exit status are
 observed independently of any of it.
+
+**Delivery never blocks the work.** Reading the child only redacts, bounds, prints
+and buffers; every Platform request is made by the stream's own timer thread, so a
+slow or hanging Platform cannot back-pressure the provider's stdout pipe. The same
+rule holds at the end of an attempt: `finish` performs no Platform request of its
+own. It hands the last delivery to that thread and waits a small fixed shutdown
+budget — deliberately independent of the client's 1,800-second read timeout — so a
+finished provider's result, package and report are never held behind the progress
+channel.
+
+**Retries preserve identity; gaps are named.** A transport failure keeps the
+envelope and a later delivery opportunity re-sends the *original* bytes at the
+*original* sequence, so Platform's existing idempotency rules decide whether each
+one is new or a duplicate and a reconnect can never renumber or re-render progress.
+Deliveries are serialized on the one thread, so an older sequence always precedes a
+newer one. A refusal — Platform read the payload and rejected it — is dropped
+rather than retried forever. Whatever is still unacknowledged when the attempt ends
+is reported once, locally, as a delivery gap: it says at least N updates were not
+acknowledged before the attempt ended and that delivery may still have succeeded,
+because a request stopped mid-flight may well have been accepted. Platform orders
+by sequence and reports any gap it sees, so a missing update is visible on both
+sides rather than silently absent.
+
+**The result is not the progress.** The package, the report and the attempt's
+outcome are parsed from the provider's terminal result alone, and keep their
+existing authoritative validation and bytes. Progress delivery failing — or being
+cut short at shutdown — changes none of them, and a run is never reclassified
+because its live view was incomplete.
 
 The report carries the bounded stream as its own artifact,
 `evidence/live-executor-log.txt`, deliberately separate from the full
@@ -871,7 +921,9 @@ These are enforced, with a test per flag, not documented hopes:
   interpolation, no `eval`.
 - `command`'s basename must be `claude`. Another CLI is refused rather than
   silently executed.
-- Refused flags: `--output-format`, `--input-format`, `--mcp-config`,
+- Required flags: `--output-format stream-json` and `--verbose` (MAPIAI-60) — the
+  profile is structured-output only.
+- Refused flags: `--input-format`, `--mcp-config`,
   `--strict-mcp-config`, `--bg`/`--background`, `--chrome`, `--remote-control`,
   `--tmux`, `-c`/`--continue`/`-r`/`--resume`/`--fork-session`/`--session-id`.
 - `env:` must carry **no credential** — that block travels to Platform in the

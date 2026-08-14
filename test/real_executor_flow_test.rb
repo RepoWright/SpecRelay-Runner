@@ -25,6 +25,10 @@ class RealExecutorFlowTest < Minitest::Test
     FileUtils.remove_entry(@root) if @root && File.directory?(@root)
   end
 
+  # The supported argv, in ONE place: MAPIAI-60 made structured output mandatory, so a fixture
+  # that spelled the flags out per test would drift from the profile it is meant to exercise.
+  ARGS = %w[--print --output-format stream-json --verbose --dangerously-skip-permissions].freeze
+
   # The claim payload Platform returns once it has merged this runner's `executor:`
   # override over the workspace definition — i.e. the real Claude profile.
   def claude_payload(overrides = {})
@@ -32,14 +36,14 @@ class RealExecutorFlowTest < Minitest::Test
     payload.merge(
       "executor" => payload.fetch("executor").merge(
         "provider" => "claude", "command" => "claude",
-        "args" => %w[--print --dangerously-skip-permissions],
+        "args" => ARGS,
         "prompt_delivery" => "argument", "mode" => "print", "timeout_seconds" => 30
       ).merge(overrides)
     )
   end
 
   # A runner config that SELECTS the real Claude profile locally.
-  def claude_config(args: %w[--print --dangerously-skip-permissions], timeout_seconds: 30)
+  def claude_config(args: ARGS, timeout_seconds: 30)
     write_config(<<~YAML)
       platform:
         base_url: #{@platform.base_url}
@@ -182,7 +186,7 @@ class RealExecutorFlowTest < Minitest::Test
     start_platform(claude_payload)
     bin_dir, = FakeClaudeCli.build
 
-    exit_code = run_cli(claude_config(args: %w[--print --resume]), bin_dir: bin_dir)
+    exit_code = run_cli(claude_config(args: ARGS + %w[--resume]), bin_dir: bin_dir)
 
     assert_equal SpecrelayRunner::CLI::USAGE_ERROR, exit_code, @io.string
     assert_equal 0, @platform.requests.size
@@ -281,13 +285,13 @@ class RealExecutorFlowTest < Minitest::Test
   end
 
   def test_a_claimed_payload_with_different_args_is_refused
-    start_platform(claude_payload("args" => %w[--print --output-format stream-json]))
+    start_platform(claude_payload("args" => ARGS + %w[--model opus]))
     bin_dir, = FakeClaudeCli.build
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli(claude_config, bin_dir: bin_dir), @io.string
     assert_equal 0, @platform.requests_to("/api/runner/reports").size
     assert_match(/preflight_failed/, @io.string)
-    assert_match(/--output-format/, @io.string)
+    assert_match(/differs from the selected profile in args/, @io.string)
   end
 
   # --- the complete real-profile success seam (acceptance criterion 6) -------
@@ -304,8 +308,8 @@ class RealExecutorFlowTest < Minitest::Test
     # The prompt reached the CLI as ONE distinct argv element — no shell, no
     # interpolation, no splitting.
     argv = JSON.parse(File.read(argv_log))
-    assert_equal %w[--print --dangerously-skip-permissions], argv.first(2)
-    assert_equal 3, argv.length
+    assert_equal ARGS, argv.first(ARGS.length)
+    assert_equal ARGS.length + 1, argv.length
     assert_includes argv.last, "Automated execution task — #{TASK}"
     assert_includes argv.last, "Approved spec for #{TASK}"
 
@@ -324,7 +328,7 @@ class RealExecutorFlowTest < Minitest::Test
 
     manifest = YAML.safe_load(decode_file("manifest.yml"))
     assert_equal "claude", manifest.dig("executor", "provider")
-    assert_equal %w[claude --print --dangerously-skip-permissions <PROMPT>], manifest.dig("executor", "argv")
+    assert_equal [ "claude", *ARGS, "<PROMPT>" ], manifest.dig("executor", "argv")
     assert_equal 0, manifest.dig("executor", "exit_code")
     assert_equal "succeeded", manifest["execution_status"]
 
@@ -341,6 +345,62 @@ class RealExecutorFlowTest < Minitest::Test
       "loggedIn", FakeClaudeCli::LEAKED_TOKEN ].each do |forbidden|
       refute_includes whole_bundle, forbidden, "#{forbidden.inspect} must never reach the uploaded report"
     end
+  end
+
+  # --- MAPIAI-60: live provider progress on both surfaces --------------------
+
+  # The whole point of the ticket, proven on the real profile seam: while Claude works, the
+  # operator's terminal and Platform receive the SAME transcript, from the same decoder, in the
+  # same order — and neither ever receives a raw frame.
+  def test_claude_progress_reaches_the_terminal_and_platform_before_the_attempt_finishes
+    start_platform(claude_payload)
+    bin_dir, = FakeClaudeCli.build
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli(claude_config, bin_dir: bin_dir), @io.string
+
+    expected = [ "Provider started", "> Read ", "> Edit ", "> Bash npm test" ]
+    expected.each { |line| assert_includes @io.string, line }
+    assert_includes @io.string, "demo-app/index.html", "the file the provider worked on is named"
+
+    types = @platform.protocol_events.map { |event| event["event_type"] }
+    chunks = @platform.protocol_events.select { |event| event["event_type"] == "log.chunk" }
+    assert_operator types.index("core.started"), :<, types.index("log.chunk")
+    assert_operator types.index("log.chunk"), :<, types.index("verification.started")
+    assert_equal [ "status" ], chunks.map { |event| event.dig("attributes", "log_source") }.uniq,
+                 "normalized progress reuses the existing status stream; it adds no log_source"
+
+    delivered = chunks.map { |event| event["sanitized_log_chunk"].to_s }.join("\n")
+    expected.each { |fragment| assert_includes delivered, fragment }
+    positions = expected.map { |fragment| delivered.index(fragment) }
+    assert_equal positions.sort, positions,
+                 "both surfaces must show the same events in the same canonical order"
+  end
+
+  def test_no_raw_structured_frame_reaches_a_surface_and_the_result_stays_authoritative
+    start_platform(claude_payload)
+    bin_dir, = FakeClaudeCli.build
+    run_cli(claude_config, bin_dir: bin_dir)
+
+    live_log = decode_file(SpecrelayRunner::ReportBundle::LIVE_LOG_PATH)
+    [ @io.string, live_log, JSON.generate(@platform.last_report[:body]) ].each do |surface|
+      refute_includes surface, %("type":"assistant"), "a raw provider frame reached a surface"
+      refute_includes surface, FakeClaudeCli::LEAKED_TOKEN, "a credential reached a surface"
+    end
+
+    # CR-005 reverses the other half of this assertion. The provider's PUBLIC narration and its
+    # tool output are exactly what an operator needs, so they must now be present — with the
+    # credential planted inside that same narration redacted by the one boundary that owns it.
+    [ @io.string, live_log ].each do |surface|
+      assert_includes surface, "considering the task", "public narration must reach the operator"
+      assert_includes surface, "raw tool output", "tool output must reach the operator"
+      assert_includes surface, "[REDACTED]", "the planted credential must be redacted in place"
+    end
+
+    # The report's stdout evidence is the DECODED terminal result — the provider's answer, not
+    # the transport that carried it.
+    stdout_log = decode_file("evidence/stdout.log")
+    assert_includes stdout_log, "applied the heading change"
+    refute_includes stdout_log, %("type":"result")
   end
 
   # --- honest failures after the claim (acceptance criterion 5) --------------

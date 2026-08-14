@@ -20,6 +20,9 @@ require_relative "specrelay_runner/config"
 require_relative "specrelay_runner/platform_client"
 require_relative "specrelay_runner/command_runner"
 require_relative "specrelay_runner/claude_profile"
+# MAPIAI-60: the one decoder that turns the supported profile's structured output into safe
+# progress and a terminal result. Loaded here because both execution lanes depend on it.
+require_relative "specrelay_runner/claude_stream"
 # MVP-0017 guided connection: the OS secret store, the local checkout validator, the
 # non-secret local connection record, and the `connect` operation that drives them.
 require_relative "specrelay_runner/secret_store"

@@ -145,7 +145,7 @@ class ConfigTest < Minitest::Test
     config = config_with_executor(<<~YAML)
       provider: claude
       command: claude
-      args: [--print, --dangerously-skip-permissions]
+      args: [--print, --output-format, stream-json, --verbose, --dangerously-skip-permissions]
       prompt_delivery: argument
       timeout_seconds: 900
       env: {}
@@ -153,7 +153,7 @@ class ConfigTest < Minitest::Test
 
     profile = config.selected_claude_profile
     refute_nil profile
-    assert_equal %w[--print --dangerously-skip-permissions], profile.args
+    assert_equal %w[--print --output-format stream-json --verbose --dangerously-skip-permissions], profile.args
     # The override is non-secret logical config and is what Platform merges.
     assert_equal 900, config.executor_override["timeout_seconds"]
   end
@@ -164,7 +164,7 @@ class ConfigTest < Minitest::Test
     config = config_with_executor(<<~YAML)
       provider: claude
       command: claude
-      args: [--print, --resume]
+      args: [--print, --output-format, stream-json, --verbose, --resume]
     YAML
 
     error = assert_raises(SpecrelayRunner::ClaudeProfile::Error) { config.selected_claude_profile }

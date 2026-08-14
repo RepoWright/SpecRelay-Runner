@@ -34,6 +34,7 @@ module SpecrelayRunner
       @clock = clock
       @sequence = 0
       @sent = {}
+      @undelivered = []
       @mutex = Mutex.new
     end
 
@@ -48,8 +49,28 @@ module SpecrelayRunner
     # Platform re-applies it on ingest: the boundary must not depend on its caller
     # having done it.
     def emit(event_type, public_summary, log_chunk: nil, **attributes)
-      send_envelope(build_locked(event_type, public_summary, attributes, log_chunk))
+      deliver(build_locked(event_type, public_summary, attributes, log_chunk))
     end
+
+    # MAPIAI-60 — re-send every envelope a TRANSPORT failure left undelivered, oldest sequence
+    # first and byte for byte: the same sequence, the same payload, the same digest. That is what
+    # lets Platform's existing idempotency rules decide whether each one is new or a duplicate,
+    # so a closed delivery gap can never render the same progress twice or renumber it.
+    #
+    # Never raises, and stops at the first failure: this is a delivery opportunity taken on
+    # behalf of a progress view, and it must not fail — or slow down — the work it reports on.
+    # Returns how many envelopes are still owed to Platform.
+    def retry_undelivered
+      @mutex.synchronize { @undelivered.sort }.each do |sequence|
+        envelope = @mutex.synchronize { @sent[sequence] }
+        break unless envelope && redeliver(envelope)
+      end
+      undelivered_count
+    end
+
+    # How much of this attempt's stream Platform has still not accepted. Read so an operator is
+    # told about a gap rather than shown a stream that silently ends.
+    def undelivered_count = @mutex.synchronize { @undelivered.size }
 
     # Emit one adjacent pair with the HIGHER sequence sent first, proving Platform
     # accepts out-of-order delivery and still presents canonical sequence order.
@@ -105,6 +126,36 @@ module SpecrelayRunner
       envelope["sanitized_log_chunk"] = Redaction.redact(log_chunk.to_s) if log_chunk
       @sent[sequence] = envelope
       envelope
+    end
+
+    # The one place an envelope's delivery state is decided, so "what does Platform still owe us"
+    # has a single owner rather than a copy in every caller.
+    #
+    # The ledger records a sequence BEFORE the request and clears it on an answer, so it means
+    # "allocated, not yet acknowledged" rather than "known to have failed". MAPIAI-60 CR-002 F1:
+    # an attempt whose shutdown stops a request that never returned is exactly the case that must
+    # not read as delivered, and only marking on failure would have missed it silently.
+    #
+    # The distinction that matters is the one PlatformClient::Error already draws: a REFUSAL
+    # means Platform read this payload and rejected it, so re-sending the same bytes can only be
+    # refused again and the envelope is dropped from the ledger. Anything else left the request's
+    # fate unknown, so the envelope is kept for a later opportunity.
+    def deliver(envelope)
+      sequence = envelope["sequence"]
+      @mutex.synchronize { @undelivered << sequence unless @undelivered.include?(sequence) }
+      response = send_envelope(envelope)
+      @mutex.synchronize { @undelivered.delete(sequence) }
+      response
+    rescue PlatformClient::Error => e
+      @mutex.synchronize { @undelivered.delete(sequence) if e.refused? }
+      raise
+    end
+
+    def redeliver(envelope)
+      deliver(envelope)
+      true
+    rescue PlatformClient::Error
+      false
     end
 
     def send_envelope(envelope)

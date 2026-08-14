@@ -259,7 +259,8 @@ class ConnectionDiagnosisTest < Minitest::Test
 
   def use_claude_executor
     @platform.claim_payload_executor = {
-      "provider" => "claude", "command" => "claude", "args" => [ "--print" ],
+      "provider" => "claude", "command" => "claude",
+      "args" => [ "--print", "--output-format", "stream-json", "--verbose" ],
       "prompt_delivery" => "argument", "timeout_seconds" => 900, "env" => {}
     }
     FileUtils.mkdir_p(File.join(@dir, "empty-bin"))

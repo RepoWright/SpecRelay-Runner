@@ -13,7 +13,7 @@ module SpecrelayRunner
   #   executor:
   #     provider: claude
   #     command: claude
-  #     args: [--print, --dangerously-skip-permissions]
+  #     args: [--print, --output-format, stream-json, --verbose, --dangerously-skip-permissions]
   #     prompt_delivery: argument
   #     timeout_seconds: 900
   #     env: {}
@@ -51,6 +51,19 @@ module SpecrelayRunner
     # once and exit instead of opening a session, so it is mandatory.
     PRINT_FLAGS = %w[--print -p].freeze
 
+    # MAPIAI-60 — this profile is STRUCTURED-OUTPUT-ONLY. `--output-format stream-json` is what
+    # makes the CLI report each turn as a JSON-lines message while it works (`--verbose` is what
+    # the CLI requires before it will do so in print mode), and {ClaudeStream} is the only reader
+    # of that stream. Text output is gone rather than kept as a fallback: with two accepted output
+    # shapes there would be two result parsers and no way to prove which one produced a package.
+    #
+    # They are REQUIRED args rather than flags this class appends, because the launch is built
+    # from the claimed payload's own `args`. A flag the runner added silently would not be part of
+    # the profile identity, so the fail-closed comparison would pass while the effective
+    # invocation differed — the precise failure `identity` exists to prevent.
+    STREAM_FORMAT = "stream-json"
+    REQUIRED_FLAGS = { "--output-format" => STREAM_FORMAT, "--verbose" => nil }.freeze
+
     # Bounded so a hung CLI can never stall the runner before it claims. These are
     # metadata calls (no inference), so a few seconds is generous.
     PROBE_TIMEOUT_SECONDS = 20
@@ -60,7 +73,6 @@ module SpecrelayRunner
     # "non-interactive, text output, no session reuse, no MCP, no remote control"
     # an enforced property instead of a documented hope.
     FORBIDDEN_FLAGS = {
-      "--output-format" => "text output is the supported evidence format; streamed/JSON output is not",
       "--input-format" => "streamed provider input is not part of this profile",
       "--mcp-config" => "a custom MCP configuration is out of scope for this profile",
       "--strict-mcp-config" => "a custom MCP configuration is out of scope for this profile",
@@ -242,6 +254,9 @@ module SpecrelayRunner
       raise Error, "executor.prompt_delivery must be '#{PROMPT_DELIVERY}' so the prompt stays a distinct argv element" unless prompt_delivery == PROMPT_DELIVERY
       raise Error, "executor.args must request non-interactive output (#{PRINT_FLAGS.join(' or ')})" unless non_interactive?
 
+      missing = REQUIRED_FLAGS.find { |flag, value| !passes?(flag, value) }
+      raise Error, "executor.args must request structured output (#{required_description})" if missing
+
       forbidden = args.find { |arg| FORBIDDEN_FLAGS.key?(flag_name(arg)) }
       raise Error, "executor.args must not pass #{flag_name(forbidden)}: #{FORBIDDEN_FLAGS.fetch(flag_name(forbidden))}" if forbidden
 
@@ -258,7 +273,21 @@ module SpecrelayRunner
     def claude_executable? = File.basename(command) == EXECUTABLE
     def non_interactive? = args.any? { |arg| PRINT_FLAGS.include?(flag_name(arg)) }
 
-    # `--output-format=text` and `--output-format text` are the same flag.
+    # A required flag is present, and — when it takes one — carries the required value, written
+    # either as `--flag value` or as `--flag=value`.
+    def passes?(flag, value)
+      index = args.index { |arg| flag_name(arg) == flag }
+      return false if index.nil?
+      return true if value.nil?
+
+      (args[index].to_s.split("=", 2)[1] || args[index + 1].to_s) == value
+    end
+
+    def required_description
+      REQUIRED_FLAGS.map { |flag, value| [ flag, value ].compact.join(" ") }.join(", ")
+    end
+
+    # `--output-format=stream-json` and `--output-format stream-json` are the same flag.
     def flag_name(arg) = arg.to_s.split("=", 2).first.to_s
 
     def classify_version(result)

@@ -177,13 +177,22 @@ module SpecrelayRunner
           @command_runner = command_runner
         end
 
+        # MAPIAI-60 — the third and last launch of the supported profile, which is now
+        # structured-output-only. It reads the terminal result through the SAME {ClaudeStream}
+        # both execution lanes use, because "which bytes are the provider's answer" is one rule
+        # with one owner. It attaches no display sink: this is a preflight input-gathering step,
+        # not a lane the operator watches, and giving it a live stream would be a third surface
+        # nothing asked for.
         def analyze(kind:, reference:)
-          result = run(prompt_for(kind, reference))
+          stream = ClaudeStream.new
+          result = run(prompt_for(kind, reference), stream)
           return Outcome.new(verdict: :failed, summary: "the analyzer timed out") if result.timed_out?
           return Outcome.new(verdict: :failed, summary: "the analyzer exited #{result.exit_code}") unless
             result.success?
+          return Outcome.new(verdict: :failed, summary: "the analyzer's output could not be read") if
+            stream.close.failure
 
-          parse(result.stdout)
+          parse(stream.final_text)
         end
 
         private
@@ -196,11 +205,12 @@ module SpecrelayRunner
         # choice.
         FORWARDED_ENV = %w[PATH HOME].freeze
 
-        def run(prompt)
+        def run(prompt, stream)
           Dir.mktmpdir("specrelay-reference-claude-") do |workdir|
             command_runner.run([ profile.command, *profile.args, prompt ], chdir: workdir, env: child_env,
                                                                           timeout_seconds:
-                                                                            settings.external_reference_timeout_seconds)
+                                                                            settings.external_reference_timeout_seconds,
+                                                                          on_output: stream.sink)
           end
         end
 
