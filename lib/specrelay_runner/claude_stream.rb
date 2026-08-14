@@ -39,6 +39,10 @@ module SpecrelayRunner
     MAX_RESULT_BYTES = 4_000_000
     # A previewed command line, kept short enough to read on one terminal row.
     MAX_COMMAND_CHARS = 120
+    # How many tool calls may await their result. A provider that never answers one must not grow
+    # this map for the life of the process, so the oldest is dropped and its completion falls back
+    # to the generic wording — a forgotten correlation costs a description, never safety.
+    MAX_OUTSTANDING_TOOLS = 64
 
     # The runner's own stream name for normalized progress — an existing `log_source` value, not
     # a new one, so the wire contract and the Platform panel are unchanged.
@@ -93,6 +97,10 @@ module SpecrelayRunner
       @result_seen = false
       @failure = nil
       @diagnostic_reported = false
+      # tool-use id => the completion wording its result may use. In memory, bounded, and holding
+      # only text this class already decided was safe to show.
+      @outstanding = {}
+      @last_status = nil
     end
 
     # The consumer handed to CommandRunner. Every line the provider writes comes through here.
@@ -167,7 +175,18 @@ module SpecrelayRunner
       capture_result(message) if message["type"].to_s == "result"
       return if @failure
 
-      statuses(message).each { |text| forward(STATUS, text) }
+      statuses(message).each { |text| publish(text) }
+    end
+
+    # CR-004 — a provider that emits unrecognised messages in a row would otherwise fill the log
+    # with identical generic lines that say nothing. Only a CONSECUTIVE repeat of the generic
+    # activity line is dropped; every described status is published as it arrives, and the quiet
+    # heartbeat ExecutorLogStream owns is not involved.
+    def publish(text)
+      return if text == ACTIVITY && @last_status == ACTIVITY
+
+      @last_status = text
+      forward(STATUS, text)
     end
 
     # ---- projection ---------------------------------------------------------
@@ -189,10 +208,20 @@ module SpecrelayRunner
     end
 
     # A tool result says only that a step ended and how. Its content is raw provider/tool output
-    # — file bytes, command output, stack traces — and is never read.
+    # — file bytes, command output, stack traces — and is never read. CR-004: what the step WAS
+    # comes from the correlated `tool_use`, so the wording still describes only facts this class
+    # already projected, and a result whose call is unknown or forgotten stays generic.
     def tool_result_statuses(message)
       blocks(message).select { |block| block["type"].to_s == "tool_result" }
-                     .map { |block| block["is_error"] ? STEP_FAILED : STEP_COMPLETED }
+                     .map { |block| tool_result_status(block) }
+    end
+
+    def tool_result_status(block)
+      failed = block["is_error"]
+      completion = @outstanding.delete(block["tool_use_id"].to_s)
+      return failed ? STEP_FAILED : STEP_COMPLETED if completion.nil?
+
+      failed ? completion.last : completion.first
     end
 
     def blocks(message)
@@ -201,18 +230,50 @@ module SpecrelayRunner
     end
 
     def tool_status(block)
-      name = block["name"].to_s.downcase
-      input = block["input"].is_a?(Hash) ? block["input"] : {}
-      return path_status("Inspecting", input) if READ_TOOLS.include?(name)
-      return path_status("Editing", input) if EDIT_TOOLS.include?(name)
-      return command_status(input) if COMMAND_TOOLS.include?(name)
-
-      ACTIVITY
+      start, completion = describe(block)
+      remember(block["id"], completion)
+      start
     end
 
-    def path_status(verb, input)
-      path = contained_path(input["file_path"] || input["path"] || input["notebook_path"])
-      path ? "#{verb} #{path}" : "#{verb} a file"
+    # ONE place decides both what a step is called while it runs and what its completion is
+    # called, so the two wordings cannot drift apart and there is a single owner of status text.
+    # A nil completion means the step has no safe description and its end stays generic.
+    def describe(block)
+      name = block["name"].to_s.downcase
+      input = block["input"].is_a?(Hash) ? block["input"] : {}
+      return path_pair("Inspecting", input) if READ_TOOLS.include?(name)
+      return path_pair("Editing", input) if EDIT_TOOLS.include?(name)
+      return command_pair(input) if COMMAND_TOOLS.include?(name)
+
+      [ ACTIVITY, nil ]
+    end
+
+    def path_pair(verb, input)
+      subject = path_subject(input)
+      [ "#{verb} #{subject}",
+        [ "Finished #{verb.downcase} #{subject}", "Failed #{verb.downcase} #{subject}" ] ]
+    end
+
+    def path_subject(input)
+      contained_path(input["file_path"] || input["path"] || input["notebook_path"]) || "a file"
+    end
+
+    # A command the allowlist refused has no safe description, so neither end of it gains one.
+    def command_pair(input)
+      preview = previewable_command(input["command"])
+      return [ GENERIC_COMMAND, nil ] if preview.nil?
+
+      noun = TEST_HINT.match?(preview) ? "Test command" : "Command"
+      [ "Running #{noun.downcase}: #{preview}",
+        [ "#{noun} completed successfully", "#{noun} failed" ] ]
+    end
+
+    def remember(id, completion)
+      key = id.to_s
+      return if key.empty? || completion.nil?
+
+      @outstanding[key] = completion
+      @outstanding.shift while @outstanding.size > MAX_OUTSTANDING_TOOLS
     end
 
     # A path is shown ONLY when it is provably inside the assigned repository. `expand_path`
@@ -226,13 +287,6 @@ module SpecrelayRunner
       return nil unless absolute.start_with?("#{repository_path}#{File::SEPARATOR}")
 
       absolute.delete_prefix("#{repository_path}#{File::SEPARATOR}")
-    end
-
-    def command_status(input)
-      preview = previewable_command(input["command"])
-      return GENERIC_COMMAND if preview.nil?
-
-      "#{TEST_HINT.match?(preview) ? 'Running test command' : 'Running command'}: #{preview}"
     end
 
     def previewable_command(value)

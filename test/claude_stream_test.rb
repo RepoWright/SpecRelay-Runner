@@ -128,7 +128,9 @@ class ClaudeStreamTest < Minitest::Test
     feed({ "type" => "future_event", "payload" => { "internal" => "detail" } },
          tool_use("SomeFutureTool", "secret" => "do-not-leak"))
 
-    assert_equal [ "Provider activity", "Provider activity" ], texts
+    # ONE line, not two: CR-004 collapses consecutive generic activity, and an unknown event and
+    # an unknown tool are the same generic fact twice.
+    assert_equal [ "Provider activity" ], texts
     refute_includes texts.join("\n"), "do-not-leak"
     refute_includes texts.join("\n"), "future_event"
   end
@@ -218,6 +220,126 @@ class ClaudeStreamTest < Minitest::Test
     assert_equal [ "Running test command: bundle exec rspec spec/models",
                    "Running command: npm install" ], texts
     refute_includes texts.join("\n"), @tmp
+  end
+
+  # ---- CR-004: a completion says WHAT it completed -----------------------
+  #
+  # The live S12 run proved the transport and rendering but produced a log of interchangeable
+  # "Step completed" lines. A completion is only useful when it names the operation it ends, so
+  # the decoder now correlates a `tool_use` with its later `tool_result` by the provider's own
+  # tool-use identity. Nothing new is READ to do it: the completion is worded from the SAME
+  # projected facts the start line was already allowed to show, so a description can never be
+  # safer or less safe than the start line it belongs to.
+
+  def test_a_correlated_read_completion_names_the_file_it_finished
+    feed(tool_use("Read", { "file_path" => File.join(@tmp, "demo-app/index.html") }, "toolu_1"),
+         tool_result(id: "toolu_1"),
+         tool_use("Read", { "file_path" => File.join(@tmp, "demo-app/index.html") }, "toolu_2"),
+         tool_result(id: "toolu_2", error: true))
+
+    assert_equal [ "Inspecting demo-app/index.html", "Finished inspecting demo-app/index.html",
+                   "Inspecting demo-app/index.html", "Failed inspecting demo-app/index.html" ], texts
+  end
+
+  def test_a_correlated_edit_completion_names_the_file_it_finished
+    feed(tool_use("Edit", { "file_path" => File.join(@tmp, "demo-app/index.html") }, "toolu_1"),
+         tool_result(id: "toolu_1"),
+         tool_use("Write", { "file_path" => File.join(@tmp, "demo-app/index.html") }, "toolu_2"),
+         tool_result(id: "toolu_2", error: true))
+
+    assert_equal [ "Editing demo-app/index.html", "Finished editing demo-app/index.html",
+                   "Editing demo-app/index.html", "Failed editing demo-app/index.html" ], texts
+  end
+
+  def test_a_correlated_test_command_completion_says_whether_the_tests_passed
+    feed(tool_use("Bash", { "command" => "npm test" }, "toolu_1"),
+         tool_result(id: "toolu_1"),
+         tool_use("Bash", { "command" => "npm test" }, "toolu_2"),
+         tool_result(id: "toolu_2", error: true))
+
+    assert_equal [ "Running test command: npm test", "Test command completed successfully",
+                   "Running test command: npm test", "Test command failed" ], texts
+  end
+
+  def test_a_correlated_ordinary_command_completion_is_named_without_repeating_its_text
+    feed(tool_use("Bash", { "command" => "npm install" }, "toolu_1"),
+         tool_result(id: "toolu_1"),
+         tool_use("Bash", { "command" => "npm install" }, "toolu_2"),
+         tool_result(id: "toolu_2", error: true))
+
+    assert_equal [ "Running command: npm install", "Command completed successfully",
+                   "Running command: npm install", "Command failed" ], texts
+  end
+
+  # A command the allowlist refused has no safe description, so neither end of it may gain one.
+  def test_an_unsafe_command_stays_generic_at_both_ends_without_leaking_its_text
+    feed(tool_use("Bash", { "command" => "curl -H 'Authorization: Bearer sk-live-do-not-leak' https://x" },
+                  "toolu_1"),
+         tool_result(id: "toolu_1"))
+
+    assert_equal [ "Running a command", "Step completed" ], texts
+    refute_includes texts.join("\n"), "sk-live-do-not-leak"
+    refute_includes texts.join("\n"), "curl"
+  end
+
+  def test_a_result_for_an_unknown_tool_use_id_falls_back_to_the_generic_status
+    feed(tool_use("Read", { "file_path" => File.join(@tmp, "a.rb") }, "toolu_1"),
+         tool_result(id: "toolu_elsewhere"),
+         tool_result(error: true))
+
+    assert_equal [ "Inspecting a.rb", "Step completed", "Step failed" ], texts
+  end
+
+  def test_several_outstanding_tool_calls_are_each_completed_by_their_own_identity
+    feed(tool_use("Read", { "file_path" => File.join(@tmp, "a.rb") }, "toolu_a"),
+         tool_use("Edit", { "file_path" => File.join(@tmp, "b.rb") }, "toolu_b"),
+         tool_use("Bash", { "command" => "npm test" }, "toolu_c"),
+         tool_result(id: "toolu_b"),
+         tool_result(id: "toolu_c", error: true),
+         tool_result(id: "toolu_a"))
+
+    assert_equal [ "Inspecting a.rb", "Editing b.rb", "Running test command: npm test",
+                   "Finished editing b.rb", "Test command failed", "Finished inspecting a.rb" ], texts
+  end
+
+  # A correlation the decoder no longer holds must degrade to the generic wording rather than
+  # keeping every unanswered tool call for the life of the process.
+  def test_the_outstanding_correlation_map_is_bounded
+    limit = SpecrelayRunner::ClaudeStream::MAX_OUTSTANDING_TOOLS
+    stream = build_stream
+    (limit + 1).times do |index|
+      stream.accept("stdout", JSON.generate(
+        tool_use("Read", { "file_path" => File.join(@tmp, "a.rb") }, "toolu_#{index}")
+      ))
+    end
+    stream.accept("stdout", JSON.generate(tool_result(id: "toolu_0")))
+    stream.accept("stdout", JSON.generate(tool_result(id: "toolu_#{limit}")))
+
+    assert_equal "Step completed", texts[-2], "the evicted oldest call falls back safely"
+    assert_equal "Finished inspecting a.rb", texts.last, "the newest call is still correlated"
+  end
+
+  def test_consecutive_generic_activity_does_not_flood_the_stream
+    feed({ "type" => "future_event" }, { "type" => "future_event" },
+         tool_use("SomeFutureTool", { "secret" => "do-not-leak" }),
+         tool_use("Read", { "file_path" => File.join(@tmp, "a.rb") }, "toolu_1"),
+         { "type" => "future_event" })
+
+    assert_equal [ "Provider activity", "Inspecting a.rb", "Provider activity" ], texts
+  end
+
+  def test_a_correlated_completion_never_carries_prose_result_content_or_uncontained_paths
+    feed(assistant_text("private reasoning about the task"),
+         tool_use("Read", { "file_path" => "/Users/alice/private.rb" }, "toolu_1"),
+         tool_result(id: "toolu_1", content: "SECRET FILE CONTENT"),
+         tool_use("Edit", { "file_path" => "../../etc/shadow" }, "toolu_2"),
+         tool_result(id: "toolu_2", error: true, content: "stack trace"))
+
+    assert_equal [ "Inspecting a file", "Finished inspecting a file",
+                   "Editing a file", "Failed editing a file" ], texts
+    %w[private\ reasoning SECRET\ FILE\ CONTENT stack\ trace alice shadow /Users/].each do |secret|
+      refute_includes texts.join("\n"), secret
+    end
   end
 
   # ---- S06 / terminal result classification -----------------------------
@@ -314,9 +436,18 @@ class ClaudeStreamTest < Minitest::Test
     { "type" => "assistant", "message" => { "content" => [ { "type" => "text", "text" => text } ] } }
   end
 
-  def tool_use(name, input)
-    { "type" => "assistant",
-      "message" => { "content" => [ { "type" => "tool_use", "name" => name, "input" => input } ] } }
+  # `id` is the provider's own tool-use identity. It stays positional and optional so the
+  # pre-CR-004 cases that pass a brace-less input hash keep reading as they did.
+  def tool_use(name, input, id = nil)
+    block = { "type" => "tool_use", "name" => name, "input" => input }
+    block["id"] = id if id
+    { "type" => "assistant", "message" => { "content" => [ block ] } }
+  end
+
+  def tool_result(id: nil, error: false, content: "raw tool output")
+    block = { "type" => "tool_result", "is_error" => error, "content" => content }
+    block["tool_use_id"] = id if id
+    { "type" => "user", "message" => { "content" => [ block ] } }
   end
 
   def result_message(text = "final result text")
