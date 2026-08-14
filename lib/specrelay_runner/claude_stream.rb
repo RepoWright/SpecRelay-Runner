@@ -17,11 +17,18 @@ module SpecrelayRunner
   # They never mix. A displayed event can never become specification input or a report, and the
   # final result is never duplicated into the live view.
   #
-  # PROJECTION IS AN ALLOWLIST, not a filter. Only the facts named below reach a surface; every
-  # other field — prompts, reasoning, assistant prose, raw tool inputs and results, file content,
-  # environment, account identity, model, cwd, MCP configuration — is simply never read. A valid
-  # message this decoder does not recognize produces one bounded generic status rather than its
-  # object, so a future CLI cannot leak by being new.
+  # CR-005 — the first product shows the PUBLIC TRANSCRIPT, not a title per event. Narration,
+  # the tool and its description, the exact command, its stdout and stderr, file paths and
+  # contents, an edit's before/after, delegated Task input and output, and the provider's own
+  # timing are all rendered, in the order the provider emitted them. Normalized titles told an
+  # operator that something happened and never what.
+  #
+  # Exactly two things are withheld: `thinking` blocks, which are the model's private reasoning
+  # and are not public text even though the transport carries them, and the JSONL wrappers
+  # themselves. Credentials are NOT filtered here — {Redaction} is the single boundary that
+  # removes them, and it runs over every line on the way to both surfaces. A message type this
+  # decoder does not recognize renders nothing rather than its object, so a future CLI cannot
+  # leak by being new.
   #
   # FAIL CLOSED. Malformed output, no terminal result, or two terminal results all mean the
   # runner can no longer prove which bytes are progress and which are the authoritative result.
@@ -37,47 +44,33 @@ module SpecrelayRunner
     # The terminal result the existing parsers receive. Anything larger is a provider fault,
     # not a very thorough answer.
     MAX_RESULT_BYTES = 4_000_000
-    # A previewed command line, kept short enough to read on one terminal row.
-    MAX_COMMAND_CHARS = 120
-    # How many tool calls may await their result. A provider that never answers one must not grow
-    # this map for the life of the process, so the oldest is dropped and its completion falls back
-    # to the generic wording — a forgotten correlation costs a description, never safety.
-    MAX_OUTSTANDING_TOOLS = 64
+    # ONE block — a file's contents, a command's output, a delegated Task's answer — may spend
+    # this much of the operator's attention. ExecutorLogStream bounds the whole stream and says
+    # so; this stops a single large read from spending that whole budget before anything else is
+    # seen. Both notices are truthful; neither truncation is silent.
+    MAX_BLOCK_LINES = 40
+    MAX_LINE_CHARS = 500
+    # How deep a public input value is unwrapped before it stops being readable as one line.
+    MAX_VALUE_DEPTH = 2
+
+    # Input keys the specialized presentation already showed, and the transport's own identity.
+    # Everything else a tool declares publicly goes through the generic renderer.
+    SUBJECT_KEYS = %w[file_path path notebook_path command description].freeze
+    SPECIALIZED_KEYS = %w[old_string new_string content contents prompt].freeze
+    WRAPPER_KEYS = %w[id type caller].freeze
 
     # The runner's own stream name for normalized progress — an existing `log_source` value, not
     # a new one, so the wire contract and the Platform panel are unchanged.
     STATUS = "status"
 
     STARTED = "Provider started"
-    ACTIVITY = "Provider activity"
-    GENERIC_COMMAND = "Running a command"
-    STEP_COMPLETED = "Step completed"
-    STEP_FAILED = "Step failed"
     COMPLETED = "Provider completed"
     FAILED = "Provider failed"
+    COMPLETED_STEP = "< step completed"
+    FAILED_STEP = "! step failed"
+    INTERRUPTED_STEP = "! step interrupted"
+    RATE_LIMIT = "Rate limit"
     DIAGNOSTIC = "Provider wrote diagnostic output"
-
-    # Tool categories, matched case-insensitively so a renamed-casing tool still projects safely.
-    READ_TOOLS = %w[read glob grep notebookread].freeze
-    EDIT_TOOLS = %w[edit write multiedit notebookedit].freeze
-    COMMAND_TOOLS = %w[bash bashoutput].freeze
-
-    # A command may be PREVIEWED only when EVERY token is a fact this class already recognises:
-    # an approved executable, one of a closed set of subcommands, or a path the existing
-    # repository-containment projection proves. What is shown is then REBUILT from those facts —
-    # provider text is never echoed.
-    #
-    # CR-001 F2: the previous rule was a permissive character pattern over the whole line, which
-    # passed `python3 /Users/alice/private.py` and `bundle exec rspec --seed <secret>` intact. A
-    # pattern says what a string looks like; only an allowlist says what it is.
-    PREVIEWABLE_COMMANDS = %w[bundle rake rails rspec ruby rubocop npm npx yarn pnpm node
-                              pytest python python3 go cargo make bin/rails bin/rspec
-                              bin/rake bin/dev].freeze
-    PREVIEWABLE_WORDS = %w[exec run test check lint build install ci].freeze
-    # A path-shaped token: no shell metacharacter, no whitespace, and an actual separator or
-    # extension, so a bare word can never be mistaken for a repository-relative path.
-    PATH_TOKEN = %r{\A[A-Za-z0-9_./-]+\z}
-    TEST_HINT = /\b(test|tests|spec|specs|rspec|minitest|pytest|jest)\b/i
 
     FAILURE_UNREADABLE = "the provider's structured output could not be read"
     FAILURE_INCOMPLETE = "the provider's structured output ended mid-message"
@@ -87,8 +80,10 @@ module SpecrelayRunner
 
     # `sink` receives `(stream_name, text)` exactly as CommandRunner's own consumer does, so the
     # existing ExecutorLogStream is the fan-out owner and this class shows nothing itself.
-    # `repository_path` is the assigned worktree, or nil for a lane that has none — a path may
-    # only be shown when containment in it is provable, so nil means no path is ever shown.
+    #
+    # `repository_path` is the assigned worktree, or nil for a lane that has none. CR-005 no
+    # longer filters display on it — an ordinary path is not a secret — so it is kept only as the
+    # caller's declared work location; both lanes render the same transcript with or without it.
     def initialize(sink: nil, repository_path: nil)
       @sink = sink
       @repository_path = repository_path && File.expand_path(repository_path.to_s)
@@ -97,10 +92,6 @@ module SpecrelayRunner
       @result_seen = false
       @failure = nil
       @diagnostic_reported = false
-      # tool-use id => the completion wording its result may use. In memory, bounded, and holding
-      # only text this class already decided was safe to show.
-      @outstanding = {}
-      @last_status = nil
     end
 
     # The consumer handed to CommandRunner. Every line the provider writes comes through here.
@@ -175,53 +166,56 @@ module SpecrelayRunner
       capture_result(message) if message["type"].to_s == "result"
       return if @failure
 
-      statuses(message).each { |text| publish(text) }
+      statuses(message).each { |text| forward(STATUS, text) }
     end
 
-    # CR-004 — a provider that emits unrecognised messages in a row would otherwise fill the log
-    # with identical generic lines that say nothing. Only a CONSECUTIVE repeat of the generic
-    # activity line is dropped; every described status is published as it arrives, and the quiet
-    # heartbeat ExecutorLogStream owns is not involved.
-    def publish(text)
-      return if text == ACTIVITY && @last_status == ACTIVITY
-
-      @last_status = text
-      forward(STATUS, text)
-    end
-
-    # ---- projection ---------------------------------------------------------
-
+    # ---- the public transcript ----------------------------------------------
+    #
+    # CR-005: what an operator reads must be the provider's own public transcript, not a title
+    # per event. Every PUBLIC item the supported stream-json contract carries is rendered here —
+    # narration, the tool and its description, the exact command, its stdout and stderr, file
+    # paths and contents, the before/after of an edit, delegated Task input and output, and the
+    # provider's own timing — in the order the provider emitted it.
+    #
+    # Two things, and only two, are still withheld: the model's `thinking` blocks, which are the
+    # private reasoning the CLI itself does not present as public text, and the JSONL wrappers
+    # themselves. Credentials are not filtered here at all: {Redaction} is the ONE boundary that
+    # removes them, and it already runs over every line on its way to both surfaces.
     def statuses(message)
       case message["type"].to_s
-      when "system" then [ message["subtype"].to_s == "init" ? STARTED : ACTIVITY ]
-      when "assistant" then tool_statuses(message)
-      when "user" then tool_result_statuses(message)
+      when "system" then system_lines(message)
+      when "assistant" then assistant_lines(message)
+      when "user" then result_lines(message)
       when "result" then [ terminal_status(message) ]
-      else [ ACTIVITY ]
+      when "rate_limit_event" then rate_limit_lines(message)
+      else []
       end
     end
 
-    # Only `tool_use` blocks are read. Assistant text and reasoning are not progress and are not
-    # this product: an operator watching a run must never be shown private model prose.
-    def tool_statuses(message)
-      blocks(message).select { |block| block["type"].to_s == "tool_use" }.map { |block| tool_status(block) }
+    # `system/thinking_tokens` carries an estimated token COUNT and no duration, so it cannot
+    # reproduce the Claude Code UI's "Thought for 1s" and is not rendered: a running count of
+    # tokens for reasoning the operator may not read is noise, not status. The contract has no
+    # thinking-duration field to render instead. Public timing does reach the operator — from
+    # the terminal `result`, which reports the run's own duration and turn count.
+    def system_lines(message)
+      message["subtype"].to_s == "init" ? [ STARTED ] : []
     end
 
-    # A tool result says only that a step ended and how. Its content is raw provider/tool output
-    # — file bytes, command output, stack traces — and is never read. CR-004: what the step WAS
-    # comes from the correlated `tool_use`, so the wording still describes only facts this class
-    # already projected, and a result whose call is unknown or forgotten stays generic.
-    def tool_result_statuses(message)
-      blocks(message).select { |block| block["type"].to_s == "tool_result" }
-                     .map { |block| tool_result_status(block) }
+    def rate_limit_lines(message)
+      info = message["rate_limit_info"]
+      return [] unless info.is_a?(Hash)
+
+      [ "#{RATE_LIMIT}: #{info['status']} (#{info['rateLimitType']})" ]
     end
 
-    def tool_result_status(block)
-      failed = block["is_error"]
-      completion = @outstanding.delete(block["tool_use_id"].to_s)
-      return failed ? STEP_FAILED : STEP_COMPLETED if completion.nil?
-
-      failed ? completion.last : completion.first
+    def assistant_lines(message)
+      blocks(message).flat_map do |block|
+        case block["type"].to_s
+        when "text" then bounded(block["text"].to_s)
+        when "tool_use" then tool_use_lines(block)
+        else []                                  # `thinking` and anything else: never public
+        end
+      end
     end
 
     def blocks(message)
@@ -229,89 +223,147 @@ module SpecrelayRunner
       content.is_a?(Array) ? content.grep(Hash) : []
     end
 
-    def tool_status(block)
-      start, completion = describe(block)
-      remember(block["id"], completion)
-      start
-    end
-
-    # ONE place decides both what a step is called while it runs and what its completion is
-    # called, so the two wordings cannot drift apart and there is a single owner of status text.
-    # A nil completion means the step has no safe description and its end stays generic.
-    def describe(block)
-      name = block["name"].to_s.downcase
+    # The call as the operator would read it: what ran, why, and — for an edit — exactly what
+    # changed. `input` is the provider's own public tool input; it is shown rather than
+    # summarized, because a summary is what made the old log useless.
+    def tool_use_lines(block)
+      name = block["name"].to_s
       input = block["input"].is_a?(Hash) ? block["input"] : {}
-      return path_pair("Inspecting", input) if READ_TOOLS.include?(name)
-      return path_pair("Editing", input) if EDIT_TOOLS.include?(name)
-      return command_pair(input) if COMMAND_TOOLS.include?(name)
-
-      [ ACTIVITY, nil ]
+      [ "> #{name}#{subject(input) && " #{subject(input)}"}" ] +
+        indent(input["description"].to_s) + indent(*call_body(name, input))
     end
 
-    def path_pair(verb, input)
-      subject = path_subject(input)
-      [ "#{verb} #{subject}",
-        [ "Finished #{verb.downcase} #{subject}", "Failed #{verb.downcase} #{subject}" ] ]
+    def subject(input)
+      value = SUBJECT_KEYS.filter_map { |key| input[key] }.first
+      value.to_s.empty? ? nil : clip_line(redact(value))
     end
 
-    def path_subject(input)
-      contained_path(input["file_path"] || input["path"] || input["notebook_path"]) || "a file"
+    # What is worth showing BEYOND the subject line. The specialized forms come first because an
+    # edit's before/after and a delegated Task's prompt are the point of those events; everything
+    # else the tool declared publicly is then rendered by ONE generic renderer, so a new tool's
+    # input is shown rather than silently dropped (CR-006 F2). No per-tool registry, and nothing
+    # already shown above is repeated.
+    def call_body(name, input)
+      specialized =
+        if input.key?("new_string") then diff(input["old_string"], input["new_string"])
+        elsif name == "Write" then bounded(input["contents"] || input["content"])
+        elsif input.key?("prompt") then bounded(input["prompt"])
+        else []
+        end
+      specialized + generic_input(input)
     end
 
-    # A command the allowlist refused has no safe description, so neither end of it gains one.
-    def command_pair(input)
-      preview = previewable_command(input["command"])
-      return [ GENERIC_COMMAND, nil ] if preview.nil?
-
-      noun = TEST_HINT.match?(preview) ? "Test command" : "Command"
-      [ "Running #{noun.downcase}: #{preview}",
-        [ "#{noun} completed successfully", "#{noun} failed" ] ]
+    # Every remaining public input field, in the provider's own key order so two identical calls
+    # render identically. Wrapper identity (`id`, `caller`, `type`) belongs to the transport and
+    # is never printed.
+    def generic_input(input)
+      (input.keys - SUBJECT_KEYS - SPECIALIZED_KEYS - WRAPPER_KEYS).filter_map do |key|
+        rendered = render_value(input[key])
+        rendered.empty? ? nil : clip_line("#{key}: #{rendered}")
+      end
     end
 
-    def remember(id, completion)
-      key = id.to_s
-      return if key.empty? || completion.nil?
+    # A public value as an operator would read it: a scalar as itself, a list comma-separated, an
+    # object as `key=value` pairs. Never a Ruby or JSON transport dump.
+    def render_value(value, depth = 0)
+      case value
+      when nil then ""
+      when String then redact(value).tr("\n", " ").strip
+      when Array then depth < MAX_VALUE_DEPTH ? value.map { |v| render_value(v, depth + 1) }.reject(&:empty?).join(", ") : ""
+      when Hash
+        return "" unless depth < MAX_VALUE_DEPTH
 
-      @outstanding[key] = completion
-      @outstanding.shift while @outstanding.size > MAX_OUTSTANDING_TOOLS
+        value.filter_map { |k, v| "#{k}=#{render_value(v, depth + 1)}" unless render_value(v, depth + 1).empty? }.join(", ")
+      else value.to_s
+      end
     end
 
-    # A path is shown ONLY when it is provably inside the assigned repository. `expand_path`
-    # resolves `..` first, so a traversal-shaped value is compared as the location it really
-    # names rather than as the string it was written as.
-    def contained_path(value)
-      raw = value.to_s
-      return nil if repository_path.nil? || raw.empty?
-
-      absolute = File.expand_path(raw, repository_path)
-      return nil unless absolute.start_with?("#{repository_path}#{File::SEPARATOR}")
-
-      absolute.delete_prefix("#{repository_path}#{File::SEPARATOR}")
+    def diff(before, after)
+      bounded(before).map { |line| "-#{line}" } + bounded(after).map { |line| "+#{line}" }
     end
 
-    def previewable_command(value)
-      text = value.to_s.strip
-      return nil if text.empty? || text.length > MAX_COMMAND_CHARS
+    # A tool result. `tool_use_result` is the structured form the contract provides and is
+    # preferred because it separates stdout from stderr and names the file it read; the
+    # `tool_result` block's own `content` is the fallback when there is no structured form.
+    # CR-006 F3: EVERY result states its disposition exactly once, including a success that
+    # produced no output at all — silence used to be indistinguishable from an interruption.
+    # The three dispositions come only from fields the real capture carries: the block's own
+    # `is_error`, and `tool_use_result.interrupted`. No timeout is inferred from anything else.
+    def result_lines(message)
+      detail = message["tool_use_result"]
+      blocks(message).flat_map do |block|
+        next [] unless block["type"].to_s == "tool_result"
 
-      tokens = text.split(/\s+/)
-      return nil unless PREVIEWABLE_COMMANDS.include?(tokens.first)
-
-      projected = tokens.map { |token| approved_token(token) }
-      projected.all? ? projected.join(" ") : nil
+        [ disposition(block, detail) ] + indent(*outcome(detail, block["content"]))
+      end
     end
 
-    # The token as it may be SHOWN, or nil when it is not an approved fact. A path is returned as
-    # its repository-relative projection — the same rule a tool path passes — so an absolute or
-    # escaping path is refused here rather than displayed.
-    def approved_token(token)
-      return token if PREVIEWABLE_COMMANDS.include?(token) || PREVIEWABLE_WORDS.include?(token)
-      return nil unless PATH_TOKEN.match?(token) && token.match?(%r{[/.]})
+    def disposition(block, detail)
+      return FAILED_STEP if block["is_error"]
+      return INTERRUPTED_STEP if detail.is_a?(Hash) && detail["interrupted"]
 
-      contained_path(token)
+      COMPLETED_STEP
+    end
+
+    def outcome(detail, fallback)
+      return bounded(fallback) unless detail.is_a?(Hash)
+      # A background/TaskOutput poll, exactly as the supported CLI emitted it in the CR-006
+      # probe: the answer is the task's own output, not the retrieval envelope around it.
+      return bounded(detail.dig("task", "output")) if detail["task"].is_a?(Hash)
+      return bounded(detail.dig("file", "content")) if detail["file"].is_a?(Hash)
+      # An edit's change was already shown as the diff on the call itself.
+      return [] if detail.key?("oldString")
+      return bounded(detail["stdout"]) + bounded(detail["stderr"]) if detail.key?("stdout")
+
+      bounded(fallback)
     end
 
     def terminal_status(message)
-      message["is_error"] || message["subtype"].to_s != "success" ? FAILED : COMPLETED
+      outcome = message["is_error"] || message["subtype"].to_s != "success" ? FAILED : COMPLETED
+      "#{outcome}#{timing(message)}"
+    end
+
+    # The provider's own public timing, when it reports it.
+    def timing(message)
+      duration, turns = message["duration_ms"], message["num_turns"]
+      return "" unless duration.is_a?(Numeric) || turns.is_a?(Numeric)
+
+      parts = []
+      parts << "#{(duration / 1000.0).round(1)}s" if duration.is_a?(Numeric)
+      parts << "#{turns} turns" if turns.is_a?(Numeric)
+      " in #{parts.join(', ')}"
+    end
+
+    # ---- bounds -------------------------------------------------------------
+
+    # ExecutorLogStream bounds the WHOLE stream and announces that; this bounds ONE block, so a
+    # single large file or log cannot spend the run's whole budget before anything else is seen.
+    # Both notices are truthful and neither is silent.
+    def bounded(value)
+      # CR-006 F1. The multiline private-key rule can only fire while the block is still whole,
+      # and this method is where a block stops being whole. Redaction stays the ONE owner of
+      # credential patterns; it is simply called before the split rather than only after it, and
+      # ExecutorLogStream still redacts every line on its own way out ([REDACTED] is idempotent).
+      text = redact(value)
+      return [] if text.empty?
+
+      lines = text.split("\n", -1)
+      lines.pop while lines.last == ""
+      return lines.map { |line| clip_line(line) } if lines.length <= MAX_BLOCK_LINES
+
+      lines.first(MAX_BLOCK_LINES).map { |line| clip_line(line) } <<
+        "[... #{lines.length - MAX_BLOCK_LINES} more lines]"
+    end
+
+    def redact(value) = Redaction.redact(value.to_s)
+
+    def clip_line(line)
+      line.length > MAX_LINE_CHARS ? "#{line[0, MAX_LINE_CHARS]}[... clipped]" : line
+    end
+
+    def indent(*values)
+      values.flatten.flat_map { |value| value.is_a?(String) ? bounded(value) : [] }
+            .map { |line| "  #{line}" }
     end
 
     # ---- the terminal result ------------------------------------------------

@@ -87,8 +87,9 @@ class SpecificationProviderPropagationTest < Minitest::Test
 
     assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
 
-    # The lane is assigned no repository, so containment cannot be proven and no path is shown.
-    expected = [ "Provider started", "Inspecting a file", "Provider completed" ]
+    # CR-005: the specification lane has no repository and still renders the same transcript,
+    # path included — an ordinary path is not a secret, and both lanes share one renderer.
+    expected = [ "Provider started", "> Read /elsewhere/notes.md", "Provider completed" ]
     expected.each { |status| assert_includes @io.string, "[claude:status] #{status}" }
 
     chunks = @platform.protocol_events.select { |event| event["event_type"] == "log.chunk" }

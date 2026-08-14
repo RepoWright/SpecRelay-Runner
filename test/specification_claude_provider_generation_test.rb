@@ -55,13 +55,16 @@ class SpecificationClaudeProviderGenerationTest < Minitest::Test
     [ Provider::Claude.new(profile: profile, settings: settings, env: env, command_runner: runner), runner ]
   end
 
-  # A provider that worked and then answered: one `init`, private prose that must never surface,
+  # A provider that worked and then answered: one `init`, one PUBLIC narration line the operator
+  # must now read (CR-005), one `thinking` block that must never surface whatever else changes,
   # and one terminal result carrying `answer` — which is what the package parser, and only the
   # package parser, is given.
   def answering(answer, duration_seconds: 1.2)
     lines = [ JSON.generate("type" => "system", "subtype" => "init"),
               JSON.generate("type" => "assistant", "message" => { "content" => [
-                { "type" => "text", "text" => "private reasoning that must never be shown" } ] }),
+                { "type" => "text", "text" => "Composing the package." },
+                { "type" => "thinking", "thinking" => "private reasoning that must never be shown",
+                  "signature" => "sig-1" } ] }),
               JSON.generate("type" => "result", "subtype" => "success", "is_error" => false,
                             "result" => answer) ]
     [ Result.new(exit_code: 0, stdout: "", stderr: "", duration_seconds: duration_seconds, timed_out: false),
@@ -98,7 +101,8 @@ class SpecificationClaudeProviderGenerationTest < Minitest::Test
     documents, _runner, progress = generate({ "issue_key" => "SR-700" })
 
     assert_equal VALID_DOCUMENTS, documents
-    assert_equal [ [ "status", "Provider started" ], [ "status", "Provider completed" ] ], progress
+    assert_equal [ [ "status", "Provider started" ], [ "status", "Composing the package." ],
+                   [ "status", "Provider completed" ] ], progress
     refute_includes progress.flatten.join(" "), "private reasoning"
     refute_includes progress.flatten.join(" "), "spec.md"
   end

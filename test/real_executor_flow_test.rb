@@ -350,16 +350,17 @@ class RealExecutorFlowTest < Minitest::Test
   # --- MAPIAI-60: live provider progress on both surfaces --------------------
 
   # The whole point of the ticket, proven on the real profile seam: while Claude works, the
-  # operator's terminal and Platform receive the SAME normalized events, from the same decoder,
-  # in the same order — and neither ever receives a raw frame.
+  # operator's terminal and Platform receive the SAME transcript, from the same decoder, in the
+  # same order — and neither ever receives a raw frame.
   def test_claude_progress_reaches_the_terminal_and_platform_before_the_attempt_finishes
     start_platform(claude_payload)
     bin_dir, = FakeClaudeCli.build
 
     assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli(claude_config, bin_dir: bin_dir), @io.string
 
-    expected = [ "Provider started", "Editing demo-app/index.html", "Running test command: npm test" ]
-    expected.each { |status| assert_includes @io.string, "[claude:status] #{status}" }
+    expected = [ "Provider started", "> Read ", "> Edit ", "> Bash npm test" ]
+    expected.each { |line| assert_includes @io.string, line }
+    assert_includes @io.string, "demo-app/index.html", "the file the provider worked on is named"
 
     types = @platform.protocol_events.map { |event| event["event_type"] }
     chunks = @platform.protocol_events.select { |event| event["event_type"] == "log.chunk" }
@@ -369,8 +370,9 @@ class RealExecutorFlowTest < Minitest::Test
                  "normalized progress reuses the existing status stream; it adds no log_source"
 
     delivered = chunks.map { |event| event["sanitized_log_chunk"].to_s }.join("\n")
-    expected.each { |status| assert_includes delivered, status }
-    assert_equal expected, delivered.split("\n").select { |line| expected.include?(line) },
+    expected.each { |fragment| assert_includes delivered, fragment }
+    positions = expected.map { |fragment| delivered.index(fragment) }
+    assert_equal positions.sort, positions,
                  "both surfaces must show the same events in the same canonical order"
   end
 
@@ -382,8 +384,16 @@ class RealExecutorFlowTest < Minitest::Test
     live_log = decode_file(SpecrelayRunner::ReportBundle::LIVE_LOG_PATH)
     [ @io.string, live_log, JSON.generate(@platform.last_report[:body]) ].each do |surface|
       refute_includes surface, %("type":"assistant"), "a raw provider frame reached a surface"
-      refute_includes surface, "considering the task", "private assistant prose reached a surface"
-      refute_includes surface, "raw tool output", "a raw tool result reached a surface"
+      refute_includes surface, FakeClaudeCli::LEAKED_TOKEN, "a credential reached a surface"
+    end
+
+    # CR-005 reverses the other half of this assertion. The provider's PUBLIC narration and its
+    # tool output are exactly what an operator needs, so they must now be present — with the
+    # credential planted inside that same narration redacted by the one boundary that owns it.
+    [ @io.string, live_log ].each do |surface|
+      assert_includes surface, "considering the task", "public narration must reach the operator"
+      assert_includes surface, "raw tool output", "tool output must reach the operator"
+      assert_includes surface, "[REDACTED]", "the planted credential must be redacted in place"
     end
 
     # The report's stdout evidence is the DECODED terminal result — the provider's answer, not

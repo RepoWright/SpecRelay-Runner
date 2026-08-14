@@ -433,9 +433,9 @@ class LiveLogTest < Minitest::Test
     assert_equal "the provider's own answer", decoder.final_text
   end
 
-  # CR-004 — the improved wording is not a second product. A correlated completion is one more
-  # status line through the SAME fan-out, so the terminal and the Platform envelope receive the
-  # identical text without a new log source, event type or protocol field.
+  # CR-005 — the transcript is not a second product. Its lines go through the SAME fan-out, so
+  # the terminal and the Platform envelope receive identical text without a new log source,
+  # event type or protocol field, and the tool output is part of what the operator reads.
   def test_a_correlated_completion_reaches_both_surfaces_through_the_existing_fan_out
     client = RecordingClient.new
     stream, io = live_stream(client)
@@ -456,10 +456,11 @@ class LiveLogTest < Minitest::Test
 
     envelope = client.accepted_for(1)
     delivered = envelope["sanitized_log_chunk"].to_s
-    assert_includes io.string, "Finished editing demo-app/index.html"
-    assert_includes delivered, "Finished editing demo-app/index.html"
+    [ "> Edit #{File.join(@tmp, 'demo-app/index.html')}", "RAW TOOL OUTPUT" ].each do |fragment|
+      assert_includes io.string, fragment
+      assert_includes delivered, fragment
+    end
     assert_equal SpecrelayRunner::ClaudeStream::STATUS, envelope.dig("attributes", "log_source")
-    refute_includes "#{io.string}\n#{delivered}", "RAW TOOL OUTPUT"
   end
 
   def test_an_envelope_lost_to_a_transport_outage_is_retried_verbatim_when_delivery_returns
