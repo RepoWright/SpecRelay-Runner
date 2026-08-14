@@ -34,10 +34,18 @@ module SpecrelayRunner
   #
   # Thread model: `accept` is called from CommandRunner's two reader threads, so all mutable
   # state is behind one mutex. Every Platform request for this stream is made by the ONE timer
-  # thread, or by `finish` once the provider has already exited — never by a reader thread, and
-  # never inside the mutex. That is what makes "a slow Platform cannot apply back-pressure to
-  # the executor's stdout pipe" a property of the structure rather than a hope about latency
-  # (MAPIAI-60 CR-001 F3; review 001 measured one reader `accept` blocked for 0.503s).
+  # thread — never by a reader thread, never by the orchestrator, and never inside the mutex.
+  # That is what makes "a slow Platform cannot apply back-pressure to the executor's stdout pipe"
+  # a property of the structure rather than a hope about latency (MAPIAI-60 CR-001 F3; review 001
+  # measured one reader `accept` blocked for 0.503s).
+  #
+  # `finish` is the same rule applied to the END of an attempt (CR-002 F1). It used to flush,
+  # announce and retry on the CALLER's thread, inside the `ensure` both orchestrators wrap around
+  # the provider call — so a Platform that accepted the connection and then stopped answering held
+  # a FINISHED provider's result behind the progress channel for up to PlatformClient's
+  # 1,800-second read timeout. Finalization now hands the last delivery to the thread that already
+  # owns delivery and waits a bounded moment for it to settle; whatever that moment does not cover
+  # is reported as a gap. The progress channel can lose an update. The result channel cannot wait.
   #
   # There is one delivery owner and it needs no queue of its own: the per-stream buffers are the
   # pending work, bounded by MAX_TOTAL_BYTES, and EventEmitter holds the exact envelopes an
@@ -55,6 +63,12 @@ module SpecrelayRunner
     FLUSH_INTERVAL_SECONDS = 2
     HEARTBEAT_INTERVAL_SECONDS = 15
     TICK_SECONDS = 0.25
+    # How long finalization waits for the delivery thread to settle. It is a SHUTDOWN bound, not
+    # a request timeout and not a retry policy: it covers one tick plus an ordinary round trip, so
+    # a healthy Platform completes the last delivery inside it. It is deliberately not derived
+    # from — and is three orders of magnitude below — PlatformClient's read timeout, because the
+    # whole point is that the attempt's result stops depending on how long Platform takes.
+    SHUTDOWN_SECONDS = 2
 
     LINE_CLIP_MARKER = " [line clipped at #{MAX_LINE_BYTES} bytes]"
     TRUNCATION_NOTICE = "live executor output reached its #{MAX_TOTAL_BYTES}-byte budget; " \
@@ -121,8 +135,12 @@ module SpecrelayRunner
       @mutex.synchronize { record(source, text) }
     end
 
-    # Stops the timer, flushes what is buffered, and emits the truncation notice if
-    # the budget was reached.
+    # Ends the attempt's live stream: tell the delivery thread to make its last pass, give it a
+    # bounded moment to settle, then say locally what Platform never acknowledged.
+    #
+    # It performs NO Platform request of its own (CR-002 F1). Both orchestrators call this from
+    # the `ensure` that wraps the provider call, so every second spent here is a second the
+    # attempt's own result — the package, the report — is not being written.
     #
     # IDEMPOTENT by design: Execution stops the stream when the executor returns
     # (so the live log closes with the core phase) and again in its outer `ensure`
@@ -132,32 +150,10 @@ module SpecrelayRunner
       return self if claim_finish_turn == :already_finished
 
       @running = false
-      @timer&.join
-      @timer = nil
-      flush_all
-      announce_truncation
-      # MAPIAI-60 — the last delivery opportunity of the attempt. A gap that closed here still
-      # closed during the attempt, which is why the report below runs after it, not before.
-      emitter.retry_undelivered
+      settle_delivery
       report_delivery_gap
       # A quiet-provider status row is only true while the provider is running.
       io.clear_status
-      self
-    end
-
-    # The timer thread's unit of work, and the ONE place this stream talks to Platform while the
-    # provider is still running: settle whatever an earlier outage left owed, then send any batch
-    # that is now due.
-    #
-    # Public because it names the delivery boundary CR-001 F3 moved off the reader. The timer
-    # drives it; a test steps it directly instead of racing a wall clock.
-    def deliver_pending
-      batches = @mutex.synchronize do
-        next [] unless now - @last_flush_at >= flush_interval || buffered_bytes >= FLUSH_BYTES
-
-        @buffers.keys.filter_map { |source| take(source) }
-      end
-      batches.each { |batch| flush(batch) }
       self
     end
 
@@ -189,6 +185,44 @@ module SpecrelayRunner
         @finished = true
         :first
       end
+    end
+
+    # Waits SHUTDOWN_SECONDS for the delivery thread to leave its loop and make its final pass.
+    # If it is still inside a Platform request after that, it is stopped where it stands: an
+    # abandoned thread would otherwise keep writing to the operator's terminal and emitting into
+    # an attempt that has already ended. Killing it unwinds `Mutex#synchronize` and the client's
+    # own `ensure` blocks, and the second bounded join is what makes the gap count below a
+    # settled number rather than one racing a request still in flight.
+    def settle_delivery
+      timer = @timer
+      @timer = nil
+      return if timer.nil? || timer.join(SHUTDOWN_SECONDS)
+
+      timer.kill
+      timer.join(SHUTDOWN_SECONDS)
+    end
+
+    # The delivery thread's unit of work, and the ONE place this stream talks to Platform while
+    # the provider is still running: settle whatever an earlier outage left owed, then send any
+    # batch that is now due.
+    def deliver_pending
+      batches = @mutex.synchronize do
+        next [] unless now - @last_flush_at >= flush_interval || buffered_bytes >= FLUSH_BYTES
+
+        @buffers.keys.filter_map { |source| take(source) }
+      end
+      batches.each { |batch| flush(batch) }
+      self
+    end
+
+    # The last pass, made by the delivery thread on its way out rather than by the orchestrator:
+    # everything still buffered, the truncation notice, and one final opportunity for whatever an
+    # earlier outage left owed. A gap that closes here still closed during the attempt, which is
+    # why {#report_delivery_gap} runs after this and not before.
+    def final_delivery
+      flush_all
+      announce_truncation
+      emitter.retry_undelivered
     end
 
     # ---- accounting (always under the mutex) --------------------------------
@@ -278,16 +312,18 @@ module SpecrelayRunner
       submit(TRUNCATED_EVENT, TRUNCATION_NOTICE, log_source: "status", phase: "core", note: "budget_exhausted")
     end
 
-    # What Platform never accepted, reported once at the end so a silent gap in the Platform-side
-    # log is never invisible to the operator. It is the emitter's count, not a local one: after
-    # MAPIAI-60 a failed delivery may still be retried, so "how many attempts failed" would
-    # overstate the gap and claim missing output that in fact arrived.
+    # What Platform never acknowledged, reported once at the end so a silent gap in the
+    # Platform-side log is never invisible to the operator. Two things are owed at this point and
+    # both are counted: envelopes the emitter never saw accepted (a failed delivery, or one this
+    # attempt's shutdown cut short), and any buffer the final pass did not get to. The buffered
+    # remainder is counted as one update per stream rather than guessed at line level, so the
+    # number is a floor — hence "at least", which is the only wording that stays true either way.
     def report_delivery_gap
-      owed = emitter.undelivered_count
+      owed = emitter.undelivered_count + @mutex.synchronize { @buffers.values.count(&:any?) }
       return if owed.zero?
 
-      write "[core.progress] #{owed} live log update(s) could not be delivered to Platform; " \
-            "the terminal output above and the report evidence are unaffected"
+      write "[core.progress] at least #{owed} live log update(s) could not be delivered to " \
+            "Platform; the terminal output above and the report evidence are unaffected"
     end
 
     # The one place a live log event is sent. A transport failure is swallowed, never raised: the
@@ -351,6 +387,7 @@ module SpecrelayRunner
         deliver_pending
         heartbeat_if_quiet
       end
+      final_delivery
     rescue StandardError
       # A progress thread must never take the run down with it.
       nil

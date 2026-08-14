@@ -102,6 +102,28 @@ class SpecificationProviderPropagationTest < Minitest::Test
     refute_includes @io.string, %("type":"result"), "a raw frame reached the terminal"
   end
 
+  # CR-002 F1 — the same finalization boundary on this lane's own orchestrator. `Generation`
+  # finishes the stream in an `ensure` around the provider call, so a live-log channel that stops
+  # answering used to hold the generated DOCUMENTS behind it. Held far longer than any legitimate
+  # shutdown, so "waited for Platform" cannot be mistaken for "settled its own thread".
+  LOG_EVENT_DELAY = 15
+
+  def test_a_platform_that_stops_answering_the_log_channel_never_holds_the_generated_package
+    stub_claude
+    start_platform(profile: "claude", executor: CLAUDE_PROFILE)
+    @platform.log_event_delay = LOG_EVENT_DELAY
+
+    started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
+    elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+
+    assert_operator elapsed, :<, LOG_EVENT_DELAY,
+                    "generation took #{elapsed.round(3)}s: it waited for the live-log channel"
+    assert_equal "generated", @platform.last_specification_generation["outcome"], @io.string
+    assert_includes @io.string, "could not be delivered to Platform",
+                    "and the undelivered progress is named rather than silently dropped"
+  end
+
   # ------------------------------------------------------------------ what must still refuse
 
   # The fixture is a real selection with no specification provider behind it. It must refuse —

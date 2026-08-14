@@ -131,23 +131,23 @@ module SpecrelayRunner
     # The one place an envelope's delivery state is decided, so "what does Platform still owe us"
     # has a single owner rather than a copy in every caller.
     #
+    # The ledger records a sequence BEFORE the request and clears it on an answer, so it means
+    # "allocated, not yet acknowledged" rather than "known to have failed". MAPIAI-60 CR-002 F1:
+    # an attempt whose shutdown stops a request that never returned is exactly the case that must
+    # not read as delivered, and only marking on failure would have missed it silently.
+    #
     # The distinction that matters is the one PlatformClient::Error already draws: a REFUSAL
     # means Platform read this payload and rejected it, so re-sending the same bytes can only be
     # refused again and the envelope is dropped from the ledger. Anything else left the request's
     # fate unknown, so the envelope is kept for a later opportunity.
     def deliver(envelope)
       sequence = envelope["sequence"]
+      @mutex.synchronize { @undelivered << sequence unless @undelivered.include?(sequence) }
       response = send_envelope(envelope)
       @mutex.synchronize { @undelivered.delete(sequence) }
       response
     rescue PlatformClient::Error => e
-      @mutex.synchronize do
-        if e.refused?
-          @undelivered.delete(sequence)
-        elsif !@undelivered.include?(sequence)
-          @undelivered << sequence
-        end
-      end
+      @mutex.synchronize { @undelivered.delete(sequence) if e.refused? }
       raise
     end
 

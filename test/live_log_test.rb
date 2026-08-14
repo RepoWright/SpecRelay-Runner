@@ -253,7 +253,7 @@ class LiveLogTest < Minitest::Test
 
   def test_a_heartbeat_is_emitted_only_while_the_provider_is_quiet
     clock = FakeClock.new
-    stream, io, emitter = build_stream(clock: clock, heartbeat_interval: 10)
+    stream, io, emitter = build_stream(clock: clock, heartbeat_interval: 10, delivering: false)
     clock.advance(11)
     stream.send(:heartbeat_if_quiet)
 
@@ -285,7 +285,7 @@ class LiveLogTest < Minitest::Test
     clock = FakeClock.new
     terminal = RecordingTerminal.new
     presenter = SpecrelayRunner::TerminalPresenter.new(out: terminal, transient: true, columns: 100)
-    stream, _io, emitter = build_stream(clock: clock, heartbeat_interval: 10, io: presenter)
+    stream, _io, emitter = build_stream(clock: clock, heartbeat_interval: 10, io: presenter, delivering: false)
     clock.advance(11)
     stream.send(:heartbeat_if_quiet)
     clock.advance(11)
@@ -330,7 +330,7 @@ class LiveLogTest < Minitest::Test
   # to show that a silent executor is still alive.
   def test_without_a_terminal_the_quiet_heartbeat_remains_line_oriented
     clock = FakeClock.new
-    stream, io, emitter = build_stream(clock: clock, heartbeat_interval: 10)
+    stream, io, emitter = build_stream(clock: clock, heartbeat_interval: 10, delivering: false)
     clock.advance(11)
     stream.send(:heartbeat_if_quiet)
 
@@ -346,7 +346,7 @@ class LiveLogTest < Minitest::Test
     clock = FakeClock.new
     terminal = RecordingTerminal.new
     presenter = SpecrelayRunner::TerminalPresenter.new(out: terminal, transient: true, columns: 200)
-    stream, _io, _emitter = build_stream(clock: clock, heartbeat_interval: 1, io: presenter)
+    stream, _io, _emitter = build_stream(clock: clock, heartbeat_interval: 1, io: presenter, delivering: false)
     readers = %w[stdout stderr].map do |source|
       Thread.new { 40.times { |i| stream.accept(source, "#{source} line #{i} #{'-' * 30}") } }
     end
@@ -405,7 +405,7 @@ class LiveLogTest < Minitest::Test
     assert_operator elapsed, :<, SLOW_CALL_SECONDS / 2,
                     "the reader path waited #{elapsed.round(3)}s for Platform; it must only " \
                     "normalize, bound, print and buffer"
-    stream.finish
+    stream.send(:deliver_pending)
     assert_equal [ 1 ], client.accepted_sequences, "and the delivery still happened, off that path"
   end
 
@@ -439,10 +439,10 @@ class LiveLogTest < Minitest::Test
 
     client.offline = true
     flush_batch(stream, "Provider started")
-    stream.deliver_pending
+    stream.send(:deliver_pending)
     client.offline = false
     flush_batch(stream, "Editing app/index.html")
-    stream.deliver_pending
+    stream.send(:deliver_pending)
     stream.finish
 
     assert_equal [ 1, 2 ], client.accepted_sequences,
@@ -460,10 +460,10 @@ class LiveLogTest < Minitest::Test
 
     client.refuse = true
     flush_batch(stream, "Provider started")
-    stream.deliver_pending
+    stream.send(:deliver_pending)
     client.refuse = false
     flush_batch(stream, "Editing app/index.html")
-    stream.deliver_pending
+    stream.send(:deliver_pending)
     stream.finish
 
     assert_equal [ 2 ], client.accepted_sequences
@@ -476,6 +476,7 @@ class LiveLogTest < Minitest::Test
 
     client.offline = true
     flush_batch(stream, "Provider started")
+    stream.send(:deliver_pending)
     stream.finish
 
     assert_empty client.accepted_sequences
@@ -535,6 +536,29 @@ class LiveLogTest < Minitest::Test
     end
   end
 
+  # ---- CR-002 F1: the result path never waits for the progress path ---------
+  #
+  # CR-001 took Platform I/O off the child's reader, but left it in `finish` — which both
+  # orchestrators call in an `ensure` around the provider call. A Platform that accepted the
+  # connection and then stopped answering therefore still held the FINISHED provider's result,
+  # for up to PlatformClient's 1,800-second read timeout, before the package or report could be
+  # written. Review 002 measured 1.007s against a 0.5s client; the timeout is the real bound.
+  #
+  # Held far longer than any legitimate shutdown, so "waited for Platform" and "settled its own
+  # thread" cannot be confused for one another.
+  LOG_EVENT_DELAY = 15
+
+  def test_a_platform_that_stops_answering_the_log_channel_never_holds_the_attempt_result
+    with_execution(log_event_delay: LOG_EVENT_DELAY) do |platform, output, elapsed|
+      assert_operator elapsed, :<, LOG_EVENT_DELAY,
+                      "the attempt took #{elapsed.round(3)}s: finalization waited for the live-log channel"
+      refute_nil platform.last_report, "the executor's authoritative result still reached Platform"
+      assert_includes output, "could not be delivered to Platform",
+                      "and what Platform never acknowledged is named rather than silently dropped"
+      assert_includes output, "[fake:stdout]", "the operator still saw the run locally"
+    end
+  end
+
   def test_the_uploaded_report_carries_the_bounded_live_log_as_its_own_evidence_file
     with_execution do |platform, _output|
       files = platform.last_report.dig(:body, "report", "files").to_h { |f| [ f["relative_path"], f ] }
@@ -559,15 +583,20 @@ class LiveLogTest < Minitest::Test
     path
   end
 
-  # A stream wired to a recording emitter, with the timer thread never started so
-  # the heartbeat/flush schedule is driven explicitly by the test.
-  def build_stream(clock: FakeClock.new, heartbeat_interval: 15, io: StringIO.new)
+  # A stream wired to a recording emitter. It RUNS its delivery thread, because since CR-002 F1
+  # that thread is what `finish` hands the attempt's last delivery to — a stream built without one
+  # has no delivery owner at all, so asserting on what `finish` uploaded would prove nothing.
+  #
+  # `delivering: false` is for the tests that drive the heartbeat schedule by hand against a
+  # frozen clock and assert an exact beat or row count: a timer racing those assertions could
+  # emit the same beat a microsecond before the test asks for it.
+  def build_stream(clock: FakeClock.new, heartbeat_interval: 15, io: StringIO.new, delivering: true)
     emitter = RecordingEmitter.new
     stream = SpecrelayRunner::ExecutorLogStream.new(
       emitter: emitter, io: io, provider: "fake", task_id: "DEMO-0018",
       clock: clock, heartbeat_interval: heartbeat_interval
     )
-    [ stream, io, emitter ]
+    [ delivering ? stream.start : stream, io, emitter ]
   end
 
   # A real provider that reports enough long-path activity to cross the flush threshold several
@@ -598,6 +627,12 @@ class LiveLogTest < Minitest::Test
 
   # A stream wired to the REAL EventEmitter, because exact-envelope retry is a claim about the
   # sequence and payload an emitter builds — a double could only restate the assertion.
+  #
+  # Its delivery thread is NOT started: ordering is the property under test, so each delivery
+  # attempt is stepped through the same private boundary the timer drives, exactly as the
+  # heartbeat tests step `heartbeat_if_quiet`. Racing a 0.25s tick against an outage a test flips
+  # by hand would decide how many attempts happened by scheduling. The started thread's own
+  # shutdown is covered where it belongs — at the two real orchestration boundaries.
   def live_stream(client, io: StringIO.new)
     emitter = SpecrelayRunner::EventEmitter.new(client: client, run_id: "run_60", attempt_id: "rex_60")
     stream = SpecrelayRunner::ExecutorLogStream.new(emitter: emitter, io: io, provider: "claude",
@@ -605,9 +640,10 @@ class LiveLogTest < Minitest::Test
     [ stream, io ]
   end
 
-  def with_execution
+  def with_execution(log_event_delay: nil)
     root, executor = DemoWorkspace.build
     platform = FakePlatform.new(claim_payload: claim_payload_for(task_id: "DEMO-0018", executor_command: executor)).start
+    platform.log_event_delay = log_event_delay
     path = File.join(Dir.mktmpdir("cfg"), "runner.yml")
     File.write(path, <<~YAML)
       platform:
@@ -622,10 +658,12 @@ class LiveLogTest < Minitest::Test
         tiny-demo-workspace: #{root}
     YAML
     io = StringIO.new
+    started = monotonic
     code = SpecrelayRunner::CLI.run(%W[claim-once --config #{path}], out: io, err: io,
                                                                     env: { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN, "PATH" => ENV["PATH"] })
+    elapsed = monotonic - started
     assert_equal SpecrelayRunner::CLI::SUCCESS, code, io.string
-    yield platform, io.string
+    yield platform, io.string, elapsed
   ensure
     platform&.stop
     FileUtils.remove_entry(root) if root && File.directory?(root)
