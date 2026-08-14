@@ -370,7 +370,7 @@ class LiveLogTest < Minitest::Test
     stream.accept("stdout", "a line that cannot be delivered")
     stream.finish
 
-    assert_includes io.string, "could not be delivered to Platform"
+    assert_includes io.string, "were not acknowledged by Platform before this attempt ended"
     assert_includes io.string, "a line that cannot be delivered", "the terminal still showed it"
     assert_includes stream.evidence_text, "a line that cannot be delivered", "and the report still records it"
   end
@@ -450,7 +450,7 @@ class LiveLogTest < Minitest::Test
     assert_equal client.first_attempt_for(1), client.accepted_for(1),
                  "the retry must be the ORIGINAL envelope, byte for byte"
     assert_includes io.string, "Provider started", "local display never waited for Platform"
-    refute_includes io.string, "could not be delivered to Platform",
+    refute_includes io.string, "were not acknowledged by Platform",
                     "the gap closed during the attempt, so there is nothing to warn about"
   end
 
@@ -480,7 +480,7 @@ class LiveLogTest < Minitest::Test
     stream.finish
 
     assert_empty client.accepted_sequences
-    assert_includes io.string, "could not be delivered to Platform"
+    assert_includes io.string, "were not acknowledged by Platform before this attempt ended"
     assert_includes stream.evidence_text, "Provider started", "the local record is unaffected"
   end
 
@@ -548,13 +548,49 @@ class LiveLogTest < Minitest::Test
   # thread" cannot be confused for one another.
   LOG_EVENT_DELAY = 15
 
+  # The F2 boundary proof: how long `finish` itself may take when the delivery thread is inside a
+  # response that never comes. The two orchestration examples below measure a whole workflow, so
+  # their 15-second ceiling is only a coarse deadlock guard — a shutdown wait that grew from 2
+  # seconds to 10 would still pass them.
+  #
+  # A FIXED budget, deliberately not computed from SHUTDOWN_SECONDS: a ceiling derived from the
+  # constant would move with it and could never fail when it grows, which is the regression this
+  # exists to catch. It is the accepted two-second bound plus scheduling margin.
+  FINALIZATION_BUDGET_SECONDS = 3
+  # Far beyond any legitimate shutdown, so what is measured is the runner's own bound and never
+  # the request completing on its own.
+  WITHHELD_RESPONSE_SECONDS = 30
+
+  def test_finalization_gives_up_on_a_withheld_response_within_its_own_small_budget
+    client = RecordingClient.new(delay: WITHHELD_RESPONSE_SECONDS)
+    emitter = SpecrelayRunner::EventEmitter.new(client: client, run_id: "run_60", attempt_id: "rex_60")
+    io = StringIO.new
+    stream = SpecrelayRunner::ExecutorLogStream.start(emitter: emitter, io: io, provider: "claude",
+                                                      task_id: "DEMO-0060")
+    # Enough buffered output that the delivery thread has a batch to send, so finalization is
+    # always waiting on the withheld response rather than on an empty stream.
+    flush_batch(stream, "Provider started")
+
+    started = monotonic
+    stream.finish
+    elapsed = monotonic - started
+
+    assert_operator elapsed, :<, FINALIZATION_BUDGET_SECONDS,
+                    "finish took #{elapsed.round(3)}s: the attempt's result waited on the progress channel"
+    assert_empty client.accepted_sequences, "nothing was acknowledged, which is what the gap reports"
+    assert_includes io.string, "were not acknowledged by Platform before this attempt ended"
+  end
+
   def test_a_platform_that_stops_answering_the_log_channel_never_holds_the_attempt_result
     with_execution(log_event_delay: LOG_EVENT_DELAY) do |platform, output, elapsed|
       assert_operator elapsed, :<, LOG_EVENT_DELAY,
                       "the attempt took #{elapsed.round(3)}s: finalization waited for the live-log channel"
       refute_nil platform.last_report, "the executor's authoritative result still reached Platform"
-      assert_includes output, "could not be delivered to Platform",
-                      "and what Platform never acknowledged is named rather than silently dropped"
+      # CR-003 F1: this fake ROUTED and answered the event before withholding the response, so
+      # Platform has it and only the acknowledgement was lost. The runner cannot tell that case
+      # from a genuine loss, so it must claim neither.
+      assert_includes output, "were not acknowledged by Platform before this attempt ended"
+      assert_includes output, "delivery may still have succeeded"
       assert_includes output, "[fake:stdout]", "the operator still saw the run locally"
     end
   end

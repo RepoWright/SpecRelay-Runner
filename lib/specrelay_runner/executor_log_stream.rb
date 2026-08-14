@@ -318,12 +318,18 @@ module SpecrelayRunner
     # attempt's shutdown cut short), and any buffer the final pass did not get to. The buffered
     # remainder is counted as one update per stream rather than guessed at line level, so the
     # number is a floor — hence "at least", which is the only wording that stays true either way.
+    #
+    # CR-003 F1: what is owed is UNCONFIRMED, not known to be lost. A request stopped by shutdown
+    # may already have been accepted — only the acknowledgement failed to return — so the runner
+    # states the uncertainty it actually has instead of reporting a delivery failure it cannot
+    # observe. The operator's action is the same either way: read the local record below.
     def report_delivery_gap
       owed = emitter.undelivered_count + @mutex.synchronize { @buffers.values.count(&:any?) }
       return if owed.zero?
 
-      write "[core.progress] at least #{owed} live log update(s) could not be delivered to " \
-            "Platform; the terminal output above and the report evidence are unaffected"
+      write "[core.progress] at least #{owed} live log update(s) were not acknowledged by " \
+            "Platform before this attempt ended; delivery may still have succeeded. The " \
+            "terminal output above and the report evidence are unaffected"
     end
 
     # The one place a live log event is sent. A transport failure is swallowed, never raised: the

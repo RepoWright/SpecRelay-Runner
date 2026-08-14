@@ -120,8 +120,10 @@ class SpecificationProviderPropagationTest < Minitest::Test
     assert_operator elapsed, :<, LOG_EVENT_DELAY,
                     "generation took #{elapsed.round(3)}s: it waited for the live-log channel"
     assert_equal "generated", @platform.last_specification_generation["outcome"], @io.string
-    assert_includes @io.string, "could not be delivered to Platform",
-                    "and the undelivered progress is named rather than silently dropped"
+    # CR-003 F1: Platform accepted the event and only its acknowledgement was withheld, so the
+    # unconfirmed progress must be named without being called a failed delivery.
+    assert_includes @io.string, "were not acknowledged by Platform before this attempt ended"
+    assert_includes @io.string, "delivery may still have succeeded"
   end
 
   # ------------------------------------------------------------------ what must still refuse
