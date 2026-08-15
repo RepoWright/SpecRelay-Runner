@@ -69,13 +69,23 @@ module SpecrelayRunner
     # one segment. Requiring a segment leaves ordinary prose (`input / output`) alone; the
     # lookbehind leaves relative paths (`spec/models`), git refs (`origin/main`), dates, closing
     # tags (`</h1>`) and a URL's own path alone. Windows syntax is deliberately not parsed.
-    PATH_BODY = %r{/[\w.\-+@%~]+(?:/[\w.\-+@%~]+)*/?}
+    #
+    # CR-001 — a segment is described by what CANNOT be in one, not by an ASCII allowlist. The
+    # allowlist stopped at a Unicode directory name and at a space, and the projector then
+    # replaced only the prefix it had recognized, leaving the private basename public. Recognizing
+    # LESS of a path is not the safe direction, so a segment character is now anything a shell, a
+    # tool or ordinary narration would not use to END the span.
+    PATH_CHAR = %r{[^\s/\\'"<>|;&`$()\[\]\{\},:*?=]}
+    # `\ ` is how an UNQUOTED shell path carries a space, so the escape belongs to the span.
+    PATH_UNIT = %r{(?:\\.|#{PATH_CHAR.source})}
+    PATH_BODY = %r{/#{PATH_UNIT.source}+(?:/#{PATH_UNIT.source}+)*/?}
     PATH_SCAN = %r{
-      (?<file>file://(?:localhost)?#{PATH_BODY.source})  # a local path wearing a scheme
-      | (?<url>[A-Za-z][A-Za-z0-9+.\-]*://[^\s"'<>]*)    # any other scheme: a network location
-      | (?<path>(?<![\w.~/<])#{PATH_BODY.source})        # a bare absolute POSIX span
+      (?<q>['"])(?<quoted>(?:file://[^\s'"/]*)?/[^'"\n]*)\k<q>  # quoted: a literal space is path
+      | (?<file>file://[^\s'"<>]*)                              # a local path wearing a scheme
+      | (?<url>[A-Za-z][A-Za-z0-9+.\-]*://[^\s"'<>]*)           # any other scheme: the network
+      | (?<path>(?<![[:word:].~/<])#{PATH_BODY.source})         # a bare absolute POSIX span
     }x
-    private_constant :PATH_BODY, :PATH_SCAN
+    private_constant :PATH_CHAR, :PATH_UNIT, :PATH_BODY, :PATH_SCAN
 
     # Input keys the specialized presentation already showed, and the transport's own identity.
     # Everything else a tool declares publicly goes through the generic renderer.
@@ -393,8 +403,11 @@ module SpecrelayRunner
       text.gsub(PATH_SCAN) do
         match = Regexp.last_match
         next match[:url] if match[:url]
+        # CR-001 — the quote DELIMITS the span, so it stays outside the replacement while the
+        # complete quoted path, spaces included, goes through the one projection.
+        next "#{match[:q]}#{project(match[:quoted])}#{match[:q]}" if match[:quoted]
 
-        project(match[:file]&.sub(%r{\Afile://(?:localhost)?}, "") || match[:path])
+        project(match[:file] || match[:path])
       end
     end
 
@@ -404,17 +417,29 @@ module SpecrelayRunner
     # names files that do not exist yet, and the public question is about the path TEXT, not about
     # filesystem authorization — so no symlink is resolved and no existence is required.
     def project(span)
-      return LOCAL_PATH if span.split("/").any? { |segment| segment == "." || segment == ".." }
-
-      # A sentence's closing period is punctuation around the span, not part of it.
-      trailing = span[/\.+\z/].to_s
+      # A sentence's closing punctuation surrounds the span; it is not part of it.
+      trailing = span[/[.,;:!?]+\z/].to_s
       path = span.delete_suffix(trailing)
-      return LOCAL_PATH + trailing if repository_path.nil?
+      path = file_url_path(path) if path.start_with?("file://")
+      return LOCAL_PATH + trailing if path.nil? || traversal?(path) || repository_path.nil?
       return ".#{trailing}" if path == repository_path
       return LOCAL_PATH + trailing unless path.start_with?("#{repository_path}/")
 
       relative = path.delete_prefix("#{repository_path}/")
       (relative.empty? ? "." : relative) + trailing
+    end
+
+    def traversal?(path) = path.split("/").any? { |segment| segment == "." || segment == ".." }
+
+    # CR-001 — a `file://` authority names a HOST. An empty one and `localhost` are THIS machine,
+    # so their path can be tested against the approved root like any other. Any other authority
+    # describes a filesystem this runner has no root for, so membership is unprovable by
+    # definition and `nil` sends it to the placeholder.
+    def file_url_path(span)
+      authority, _, rest = span.delete_prefix("file://").partition("/")
+      return nil unless authority.empty? || authority == "localhost"
+
+      "/#{rest}"
     end
 
     def clip_line(line)

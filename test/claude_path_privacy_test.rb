@@ -268,7 +268,121 @@ class ClaudePathPrivacyTest < Minitest::Test
     assert_private_absent @seen.join("\n")
   end
 
+  # ---- CR-001: the COMPLETE span, never its ASCII prefix -----------------
+  #
+  # Review 001 F1 measured four ordinary POSIX forms whose recognized prefix was replaced while
+  # the private remainder stayed public. An outside basename or directory identifies a customer,
+  # project or temporary artifact on its own, so a partial replacement is still a disclosure.
+
+  CLIENT = "/Users/dev-fixture/Secret Client/report draft.md"
+
+  def test_cr001_a_single_quoted_out_of_root_path_with_spaces_is_replaced_whole
+    text = transcript(J.bash_call("cat '#{CLIENT}'"))
+
+    assert_includes text, "cat '#{PLACEHOLDER}'", "the quotes are delimiters, not part of the span"
+    assert_leak_absent text
+  end
+
+  def test_cr001_a_double_quoted_out_of_root_path_with_spaces_is_replaced_whole
+    text = transcript(J.bash_call(%(cat "#{CLIENT}")))
+
+    assert_includes text, %(cat "#{PLACEHOLDER}")
+    assert_leak_absent text
+  end
+
+  def test_cr001_an_unquoted_escaped_space_path_is_replaced_whole
+    text = transcript(J.bash_call("cat /Users/dev-fixture/Secret\\ Client/report.md"))
+
+    assert_includes text, "cat #{PLACEHOLDER}"
+    refute_includes text, "\\", "the escape must not stay attached to a private suffix"
+    assert_leak_absent text
+  end
+
+  # `\w` is ASCII, so a Unicode directory used to end the span and restart it after the segment.
+  def test_cr001_unicode_segments_do_not_split_one_path_into_public_fragments
+    text = transcript(J.read_call("/Users/dev-fixture/Kundenprojekte/Ärzte-Portal/Bericht-Ünicode.md"))
+
+    assert_equal 1, text.scan(PLACEHOLDER).length, "one path is one span: #{text}"
+    [ "Kundenprojekte", "Ärzte-Portal", "Bericht", "Ünicode" ].each { |leak| refute_includes text, leak }
+    assert_private_absent text
+  end
+
+  # An authority names ANOTHER host, so membership in this machine's approved root is unprovable.
+  def test_cr001_a_file_url_with_another_authority_can_never_prove_membership
+    text = transcript(J.tool_call("Read", "path" => "file://workstation/Users/dev-fixture/report.md"))
+
+    assert_includes text, "> Read #{PLACEHOLDER}"
+    refute_includes text, "workstation"
+    refute_includes text, "report.md"
+    assert_private_absent text
+  end
+
+  # The mirror of the rule: an empty or `localhost` authority IS this machine, so the same
+  # containment test decides it.
+  def test_cr001_an_empty_or_localhost_file_authority_is_evaluated_against_the_approved_root
+    text = transcript(J.tool_call("Read", "empty" => "file://#{MAC_ROOT}/app/a.rb",
+                                          "local" => "file://localhost#{MAC_ROOT}/app/b.rb",
+                                          "away" => "file://localhost/Users/dev-fixture/Desktop/c.rb"))
+
+    assert_includes text, "empty: app/a.rb"
+    assert_includes text, "local: app/b.rb"
+    assert_includes text, "away: #{PLACEHOLDER}"
+    assert_private_absent text
+  end
+
+  # Containment still wins where it is provable, in every one of the new forms. This is a
+  # REGRESSION control, not a failing-first case: an in-root span's replaced prefix is exactly the
+  # private part, so the old partial match happened to render the same text the whole span does.
+  def test_cr001_in_root_quoted_escaped_and_unicode_paths_stay_repository_relative
+    text = transcript(J.bash_call("cp '#{MAC_ROOT}/app/My Views/a.erb' " \
+                                  "#{MAC_ROOT}/app/My\\ Views/b.erb"),
+                      J.read_call("#{MAC_ROOT}/app/Ärzte/Bericht.md"))
+
+    assert_includes text, "cp 'app/My Views/a.erb' app/My\\ Views/b.erb"
+    assert_includes text, "app/Ärzte/Bericht.md"
+    refute_includes text, PLACEHOLDER
+    assert_private_absent text
+  end
+
+  def test_cr001_the_new_forms_survive_embedding_with_safe_punctuation
+    text = transcript(J.narration(
+      "Read '#{CLIENT}' now, then /Users/dev-fixture/Ärzte/Bericht.md, and " \
+      "finally file://workstation/Users/dev-fixture/x.md."
+    ))
+
+    assert_includes text, "Read '#{PLACEHOLDER}' now, then #{PLACEHOLDER}, and " \
+                          "finally #{PLACEHOLDER}."
+    assert_leak_absent text
+  end
+
+  # The wider grammar must not start eating safe text. These are the CR-001 negative controls.
+  def test_cr001_the_wider_span_grammar_leaves_safe_controls_unchanged
+    text = transcript(
+      J.bash_call("bundle exec rspec spec/models --seed 1 | tail -5",
+                  description: "MAPIAI-77 on origin/main, see refs/heads/main"),
+      J.tool_call("WebFetch", "url" => "https://example.test/spec/models?q=a+b",
+                              "note" => "read/write is 50/50; don't cd 'here'"),
+      J.bash_result("toolu_bash", stdout: "café/menü.rb:12: ok\n<h1>Hello</h1>\nsed 's/a/b/'\n")
+    )
+
+    [ "spec/models", "--seed 1", "| tail -5", "MAPIAI-77", "origin/main", "refs/heads/main",
+      "https://example.test/spec/models?q=a+b", "read/write", "50/50", "don't cd 'here'",
+      "café/menü.rb:12", "<h1>Hello</h1>", "sed 's/a/b/'" ].each do |control|
+      assert_includes text, control, "a safe control was corrupted by the wider span grammar"
+    end
+    refute_includes text, PLACEHOLDER
+  end
+
   private
+
+  # The four private facts review 001 measured surviving a partial replacement.
+  def assert_leak_absent(text)
+    [ "Secret Client", "report draft.md", "report.md", "Client", "workstation", "Ärzte",
+      "Bericht" ].each do |leak|
+      refute_includes text, leak, "a private path fragment survived the replacement"
+    end
+    assert_private_absent text
+  end
 
   # Every private fact MAPIAI-73 proved reachable, checked on every surface.
   def assert_private_absent(text)
