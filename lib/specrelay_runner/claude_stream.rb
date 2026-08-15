@@ -30,6 +30,14 @@ module SpecrelayRunner
   # decoder does not recognize renders nothing rather than its object, so a future CLI cannot
   # leak by being new.
   #
+  # MAPIAI-77 — an absolute LOCAL path is withheld too, and the decision belongs here because
+  # this is the only place that holds the complete public content together with the verified
+  # worktree root. A path this class can prove is inside that root is shown in its
+  # repository-relative form; every other absolute path — and every absolute path in the
+  # specification lane, which has no approved root at all — becomes {LOCAL_PATH}. That is a
+  # projection rule about one lane's root, not a credential pattern, so {Redaction} keeps
+  # owning secrets and is called rather than copied.
+  #
   # FAIL CLOSED. Malformed output, no terminal result, or two terminal results all mean the
   # runner can no longer prove which bytes are progress and which are the authoritative result.
   # It refuses both rather than guessing, and it never displays or stores the offending frame.
@@ -52,6 +60,22 @@ module SpecrelayRunner
     MAX_LINE_CHARS = 500
     # How deep a public input value is unwrapped before it stops being readable as one line.
     MAX_VALUE_DEPTH = 2
+
+    # MAPIAI-77 — what an absolute path this class cannot prove is in-root renders as. One stable
+    # token across users, hosts, runs, lanes and path categories: keeping even a basename would
+    # still disclose a private project, customer or temporary-file name.
+    LOCAL_PATH = "[LOCAL_PATH]"
+    # ONE POSIX absolute span: a separator that does not continue an earlier token, then at least
+    # one segment. Requiring a segment leaves ordinary prose (`input / output`) alone; the
+    # lookbehind leaves relative paths (`spec/models`), git refs (`origin/main`), dates, closing
+    # tags (`</h1>`) and a URL's own path alone. Windows syntax is deliberately not parsed.
+    PATH_BODY = %r{/[\w.\-+@%~]+(?:/[\w.\-+@%~]+)*/?}
+    PATH_SCAN = %r{
+      (?<file>file://(?:localhost)?#{PATH_BODY.source})  # a local path wearing a scheme
+      | (?<url>[A-Za-z][A-Za-z0-9+.\-]*://[^\s"'<>]*)    # any other scheme: a network location
+      | (?<path>(?<![\w.~/<])#{PATH_BODY.source})        # a bare absolute POSIX span
+    }x
+    private_constant :PATH_BODY, :PATH_SCAN
 
     # Input keys the specialized presentation already showed, and the transport's own identity.
     # Everything else a tool declares publicly goes through the generic renderer.
@@ -81,9 +105,11 @@ module SpecrelayRunner
     # `sink` receives `(stream_name, text)` exactly as CommandRunner's own consumer does, so the
     # existing ExecutorLogStream is the fan-out owner and this class shows nothing itself.
     #
-    # `repository_path` is the assigned worktree, or nil for a lane that has none. CR-005 no
-    # longer filters display on it — an ordinary path is not a secret — so it is kept only as the
-    # caller's declared work location; both lanes render the same transcript with or without it.
+    # `repository_path` is the assigned worktree, or nil for a lane that has none. MAPIAI-77 makes
+    # it the ONE approved root: it is the only filesystem location this boundary can prove a path
+    # belongs to, so it is the only prefix a public path may be shown relative to. A lane without
+    # one (specification creation, whose provider works in a private temporary directory) can
+    # prove nothing and therefore shows no absolute path at all.
     def initialize(sink: nil, repository_path: nil)
       @sink = sink
       @repository_path = repository_path && File.expand_path(repository_path.to_s)
@@ -355,7 +381,41 @@ module SpecrelayRunner
         "[... #{lines.length - MAX_BLOCK_LINES} more lines]"
     end
 
-    def redact(value) = Redaction.redact(value.to_s)
+    # MAPIAI-77 — the ONE place public text is normalized, and the order matters. Path policy runs
+    # first, then {Redaction} over the still-whole block, and only then does anything split or
+    # clip: a sensitive span removed before both bounds cannot survive as a retained prefix or
+    # suffix on the terminal, in the report's live-log evidence, or in a Platform chunk.
+    def redact(value) = Redaction.redact(sanitize_paths(value.to_s))
+
+    def sanitize_paths(text)
+      return text unless text.include?("/")
+
+      text.gsub(PATH_SCAN) do
+        match = Regexp.last_match
+        next match[:url] if match[:url]
+
+        project(match[:file]&.sub(%r{\Afile://(?:localhost)?}, "") || match[:path])
+      end
+    end
+
+    # Containment must be PROVEN lexically, never assumed: a traversal segment, a prefix collision
+    # (`/repo` against `/repo-copy`), and a lane with no approved root all fail to the placeholder
+    # rather than to the original span. Nothing here touches the filesystem — a live transcript
+    # names files that do not exist yet, and the public question is about the path TEXT, not about
+    # filesystem authorization — so no symlink is resolved and no existence is required.
+    def project(span)
+      return LOCAL_PATH if span.split("/").any? { |segment| segment == "." || segment == ".." }
+
+      # A sentence's closing period is punctuation around the span, not part of it.
+      trailing = span[/\.+\z/].to_s
+      path = span.delete_suffix(trailing)
+      return LOCAL_PATH + trailing if repository_path.nil?
+      return ".#{trailing}" if path == repository_path
+      return LOCAL_PATH + trailing unless path.start_with?("#{repository_path}/")
+
+      relative = path.delete_prefix("#{repository_path}/")
+      (relative.empty? ? "." : relative) + trailing
+    end
 
     def clip_line(line)
       line.length > MAX_LINE_CHARS ? "#{line[0, MAX_LINE_CHARS]}[... clipped]" : line

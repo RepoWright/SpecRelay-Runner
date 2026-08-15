@@ -47,8 +47,9 @@ class ClaudeStreamTest < Minitest::Test
     assert_equal 0, result.exit_code
     assert_nil stream.close.failure
     assert_equal "done", stream.final_text
-    assert_equal [ "Provider started", "> Read #{File.join(@tmp, 'app/index.html')}",
-                   "Provider completed" ], texts
+    # MAPIAI-77 — the assigned worktree is the ONE approved root, so an in-root path reaches the
+    # operator in its repository-relative form and the temporary root itself never does.
+    assert_equal [ "Provider started", "> Read app/index.html", "Provider completed" ], texts
     gap = times.last - times[1]
     assert_operator gap, :>=, 0.4,
                     "the tool progress must arrive BEFORE the provider's terminal result, not with it"
@@ -92,8 +93,7 @@ class ClaudeStreamTest < Minitest::Test
   def test_several_messages_delivered_in_one_batch_each_produce_their_own_event
     feed(init, tool_use("Edit", "file_path" => File.join(@tmp, "b.rb")), result_message)
 
-    assert_equal [ "Provider started", "> Edit #{File.join(@tmp, 'b.rb')}",
-                   "Provider completed" ], texts
+    assert_equal [ "Provider started", "> Edit b.rb", "Provider completed" ], texts
   end
 
   # ---- S03: private material and the transport itself never reach a surface ----

@@ -456,7 +456,8 @@ class LiveLogTest < Minitest::Test
 
     envelope = client.accepted_for(1)
     delivered = envelope["sanitized_log_chunk"].to_s
-    [ "> Edit #{File.join(@tmp, 'demo-app/index.html')}", "RAW TOOL OUTPUT" ].each do |fragment|
+    # MAPIAI-77 — the path arrives repository-relative to the assigned worktree on BOTH surfaces.
+    [ "> Edit demo-app/index.html", "RAW TOOL OUTPUT" ].each do |fragment|
       assert_includes io.string, fragment
       assert_includes delivered, fragment
     end
