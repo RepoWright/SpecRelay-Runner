@@ -65,27 +65,31 @@ module SpecrelayRunner
     # token across users, hosts, runs, lanes and path categories: keeping even a basename would
     # still disclose a private project, customer or temporary-file name.
     LOCAL_PATH = "[LOCAL_PATH]"
-    # ONE POSIX absolute span: a separator that does not continue an earlier token, then at least
-    # one segment. Requiring a segment leaves ordinary prose (`input / output`) alone; the
-    # lookbehind leaves relative paths (`spec/models`), git refs (`origin/main`), dates, closing
-    # tags (`</h1>`) and a URL's own path alone. Windows syntax is deliberately not parsed.
-    #
-    # CR-001 — a segment is described by what CANNOT be in one, not by an ASCII allowlist. The
-    # allowlist stopped at a Unicode directory name and at a space, and the projector then
-    # replaced only the prefix it had recognized, leaving the private basename public. Recognizing
-    # LESS of a path is not the safe direction, so a segment character is now anything a shell, a
-    # tool or ordinary narration would not use to END the span.
-    PATH_CHAR = %r{[^\s/\\'"<>|;&`$()\[\]\{\},:*?=]}
-    # `\ ` is how an UNQUOTED shell path carries a space, so the escape belongs to the span.
-    PATH_UNIT = %r{(?:\\.|#{PATH_CHAR.source})}
-    PATH_BODY = %r{/#{PATH_UNIT.source}+(?:/#{PATH_UNIT.source}+)*/?}
+    # CR-002 — deliberately NOT a filename-character list. Both earlier attempts described what a
+    # segment MAY contain, and every such list has a next unenumerated character: a space, a
+    # Unicode letter, then `:`, `=`, `,`, `()`, `[]`, `{}`, `*` and `?` — all legal in a POSIX
+    # segment, and each one the scanner treated as a terminator published whatever followed it.
+    # Recognizing LESS of a path is the fail-open direction, so the boundary is stated ONCE and in
+    # the safe direction: an unquoted token ends only at whitespace or a quote, the delimiters that
+    # cannot appear unescaped inside a shell word, with `\ ` explicitly continuing it. Everything
+    # the token swallowed is withheld; only {WRAPPER} punctuation is handed back, and no member of
+    # that set can BE path material, so peeling it is disclosure-safe by construction.
+    PATH_TOKEN = %r{/(?:\\.|[^\s'"\\])+}
+    WRAPPER = %r{[)\]\}>.,;:!?'"`]+\z}
+    # The lookbehind decides where a token may START, and fails safe in the other direction: a `/`
+    # that CONTINUES something is not an absolute path. That leaves relative paths (`spec/models`),
+    # git refs (`origin/main`), dates, Unicode segments, closing tags (`</h1>`), a URL's own path,
+    # a separator after a closing wrapper (`Acme(Client)/report.md`) and a shell expansion
+    # (`${HOME}/x`) alone. Requiring one character after the separator leaves prose
+    # (`input / output`) alone. Windows syntax is deliberately not parsed.
+    PATH_START = %r{(?<![[:word:].~/<)\]\}])}
     PATH_SCAN = %r{
-      (?<q>['"])(?<quoted>(?:file://[^\s'"/]*)?/[^'"\n]*)\k<q>  # quoted: a literal space is path
-      | (?<file>file://[^\s'"<>]*)                              # a local path wearing a scheme
-      | (?<url>[A-Za-z][A-Za-z0-9+.\-]*://[^\s"'<>]*)           # any other scheme: the network
-      | (?<path>(?<![[:word:].~/<])#{PATH_BODY.source})         # a bare absolute POSIX span
+      (?<q>['"])(?<quoted>(?:file://[^\s'"/]*)?/[^'"\n]*)\k<q>   # quoted: a literal space is path
+      | (?<file>file://[^\s'"/]*#{PATH_TOKEN.source})            # a local path wearing a scheme
+      | (?<url>[A-Za-z][A-Za-z0-9+.\-]*://[^\s"'<>]*)            # any other scheme: the network
+      | (?<path>#{PATH_START.source}#{PATH_TOKEN.source})        # a bare absolute POSIX token
     }x
-    private_constant :PATH_CHAR, :PATH_UNIT, :PATH_BODY, :PATH_SCAN
+    private_constant :PATH_TOKEN, :WRAPPER, :PATH_START, :PATH_SCAN
 
     # Input keys the specialized presentation already showed, and the transport's own identity.
     # Everything else a tool declares publicly goes through the generic renderer.
@@ -417,15 +421,24 @@ module SpecrelayRunner
     # names files that do not exist yet, and the public question is about the path TEXT, not about
     # filesystem authorization — so no symlink is resolved and no existence is required.
     def project(span)
-      # A sentence's closing punctuation surrounds the span; it is not part of it.
-      trailing = span[/[.,;:!?]+\z/].to_s
+      # CR-002 — the ONLY thing handed back from a captured token. These characters wrap or end a
+      # path in prose and in shell text; none of them can be path material on its own, so at worst
+      # a name that really ended in one renders a stray delimiter beside the placeholder.
+      trailing = span[WRAPPER].to_s
       path = span.delete_suffix(trailing)
       path = file_url_path(path) if path.start_with?("file://")
+      # Once the wrapper is off, a token that is nothing but the separator names no file. XML's
+      # `/>` is the common one; withholding it would corrupt markup to hide nothing.
+      return span if path == "/"
       return LOCAL_PATH + trailing if path.nil? || traversal?(path) || repository_path.nil?
       return ".#{trailing}" if path == repository_path
       return LOCAL_PATH + trailing unless path.start_with?("#{repository_path}/")
 
       relative = path.delete_prefix("#{repository_path}/")
+      # An in-root PREFIX must not carry an outside path out with it: a token that still holds an
+      # absolute start is not ONE provable in-root path, so it is withheld rather than published.
+      return LOCAL_PATH + trailing if relative.match?(PATH_SCAN)
+
       (relative.empty? ? "." : relative) + trailing
     end
 

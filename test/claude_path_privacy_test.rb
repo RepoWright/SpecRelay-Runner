@@ -373,7 +373,111 @@ class ClaudePathPrivacyTest < Minitest::Test
     refute_includes text, PLACEHOLDER
   end
 
+  # ---- CR-002: one whole-token boundary, not a character list ------------
+  #
+  # Review 002 F1: every one of these characters is legal inside a POSIX segment, and each one the
+  # scanner treated as a terminator published whatever followed it. The defect is the STRATEGY, so
+  # the coverage is an equivalence-class table rather than another list of named examples.
+
+  # `Acme`, not `Secret`: a segment named `Secret:...` is a LABELLED SECRET, and {Redaction} —
+  # which still owns that rule and still runs after this one — would answer the table instead of
+  # the path boundary. That interaction is asserted separately below.
+  PUNCTUATED = {
+    "colon" => "Acme:Client",
+    "equals" => "Acme=Client",
+    "comma" => "Acme,Client",
+    "parentheses" => "Acme(Client)",
+    "brackets" => "Acme[Client]",
+    "braces" => "Acme{Client}",
+    "star" => "Acme*Client",
+    "question" => "Acme?Client"
+  }.freeze
+
+  def test_cr002_outside_root_segments_with_valid_pathname_punctuation_are_withheld_whole
+    rendered = PUNCTUATED.transform_values do |segment|
+      subject_of(J.read_call("/Users/dev-fixture/#{segment}/report.md"))
+    end
+
+    assert_equal PUNCTUATED.transform_values { PLACEHOLDER }, rendered
+  end
+
+  # The mirror: the same punctuation must stay READABLE where containment is provable, or the
+  # correction would have bought privacy by destroying the log.
+  def test_cr002_in_root_segments_with_the_same_punctuation_stay_relative_and_useful
+    rendered = PUNCTUATED.transform_values do |segment|
+      subject_of(J.read_call("#{MAC_ROOT}/app/#{segment}/report.md"))
+    end
+
+    assert_equal PUNCTUATED.transform_values { |s| "app/#{s}/report.md" }, rendered
+  end
+
+  # Review 002 F2 plus the wrapper/punctuation cases CR-002 names. The captured token is withheld
+  # whole; only delimiters that cannot BE path material are handed back.
+  WRAPPED = {
+    "bare in parentheses" =>
+      [ "Read (/Users/dev-fixture/Secret/report.md). Done", "Read ([LOCAL_PATH]). Done" ],
+    "bare in brackets" =>
+      [ "Read [/Users/dev-fixture/Secret/report.md], then", "Read [[LOCAL_PATH]], then" ],
+    "file url in parentheses" =>
+      [ "Read (file:///Users/dev-fixture/Secret/report.md). Done", "Read ([LOCAL_PATH]). Done" ],
+    "file url in brackets" =>
+      [ "Read [file://localhost/Users/dev-fixture/Secret/report.md]!", "Read [[LOCAL_PATH]]!" ],
+    "sentence period" =>
+      [ "Wrote /Users/dev-fixture/Secret/report.md.", "Wrote [LOCAL_PATH]." ],
+    "line-number suffix" =>
+      [ "Failure at /outside/private.rb:12 in the spec", "Failure at [LOCAL_PATH] in the spec" ],
+    "in-root line-number suffix" =>
+      [ "Failure at #{MAC_ROOT}/app/a.rb:12 in the spec", "Failure at app/a.rb:12 in the spec" ],
+    "shell operator after the token" =>
+      [ "cat /outside/a.rb; ls", "cat [LOCAL_PATH]; ls" ],
+    "several mixed spans on one line" =>
+      [ "cp /outside/Secret:Client/a.rb #{MAC_ROOT}/app/b,c.rb and file://host/outside/d.rb.",
+        "cp [LOCAL_PATH] app/b,c.rb and [LOCAL_PATH]." ],
+    # A whole-token rule must not let an in-root PREFIX smuggle an outside path out with it.
+    "in-root token that also carries an outside path" =>
+      [ "cp #{MAC_ROOT}/app/a.rb=/Users/dev-fixture/Secret/b.rb done", "cp [LOCAL_PATH] done" ],
+    # Path policy first, {Redaction} still second and still the owner of labelled secrets: a
+    # credential-shaped in-root segment is relative to the root AND redacted.
+    "in-root path whose segment is credential-shaped" =>
+      [ "Read #{MAC_ROOT}/app/token:abc123def/x.rb now", "Read app/[REDACTED] now" ],
+    # The ASSERTED readability cost of withholding an ambiguous token: an in-root glob holds a
+    # second absolute-looking start, cannot be proven to be one path, and is withheld. Safe
+    # direction, recorded rather than hidden.
+    "in-root glob is withheld as ambiguous" =>
+      [ "glob #{MAC_ROOT}/app/**/*.rb now", "glob [LOCAL_PATH] now" ]
+  }.freeze
+
+  def test_cr002_wrappers_punctuation_and_mixed_spans_render_exactly
+    rendered = WRAPPED.transform_values { |(input, _)| transcript(J.narration(input)).strip }
+
+    assert_equal WRAPPED.transform_values { |(_, want)| want }, rendered
+  end
+
+  # The negative controls the wider capture must still leave alone, in one table so a future
+  # boundary change cannot quietly trade readability for privacy.
+  UNTOUCHED = [
+    "bundle exec rspec spec/models --seed 1 | tail -5",
+    "MAPIAI-77 on origin/main, see refs/heads/main and a/b...c/d",
+    "https://example.test/spec/models?q=a+b&r=(1,2)",
+    "read/write is 50/50 on 2026/08/15; don't cd 'here'",
+    "café/menü.rb:12: ok",
+    "<h1>Hello</h1><div class=\"x\"></div><img src=\"a.png\"/>",
+    "export DIR=${HOME}/notes && cd ${DIR}/sub",
+    "sed 's/a/b/' | awk '{print $1}' && echo ok",
+    "he said input / output, and/or either"
+  ].freeze
+
+  def test_cr002_the_whole_token_boundary_leaves_every_safe_control_unchanged
+    rendered = UNTOUCHED.to_h { |line| [ line, transcript(J.narration(line)).strip ] }
+
+    assert_equal UNTOUCHED.to_h { |line| [ line, line ] }, rendered
+  end
+
   private
+
+  # The transcript's subject line without its `> Tool ` prefix, so a table asserts the projection
+  # rather than the presentation around it.
+  def subject_of(message) = transcript(message).strip.sub(/\A> \w+ /, "")
 
   # The four private facts review 001 measured surviving a partial replacement.
   def assert_leak_absent(text)
