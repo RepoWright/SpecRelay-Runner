@@ -473,6 +473,83 @@ class ClaudePathPrivacyTest < Minitest::Test
     assert_equal UNTOUCHED.to_h { |line| [ line, line ] }, rendered
   end
 
+  # ---- CR-003: three separate boundary decisions --------------------------
+
+  OUTSIDE = "/Users/dev-fixture/outside"
+
+  # F1 — narration is not shell-quoted, so a space does not prove the path ended. A following word
+  # that is itself path-shaped is AMBIGUOUS; over-redacting it is acceptable, returning it is not.
+  NARRATION = {
+    "unquoted literal-space continuation is withheld" =>
+      [ "Read /Users/dev-fixture/Secret Client/report.md, then stop",
+        "Read [LOCAL_PATH], then stop" ],
+    "the same continuation stays useful when it is provably in-root" =>
+      [ "Read #{MAC_ROOT}/app/My Views/index.erb, then stop",
+        "Read app/My Views/index.erb, then stop" ],
+    # S07 must not regress: two EXPLICIT absolute spans stay independent and in order.
+    "two absolute spans separated by whitespace stay independent" =>
+      [ "diff #{MAC_ROOT}/app/a.rb /Users/dev-fixture/Desktop/b.rb",
+        "diff app/a.rb [LOCAL_PATH]" ],
+    "an ordinary following word is not absorbed" =>
+      [ "Wrote /Users/dev-fixture/Secret/a.md and finished", "Wrote [LOCAL_PATH] and finished" ],
+    # A space inside the FINAL segment: once a continuation proved the boundary ambiguous, the
+    # name that completes it must go too, or `draft.md` survives.
+    "a space inside the final segment takes the trailing name with it" =>
+      [ "Read /Users/dev-fixture/Secret Client/report draft.md, then stop",
+        "Read [LOCAL_PATH], then stop" ],
+    # ...but that clause is GATED on a continuation, so an ordinary sentence is untouched.
+    "a trailing name is not absorbed without an ambiguous continuation" =>
+      [ "Wrote /Users/dev-fixture/Secret/a.md. Done.", "Wrote [LOCAL_PATH]. Done." ]
+  }.freeze
+
+  def test_cr003_f1_an_ambiguous_unquoted_continuation_is_withheld_not_returned
+    rendered = NARRATION.transform_values { |(input, _)| transcript(J.narration(input)).strip }
+
+    assert_equal NARRATION.transform_values { |(_, want)| want }, rendered
+    refute_includes rendered.values.join(" "), "Client"
+    refute_includes rendered.values.join(" "), "report.md"
+  end
+
+  # F2 — unescaped `;`, `&`, `|`, `<` and `>` delimit a shell token with or without spaces. This is
+  # shell grammar, not an enumeration of legal filename characters.
+  OPERATORS = {
+    "semicolon" => [ "cat #{OUTSIDE}/a.rb;echo safe", "cat [LOCAL_PATH];echo safe" ],
+    "and-and" => [ "test -f #{OUTSIDE}/a.rb&&echo safe", "test -f [LOCAL_PATH]&&echo safe" ],
+    "pipe" => [ "cat #{OUTSIDE}/a.rb|wc -l", "cat [LOCAL_PATH]|wc -l" ],
+    "redirection between two paths" =>
+      [ "cat #{OUTSIDE}/a.rb>#{OUTSIDE}/b.log", "cat [LOCAL_PATH]>[LOCAL_PATH]" ],
+    "file url with an adjacent semicolon" =>
+      [ "cat file://#{OUTSIDE}/a.rb;echo safe", "cat [LOCAL_PATH];echo safe" ],
+    "an ESCAPED control is path text, not a boundary" =>
+      [ "cat #{OUTSIDE}/a\\;b.rb done", "cat [LOCAL_PATH] done" ],
+    "in-root redirection keeps both sides useful" =>
+      [ "cat #{MAC_ROOT}/app/a.rb>#{MAC_ROOT}/log/b.log", "cat app/a.rb>log/b.log" ]
+  }.freeze
+
+  def test_cr003_f2_unescaped_shell_controls_bound_the_token_and_scanning_continues
+    rendered = OPERATORS.transform_values { |(input, _)| transcript(J.narration(input)).strip }
+
+    assert_equal OPERATORS.transform_values { |(_, want)| want }, rendered
+  end
+
+  # F3 — containment is decided from the UNSTRIPPED candidate. Peeling presentation punctuation is
+  # what an outside root sibling used to exploit to become the approved root itself.
+  ROOT_BOUNDARY = {
+    "the exact root" => [ "cd #{MAC_ROOT} now", "cd . now" ],
+    "root plus a period is NOT the root" => [ "cd #{MAC_ROOT}. now", "cd [LOCAL_PATH]. now" ],
+    "root plus a bang is NOT the root" => [ "cd #{MAC_ROOT}! now", "cd [LOCAL_PATH]! now" ],
+    "an ordinary descendant" => [ "cd #{MAC_ROOT}/app/a.rb now", "cd app/a.rb now" ],
+    "a descendant ending a sentence" => [ "cd #{MAC_ROOT}/app/a.rb.", "cd app/a.rb." ],
+    "a prefix collision" => [ "cd #{MAC_ROOT}-copy/app now", "cd [LOCAL_PATH] now" ],
+    "a traversal" => [ "cd #{MAC_ROOT}/../etc/passwd now", "cd [LOCAL_PATH] now" ]
+  }.freeze
+
+  def test_cr003_f3_containment_is_decided_before_presentation_punctuation
+    rendered = ROOT_BOUNDARY.transform_values { |(input, _)| transcript(J.narration(input)).strip }
+
+    assert_equal ROOT_BOUNDARY.transform_values { |(_, want)| want }, rendered
+  end
+
   private
 
   # The transcript's subject line without its `> Tool ` prefix, so a table asserts the projection

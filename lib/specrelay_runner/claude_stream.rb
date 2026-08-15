@@ -74,7 +74,24 @@ module SpecrelayRunner
     # cannot appear unescaped inside a shell word, with `\ ` explicitly continuing it. Everything
     # the token swallowed is withheld; only {WRAPPER} punctuation is handed back, and no member of
     # that set can BE path material, so peeling it is disclosure-safe by construction.
-    PATH_TOKEN = %r{/(?:\\.|[^\s'"\\])+}
+    #
+    # CR-003 — a token also ends at an UNESCAPED shell control. `;`, `&`, `|`, `<` and `>` are
+    # operators in shell grammar with or without surrounding spaces, so `a.rb;echo` is two tokens;
+    # treating them as path text swallowed the operator, the command after it, and a second path
+    # in a redirection. This is a short fixed operator set, not a list of legal filename
+    # characters — an escaped control (`\;`) is still path text.
+    PATH_CHAR = %r{(?:\\.|[^\s'"\\;&|<>/])}
+    # CR-003 — assistant narration is not shell-quoted, so whitespace does NOT prove a path ended.
+    # A following word that is itself path-shaped is an ambiguous continuation, and an ambiguous
+    # continuation is WITHHELD with the token rather than returned: its directory and basename are
+    # exactly the private material at stake. Over-redacting it is acceptable; returning it is not.
+    PATH_SPAN = %r{
+      /(?:/|#{PATH_CHAR.source})+                                     # the absolute token itself
+      (?:                                                             # only once a space is
+        (?:[ \t]+(?!/)(?:/|#{PATH_CHAR.source})*/(?:/|#{PATH_CHAR.source})*)+  # ...ambiguous:
+        (?:[ \t]+#{PATH_CHAR.source}*\.#{PATH_CHAR.source}+)?         # its final name may follow
+      )?
+    }x
     WRAPPER = %r{[)\]\}>.,;:!?'"`]+\z}
     # The lookbehind decides where a token may START, and fails safe in the other direction: a `/`
     # that CONTINUES something is not an absolute path. That leaves relative paths (`spec/models`),
@@ -85,11 +102,11 @@ module SpecrelayRunner
     PATH_START = %r{(?<![[:word:].~/<)\]\}])}
     PATH_SCAN = %r{
       (?<q>['"])(?<quoted>(?:file://[^\s'"/]*)?/[^'"\n]*)\k<q>   # quoted: a literal space is path
-      | (?<file>file://[^\s'"/]*#{PATH_TOKEN.source})            # a local path wearing a scheme
+      | (?<file>file://[^\s'"/]*#{PATH_SPAN.source})             # a local path wearing a scheme
       | (?<url>[A-Za-z][A-Za-z0-9+.\-]*://[^\s"'<>]*)            # any other scheme: the network
-      | (?<path>#{PATH_START.source}#{PATH_TOKEN.source})        # a bare absolute POSIX token
+      | (?<path>#{PATH_START.source}#{PATH_SPAN.source})         # a bare absolute POSIX token
     }x
-    private_constant :PATH_TOKEN, :WRAPPER, :PATH_START, :PATH_SCAN
+    private_constant :PATH_CHAR, :PATH_SPAN, :WRAPPER, :PATH_START, :PATH_SCAN
 
     # Input keys the specialized presentation already showed, and the transport's own identity.
     # Everything else a tool declares publicly goes through the generic renderer.
@@ -420,27 +437,29 @@ module SpecrelayRunner
     # rather than to the original span. Nothing here touches the filesystem — a live transcript
     # names files that do not exist yet, and the public question is about the path TEXT, not about
     # filesystem authorization — so no symlink is resolved and no existence is required.
+    # CR-003 — containment is decided from the UNSTRIPPED candidate, and nothing is peeled first.
+    # Wrapper recovery is PRESENTATION; letting it run earlier is what allowed `<root>.` and
+    # `<root>!` — outside siblings — to become the approved root itself and render as `.`.
     def project(span)
-      # CR-002 — the ONLY thing handed back from a captured token. These characters wrap or end a
-      # path in prose and in shell text; none of them can be path material on its own, so at worst
-      # a name that really ended in one renders a stray delimiter beside the placeholder.
-      trailing = span[WRAPPER].to_s
-      path = span.delete_suffix(trailing)
-      path = file_url_path(path) if path.start_with?("file://")
-      # Once the wrapper is off, a token that is nothing but the separator names no file. XML's
-      # `/>` is the common one; withholding it would corrupt markup to hide nothing.
-      return span if path == "/"
-      return LOCAL_PATH + trailing if path.nil? || traversal?(path) || repository_path.nil?
-      return ".#{trailing}" if path == repository_path
-      return LOCAL_PATH + trailing unless path.start_with?("#{repository_path}/")
+      path = span.start_with?("file://") ? file_url_path(span) : span
+      return withheld(span) if path.nil? || traversal?(path) || repository_path.nil?
+      return "." if path == repository_path
+      return withheld(span) unless path.start_with?("#{repository_path}/")
 
       relative = path.delete_prefix("#{repository_path}/")
       # An in-root PREFIX must not carry an outside path out with it: a token that still holds an
       # absolute start is not ONE provable in-root path, so it is withheld rather than published.
-      return LOCAL_PATH + trailing if relative.match?(PATH_SCAN)
+      return withheld(span) if relative.match?(PATH_SCAN)
 
-      (relative.empty? ? "." : relative) + trailing
+      # A proven in-root span needs no peeling: its trailing punctuation is already outside the
+      # root prefix, so it survives in the relative form untouched.
+      relative.empty? ? "." : relative
     end
+
+    # CR-002 — the ONLY thing handed back from a withheld token. These characters wrap or end a
+    # path in prose and in shell text; none of them can be path material on its own, so at worst a
+    # name that really ended in one renders a stray delimiter beside the placeholder.
+    def withheld(span) = LOCAL_PATH + span[WRAPPER].to_s
 
     def traversal?(path) = path.split("/").any? { |segment| segment == "." || segment == ".." }
 
