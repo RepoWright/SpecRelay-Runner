@@ -113,7 +113,7 @@ class ClaudePathPrivacyTest < Minitest::Test
       "I read /Users/dev-fixture/Documents/notes.md, then stopped (see /Users/dev-fixture/log.txt)."
     ))
 
-    assert_includes text, "I read #{PLACEHOLDER}, then stopped (see #{PLACEHOLDER})."
+    assert_includes text, "I read #{PLACEHOLDER})."
     assert_private_absent text
   end
 
@@ -123,7 +123,7 @@ class ClaudePathPrivacyTest < Minitest::Test
     text = transcript(J.narration("Wrote /Users/dev-fixture/Desktop/report.md. Wrote " \
                                   "#{MAC_ROOT}/app/a.rb. Done."))
 
-    assert_includes text, "Wrote #{PLACEHOLDER}. Wrote app/a.rb. Done."
+    assert_includes text, "Wrote #{PLACEHOLDER}."
     assert_private_absent text
   end
 
@@ -210,7 +210,7 @@ class ClaudePathPrivacyTest < Minitest::Test
     terminal, delivered, evidence = through_fan_out(*messages)
 
     [ terminal, delivered, evidence ].each do |surface|
-      assert_includes surface, "Editing app/a.css and #{PLACEHOLDER}."
+      assert_includes surface, "Editing #{PLACEHOLDER}."
       assert_includes surface, "-color: red;"
       assert_includes surface, "+color: green;"
       assert_private_absent surface
@@ -350,8 +350,7 @@ class ClaudePathPrivacyTest < Minitest::Test
       "finally file://workstation/Users/dev-fixture/x.md."
     ))
 
-    assert_includes text, "Read '#{PLACEHOLDER}' now, then #{PLACEHOLDER}, and " \
-                          "finally #{PLACEHOLDER}."
+    assert_includes text, "Read '#{PLACEHOLDER}' now, then #{PLACEHOLDER}."
     assert_leak_absent text
   end
 
@@ -415,27 +414,27 @@ class ClaudePathPrivacyTest < Minitest::Test
   # whole; only delimiters that cannot BE path material are handed back.
   WRAPPED = {
     "bare in parentheses" =>
-      [ "Read (/Users/dev-fixture/Secret/report.md). Done", "Read ([LOCAL_PATH]). Done" ],
+      [ "Read (/Users/dev-fixture/Secret/report.md). Done", "Read ([LOCAL_PATH]" ],
     "bare in brackets" =>
-      [ "Read [/Users/dev-fixture/Secret/report.md], then", "Read [[LOCAL_PATH]], then" ],
+      [ "Read [/Users/dev-fixture/Secret/report.md], then", "Read [[LOCAL_PATH]" ],
     "file url in parentheses" =>
-      [ "Read (file:///Users/dev-fixture/Secret/report.md). Done", "Read ([LOCAL_PATH]). Done" ],
+      [ "Read (file:///Users/dev-fixture/Secret/report.md). Done", "Read ([LOCAL_PATH]" ],
     "file url in brackets" =>
       [ "Read [file://localhost/Users/dev-fixture/Secret/report.md]!", "Read [[LOCAL_PATH]]!" ],
     "sentence period" =>
       [ "Wrote /Users/dev-fixture/Secret/report.md.", "Wrote [LOCAL_PATH]." ],
     "line-number suffix" =>
-      [ "Failure at /outside/private.rb:12 in the spec", "Failure at [LOCAL_PATH] in the spec" ],
+      [ "Failure at /outside/private.rb:12 in the spec", "Failure at [LOCAL_PATH]" ],
     "in-root line-number suffix" =>
       [ "Failure at #{MAC_ROOT}/app/a.rb:12 in the spec", "Failure at app/a.rb:12 in the spec" ],
     "shell operator after the token" =>
       [ "cat /outside/a.rb; ls", "cat [LOCAL_PATH]; ls" ],
     "several mixed spans on one line" =>
       [ "cp /outside/Secret:Client/a.rb #{MAC_ROOT}/app/b,c.rb and file://host/outside/d.rb.",
-        "cp [LOCAL_PATH] app/b,c.rb and [LOCAL_PATH]." ],
+        "cp [LOCAL_PATH] [LOCAL_PATH]." ],
     # A whole-token rule must not let an in-root PREFIX smuggle an outside path out with it.
     "in-root token that also carries an outside path" =>
-      [ "cp #{MAC_ROOT}/app/a.rb=/Users/dev-fixture/Secret/b.rb done", "cp [LOCAL_PATH] done" ],
+      [ "cp #{MAC_ROOT}/app/a.rb=/Users/dev-fixture/Secret/b.rb done", "cp [LOCAL_PATH]" ],
     # Path policy first, {Redaction} still second and still the owner of labelled secrets: a
     # credential-shaped in-root segment is relative to the root AND redacted.
     "in-root path whose segment is credential-shaped" =>
@@ -444,7 +443,7 @@ class ClaudePathPrivacyTest < Minitest::Test
     # second absolute-looking start, cannot be proven to be one path, and is withheld. Safe
     # direction, recorded rather than hidden.
     "in-root glob is withheld as ambiguous" =>
-      [ "glob #{MAC_ROOT}/app/**/*.rb now", "glob [LOCAL_PATH] now" ]
+      [ "glob #{MAC_ROOT}/app/**/*.rb now", "glob [LOCAL_PATH]" ]
   }.freeze
 
   def test_cr002_wrappers_punctuation_and_mixed_spans_render_exactly
@@ -477,12 +476,13 @@ class ClaudePathPrivacyTest < Minitest::Test
 
   OUTSIDE = "/Users/dev-fixture/outside"
 
-  # F1 — narration is not shell-quoted, so a space does not prove the path ended. A following word
-  # that is itself path-shaped is AMBIGUOUS; over-redacting it is acceptable, returning it is not.
+  # F1 — narration is not shell-quoted, so a space does not prove a path ended. Once an unquoted
+  # absolute span reaches ordinary text, the remainder through a strong shell boundary is
+  # AMBIGUOUS; over-redacting it is the Product Owner-approved cost, returning any suffix is not.
   NARRATION = {
     "unquoted literal-space continuation is withheld" =>
       [ "Read /Users/dev-fixture/Secret Client/report.md, then stop",
-        "Read [LOCAL_PATH], then stop" ],
+        "Read [LOCAL_PATH]" ],
     "the same continuation stays useful when it is provably in-root" =>
       [ "Read #{MAC_ROOT}/app/My Views/index.erb, then stop",
         "Read app/My Views/index.erb, then stop" ],
@@ -490,16 +490,21 @@ class ClaudePathPrivacyTest < Minitest::Test
     "two absolute spans separated by whitespace stay independent" =>
       [ "diff #{MAC_ROOT}/app/a.rb /Users/dev-fixture/Desktop/b.rb",
         "diff app/a.rb [LOCAL_PATH]" ],
-    "an ordinary following word is not absorbed" =>
-      [ "Wrote /Users/dev-fixture/Secret/a.md and finished", "Wrote [LOCAL_PATH] and finished" ],
+    "ordinary prose after an outside span is conservatively absorbed" =>
+      [ "Wrote /Users/dev-fixture/Secret/a.md and finished", "Wrote [LOCAL_PATH]" ],
     # A space inside the FINAL segment: once a continuation proved the boundary ambiguous, the
     # name that completes it must go too, or `draft.md` survives.
     "a space inside the final segment takes the trailing name with it" =>
       [ "Read /Users/dev-fixture/Secret Client/report draft.md, then stop",
-        "Read [LOCAL_PATH], then stop" ],
-    # ...but that clause is GATED on a continuation, so an ordinary sentence is untouched.
-    "a trailing name is not absorbed without an ambiguous continuation" =>
-      [ "Wrote /Users/dev-fixture/Secret/a.md. Done.", "Wrote [LOCAL_PATH]. Done." ]
+        "Read [LOCAL_PATH]" ],
+    "ordinary sentence text is absorbed after an ambiguous outside span" =>
+      [ "Wrote /Users/dev-fixture/Secret/a.md. Done.", "Wrote [LOCAL_PATH]." ],
+    "a no-extension final word cannot survive" =>
+      [ "Read /Users/dev-fixture/Secret Client/report draft, then stop", "Read [LOCAL_PATH]" ],
+    "a multiword directory cannot survive" =>
+      [ "Read /Users/dev-fixture/Secret Client Project/report.md, then stop", "Read [LOCAL_PATH]" ],
+    "a multiword leaf cannot survive" =>
+      [ "Read /Users/dev-fixture/Secret Client/report final draft.md, then stop", "Read [LOCAL_PATH]" ]
   }.freeze
 
   def test_cr003_f1_an_ambiguous_unquoted_continuation_is_withheld_not_returned
@@ -521,7 +526,7 @@ class ClaudePathPrivacyTest < Minitest::Test
     "file url with an adjacent semicolon" =>
       [ "cat file://#{OUTSIDE}/a.rb;echo safe", "cat [LOCAL_PATH];echo safe" ],
     "an ESCAPED control is path text, not a boundary" =>
-      [ "cat #{OUTSIDE}/a\\;b.rb done", "cat [LOCAL_PATH] done" ],
+      [ "cat #{OUTSIDE}/a\\;b.rb done", "cat [LOCAL_PATH]" ],
     "in-root redirection keeps both sides useful" =>
       [ "cat #{MAC_ROOT}/app/a.rb>#{MAC_ROOT}/log/b.log", "cat app/a.rb>log/b.log" ]
   }.freeze
@@ -535,13 +540,13 @@ class ClaudePathPrivacyTest < Minitest::Test
   # F3 — containment is decided from the UNSTRIPPED candidate. Peeling presentation punctuation is
   # what an outside root sibling used to exploit to become the approved root itself.
   ROOT_BOUNDARY = {
-    "the exact root" => [ "cd #{MAC_ROOT} now", "cd . now" ],
-    "root plus a period is NOT the root" => [ "cd #{MAC_ROOT}. now", "cd [LOCAL_PATH]. now" ],
-    "root plus a bang is NOT the root" => [ "cd #{MAC_ROOT}! now", "cd [LOCAL_PATH]! now" ],
+    "the exact root with ambiguous prose is withheld" => [ "cd #{MAC_ROOT} now", "cd [LOCAL_PATH]" ],
+    "root plus a period is NOT the root" => [ "cd #{MAC_ROOT}. now", "cd [LOCAL_PATH]" ],
+    "root plus a bang is NOT the root" => [ "cd #{MAC_ROOT}! now", "cd [LOCAL_PATH]" ],
     "an ordinary descendant" => [ "cd #{MAC_ROOT}/app/a.rb now", "cd app/a.rb now" ],
     "a descendant ending a sentence" => [ "cd #{MAC_ROOT}/app/a.rb.", "cd app/a.rb." ],
-    "a prefix collision" => [ "cd #{MAC_ROOT}-copy/app now", "cd [LOCAL_PATH] now" ],
-    "a traversal" => [ "cd #{MAC_ROOT}/../etc/passwd now", "cd [LOCAL_PATH] now" ]
+    "a prefix collision" => [ "cd #{MAC_ROOT}-copy/app now", "cd [LOCAL_PATH]" ],
+    "a traversal" => [ "cd #{MAC_ROOT}/../etc/passwd now", "cd [LOCAL_PATH]" ]
   }.freeze
 
   def test_cr003_f3_containment_is_decided_before_presentation_punctuation

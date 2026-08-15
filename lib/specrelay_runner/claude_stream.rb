@@ -70,10 +70,10 @@ module SpecrelayRunner
     # Unicode letter, then `:`, `=`, `,`, `()`, `[]`, `{}`, `*` and `?` — all legal in a POSIX
     # segment, and each one the scanner treated as a terminator published whatever followed it.
     # Recognizing LESS of a path is the fail-open direction, so the boundary is stated ONCE and in
-    # the safe direction: an unquoted token ends only at whitespace or a quote, the delimiters that
-    # cannot appear unescaped inside a shell word, with `\ ` explicitly continuing it. Everything
-    # the token swallowed is withheld; only {WRAPPER} punctuation is handed back, and no member of
-    # that set can BE path material, so peeling it is disclosure-safe by construction.
+    # the safe direction. A quoted token ends at its quote. A bare token continues across ambiguous
+    # whitespace until a strong shell control or the line end, with a following explicit `/...`
+    # left for the next independent scan. Everything swallowed is withheld unless the complete
+    # candidate is provably in-root; only {WRAPPER} punctuation is handed back.
     #
     # CR-003 — a token also ends at an UNESCAPED shell control. `;`, `&`, `|`, `<` and `>` are
     # operators in shell grammar with or without surrounding spaces, so `a.rb;echo` is two tokens;
@@ -81,16 +81,14 @@ module SpecrelayRunner
     # in a redirection. This is a short fixed operator set, not a list of legal filename
     # characters — an escaped control (`\;`) is still path text.
     PATH_CHAR = %r{(?:\\.|[^\s'"\\;&|<>/])}
-    # CR-003 — assistant narration is not shell-quoted, so whitespace does NOT prove a path ended.
-    # A following word that is itself path-shaped is an ambiguous continuation, and an ambiguous
-    # continuation is WITHHELD with the token rather than returned: its directory and basename are
-    # exactly the private material at stake. Over-redacting it is acceptable; returning it is not.
+    # MAPIAI-77 Product Owner closure — assistant narration is not shell-quoted, so whitespace does
+    # NOT prove a path ended. Once a bare absolute token is followed by ordinary text, no character
+    # rule can tell whether that text is a multiword pathname or prose. Withhold through the next
+    # strong shell boundary (or the line end) instead of guessing. A second explicit absolute span
+    # remains independently recognizable because `/` cannot continue this whitespace branch.
     PATH_SPAN = %r{
-      /(?:/|#{PATH_CHAR.source})+                                     # the absolute token itself
-      (?:                                                             # only once a space is
-        (?:[ \t]+(?!/)(?:/|#{PATH_CHAR.source})*/(?:/|#{PATH_CHAR.source})*)+  # ...ambiguous:
-        (?:[ \t]+#{PATH_CHAR.source}*\.#{PATH_CHAR.source}+)?         # its final name may follow
-      )?
+      /(?:/|#{PATH_CHAR.source})+                       # the unambiguous absolute-token prefix
+      (?:[ \t]+(?!/)[^'"\\;&|<>\n]*)?                # ambiguous narration: fail closed
     }x
     WRAPPER = %r{[)\]\}>.,;:!?'"`]+\z}
     # The lookbehind decides where a token may START, and fails safe in the other direction: a `/`
@@ -428,7 +426,9 @@ module SpecrelayRunner
         # complete quoted path, spaces included, goes through the one projection.
         next "#{match[:q]}#{project(match[:quoted])}#{match[:q]}" if match[:quoted]
 
-        project(match[:file] || match[:path])
+        span = match[:file] || match[:path]
+        trailing_space = span[/[ \t]+\z/].to_s
+        project(span.delete_suffix(trailing_space)) + trailing_space
       end
     end
 
