@@ -87,9 +87,10 @@ class SpecificationProviderPropagationTest < Minitest::Test
 
     assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
 
-    # CR-005: the specification lane has no repository and still renders the same transcript,
-    # path included — an ordinary path is not a secret, and both lanes share one renderer.
-    expected = [ "Provider started", "> Read /elsewhere/notes.md", "Provider completed" ]
+    # MAPIAI-77: the specification lane has no approved root — its provider works in a private
+    # temporary directory — so containment can never be proven and every absolute local path
+    # renders as the placeholder. The lane still shares one renderer and one fan-out.
+    expected = [ "Provider started", "> Read [LOCAL_PATH]", "Provider completed" ]
     expected.each { |status| assert_includes @io.string, "[claude:status] #{status}" }
 
     chunks = @platform.protocol_events.select { |event| event["event_type"] == "log.chunk" }

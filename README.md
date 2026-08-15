@@ -643,18 +643,19 @@ writes one JSON object per line while it works, and that stream is a transport, 
 operator text — one Runner-owned decoder reads it and produces two independent
 things: safe public progress, and the terminal result.
 
-**Nothing raw is ever shown.** Progress is an allowlist projection, not a filter:
-initialization, a read/edit, a command or test, a tool completion, and completion or
-failure each become one bounded status line. Assistant prose, user messages, raw
-tool inputs and results, and account/model/cwd identity have no projection and
-therefore no way to reach a terminal, a log file, or the wire. A file path appears
-only when it is *proven* to sit inside the assigned repository, shown relative to
-it; a command is previewed only when every token is an approved executable, one of
-a closed set of subcommands, or such a proven path — anything else collapses to a
-generic status. Malformed output, a missing terminal result, or two terminal
-results fail the attempt closed without displaying the frame. Both workflows —
-implementation and specification creation — use this one decoder and this one
-stream; there is no second, lane-specific rule.
+**The public transcript is projected once.** Public assistant prose, tool calls and
+results are rendered from the structured stream; private reasoning, transport
+wrappers, session identity and raw diagnostic bytes are not. Before any rendered
+text is clipped or fanned out, absolute local paths are sanitized. A path proven
+inside the assigned implementation worktree is shown repository-relative; every
+other absolute path becomes `[LOCAL_PATH]`. Specification creation has no approved
+root, so all of its absolute paths use the placeholder. An unquoted path followed
+by ambiguous prose is conservatively withheld through the next strong shell
+boundary or line end; privacy takes precedence over retaining that suffix. Quoted
+paths and explicit adjacent shell operators retain their deterministic boundaries.
+Malformed output, a missing terminal result, or two terminal results fail the
+attempt closed without displaying the frame. Both workflows use this one decoder
+and this one stream; there is no lane-specific path rule.
 
 A `core.progress` **heartbeat** still names the elapsed time after 15s of genuine
 silence. It is a fallback, never a substitute: real output, when available, is what

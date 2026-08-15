@@ -50,19 +50,23 @@ class ClaudeTranscriptTest < Minitest::Test
     assert_match(/fail/i, transcript)
   end
 
+  # MAPIAI-77 — the file the provider names is in the assigned worktree, so the operator reads
+  # the repository-relative path. What must still be true is that the path is USEFUL and the
+  # content is intact; `claude_path_privacy_test` owns the policy itself.
   def test_a_file_read_shows_its_path_and_content
-    feed(J.read_call("/work/demo-app/index.html"),
-         J.read_result("toolu_read", "/work/demo-app/index.html", "<h1>Hello</h1>\n"))
+    path = File.join(@tmp, "demo-app/index.html")
+    feed(J.read_call(path), J.read_result("toolu_read", path, "<h1>Hello</h1>\n"))
 
-    assert_includes transcript, "/work/demo-app/index.html"
+    assert_includes transcript, "demo-app/index.html"
     assert_includes transcript, "<h1>Hello</h1>"
   end
 
   def test_an_edit_shows_the_before_and_after_content_as_a_diff
-    feed(J.edit_call("/work/a.css", "color: red;", "color: green;"),
-         J.edit_result("toolu_edit", "/work/a.css", "color: red;", "color: green;"))
+    path = File.join(@tmp, "a.css")
+    feed(J.edit_call(path, "color: red;", "color: green;"),
+         J.edit_result("toolu_edit", path, "color: red;", "color: green;"))
 
-    assert_includes transcript, "/work/a.css"
+    assert_includes transcript, "a.css"
     assert_includes transcript, "-color: red;"
     assert_includes transcript, "+color: green;"
   end
@@ -144,13 +148,17 @@ class ClaudeTranscriptTest < Minitest::Test
     assert_includes text, "Done"
   end
 
-  # CR-005 removes the CR-001/CR-004 suppression of ordinary material. An absolute path, source
-  # code and a shell operator are not secrets, and hiding them is what made the log useless.
-  def test_ordinary_paths_source_and_shell_syntax_are_no_longer_suppressed
+  # CR-005 removed the CR-001/CR-004 suppression of ordinary material, and that stays removed for
+  # source, shell syntax and repository-relative paths. MAPIAI-77 takes back exactly one class of
+  # content: an absolute LOCAL path, which the MAPIAI-73 run proved discloses the developer's
+  # username and home layout.
+  def test_source_shell_syntax_and_relative_paths_survive_while_a_local_path_does_not
     feed(J.bash_call("cd /Users/operator/app && bundle exec rspec spec/models | tail -5"),
          J.bash_result("toolu_bash", stdout: "class Widget < ApplicationRecord\nend\n"))
 
-    assert_includes transcript, "/Users/operator/app"
+    refute_includes transcript, "/Users/operator/app"
+    assert_includes transcript, "[LOCAL_PATH]"
+    assert_includes transcript, "spec/models"
     assert_includes transcript, "| tail -5"
     assert_includes transcript, "class Widget < ApplicationRecord"
   end
@@ -171,13 +179,14 @@ class ClaudeTranscriptTest < Minitest::Test
   # The implementation lane wires the decoder to ExecutorLogStream; the terminal string and the
   # Platform envelope must be the same bytes, because there is one renderer and one redaction.
   def test_the_terminal_and_platform_receive_the_identical_transcript
+    path = File.join(@tmp, "a.css")
     terminal, delivered = through_fan_out(
       J.narration("Editing the stylesheet."),
-      J.edit_call("/work/a.css", "color: red;", "color: green;"),
-      J.edit_result("toolu_edit", "/work/a.css", "color: red;", "color: green;")
+      J.edit_call(path, "color: red;", "color: green;"),
+      J.edit_result("toolu_edit", path, "color: red;", "color: green;")
     )
 
-    [ "Editing the stylesheet.", "/work/a.css", "-color: red;", "+color: green;" ].each do |fragment|
+    [ "Editing the stylesheet.", "a.css", "-color: red;", "+color: green;" ].each do |fragment|
       assert_includes terminal, fragment
       assert_includes delivered, fragment
     end
@@ -271,9 +280,9 @@ class ClaudeTranscriptTest < Minitest::Test
 
   # The specialized presentation stays, and a value it already showed is not repeated.
   def test_the_specialized_presentation_is_not_duplicated_by_the_generic_renderer
-    feed(J.edit_call("/work/a.css", "color: red;", "color: green;"))
+    feed(J.edit_call(File.join(@tmp, "a.css"), "color: red;", "color: green;"))
 
-    assert_equal 1, transcript.scan("/work/a.css").length
+    assert_equal 1, transcript.scan("a.css").length
     refute_includes transcript, "old_string:"
     refute_includes transcript, "new_string:"
   end
