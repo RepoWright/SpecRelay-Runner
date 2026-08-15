@@ -141,13 +141,16 @@ class FakePlatform
   # MVP-0033 — what the runner actually submitted for a claimed review. `review_results` being
   # EMPTY is as load-bearing as its contents: a refused checkout must not produce a verdict.
   #
-  # A stale-target report goes to the same endpoint with a different body, and is kept apart
-  # here for the same reason Platform keeps it apart: "no verdict because the reviewer failed"
-  # and "no verdict because the target moved" are different facts (CR-001 F3).
+  # A stale-target report and (since MAPIAI-78) an explicit failure report go to the same
+  # endpoint with different bodies, and are kept apart here for the same reason Platform keeps
+  # them apart: "no verdict because the reviewer failed", "no verdict because the reviewer
+  # produced nothing usable" and "no verdict because the target moved" are different facts.
   def review_submissions = requests_to("/api/runner/review_results")
-  def review_results = review_submissions.reject { |request| request[:body].to_h.key?("stale") }
+  def review_results = review_submissions.select { |request| request[:body].to_h.key?("review") }
   def stale_reports = review_submissions.filter_map { |request| request[:body].to_h if request[:body].to_h.key?("stale") }
+  def review_failures = review_submissions.filter_map { |request| request[:body].to_h["failure"] }
   def last_review = review_results.last&.dig(:body, "review")
+  def last_review_failure = review_failures.last
 
   # MVP-0036 — what the provider actually asked through the bridge. An EMPTY list is as
   # load-bearing as its contents: a locally refused request must never reach Platform.
@@ -400,10 +403,16 @@ class FakePlatform
     return review_response if review_response
     return [ 201, { contract_version: "mvp-0033",
                     review: { attempt_id: "rvt_fake", state: "STALE", outcome: nil } } ] if request[:body].to_h.key?("stale")
+    return [ 201, { contract_version: "mvp-0033",
+                    review: { attempt_id: "rvt_fake", state: "FAILED", outcome: nil } } ] if request[:body].to_h.key?("failure")
 
+    # The state Platform really records, not one constant for every verdict: NEEDS_INPUT leaves
+    # the attempt awaiting a Product Owner answer, and the runner checks the acknowledgement
+    # against the ending its delivery produces (MAPIAI-78 review-002 F1).
     review = request[:body].to_h["review"].to_h
+    state = review["outcome"] == "NEEDS_INPUT" ? "AWAITING_ANSWER" : "COMPLETED"
     [ 201, { contract_version: "mvp-0033",
-             review: { attempt_id: "rvt_fake", state: "COMPLETED", outcome: review["outcome"] } } ]
+             review: { attempt_id: "rvt_fake", state: state, outcome: review["outcome"] } } ]
   end
 
   def specification_publication(request)

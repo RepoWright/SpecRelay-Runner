@@ -15,92 +15,101 @@ module SpecrelayRunner
     # of that was in the packet Platform sent, and this object adds nothing of its own beyond
     # the fixed instructions below (approved decision 5, S22, S24).
     class Packet
-      # The Reviewer role's fixed system instructions. They are part of the runner's source —
-      # not operator configuration and not Platform-supplied — so what a reviewer is asked to
-      # do is reviewable in version control and identical on every machine.
-      INSTRUCTIONS = <<~TEXT.freeze
-        You are the independent Reviewer for a SpecRelay implementation round.
-
-        You are a FRESH process. You have no memory of the executor that produced this change
-        and no access to its reasoning. Judge only what is below and what you can inspect in
-        the checked-out repositories at the pinned head.
-
-        Do:
-        - read the approved specification, the committed diff between base and head, and the tests;
-        - run proportionate verification yourself; do not trust the report's claims about it;
-        - perform the mandatory structural review (Graphify and Context+ where available);
-        - conduct an independent browser pass when the change touched the UI;
-        - lead with actionable findings, ordered by severity, each with a file/line location.
-
-        Do not:
-        - change any file, create a branch, push, merge, or comment on a pull request;
-        - write anything to Jira;
-        - restate the specification or the report back at the reader;
-        - include your reasoning, a transcript, a credential, or an absolute local path.
-
-        Return ONE JSON object and nothing else. No prose before or after, no code fence.
-
-        {
-          "outcome": "ACCEPT" | "CHANGES_REQUESTED" | "NEEDS_INPUT",
-          "summary": "one short paragraph: what you reviewed and what you concluded",
-          "findings": [
-            { "severity": "blocking" | "major" | "minor",
-              "summary": "one sentence",
-              "reason": "why it matters",
-              "location": "repo-relative/path.rb:123" }
-          ],
-          "evidence": {
-            "structural_review": true | false,
-            "verification_run": true | false,
-            "browser_review": true | false
-          },
-          "question": {
-            "prompt": "the one decision you need",
-            "reason": "why it blocks this review",
-            "options": [
-              { "key": "short_key", "label": "…", "trade_off": "one sentence", "recommended": true | false }
-            ]
-          }
-        }
-
-        Rules the submission is checked against, so return something that passes:
-        - ACCEPT requires zero blocking findings, structural_review true, verification_run true,
-          and browser_review true when the change touched the UI.
-        - CHANGES_REQUESTED requires at least one finding.
-        - NEEDS_INPUT requires exactly one question with TWO or THREE options, at most one
-          marked recommended, each with a one-sentence trade-off. A free-text "Other" answer is
-          added automatically — do not include one. Use NEEDS_INPUT only for a decision a human
-          must make, never for something you could have investigated yourself.
-        - Omit "question" entirely unless the outcome is NEEDS_INPUT.
-        - Every field is LENGTH-BOUNDED and an over-long one loses the whole review. Stay
-          inside the limits under "Length limits" below: be specific and short, and put the
-          detail in the location rather than in prose.
-
-        If a carried answer's option is `human_browser_pass`, the Product Owner ran the browser
-        pass themselves because no reviewer could. Treat their note as evidence to assess, not as
-        work you did:
-        - check that it names the tested URL, the viewports, the result and the screenshot
-          references, and return a finding when it does not;
-        - report `browser_review` false, because you did not run the pass, and do not describe it
-          as your own anywhere in your summary or findings;
-        - you may still ACCEPT a UI change on that basis — Platform validates the human evidence
-          separately, and records it as a fact distinct from yours;
-        - never invent a URL, viewport, result or screenshot the note does not state.
-      TEXT
-
       def initialize(assignment)
         @assignment = assignment
       end
 
       # The complete prompt text handed to one fresh provider process.
       def prompt
-        [ INSTRUCTIONS, limits_section, ticket_section, specification_section, change_section,
+        [ instructions, limits_section, ticket_section, specification_section, change_section,
           evidence_section, continuation_section ].compact.join("\n\n")
       end
 
       private
 
       attr_reader :assignment
+
+      # The Reviewer role's fixed system instructions. They are part of the runner's source —
+      # not operator configuration — so what a reviewer is asked to do is reviewable in version
+      # control and identical on every machine.
+      #
+      # The one exception is the allowed OUTCOMES, rendered from the packet's own result
+      # contract: they are Platform's rule, and a copy kept here would be free to describe a
+      # set Platform no longer accepts (MAPIAI-78 design 1).
+      def instructions
+        <<~TEXT
+          You are the independent Reviewer for a SpecRelay implementation round.
+
+          You are a FRESH process. You have no memory of the executor that produced this change
+          and no access to its reasoning. Judge only what is below and what you can inspect in
+          the checked-out repositories at the pinned head.
+
+          Do:
+          - read the approved specification, the committed diff between base and head, and the tests;
+          - run proportionate verification yourself; do not trust the report's claims about it;
+          - perform the mandatory structural review (Graphify and Context+ where available);
+          - conduct an independent browser pass when the change touched the UI;
+          - lead with actionable findings, ordered by severity, each with a file/line location.
+
+          Do not:
+          - change any file, create a branch, push, merge, or comment on a pull request;
+          - write anything to Jira;
+          - restate the specification or the report back at the reader;
+          - include your reasoning, a transcript, a credential, or an absolute local path.
+
+          Return ONE JSON object and nothing else, as your own output: no prose before or after,
+          no code fence, no provider envelope, and exactly one `outcome` member.
+
+          {
+            "outcome": #{outcome_choices},
+            "summary": "one short paragraph: what you reviewed and what you concluded",
+            "findings": [
+              { "severity": "blocking" | "major" | "minor",
+                "summary": "one sentence",
+                "reason": "why it matters",
+                "location": "repo-relative/path.rb:123" }
+            ],
+            "evidence": {
+              "structural_review": true | false,
+              "verification_run": true | false,
+              "browser_review": true | false
+            },
+            "question": {
+              "prompt": "the one decision you need",
+              "reason": "why it blocks this review",
+              "options": [
+                { "key": "short_key", "label": "…", "trade_off": "one sentence", "recommended": true | false }
+              ]
+            }
+          }
+
+          Rules the submission is checked against, so return something that passes:
+          - ACCEPT requires zero blocking findings, structural_review true, verification_run true,
+            and browser_review true when the change touched the UI.
+          - CHANGES_REQUESTED requires at least one finding.
+          - NEEDS_INPUT requires exactly one question with TWO or THREE options, at most one
+            marked recommended, each with a one-sentence trade-off. A free-text "Other" answer is
+            added automatically — do not include one. Use NEEDS_INPUT only for a decision a human
+            must make, never for something you could have investigated yourself.
+          - Omit "question" entirely unless the outcome is NEEDS_INPUT.
+          - Every field is LENGTH-BOUNDED and an over-long one loses the whole review. Stay
+            inside the limits under "Length limits" below: be specific and short, and put the
+            detail in the location rather than in prose.
+
+          If a carried answer's option is `human_browser_pass`, the Product Owner ran the browser
+          pass themselves because no reviewer could. Treat their note as evidence to assess, not as
+          work you did:
+          - check that it names the tested URL, the viewports, the result and the screenshot
+            references, and return a finding when it does not;
+          - report `browser_review` false, because you did not run the pass, and do not describe it
+            as your own anywhere in your summary or findings;
+          - you may still ACCEPT a UI change on that basis — Platform validates the human evidence
+            separately, and records it as a fact distinct from yours;
+          - never invent a URL, viewport, result or screenshot the note does not state.
+        TEXT
+      end
+
+      def outcome_choices = assignment.supported_outcomes.map { |outcome| %("#{outcome}") }.join(" | ")
 
       # Platform states its own limits in the packet, so the reviewer is told the exact rule its
       # submission will be judged against rather than discovering it as a refusal after an

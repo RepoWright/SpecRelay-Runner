@@ -77,15 +77,16 @@ class ReviewFlowTest < Minitest::Test
   end
 
   # A refusal is REPORTED, not merely printed: Platform must record the failed attempt so the
-  # run page can explain why no verdict exists.
+  # run page can explain why no verdict exists. Since MAPIAI-78 it travels as an explicit
+  # failure body rather than as an outcome-less review, so the reason that explains it survives.
   def test_a_refusal_is_reported_to_platform_without_a_verdict
     build_repo(remote: "https://github.com/someone-else/other.git")
 
     run_review
 
-    assert_equal 1, @platform.review_results.size
-    assert_nil @platform.last_review["outcome"]
-    assert_includes @platform.last_review["summary"], "different remote"
+    assert_empty @platform.review_results
+    assert_equal "provider_execution_failure", @platform.last_review_failure["kind"]
+    assert_includes @platform.last_review_failure["reason"], "different remote"
   end
 
   # --- the fresh reviewer process ------------------------------------------
@@ -192,7 +193,7 @@ class ReviewFlowTest < Minitest::Test
 
     refute result.success?
     assert_includes result.message, "did not return one JSON object"
-    assert_nil @platform.last_review["outcome"]
+    assert_empty @platform.review_results
   end
 
   def test_an_unknown_outcome_is_refused
@@ -211,7 +212,7 @@ class ReviewFlowTest < Minitest::Test
 
     refute result.success?
     assert_includes result.message, "exited 3"
-    assert_nil @platform.last_review["outcome"]
+    assert_empty @platform.review_results
   end
 
   def test_oversized_output_is_refused_before_it_is_parsed

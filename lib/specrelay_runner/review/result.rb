@@ -26,12 +26,36 @@ module SpecrelayRunner
         def ok? = error.nil?
       end
 
+      # Raised while parsing a document that states one member twice.
+      DuplicateMember = Class.new(StandardError)
+
+      # The object the reviewer's JSON is built into: a Hash that refuses to be written twice
+      # under one name (MAPIAI-78 review-001 F1).
+      #
+      # A duplicate member is an ambiguous document — `{"outcome":"ACCEPT","outcome":
+      # "CHANGES_REQUESTED"}` states two verdicts — and whichever one survives is a choice this
+      # runner is not entitled to make. The standard library makes that choice silently, and
+      # differently across the versions the runner supports, so the refusal is expressed to the
+      # parser BOTH ways it will listen: this object class, which sees every member the pure-Ruby
+      # parser assigns (json 2.9, Ruby 3.4), and `allow_duplicate_key: false`, which the native
+      # parser honours (json 2.10+, Ruby 3.5+). One rule, stated once per parser generation,
+      # because neither statement alone is deterministic over the supported range.
+      class StrictDocument < Hash
+        def []=(name, value)
+          raise DuplicateMember, name if key?(name)
+
+          super
+        end
+      end
+
       MAX_OUTPUT_BYTES = 200_000
-      OUTCOMES = %w[ACCEPT CHANGES_REQUESTED NEEDS_INPUT].freeze
       SEVERITIES = %w[blocking major minor].freeze
       EVIDENCE_KEYS = %w[structural_review verification_run browser_review].freeze
 
-      def parse(output)
+      # `outcomes` is Platform's own result contract, threaded in from the packet. This module
+      # keeps no copy of the supported set: a second list here would be free to drift from the
+      # one Platform actually validates against (MAPIAI-78 design 1).
+      def parse(output, outcomes:)
         text = output.to_s
         return Parsed.new(error: "the reviewer produced no output") if text.strip.empty?
         return Parsed.new(error: "the reviewer produced more than #{MAX_OUTPUT_BYTES} bytes") if text.bytesize > MAX_OUTPUT_BYTES
@@ -39,7 +63,12 @@ module SpecrelayRunner
         document = extract_object(text)
         return Parsed.new(error: "the reviewer did not return one JSON object") if document.nil?
 
-        build(document)
+        build(document, outcomes)
+      rescue DuplicateMember
+        # Named without its value: the point is that the document says two things, not which
+        # two. Repeating them would put a verdict this runner refused into the reason it gives
+        # Platform for refusing it.
+        Parsed.new(error: "the reviewer's result states one field twice, so it means two things at once")
       end
 
       # A model reliably wraps JSON in a fence or a sentence, so the OUTERMOST balanced object
@@ -50,16 +79,19 @@ module SpecrelayRunner
         finish = text.rindex("}")
         return nil if start.nil? || finish.nil? || finish < start
 
-        JSON.parse(text[start..finish])
+        JSON.parse(text[start..finish], object_class: StrictDocument, allow_duplicate_key: false)
       rescue JSON::ParserError
         nil
       end
 
-      def build(document)
+      def build(document, outcomes)
         return Parsed.new(error: "the reviewer's result was not a JSON object") unless document.is_a?(Hash)
 
-        outcome = document["outcome"].to_s.strip.upcase
-        return Parsed.new(error: "outcome must be one of #{OUTCOMES.join(', ')}") unless OUTCOMES.include?(outcome)
+        # A scalar, or nothing. An array or an object carrying several outcomes is refused whole
+        # rather than reduced to one of its candidates.
+        raw = document["outcome"]
+        outcome = raw.is_a?(String) ? raw.strip.upcase : nil
+        return Parsed.new(error: "outcome must be one of #{outcomes.join(', ')}") unless outcomes.include?(outcome)
 
         review = { "outcome" => outcome, "summary" => clean(document["summary"]),
                    "findings" => findings(document["findings"]),
