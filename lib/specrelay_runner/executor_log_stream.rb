@@ -16,12 +16,19 @@ module SpecrelayRunner
   #      on a terminal, in a log file, or on the wire.
   #   2. CLIP. One line is capped at MAX_LINE_BYTES so a provider that emits a
   #      megabyte on one line cannot flood a terminal or a browser row.
-  #   3. BUDGET. The whole run's live stream is capped at MAX_TOTAL_BYTES. Reaching
-  #      it emits ONE `log.truncated` event and stops accepting — visibly, never
-  #      silently. The full capture is still in the report's stdout/stderr evidence.
-  #   4. BATCH. Lines are coalesced per stream and flushed on a byte threshold or a
+  #   3. BATCH. Lines are coalesced per stream and flushed on a byte threshold or a
   #      short interval, so a chatty provider produces a bounded number of events
   #      rather than one HTTP request per line.
+  #   4. CUT. One event carries at most MAX_CHUNK_BYTES and MAX_CHUNK_LINES, split on
+  #      whole-line boundaries. Cutting makes MORE events; it never drops content.
+  #
+  # MAPIAI-75 — there is deliberately no whole-attempt admission limit. There used to
+  # be one (131,072 bytes, one `log.truncated`, then silence for the rest of the
+  # attempt), and it made complete history impossible on the Platform side: no reader,
+  # paginated or not, can show output the runner refused to send. A byte total is now
+  # an observation about an attempt, not permission to stop reporting it. Every bound
+  # that protects a single terminal row, a single event, or a single browser page is
+  # unchanged — those bind per unit and can be paged through.
   #
   # And two things it must never do, both learned from the legacy runner:
   #
@@ -48,18 +55,21 @@ module SpecrelayRunner
   # is reported as a gap. The progress channel can lose an update. The result channel cannot wait.
   #
   # There is one delivery owner and it needs no queue of its own: the per-stream buffers are the
-  # pending work, bounded by MAX_TOTAL_BYTES, and EventEmitter holds the exact envelopes an
-  # outage left undelivered. Because deliveries are serialized on that single thread, a retry of
-  # an older sequence always precedes a newer one.
+  # pending work, drained every tick, and EventEmitter holds the exact envelopes an outage left
+  # undelivered. Because deliveries are serialized on that single thread, a retry of an older
+  # sequence always precedes a newer one.
   class ExecutorLogStream
     MAX_LINE_BYTES = 2_000
-    MAX_TOTAL_BYTES = 131_072
     FLUSH_BYTES = 8_192
     # The per-event cap in contracts/runner/v1/run-event.schema.json, which Platform also
     # enforces on ingest. Applied when a batch is CUT rather than when a line is appended:
     # since CR-001 F3 the reader no longer decides when to send, so a burst can buffer past
     # FLUSH_BYTES between ticks and the cap has to belong to whoever builds the chunk.
     MAX_CHUNK_BYTES = 65_536
+    # MAPIAI-75 — and no more lines than one Platform history page holds, so a single stored
+    # event can never be too large for the page that has to render it. Narrow output crosses
+    # this long before it crosses MAX_CHUNK_BYTES.
+    MAX_CHUNK_LINES = 200
     FLUSH_INTERVAL_SECONDS = 2
     HEARTBEAT_INTERVAL_SECONDS = 15
     TICK_SECONDS = 0.25
@@ -71,13 +81,10 @@ module SpecrelayRunner
     SHUTDOWN_SECONDS = 2
 
     LINE_CLIP_MARKER = " [line clipped at #{MAX_LINE_BYTES} bytes]"
-    TRUNCATION_NOTICE = "live executor output reached its #{MAX_TOTAL_BYTES}-byte budget; " \
-                        "later output is in the report's stdout/stderr evidence"
 
     # Event vocabulary (documented in docs/runner-api.md and the v1 contract).
     CHUNK_EVENT = "log.chunk"
     HEARTBEAT_EVENT = "core.progress"
-    TRUNCATED_EVENT = "log.truncated"
 
     def self.start(**kwargs) = new(**kwargs).start
 
@@ -100,10 +107,6 @@ module SpecrelayRunner
       @flush_interval = flush_interval
       @mutex = Mutex.new
       @buffers = {}
-      @evidence = []
-      @total_bytes = 0
-      @emitted_lines = 0
-      @truncated = false
       @finished = false
       @running = false
       @stop_reason = nil
@@ -162,18 +165,6 @@ module SpecrelayRunner
     # exactly as it consults Heartbeater#stop_reason.
     def stop_reason = @mutex.synchronize { @stop_reason }
 
-    def emitted_lines = @mutex.synchronize { @emitted_lines }
-    def truncated? = @mutex.synchronize { @truncated }
-
-    # The exact bounded, redacted live stream, for the report's live-log evidence
-    # file. It is deliberately a SEPARATE artifact from the full stdout/stderr
-    # capture, so a reviewer can tell what the operator actually saw during the run
-    # from what was collected for review afterwards.
-    def evidence_text
-      lines = @mutex.synchronize { @evidence.dup }
-      header + (lines.empty? ? [ "(the executor emitted no live output)" ] : lines).join("\n") + "\n"
-    end
-
     private
 
     attr_reader :emitter, :io, :provider, :task_id, :clock, :heartbeat_interval, :flush_interval
@@ -216,40 +207,23 @@ module SpecrelayRunner
     end
 
     # The last pass, made by the delivery thread on its way out rather than by the orchestrator:
-    # everything still buffered, the truncation notice, and one final opportunity for whatever an
-    # earlier outage left owed. A gap that closes here still closed during the attempt, which is
-    # why {#report_delivery_gap} runs after this and not before.
+    # everything still buffered, plus one final opportunity for whatever an earlier outage left
+    # owed. A gap that closes here still closed during the attempt, which is why
+    # {#report_delivery_gap} runs after this and not before.
     def final_delivery
       flush_all
-      announce_truncation
       emitter.retry_undelivered
     end
 
     # ---- accounting (always under the mutex) --------------------------------
 
-    # Applies the per-line clip and the whole-run budget, then appends to the per-stream buffer.
-    # Deciding that a batch is due — and sending it — is the timer thread's job.
+    # Applies the per-line clip, then prints and buffers. Deciding that a batch is due — and
+    # sending it — is the timer thread's job.
     def record(source, text)
-      return nil if @truncated
-
       clipped = clip(text)
-      # The line's own bytes PLUS the newline that will separate it from the next
-      # one when lines are joined into a chunk. Counting only the line bytes let the
-      # uploaded total drift past the budget by one byte per line.
-      cost = clipped.bytesize + 1
-      return budget_exhausted if @total_bytes + cost > MAX_TOTAL_BYTES
-
-      @total_bytes += cost
-      @emitted_lines += 1
       @last_output_at = now
-      @evidence << "[#{source}] #{clipped}"
       print_line(source, clipped)
       (@buffers[source] ||= []) << clipped
-      nil
-    end
-
-    def budget_exhausted
-      @truncated = true
       nil
     end
 
@@ -274,12 +248,15 @@ module SpecrelayRunner
       [ source, batch.join("\n") ]
     end
 
-    # As many whole lines as fit in one event. A line is already clipped to MAX_LINE_BYTES, so
-    # the first one always fits and this can never return an empty batch for a non-empty buffer.
+    # As many whole lines as fit in one event, by bytes AND by line count. A line is already
+    # clipped to MAX_LINE_BYTES, so the first one always fits and this can never return an empty
+    # batch for a non-empty buffer. Whatever does not fit stays at the front of the buffer for
+    # the next event: cutting reshapes the stream, it never shortens it.
     def cut(lines)
       bytes = 0
       batch = []
-      while (line = lines.first) && bytes + line.bytesize + 1 <= MAX_CHUNK_BYTES
+      while (line = lines.first) && batch.size < MAX_CHUNK_LINES &&
+            bytes + line.bytesize + 1 <= MAX_CHUNK_BYTES
         bytes += line.bytesize + 1
         batch << lines.shift
       end
@@ -302,14 +279,6 @@ module SpecrelayRunner
 
         batches.each { |batch| flush(batch) }
       end
-    end
-
-    def announce_truncation
-      return unless truncated?
-
-      print_line("status", TRUNCATION_NOTICE)
-      @mutex.synchronize { @evidence << "[status] #{TRUNCATION_NOTICE}" }
-      submit(TRUNCATED_EVENT, TRUNCATION_NOTICE, log_source: "status", phase: "core", note: "budget_exhausted")
     end
 
     # What Platform never acknowledged, reported once at the end so a silent gap in the
@@ -420,32 +389,11 @@ module SpecrelayRunner
       # unchanged: they are the durable protocol/evidence record of the same fact,
       # and only its TERMINAL representation became transient.
       io.status("[#{provider}:status] #{message}", fallback: :line)
-      # Recorded in the evidence file too: the quiet periods are part of what the
-      # operator saw, and a report that showed only the talkative moments would not
-      # explain why a run took as long as it did.
-      @mutex.synchronize { @evidence << "[status] #{message}" }
       submit(HEARTBEAT_EVENT, message, log_source: "status", phase: "core", duration_seconds: elapsed)
     end
 
     def quiet? = now - @last_output_at >= heartbeat_interval
     def heartbeat_due? = now - @last_heartbeat_at >= heartbeat_interval
-
-    def header
-      [ "# Live executor output (MVP-0018)",
-        "#",
-        "# What this is: the bounded, redacted stream the operator saw in the terminal",
-        "# and in Platform WHILE the executor ran. Each line is prefixed with its",
-        "# source stream.",
-        "#",
-        "# What this is NOT: the full capture. evidence/stdout.log and",
-        "# evidence/stderr.log hold the complete executor output collected for review.",
-        "# Lines here are clipped at #{MAX_LINE_BYTES} bytes and the whole stream at",
-        "# #{MAX_TOTAL_BYTES} bytes; a [status] line records it when that happened.",
-        "#",
-        "# Redacted before display, before upload, and before this file was written.",
-        "",
-        "" ].join("\n")
-    end
 
     def now = clock.clock_gettime(Process::CLOCK_MONOTONIC)
   end

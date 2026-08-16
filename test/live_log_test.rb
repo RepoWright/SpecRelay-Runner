@@ -12,8 +12,8 @@ require_relative "test_helper"
 #      `IO#read(n)` reader both lines arrived at process exit, so the gap assertion
 #      fails against pre-fix source — which is what makes it a regression test.
 #   2. output is SAFE. Redaction happens before the terminal write and before the
-#      upload, per-line clipping and a whole-run byte budget are enforced, and
-#      reaching the budget is announced instead of silently dropping output.
+#      upload, and per-line and per-event bounds are enforced. Since MAPIAI-75 those
+#      bounds SPLIT the stream into more events; none of them stops it.
 #   3. output cannot break the run. A consumer that raises, and a Platform that
 #      refuses the upload, both leave the execution's captured result untouched.
 class LiveLogTest < Minitest::Test
@@ -201,7 +201,6 @@ class LiveLogTest < Minitest::Test
     assert_equal 1, chunks.size
     refute_includes chunks.first[:log_chunk], "sk-live-DO-NOT-LEAK-0123456789", "the upload must never carry the secret"
     assert_includes chunks.first[:log_chunk], "[REDACTED]"
-    refute_includes stream.evidence_text, "sk-live-DO-NOT-LEAK-0123456789", "the report evidence must not carry it either"
   end
 
   def test_one_overlong_line_is_clipped_with_a_visible_marker
@@ -215,19 +214,23 @@ class LiveLogTest < Minitest::Test
     assert_includes io.string, "[line clipped at"
   end
 
-  def test_the_whole_run_budget_is_capped_and_the_truncation_is_announced_once
-    stream, io, emitter = build_stream
-    line = "y" * 1_000
-    200.times { stream.accept("stdout", line) } # far beyond MAX_TOTAL_BYTES
-    stream.finish
-    stream.finish # idempotent: a second stop must not re-announce
+  # MAPIAI-75 failing-first (S03): the whole-stream total is an accounting fact, not an
+  # admission limit. Platform cannot page through history the runner never sent, so
+  # crossing 131,072 bytes must neither announce a truncation nor stop later lines.
+  OLD_WHOLE_STREAM_BUDGET = 131_072
 
-    assert_predicate stream, :truncated?
-    truncations = emitter.events_of("log.truncated")
-    assert_equal 1, truncations.size, "the truncation notice is emitted exactly once"
-    assert_equal 1, io.string.scan("reached its").size, "and printed exactly once"
-    total = emitter.chunks.sum { |c| c[:log_chunk].bytesize }
-    assert_operator total, :<=, SpecrelayRunner::ExecutorLogStream::MAX_TOTAL_BYTES
+  def test_output_continues_after_the_old_whole_stream_byte_total
+    stream, _io, emitter = build_stream
+    line = "y" * 1_000
+    200.times { stream.accept("stdout", line) } # ~200 KB, far past the old whole-stream stop
+    stream.accept("stdout", "LINE-AFTER-THE-OLD-BUDGET")
+    stream.finish
+
+    assert_empty emitter.events_of("log.truncated"),
+                 "a whole-stream byte total must not be announced as truncation"
+    delivered = emitter.chunks.map { |chunk| chunk[:log_chunk] }.join("\n")
+    assert_includes delivered, "LINE-AFTER-THE-OLD-BUDGET", "later output must still be delivered"
+    assert_operator delivered.bytesize, :>, OLD_WHOLE_STREAM_BUDGET
   end
 
   def test_every_uploaded_chunk_stays_within_the_platform_per_event_cap
@@ -239,6 +242,28 @@ class LiveLogTest < Minitest::Test
       assert_operator chunk[:log_chunk].bytesize, :<=, 65_536,
                       "a single log.chunk must stay inside the documented 65536-byte contract cap"
     end
+  end
+
+  # MAPIAI-75 S04. A page of Platform history holds MAX_CHUNK_LINES lines, so no single
+  # stored event may be bigger than the page that has to render it. Narrow output crosses
+  # the line count long before it crosses the byte cap.
+  def test_a_long_burst_is_split_into_ordered_events_bounded_by_lines_and_bytes
+    stream, _io, emitter = build_stream
+    total = (SpecrelayRunner::ExecutorLogStream::MAX_CHUNK_LINES * 2) + 5
+    expected = Array.new(total) { |i| "line #{i}" }
+    expected.each { |line| stream.accept("stdout", line) }
+    stream.finish
+
+    chunks = emitter.chunks
+    assert_operator chunks.size, :>=, 3, "one oversized batch must become several ordered events"
+    chunks.each do |chunk|
+      assert_operator chunk[:log_chunk].count("\n") + 1, :<=,
+                      SpecrelayRunner::ExecutorLogStream::MAX_CHUNK_LINES
+      assert_operator chunk[:log_chunk].bytesize, :<=,
+                      SpecrelayRunner::ExecutorLogStream::MAX_CHUNK_BYTES
+    end
+    assert_equal expected, chunks.flat_map { |chunk| chunk[:log_chunk].split("\n") },
+                 "cutting an event must not drop, duplicate or reorder a line"
   end
 
   def test_a_chunk_event_names_its_stream_and_phase
@@ -268,11 +293,6 @@ class LiveLogTest < Minitest::Test
     assert_equal 1, emitter.events_of("core.progress").size,
                  "a heartbeat must never stand in for output that was actually available"
     stream.finish
-
-    # The quiet period is part of what the operator saw, so it belongs in the report
-    # evidence too — otherwise the file cannot explain why the run took as long as it did.
-    assert_includes stream.evidence_text, "[status] fake executor running for",
-                    "the evidence file must record the heartbeats, not only the chatty moments"
   end
 
   # ---- RUNNER-0001 scope 5: the quiet executor in a terminal ---------------
@@ -295,8 +315,6 @@ class LiveLogTest < Minitest::Test
     assert_empty terminal.durable_lines, "two heartbeats must not add two lines of history"
     assert_equal 2, terminal.transient_rows.length
     assert_includes terminal.transient_rows.last, "no new output yet"
-    assert_includes stream.evidence_text, "[status] fake executor running for",
-                    "the report evidence is unchanged — it is the durable record of the same fact"
   end
 
   def test_real_executor_output_clears_the_quiet_status_before_it_is_printed
@@ -372,7 +390,6 @@ class LiveLogTest < Minitest::Test
 
     assert_includes io.string, "were not acknowledged by Platform before this attempt ended"
     assert_includes io.string, "a line that cannot be delivered", "the terminal still showed it"
-    assert_includes stream.evidence_text, "a line that cannot be delivered", "and the report still records it"
   end
 
   # ---- MAPIAI-60 S10/S11: delivery gaps close without changing identity ----
@@ -512,7 +529,7 @@ class LiveLogTest < Minitest::Test
 
     assert_empty client.accepted_sequences
     assert_includes io.string, "were not acknowledged by Platform before this attempt ended"
-    assert_includes stream.evidence_text, "Provider started", "the local record is unaffected"
+    assert_includes io.string, "Provider started", "the local record is unaffected"
   end
 
   def test_a_stop_signal_on_a_log_event_response_is_observed
@@ -524,23 +541,44 @@ class LiveLogTest < Minitest::Test
     assert_equal "cancelled", stream.stop_reason
   end
 
-  def test_the_evidence_file_distinguishes_live_output_from_the_full_capture
-    stream, _io, _emitter = build_stream
-    stream.accept("stdout", "hello")
-    stream.finish
-    text = stream.evidence_text
-
-    assert_includes text, "evidence/stdout.log", "it points at where the full capture lives"
-    assert_includes text, "[stdout] hello"
-    assert_includes text, "Redacted before display, before upload"
-  end
-
-  def test_a_run_with_no_executor_output_says_so_rather_than_producing_an_empty_file
+  def test_a_run_with_no_executor_output_emits_nothing_rather_than_an_empty_event
     stream, _io, emitter = build_stream
     stream.finish
 
-    assert_includes stream.evidence_text, "(the executor emitted no live output)"
     assert_empty emitter.chunks
+  end
+
+  # ---- MAPIAI-75: acknowledged envelopes are not an in-memory archive ------
+  #
+  # `@sent` exists so a retry can re-send the ORIGINAL bytes. Without the old whole-stream
+  # stop an attempt's live log is unbounded, so remembering every acknowledged chunk would
+  # replace one archive (the report copy that was removed) with a worse one in runner memory.
+  # `resend_duplicate` is the observable form of "is this envelope still remembered".
+
+  def test_an_acknowledged_live_log_envelope_is_released_and_a_phase_envelope_is_kept
+    client = RecordingClient.new
+    emitter = SpecrelayRunner::EventEmitter.new(client: client, run_id: "run_75", attempt_id: "rex_75")
+    emitter.emit("workspace.preparing", "Preparing worktree for DEMO-0075", phase: "workspace")
+    emitter.emit("log.chunk", "fake stdout: 1 line", log_chunk: "hello", log_source: "stdout")
+
+    refute_nil emitter.resend_duplicate(1), "the protocol controls still re-send a phase envelope verbatim"
+    assert_nil emitter.resend_duplicate(2), "an acknowledged live-log envelope is released"
+    assert_equal 0, emitter.undelivered_count
+  end
+
+  def test_an_unacknowledged_envelope_is_kept_until_the_outage_closes
+    client = RecordingClient.new
+    emitter = SpecrelayRunner::EventEmitter.new(client: client, run_id: "run_75", attempt_id: "rex_75")
+    client.offline = true
+    assert_raises(SpecrelayRunner::PlatformClient::Error) do
+      emitter.emit("log.chunk", "fake stdout: 1 line", log_chunk: "owed", log_source: "stdout")
+    end
+    assert_equal 1, emitter.undelivered_count
+
+    client.offline = false
+    assert_equal 0, emitter.retry_undelivered, "the original envelope was still held and went out"
+    assert_equal "owed", client.accepted_for(1)["sanitized_log_chunk"]
+    assert_nil emitter.resend_duplicate(1), "and is released once Platform has answered for it"
   end
 
   # ---- end to end over real HTTP -----------------------------------------
@@ -626,17 +664,25 @@ class LiveLogTest < Minitest::Test
     end
   end
 
-  def test_the_uploaded_report_carries_the_bounded_live_log_as_its_own_evidence_file
+  # MAPIAI-75 — the bounded live-log copy is gone. Platform's accepted protocol events are
+  # the complete transcript now, so a second bounded copy in the report could only ever be a
+  # shorter, staler answer to the same question. The full capture stays exactly where it was.
+  LIVE_LOG_PATH = "evidence/live-executor-log.txt"
+
+  def test_the_uploaded_report_keeps_the_full_capture_and_drops_the_duplicate_live_log
     with_execution do |platform, _output|
       files = platform.last_report.dig(:body, "report", "files").to_h { |f| [ f["relative_path"], f ] }
-      path = SpecrelayRunner::ReportBundle::LIVE_LOG_PATH
-      assert_includes files.keys, path
-      assert_includes files.keys, "evidence/stdout.log", "the full capture is still a separate file"
+      assert_includes files.keys, "evidence/stdout.log"
+      assert_includes files.keys, "evidence/stderr.log"
+      refute_includes files.keys, LIVE_LOG_PATH
 
-      body = Base64.decode64(files.fetch(path)["content_base64"])
-      refute_includes body, "sk-live-DO-NOT-LEAK", "the demo executor's planted secret must be redacted"
-      assert_includes body, "[stdout]"
-      assert_includes platform.last_terminal_result.fetch("artifacts"), path
+      manifest = Base64.decode64(files.fetch("manifest.yml")["content_base64"])
+      refute_includes manifest, LIVE_LOG_PATH, "no manifest pointer may survive the artifact"
+      refute_includes manifest, "live_log"
+      refute_includes platform.last_terminal_result.fetch("artifacts"), LIVE_LOG_PATH
+
+      stdout = Base64.decode64(files.fetch("evidence/stdout.log")["content_base64"])
+      refute_includes stdout, "sk-live-DO-NOT-LEAK", "the full capture is still redacted"
     end
   end
 

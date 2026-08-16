@@ -328,8 +328,7 @@ module SpecrelayRunner
       emit("attempt.completed", "Uploading failed execution report for #{run['task_id']}", phase: "completed")
       bundle = ReportBundle.build(payload: payload, status: ReportBundle::STATUS_FAILED, executor: executor_result,
                                   test: test, changes: changes, base_commit: worktree.base_commit,
-                                  worktree_path: worktree.path, failure_details: reason,
-                                  live_log: live_log_evidence)
+                                  worktree_path: worktree.path, failure_details: reason)
       terminal = terminal_result(status: ReportBundle::STATUS_FAILED, final_sequence: emitter.sequence,
                                  exit_code: executor_result.exit_code, base_commit: worktree.base_commit,
                                  changes: changes, error_classification: "worktree_unmeasurable")
@@ -489,16 +488,9 @@ module SpecrelayRunner
       ExecutorLogStream.start(emitter: emitter, io: io, provider: provider, task_id: run["task_id"])
     end
 
-    # The bounded live-log text for the report, or nil when nothing streamed. Kept
-    # separate from the full stdout/stderr capture on purpose (see ReportBundle).
-    def live_log_evidence = @log_stream&.evidence_text
-
-    # The report-relative artifacts named in the terminal-result envelope. The live
-    # executor log joins the list only when it exists, so a run with no streamed
-    # output never claims an artifact it did not upload.
+    # The report-relative artifacts named in the terminal-result envelope.
     def terminal_artifacts
-      base = %w[README.md manifest.yml evidence/stdout.log evidence/tests.log evidence/diff.txt]
-      live_log_evidence ? base + [ ReportBundle::LIVE_LOG_PATH ] : base
+      %w[README.md manifest.yml evidence/stdout.log evidence/tests.log evidence/diff.txt]
     end
 
     def run_tests(worktree, root)
@@ -522,8 +514,7 @@ module SpecrelayRunner
            phase: "completed", exit_code: test[:exit_code])
       bundle = ReportBundle.build(payload: payload, status: status, executor: executor_result, test: test,
                                   changes: changes, base_commit: worktree.base_commit, worktree_path: worktree.path,
-                                  failure_details: failure_details(status, test, publication_failure),
-                                  live_log: live_log_evidence)
+                                  failure_details: failure_details(status, test, publication_failure))
       terminal = terminal_result(status: status, final_sequence: emitter.sequence, exit_code: test[:exit_code],
                                  base_commit: worktree.base_commit, changes: changes, publication: publication,
                                  error_classification: publication_failure ? "publication_failed" : nil)
@@ -555,8 +546,7 @@ module SpecrelayRunner
       emit("attempt.completed", "Uploading failed execution report for #{run['task_id']}", phase: "completed")
       bundle = ReportBundle.build(payload: payload, status: ReportBundle::STATUS_FAILED, executor: executor_result,
                                   test: test, changes: changes, base_commit: worktree.base_commit,
-                                  worktree_path: worktree.path, failure_details: message,
-                                  live_log: live_log_evidence)
+                                  worktree_path: worktree.path, failure_details: message)
       terminal = terminal_result(status: ReportBundle::STATUS_FAILED, final_sequence: emitter.sequence,
                                  exit_code: executor_result.exit_code, base_commit: worktree.base_commit,
                                  changes: changes, error_classification: classification)
