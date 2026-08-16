@@ -18,9 +18,6 @@ module SpecrelayRunner
   #
   # Files are returned base64-encoded so the bundle is a plain JSON body.
   class ReportBundle
-    # The report-relative path of the bounded live executor log (MVP-0018).
-    LIVE_LOG_PATH = "evidence/live-executor-log.txt"
-
     MANIFEST_VERSION = 1
     STATUS_SUCCEEDED = "succeeded"
     STATUS_FAILED = "failed"
@@ -30,7 +27,7 @@ module SpecrelayRunner
     # executor: Executor::Result, test: { command:, exit_code:, output: },
     # changes: Workspace::Changes, base_commit:, worktree_path:.
     def initialize(payload:, status:, executor:, test:, changes:, base_commit:, worktree_path:,
-                   failure_details: nil, live_log: nil)
+                   failure_details: nil)
       @payload = payload
       @status = status
       @executor = executor
@@ -39,7 +36,6 @@ module SpecrelayRunner
       @base_commit = base_commit
       @worktree_path = worktree_path
       @failure_details = failure_details
-      @live_log = live_log
     end
 
     def build
@@ -48,8 +44,7 @@ module SpecrelayRunner
 
     private
 
-    attr_reader :payload, :status, :executor, :test, :changes, :base_commit, :worktree_path, :failure_details,
-                :live_log
+    attr_reader :payload, :status, :executor, :test, :changes, :base_commit, :worktree_path, :failure_details
 
     def run = payload.fetch("run")
     def workspace = payload.fetch("workspace")
@@ -65,14 +60,12 @@ module SpecrelayRunner
       contents.map { |path, body| { "relative_path" => path, "content_base64" => Base64.strict_encode64(body) } }
     end
 
-    # MVP-0018 — `evidence/live-executor-log.txt` is a DISTINCT artifact from
-    # `evidence/stdout.log`. The live log is the bounded, redacted, per-stream
-    # stream the operator watched during the run (and the same content Platform
-    # persisted as ordered log events); stdout/stderr are the full capture taken
-    # for report review. A reviewer needs to be able to tell those apart, so they
-    # are never merged into one file.
+    # MAPIAI-75 — there is no live-log file here. It used to duplicate the bounded
+    # stream Platform already stores as ordered protocol events, which is now the
+    # complete, pageable transcript; stdout/stderr remain the full capture taken for
+    # report review, and that is a genuinely different artifact.
     def contents
-      base = {
+      {
         "README.md" => readme,
         "manifest.yml" => YAML.dump(manifest),
         "evidence/stdout.log" => Redaction.redact(executor.stdout.to_s),
@@ -81,8 +74,6 @@ module SpecrelayRunner
         "evidence/diff.txt" => changes.diff.to_s,
         "evidence/summary.md" => readme
       }
-      base[LIVE_LOG_PATH] = Redaction.redact(live_log.to_s) if live_log
-      base
     end
 
     def manifest
@@ -101,9 +92,8 @@ module SpecrelayRunner
         "worktree" => { "path" => worktree_path.to_s, "created" => true }, "git" => git_block,
         "artifacts" => {
           "stdout" => "evidence/stdout.log", "stderr" => "evidence/stderr.log",
-          "tests" => "evidence/tests.log", "diff" => "evidence/diff.txt", "summary" => "evidence/summary.md",
-          "live_log" => (LIVE_LOG_PATH if live_log)
-        }.compact
+          "tests" => "evidence/tests.log", "diff" => "evidence/diff.txt", "summary" => "evidence/summary.md"
+        }
       }.compact
     end
 
@@ -129,17 +119,13 @@ module SpecrelayRunner
     end
 
     def evidence_entries
-      entries = [
+      [
         { "path" => "evidence/stdout.log", "kind" => "text", "description" => "Executor stdout" },
         { "path" => "evidence/stderr.log", "kind" => "text", "description" => "Executor stderr" },
         { "path" => "evidence/tests.log", "kind" => "text", "description" => "Project test output" },
         { "path" => "evidence/diff.txt", "kind" => "text", "description" => "Git diff of the worktree changes" },
         { "path" => "evidence/summary.md", "kind" => "markdown", "description" => "Standalone runner execution summary" }
       ]
-      return entries unless live_log
-
-      entries + [ { "path" => LIVE_LOG_PATH, "kind" => "text",
-                    "description" => "Bounded, redacted live executor output shown during execution (MVP-0018)" } ]
     end
 
     def worktree_identity
@@ -186,26 +172,11 @@ module SpecrelayRunner
         - Changed files: #{Array(changes.changed_files).size}
         #{failure_line}
         See `manifest.yml` for the machine-readable report and `evidence/` for the
-        captured stdout, stderr, test output, and diff.
-        #{live_log_line}
+        captured stdout, stderr, test output, and diff. The live executor output the
+        operator watched is the run's ordered protocol events in Platform.
       MD
     end
 
     def failure_line = failed? ? "- Failure: #{failure_details}\n" : ""
-
-    # Names the three categories the spec requires a reviewer to be able to tell
-    # apart: what was shown live, what was captured for review, and what was
-    # redacted or dropped.
-    def live_log_line
-      return "" unless live_log
-
-      <<~MD.chomp
-        Live executor output: `#{LIVE_LOG_PATH}` holds the bounded, redacted stream that was
-        shown in the terminal and in Platform WHILE the executor ran, tagged per source
-        stream. `evidence/stdout.log` and `evidence/stderr.log` hold the full capture taken
-        for review. Both were redacted before they were written; the live log records its own
-        clipping and budget truncation inline as `[status]` lines.
-      MD
-    end
   end
 end

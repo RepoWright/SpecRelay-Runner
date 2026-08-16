@@ -381,7 +381,8 @@ class RealExecutorFlowTest < Minitest::Test
     bin_dir, = FakeClaudeCli.build
     run_cli(claude_config, bin_dir: bin_dir)
 
-    live_log = decode_file(SpecrelayRunner::ReportBundle::LIVE_LOG_PATH)
+    # MAPIAI-75 — the live surface is what Platform accepted, not a report copy of it.
+    live_log = @platform.protocol_events.filter_map { |event| event["sanitized_log_chunk"] }.join("\n")
     [ @io.string, live_log, JSON.generate(@platform.last_report[:body]) ].each do |surface|
       refute_includes surface, %("type":"assistant"), "a raw provider frame reached a surface"
       refute_includes surface, FakeClaudeCli::LEAKED_TOKEN, "a credential reached a surface"

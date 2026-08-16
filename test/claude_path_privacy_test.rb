@@ -207,9 +207,9 @@ class ClaudePathPrivacyTest < Minitest::Test
     messages = [ J.narration("Editing #{MAC_ROOT}/app/a.css and /Users/dev-fixture/Desktop/b.css."),
                  J.edit_call("#{MAC_ROOT}/app/a.css", "color: red;", "color: green;"),
                  J.edit_result("toolu_edit", "#{MAC_ROOT}/app/a.css", "color: red;", "color: green;") ]
-    terminal, delivered, evidence = through_fan_out(*messages)
+    terminal, delivered = through_fan_out(*messages)
 
-    [ terminal, delivered, evidence ].each do |surface|
+    [ terminal, delivered ].each do |surface|
       assert_includes surface, "Editing #{PLACEHOLDER}."
       assert_includes surface, "-color: red;"
       assert_includes surface, "+color: green;"
@@ -597,8 +597,8 @@ class ClaudePathPrivacyTest < Minitest::Test
     end
   end
 
-  # The REAL implementation-lane wiring: decoder -> ExecutorLogStream -> (terminal, report
-  # evidence, Platform). Returns all three sinks' text.
+  # The REAL implementation-lane wiring: decoder -> ExecutorLogStream -> (terminal, Platform).
+  # Returns both sinks' text.
   def through_fan_out(*messages, root: MAC_ROOT)
     client = RecordingProtocolClient.new
     emitter = SpecrelayRunner::EventEmitter.new(client: client, run_id: "run_77", attempt_id: "rex_77")
@@ -609,7 +609,7 @@ class ClaudePathPrivacyTest < Minitest::Test
     messages.each { |message| decoder.accept("stdout", JSON.generate(message)) }
     stream.send(:flush_all)
 
-    [ io.string, client.accepted.map { |e| e["sanitized_log_chunk"].to_s }.join, stream.evidence_text ]
+    [ io.string, client.accepted.map { |e| e["sanitized_log_chunk"].to_s }.join ]
   end
 
   def normalize(text) = text.gsub(/^\s*\[claude:status\]\s?/, "").gsub(/\s+/, " ").strip

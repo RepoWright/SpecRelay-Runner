@@ -668,11 +668,12 @@ the report evidence still records each one — the durable protocol and evidence
 records are unchanged; only the terminal representation became transient. With no
 terminal to redraw it stays a plain line at the same bounded interval.
 
-Every line is redacted before the terminal write **and** before upload, clipped at
-2000 bytes, and counted against a 131072-byte per-run budget whose exhaustion emits
-one `log.truncated` event rather than dropping output silently. Output is flushed,
-because Ruby block-buffers a non-terminal stdout and an unflushed live log is just
-a delayed one.
+Every line is redacted before the terminal write **and** before upload and clipped
+at 2000 bytes; each uploaded event carries at most 65536 bytes and 200 whole lines.
+There is no whole-attempt byte budget (MAPIAI-75): those bounds SPLIT a long stream
+into more events, they never stop it, so Platform receives the attempt's complete
+sanitized output. Output is flushed, because Ruby block-buffers a non-terminal
+stdout and an unflushed live log is just a delayed one.
 
 It cannot break the run: a consumer that raises is swallowed, an upload failure is
 counted and reported once, and the buffered capture plus the child's exit status are
@@ -706,10 +707,11 @@ existing authoritative validation and bytes. Progress delivery failing — or be
 cut short at shutdown — changes none of them, and a run is never reclassified
 because its live view was incomplete.
 
-The report carries the bounded stream as its own artifact,
-`evidence/live-executor-log.txt`, deliberately separate from the full
-`evidence/stdout.log` / `evidence/stderr.log` capture — a reviewer needs to tell
-what the operator saw live from what was collected for review.
+The report carries no copy of the live stream. Platform's accepted protocol events
+are the complete sanitized transcript and the run page pages through all of it, so a
+second bounded copy in the report could only ever be a shorter, staler answer to the
+same question. `evidence/stdout.log` and `evidence/stderr.log` still hold the full
+capture taken for review, redacted before they are written.
 
 Platform authorizes a claim only for a workspace this machine has explicitly
 connected to and been recorded `ready` for — and only while its reported
@@ -1190,7 +1192,7 @@ lib/specrelay_runner/
   report_bundle.rb              # build manifest + evidence, base64 for upload
   event_emitter.rb              # per-attempt sequence + v1 event envelope (mutex-guarded:
                                 #   the log stream allocates sequences concurrently)
-  executor_log_stream.rb        # live executor output: redact -> clip -> budget -> batch,
+  executor_log_stream.rb        # live executor output: redact -> clip -> batch -> cut,
                                 #   terminal print + ordered log events + report evidence
   terminal_result.rb            # terminal-result envelope builder
   protocol_controls.rb          # default-off deterministic protocol test controls
