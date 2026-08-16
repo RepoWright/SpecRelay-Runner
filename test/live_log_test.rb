@@ -566,6 +566,27 @@ class LiveLogTest < Minitest::Test
     assert_equal 0, emitter.undelivered_count
   end
 
+  # CR-001 F3. A refusal means Platform READ these bytes and rejected them, so re-sending
+  # them can only be refused again. The envelope stopped being retryable, and for the
+  # unbounded live-log vocabulary nothing else needs it — a refusal-heavy attempt was
+  # growing exactly the in-memory archive this ticket exists to remove.
+  def test_a_permanently_refused_live_log_envelope_is_released_while_a_phase_envelope_is_kept
+    client = RecordingClient.new
+    emitter = SpecrelayRunner::EventEmitter.new(client: client, run_id: "run_75", attempt_id: "rex_75")
+    client.refuse = true
+    assert_raises(SpecrelayRunner::PlatformClient::Error) do
+      emitter.emit("workspace.preparing", "Preparing worktree for DEMO-0075", phase: "workspace")
+    end
+    assert_raises(SpecrelayRunner::PlatformClient::Error) do
+      emitter.emit("log.chunk", "fake stdout: 1 line", log_chunk: "refused", log_source: "stdout")
+    end
+
+    assert_equal 0, emitter.undelivered_count, "a permanent refusal is never retried"
+    client.refuse = false
+    refute_nil emitter.resend_duplicate(1), "a phase envelope stays available to the protocol controls"
+    assert_nil emitter.resend_duplicate(2), "a refused ordinary live-log envelope is released"
+  end
+
   def test_an_unacknowledged_envelope_is_kept_until_the_outage_closes
     client = RecordingClient.new
     emitter = SpecrelayRunner::EventEmitter.new(client: client, run_id: "run_75", attempt_id: "rex_75")

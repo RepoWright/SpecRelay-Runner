@@ -29,14 +29,14 @@ module SpecrelayRunner
 
     # MAPIAI-75 — the live log vocabulary, and the only part of an attempt's stream
     # that is unbounded. `@sent` exists so a retry can re-send the ORIGINAL bytes, so
-    # an envelope Platform has acknowledged is no longer needed and is released:
-    # without the old whole-stream stop, remembering every chunk would turn a healthy
-    # long attempt into an in-memory archive of its own transcript.
+    # an envelope Platform has settled is no longer needed and is released: without the
+    # old whole-stream stop, remembering every chunk would turn a long attempt into an
+    # in-memory archive of its own transcript.
     #
     # The phase vocabulary is NOT released. It is a dozen envelopes per attempt, and
     # it is what {#resend_duplicate} and {#resend_conflict} re-send verbatim — those
     # controls address a sequence allocated before any log event exists.
-    RELEASED_ON_ACKNOWLEDGEMENT = %w[log.chunk core.progress].freeze
+    RELEASED_WHEN_SETTLED = %w[log.chunk core.progress].freeze
 
     def initialize(client:, run_id:, attempt_id:, clock: Time)
       @client = client
@@ -155,19 +155,25 @@ module SpecrelayRunner
       sequence = envelope["sequence"]
       @mutex.synchronize { @undelivered << sequence unless @undelivered.include?(sequence) }
       response = send_envelope(envelope)
-      @mutex.synchronize { acknowledge(sequence, envelope) }
+      @mutex.synchronize { settle(sequence, envelope) }
       response
     rescue PlatformClient::Error => e
-      @mutex.synchronize { @undelivered.delete(sequence) if e.refused? }
+      @mutex.synchronize { settle(sequence, envelope) } if e.refused?
       raise
     end
 
-    # Platform answered, so nothing owes this envelope a retry. A refusal is NOT an
-    # acknowledgement and does not come through here: it clears the ledger above and
-    # keeps the envelope, so a re-sent conflict still has the original to compare.
-    def acknowledge(sequence, envelope)
+    # Platform has DECIDED this envelope's fate — it accepted the bytes, or it read them
+    # and permanently refused them. Either way nothing owes it a retry, so the ledger
+    # clears and an ordinary live-log envelope is released.
+    #
+    # CR-001 F3: a refusal used to clear only the ledger and keep the envelope, so an
+    # attempt whose live log was being refused grew `@sent` for the rest of its life —
+    # the in-memory archive this ticket exists to remove, reached by the other door. A
+    # transport fault is NOT a decision and never reaches here: its outcome is unknown,
+    # so the exact bytes stay retryable until Platform answers for them.
+    def settle(sequence, envelope)
       @undelivered.delete(sequence)
-      @sent.delete(sequence) if RELEASED_ON_ACKNOWLEDGEMENT.include?(envelope["event_type"])
+      @sent.delete(sequence) if RELEASED_WHEN_SETTLED.include?(envelope["event_type"])
     end
 
     def redeliver(envelope)
