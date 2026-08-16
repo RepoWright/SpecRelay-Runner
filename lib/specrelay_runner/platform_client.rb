@@ -46,6 +46,30 @@ module SpecrelayRunner
     # already holds. Deliberately not the request body: see #enroll.
     CURRENT_CREDENTIAL_HEADER = "X-SpecRelay-Runner-Credential"
 
+    # The exceptions that leave a request's fate UNKNOWN, and only those.
+    #
+    # The first three happen before Platform can have read anything. The last three happen after
+    # the request was sent — the connection dies mid-exchange, which is precisely the "Platform
+    # committed it and the answer vanished" case a review delivery must survive (review-001 F4).
+    # Deliberately a named list rather than StandardError: a bug in this client, a JSON failure,
+    # or a programming error must surface, not be retried as weather.
+    TRANSPORT_FAILURES = [ SocketError, Errno::ECONNREFUSED, Timeout::Error,
+                           EOFError, Errno::ECONNRESET, Errno::EPIPE ].freeze
+
+    # The durable ending each review delivery produces, as Platform names it back (review-002
+    # F1). A delivery is confirmed by ITS OWN ending and by no other: a failure answered with
+    # `WAITING` describes an attempt that is queued for a runner, not one that ended, and
+    # accepting it let this machine exit believing Platform held something it does not.
+    #
+    # Only these two endings are stated as constants. A verdict's ending is derived from the
+    # outcome that was submitted rather than tabulated, so the supported outcome set stays
+    # Platform's alone (design 1) and no copy of it appears here.
+    FAILED_ENDING = { "state" => "FAILED", "outcome" => nil }.freeze
+    STALE_ENDING = { "state" => "STALE", "outcome" => nil }.freeze
+    # The one outcome that does not COMPLETE its attempt: NEEDS_INPUT ends the delivery and the
+    # reviewer process, and leaves the review itself waiting on a Product Owner answer.
+    AWAITING_ANSWER_OUTCOME = "NEEDS_INPUT"
+
     # A claimed run payload, or a not-claimed signal.
     ClaimResult = Struct.new(:claimed, :payload, keyword_init: true) do
       def claimed? = claimed
@@ -152,19 +176,9 @@ module SpecrelayRunner
     # sequence for a different payload. An HTTP rejection (401/422) is NOT retried;
     # it is surfaced so the caller fails closed.
     def submit_protocol_event(claim:, event:, max_attempts: 3)
-      attempt = 0
-      begin
-        attempt += 1
+      with_transport_retries(max_attempts) do
         status, body = post_json("/api/runner/events", { claim: claim, event: event })
-        return body if status == 201
-
-        raise_for(status, body)
-      rescue Error => e
-        # Only the bare transport Error (not its Unauthorized/RequestFailed
-        # subclasses) is transient and safely retryable with the same payload.
-        raise if !e.instance_of?(Error) || attempt >= max_attempts
-
-        retry
+        status == 201 ? body : raise_for(status, body)
       end
     end
 
@@ -256,18 +270,30 @@ module SpecrelayRunner
     # A 422 is a REFUSAL, not a transport failure — Platform validated the result and did not
     # accept it — so it raises like any other refusal and the caller reports the attempt as
     # failed rather than retrying a body that will never be accepted.
-    def submit_review_result(claim:, review:)
-      status, body = post_json("/api/runner/review_results", { claim: claim, review: review })
-      status == 201 ? body : raise_for(status, body)
+    # `attempt_id` and the expected ENDING are what the acknowledgement is checked against: a 201
+    # only means "delivered" when the answer names the attempt this runner holds and the durable
+    # ending this particular delivery produces.
+    def submit_review_result(claim:, attempt_id:, review:)
+      deliver_review(claim, { review: review },
+                     attempt_id: attempt_id, ending: verdict_ending(review["outcome"]))
+    end
+
+    # The same endpoint, a DIFFERENT body: the reviewer produced no usable result at all, so
+    # there is no verdict to send (MAPIAI-78 design 2). Reported explicitly rather than as an
+    # outcome-less review, because Platform must keep the runner's own reason instead of
+    # replacing it with its generic outcome-validation refusal.
+    def report_review_failure(claim:, attempt_id:, kind:, reason:)
+      deliver_review(claim, { failure: { kind: kind, reason: reason } },
+                     attempt_id: attempt_id, ending: FAILED_ENDING)
     end
 
     # The same endpoint, a DIFFERENT body: the pull request's branch no longer points at the
     # pinned head, so there is no verdict to send. Reported explicitly rather than as an
     # outcome-less result, because Platform closes the assignment for a moved target and offers
     # a fresh attempt for a failed reviewer (MVP-0033 CR-001 F3).
-    def report_stale_target(claim:, reason:)
-      status, body = post_json("/api/runner/review_results", { claim: claim, stale: { reason: reason } })
-      status == 201 ? body : raise_for(status, body)
+    def report_stale_target(claim:, attempt_id:, reason:)
+      deliver_review(claim, { stale: { reason: reason } },
+                     attempt_id: attempt_id, ending: STALE_ENDING)
     end
 
     # POST /api/runner/claim_releases — abandon THIS claim before anything executed (MVP-0035).
@@ -354,6 +380,61 @@ module SpecrelayRunner
 
     attr_reader :base, :token, :http
 
+    # The three review deliveries, through ONE poster (MAPIAI-78 design 3).
+    #
+    # A lost response leaves this machine unable to tell "Platform never saw it" from "Platform
+    # committed it and the answer vanished", so the identical body is delivered again — never a
+    # rebuilt one, and never after rerunning the provider. Platform makes the replay idempotent;
+    # this side's job is only to keep the body byte-identical across attempts.
+    #
+    # An UNCONFIRMED answer is the same fact as a lost one and is retried the same way: a 201
+    # from a proxy, a captive portal or a truncated response is not Platform recording anything
+    # (review-001 F5).
+    def deliver_review(claim, body, attempt_id:, ending:, max_attempts: 3)
+      with_transport_retries(max_attempts) do
+        status, response = post_json("/api/runner/review_results", { claim: claim }.merge(body))
+        raise_for(status, response) unless status == 201
+        raise Error, "Platform's answer did not record this attempt's ending" unless
+          acknowledged?(response, attempt_id, ending)
+
+        response
+      end
+    end
+
+    # What makes a 201 a DELIVERY: Platform answered about the attempt this runner holds, and
+    # the ending it reports is the one this delivery produces. Both halves are load-bearing —
+    # the right ending for the wrong attempt, and the wrong ending for the right attempt, are
+    # each a delivery this machine cannot claim landed.
+    def acknowledged?(response, attempt_id, ending)
+      recorded = response.is_a?(Hash) ? response["review"] : nil
+      return false unless recorded.is_a?(Hash)
+
+      recorded["attempt_id"].to_s == attempt_id.to_s &&
+        recorded["state"] == ending["state"] &&
+        recorded["outcome"] == ending["outcome"]
+    end
+
+    def verdict_ending(outcome)
+      { "state" => outcome == AWAITING_ANSWER_OUTCOME ? "AWAITING_ANSWER" : "COMPLETED",
+        "outcome" => outcome }
+    end
+
+    # Retry a request whose fate is UNKNOWN, and only that. A refusal (Unauthorized/NotFound/
+    # RequestFailed) means Platform read the body and answered, so re-sending it would only ask
+    # the same question again; the bare transport Error is the one that leaves a caller unable
+    # to say whether anything was recorded.
+    def with_transport_retries(max_attempts)
+      attempt = 0
+      begin
+        attempt += 1
+        yield
+      rescue Error => e
+        raise if !e.instance_of?(Error) || attempt >= max_attempts
+
+        retry
+      end
+    end
+
     # The workspace key is a path SEGMENT, so it is escaped rather than interpolated: a key
     # containing a slash or a space would otherwise silently address a different route.
     def connection_path(workspace_key)
@@ -384,7 +465,7 @@ module SpecrelayRunner
         conn.request(request)
       end
       [ response.code.to_i, parse(response.body) ]
-    rescue SocketError, Errno::ECONNREFUSED, Timeout::Error => e
+    rescue *TRANSPORT_FAILURES => e
       raise Error, "could not reach Platform at #{base}: #{e.class}"
     end
 

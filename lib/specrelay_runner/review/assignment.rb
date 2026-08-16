@@ -51,6 +51,17 @@ module SpecrelayRunner
       # What Platform will accept back, including its per-field length limits.
       def result_contract = payload.fetch("result_contract", {}).to_h
 
+      # The outcomes Platform will accept, as it stated them. The reviewer prompt and the early
+      # structural check both read THIS, so the runner cannot describe one contract while
+      # enforcing another (MAPIAI-78 design 1). Empty when Platform sent none, which is a
+      # refusal to review rather than a licence to assume the usual three.
+      def supported_outcomes
+        Array(result_contract["outcomes"]).filter_map do |value|
+          text = value.to_s.strip.upcase
+          text unless text.empty?
+        end
+      end
+
       def timeout_seconds = payload.dig("execution_policy", "attempt_timeout_seconds").to_i
       def lease_renewal_seconds = payload.dig("execution_policy", "lease_renewal_seconds").to_i
 

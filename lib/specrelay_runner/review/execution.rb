@@ -18,6 +18,14 @@ module SpecrelayRunner
     # rather than swallowed, so the operator sees why review did not happen and Platform can
     # offer a new attempt (S30). The implementation result is never touched.
     class Execution
+      # The two ways a review attempt can end with no verdict, reported explicitly (MAPIAI-78
+      # design 2). They are different facts with different remedies: a provider that never
+      # produced a usable result is a machine or configuration problem, while an unusable result
+      # is a reviewer problem — and neither is a verdict about the implementation.
+      PROVIDER_EXECUTION_FAILURE = "provider_execution_failure"
+      INVALID_REVIEWER_RESULT = "invalid_reviewer_result"
+      NO_CONTRACT = "Platform sent no supported review outcomes, so no result could be checked"
+
       Result = Struct.new(:outcome, :message, keyword_init: true) do
         def success? = outcome == :submitted
         # A moved target is not a machine fault: the reviewer correctly refused to judge code
@@ -39,16 +47,20 @@ module SpecrelayRunner
       end
 
       def call
-        return failure("no reviewer provider is configured on this machine") unless settings.configured?
+        return failure(PROVIDER_EXECUTION_FAILURE, "no reviewer provider is configured on this machine") unless settings.configured?
+        return failure(PROVIDER_EXECUTION_FAILURE, NO_CONTRACT) if assignment.supported_outcomes.empty?
 
         workspace_root = config.workspace_root(assignment.workspace_key, env: env)
         checkout = Checkout.verify(assignment: assignment, workspace_root: workspace_root)
         return stale(checkout.reason) if checkout.stale?
-        return failure(checkout.reason) unless checkout.ok?
+        return failure(PROVIDER_EXECUTION_FAILURE, checkout.reason) unless checkout.ok?
 
         review(workspace_root)
-      rescue Config::Error => e
-        failure(Redaction.redact(e.message))
+      rescue Config::Error, Settings::Error => e
+        # Both mean the reviewer could not be launched at all: an unusable workspace root, or a
+        # local configuration that would put the provider in an output mode whose result is not
+        # a review.
+        failure(PROVIDER_EXECUTION_FAILURE, Redaction.redact(e.message))
       end
 
       private
@@ -58,8 +70,14 @@ module SpecrelayRunner
       def review(workspace_root)
         log "Reviewing #{assignment.ticket_id} at the pinned head (attempt #{assignment.attempt_ordinal})"
         heartbeater = start_heartbeater
-        parsed = parse(launch(workspace_root))
-        return failure(parsed.error) unless parsed.ok?
+        launched = launch(workspace_root)
+        # A timeout and a non-zero exit are provider FAILURES, not results: whatever the process
+        # printed before dying is not a verdict, so it is never parsed for one.
+        return failure(PROVIDER_EXECUTION_FAILURE, "the reviewer timed out") if launched.timed_out?
+        return failure(PROVIDER_EXECUTION_FAILURE, "the reviewer exited #{launched.exit_code}") unless launched.exit_code.to_i.zero?
+
+        parsed = Review::Result.parse(launched.stdout, outcomes: assignment.supported_outcomes)
+        return failure(INVALID_REVIEWER_RESULT, parsed.error) unless parsed.ok?
 
         verdict(parsed.review, workspace_root)
       ensure
@@ -72,18 +90,9 @@ module SpecrelayRunner
       def verdict(review, workspace_root)
         recheck = Checkout.verify(assignment: assignment, workspace_root: workspace_root)
         return stale(recheck.reason) if recheck.stale?
-        return failure(recheck.reason) unless recheck.ok?
+        return failure(PROVIDER_EXECUTION_FAILURE, recheck.reason) unless recheck.ok?
 
         submit(review)
-      end
-
-      # A timeout and a non-zero exit are provider FAILURES, not results: whatever the process
-      # printed before dying is not a verdict, so it is never parsed for one.
-      def parse(result)
-        return Review::Result::Parsed.new(error: "the reviewer timed out") if result.timed_out?
-        return Review::Result::Parsed.new(error: "the reviewer exited #{result.exit_code}") unless result.exit_code.to_i.zero?
-
-        Review::Result.parse(result.stdout)
       end
 
       # ONE fresh process. The child environment is the operator's own PATH and HOME only —
@@ -108,44 +117,55 @@ module SpecrelayRunner
       end
 
       def submit(review)
-        client.submit_review_result(claim: assignment.claim_token, review: review)
+        client.submit_review_result(claim: assignment.claim_token, attempt_id: assignment.attempt_id,
+                                    review: review)
         log "Submitted #{review['outcome']} for #{assignment.ticket_id}"
         Result.new(outcome: :submitted, message: "Review submitted: #{review['outcome']}.")
       rescue PlatformClient::Error => e
-        failure("Platform refused the review result: #{Redaction.redact(e.message)}")
+        # A 4xx is Platform having READ this result and refused it, so the attempt already
+        # carries Platform's own reason and a failure report on top of it would be a second,
+        # conflicting ending for one attempt.
+        unrecorded("Platform refused the review result", e)
       end
 
-      # Reported through the dedicated stale endpoint rather than as an outcome-less result:
+      # Reported through the dedicated stale body rather than as an outcome-less result:
       # Platform must be able to tell "this reviewer failed, offer another attempt" from "this
       # target is gone, close the assignment", and an outcome-less body cannot say which.
       def stale(reason)
         safe = Redaction.redact(reason.to_s)
-        client.report_stale_target(claim: assignment.claim_token, reason: safe)
+        client.report_stale_target(claim: assignment.claim_token, attempt_id: assignment.attempt_id,
+                                   reason: safe)
         log "Review stopped: #{safe}"
         Result.new(outcome: :stale, message: "Review stopped: #{safe}")
       rescue PlatformClient::Error => e
-        failure("Platform refused the stale-target report: #{Redaction.redact(e.message)}")
+        unrecorded("Platform refused the stale-target report", e)
       end
 
-      # A refusal is reported, never merely printed: Platform must record the failed attempt so
-      # the run page explains why no verdict exists and a new attempt can be offered.
-      def failure(reason)
+      # A refusal is reported AS a failure, never as an outcome-less review body (MAPIAI-78
+      # design 2). The old shape made Platform's generic outcome-validation message replace the
+      # local reason that actually explained what happened, which is how the live MAPIAI-73
+      # review came to say that a rule nobody had broken was broken.
+      def failure(kind, reason)
         safe = Redaction.redact(reason.to_s)
-        report_failure(safe)
+        client.report_review_failure(claim: assignment.claim_token, attempt_id: assignment.attempt_id,
+                                     kind: kind, reason: safe)
         log "Review failed: #{safe}"
         Result.new(outcome: :failed, message: "Review failed: #{safe}")
+      rescue PlatformClient::Error => e
+        unrecorded("Review failed (#{safe}), and Platform refused the failure report", e)
       end
 
-      # Reported through the SAME submission endpoint, as an outcome-less body. Platform's
-      # strict validation rejects it, which is exactly the intent: the attempt is recorded
-      # FAILED with this reason and no verdict is created.
-      def report_failure(reason)
-        client.submit_review_result(claim: assignment.claim_token,
-                                    review: { "summary" => reason, "findings" => [], "evidence" => {} })
-      rescue PlatformClient::Error
-        # The attempt's lease will expire and Platform will record it. Nothing further is
-        # possible from here, and raising would replace a clear local message with a stack.
-        nil
+      # Platform's answer, or its silence, about a delivery this machine cannot resolve.
+      #
+      # Nothing further is delivered on either path: a refusal means Platform already recorded
+      # its own ending, and a transport failure means the outcome of this attempt is Platform's
+      # durable state and its lease-expiry path to decide — not something to guess at from here.
+      # Both exit non-zero, because this claim did not produce what it was made for.
+      def unrecorded(context, error)
+        message = error.refused? ? "#{context}: #{Redaction.redact(error.message)}"
+                                 : "#{context}: Platform did not confirm it (#{Redaction.redact(error.message)})"
+        log message
+        Result.new(outcome: :failed, message: message)
       end
 
       def log(message) = io.respond_to?(:line) ? io.line(message) : io.puts(message)

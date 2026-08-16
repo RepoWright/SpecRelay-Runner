@@ -41,6 +41,21 @@ module SpecrelayRunner
       PROVIDER_ENV = "SPECRELAY_RUNNER_REVIEWER_PROVIDER"
       COMMAND_ENV = "SPECRELAY_RUNNER_REVIEWER_COMMAND"
 
+      # The reviewer's ONE supported output mode (MAPIAI-78 design 1).
+      #
+      # The review document IS the provider's stdout, so the provider must be in its direct text
+      # mode. `--output-format json` wraps that document in a provider envelope whose top level
+      # carries no `outcome`: it parses, and it is not a review — the shape that stranded the
+      # live MAPIAI-73 review. It is REFUSED rather than decoded, because a second accepted
+      # output shape means a second result parser and no way to prove which one produced a
+      # verdict. The executor lane makes the opposite choice for the opposite reason: it reads a
+      # turn STREAM, so structured output is mandatory there (ClaudeProfile::REQUIRED_FLAGS).
+      OUTPUT_FORMAT_FLAG = "--output-format"
+      TEXT_OUTPUT = "text"
+      UNSUPPORTED_OUTPUT = "runner.reviewer.args must leave the reviewer in its direct text " \
+                           "output mode: remove #{OUTPUT_FORMAT_FLAG}, or state it exactly once " \
+                           "as '#{TEXT_OUTPUT}'"
+
       attr_reader :name, :provider, :command, :args, :timeout_seconds
 
       def self.from(config, env: ENV)
@@ -83,6 +98,7 @@ module SpecrelayRunner
       # accidentally omit.
       def argv(prompt)
         raise Error, "no reviewer provider is configured (set runner.reviewer.provider)" unless configured?
+        raise Error, UNSUPPORTED_OUTPUT if claude? && wrapped_output?
 
         [ resolved_command, *effective_args, prompt ]
       end
@@ -90,6 +106,30 @@ module SpecrelayRunner
       private
 
       attr_reader :env
+
+      # EVERY occurrence, in both spellings. Reading only the first one let `--output-format text
+      # --output-format json` pass while leaving the provider wrapped (review-001 F6).
+      #
+      # Exactly one selection, and it must be text. A repeated flag is refused even when its
+      # values agree: which occurrence the provider honours is the provider's business, and a
+      # configuration whose effective output mode has to be reasoned about is not the
+      # deterministic one this boundary exists to guarantee. A flag with no value reads as an
+      # empty selection and is refused by the same comparison.
+      def wrapped_output?
+        selections = output_format_selections
+        return false if selections.empty?
+
+        selections != [ TEXT_OUTPUT ]
+      end
+
+      def output_format_selections
+        args.each_with_index.filter_map do |arg, index|
+          flag, inline = arg.to_s.split("=", 2)
+          next unless flag == OUTPUT_FORMAT_FLAG
+
+          inline || args[index + 1].to_s
+        end
+      end
 
       def resolved_command
         return command if command
