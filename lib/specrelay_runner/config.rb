@@ -84,12 +84,16 @@ module SpecrelayRunner
     # so the announce line can say so. It is presentation metadata, deliberately not a
     # decision input: nothing in this class behaves differently because of it (MVP-0021).
     def self.from_connection(connection, credential:, selection_source: nil)
+      runner = { "id" => connection.runner_id, "display_name" => connection.runner_display_name,
+                 "claim_policy" => { "mode" => ALL_ELIGIBLE_MODE } }
+      # MAPIAI-91 — the reviewer the guided connection selected, restored into the ORDINARY
+      # `runner.reviewer:` shape so {Review::Settings} remains the single owner of provider
+      # precedence and launch defaults. The key is absent when nothing was selected: a machine
+      # that advertised no reviewer must not acquire one here by inference.
+      provider = connection.reviewer_provider.to_s.strip
+      runner["reviewer"] = { "provider" => provider } unless provider.empty?
       document = {
-        "platform" => { "base_url" => connection.base_url },
-        "runner" => {
-          "id" => connection.runner_id, "display_name" => connection.runner_display_name,
-          "claim_policy" => { "mode" => ALL_ELIGIBLE_MODE }
-        },
+        "platform" => { "base_url" => connection.base_url }, "runner" => runner,
         "workspace_roots" => { connection.workspace_key.to_s => connection.local_path }
       }
       new(document, source_path: nil, credential: credential, connection: connection,

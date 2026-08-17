@@ -31,23 +31,73 @@ module SpecrelayRunner
       def verify(assignment:, workspace_root:, git: Git)
         roots = {}
         assignment.repositories.each do |repository|
-          root = File.join(workspace_root, repository["repository_key"].to_s)
-          refusal = verify_repository(repository, root, git)
+          resolved = resolve(repository, workspace_root, git)
+          return resolved.refusal if resolved.refusal
+
+          refusal = verify_repository(repository, resolved.root, git)
           return refusal if refusal
 
-          roots[repository["repository_key"].to_s] = root
+          roots[repository["repository_key"].to_s] = resolved.root
         end
         Result.new(ok: true, roots: roots)
       end
 
-      def verify_repository(repository, root, git)
-        key = repository["repository_key"]
-        return refuse("no local checkout for '#{key}' at the expected workspace path") unless git.repository?(root)
+      Resolution = Struct.new(:root, :refusal, keyword_init: true)
 
+      # WHERE the reviewed repository is, chosen from exactly TWO anchored candidates: the
+      # configured workspace root itself, and its direct `repository_key` child (MAPIAI-91).
+      #
+      # Both shapes are real and neither is configuration trickery. A guided connection stores the
+      # validated CHECKOUT as its root, so on a single-repository machine the root IS the reviewed
+      # repository; in a project workspace the reviewed repositories are its direct children.
+      # Appending the key unconditionally produced a duplicated, nonexistent path and refused
+      # every review of the first shape (MAPIAI-82).
+      #
+      # Identity — not position, and never the directory's name — decides. Exactly one candidate
+      # may match the assignment's remote: zero is "not here", and two is genuinely ambiguous, so
+      # both refuse rather than pick. Nothing else is ever considered: no parent, no sibling, no
+      # grandchild, no registry, no search.
+      def resolve(repository, workspace_root, git)
+        key = repository["repository_key"].to_s
+        checkouts = candidates(workspace_root, key).select { |root| checkout?(root, git) }
         expected = identity(repository["clone_url"])
-        actual = identity(git.remote_url(root))
-        return refuse("'#{key}' points at a different remote than the reviewed repository") unless expected == actual && !expected.empty?
+        matching = checkouts.select { |root| !expected.empty? && identity(git.remote_url(root)) == expected }
 
+        return Resolution.new(refusal: refuse("no local checkout for '#{key}' at the connected " \
+                                              "workspace root or its '#{key}' directory")) if checkouts.empty?
+        return Resolution.new(refusal: refuse("'#{key}' points at a different remote than the " \
+                                              "reviewed repository")) if matching.empty?
+        return Resolution.new(refusal: refuse("both the connected workspace root and its '#{key}' " \
+                                              "directory are the reviewed repository; refusing an " \
+                                              "ambiguous checkout")) if matching.size > 1
+
+        Resolution.new(root: matching.first)
+      end
+
+      def candidates(workspace_root, key)
+        roots = [ workspace_root.to_s ]
+        roots << File.join(workspace_root.to_s, key) unless key.empty?
+        roots.uniq
+      end
+
+      # A candidate must be the TOP LEVEL of a repository, not merely inside one. `git rev-parse`
+      # answers for the nearest enclosing repository, so a plain subdirectory of a clone would
+      # otherwise present that clone's remote and pinned commit as its own — reviewing a parent
+      # this resolver is not allowed to consider.
+      def checkout?(root, git)
+        top = git.top_level(root)
+        !top.nil? && same_directory?(top, root)
+      end
+
+      # Compared through `realpath`, because git answers with the physical path while the
+      # configured root may reach it through a symlink.
+      def same_directory?(one, other)
+        File.realpath(one) == File.realpath(other)
+      rescue SystemCallError
+        false
+      end
+
+      def verify_repository(repository, root, git)
         head = repository["head_commit"].to_s
         moved = remote_refusal(repository, root, git, head)
         return moved if moved
@@ -118,6 +168,18 @@ module SpecrelayRunner
         def repository?(root)
           result = run(root, %w[rev-parse --git-dir])
           !result.nil? && result.exit_code.to_i.zero?
+        end
+
+        # The working tree's own root, or nil when this path is not in a repository at all. Asked
+        # of GIT for the same reason as `repository?`: in a worktree or a submodule the layout on
+        # disk does not reveal it. The caller compares it to the candidate path, which is what
+        # keeps a plain subdirectory of a clone from answering as that clone (MAPIAI-91).
+        def top_level(root)
+          result = run(root, %w[rev-parse --show-toplevel])
+          return nil if result.nil? || !result.exit_code.to_i.zero?
+
+          value = result.stdout.to_s.strip
+          value.empty? ? nil : value
         end
 
         REMOTE = "origin"

@@ -76,6 +76,115 @@ class ReviewFlowTest < Minitest::Test
     assert_includes result.message, "no local checkout"
   end
 
+  # --- resolving the reviewed repository (MAPIAI-91) ------------------------
+  #
+  # Exactly two locations are allowed: the configured workspace root itself, and its direct
+  # `repository_key` child. A guided connection stores the validated CHECKOUT as its root, so
+  # unconditionally appending the key produced a duplicated, nonexistent path and refused every
+  # review on a single-repository machine (MAPIAI-82).
+
+  def test_verifies_the_workspace_root_itself_when_it_is_the_reviewed_repository
+    @actual_head = build_repo_at(@root, remote: "https://github.com/SpecRelay/tiny-demo-workspace.git")
+
+    verified = verify(@root)
+
+    assert verified.ok?, verified.reason
+    assert_equal @root, verified.roots["specrelay-platform"]
+  end
+
+  def test_verifies_the_direct_child_and_reports_it_as_the_selected_root
+    build_repo
+
+    verified = verify(@root)
+
+    assert verified.ok?, verified.reason
+    assert_equal @repo, verified.roots["specrelay-platform"]
+  end
+
+  # A mixed assignment: each entry resolves independently, against its own remote, in assignment
+  # order — and neither entry decides anything for the other.
+  def test_a_root_and_a_child_repository_each_resolve_to_their_own_matching_remote
+    root_head = build_repo_at(@root, remote: "https://github.com/SpecRelay/tiny-demo-workspace.git")
+    build_repo(remote: "https://github.com/SpecRelay/specrelay-platform.git")
+    payload = review_payload
+    payload["repositories"] = [
+      repository_entry("tiny-demo-workspace", "https://github.com/SpecRelay/tiny-demo-workspace.git", root_head),
+      repository_entry("specrelay-platform", "https://github.com/SpecRelay/specrelay-platform.git", pinned_head)
+    ]
+
+    verified = SpecrelayRunner::Review::Checkout.verify(
+      assignment: SpecrelayRunner::Review::Assignment.new(payload), workspace_root: @root
+    )
+
+    assert verified.ok?, verified.reason
+    assert_equal [ "tiny-demo-workspace", "specrelay-platform" ], verified.roots.keys
+    assert_equal @root, verified.roots["tiny-demo-workspace"]
+    assert_equal @repo, verified.roots["specrelay-platform"]
+  end
+
+  # Both allowed locations are the reviewed repository. There is no defined precedence between
+  # them, so the only safe answer is to refuse rather than to pick one.
+  def test_refuses_when_both_allowed_locations_are_the_reviewed_repository
+    @actual_head = build_repo_at(@root, remote: "https://github.com/SpecRelay/tiny-demo-workspace.git")
+    build_repo_at(@repo, remote: "https://github.com/SpecRelay/tiny-demo-workspace.git")
+
+    result = verify(@root)
+
+    refute result.ok?
+    refute result.stale?
+    assert_includes result.reason, "ambiguous"
+  end
+
+  # `git rev-parse` walks UPWARD, so a plain subdirectory of a clone answers for that clone. A
+  # candidate must therefore be the repository's own top level: a matching repository in a parent
+  # — or in a grandchild, or a sibling — is not one of the two allowed locations.
+  def test_a_matching_repository_outside_the_two_allowed_locations_is_refused
+    @actual_head = build_repo_at(@root, remote: "https://github.com/SpecRelay/tiny-demo-workspace.git")
+    nested = File.join(@root, "nested")
+    FileUtils.mkdir_p(File.join(nested, "specrelay-platform", "inner"))
+
+    result = SpecrelayRunner::Review::Checkout.verify(
+      assignment: SpecrelayRunner::Review::Assignment.new(review_payload), workspace_root: nested
+    )
+
+    refute result.ok?
+    assert_includes result.reason, "no local checkout"
+  end
+
+  # Not merely "the right answer": the two allowed locations are the ONLY paths git is asked
+  # about, so no parent, sibling, grandchild or registry can influence the result.
+  def test_verification_inspects_only_the_workspace_root_and_its_direct_child
+    build_repo
+    recorder = RecordingGit.new
+
+    SpecrelayRunner::Review::Checkout.verify(
+      assignment: SpecrelayRunner::Review::Assignment.new(review_payload), workspace_root: @root,
+      git: recorder
+    )
+
+    assert_equal [ @root, @repo ].sort, recorder.roots.uniq.sort
+  end
+
+  # Records every path it is asked about and matches nothing, so the recorded set IS the set of
+  # locations the resolver considered.
+  class RecordingGit
+    attr_reader :roots
+
+    def initialize = @roots = []
+
+    def repository?(root) = record(root) && false
+    def top_level(root) = record(root) && nil
+    def remote_url(root) = record(root) && ""
+    def remote_head(root, _branch) = record(root) && nil
+    def commit?(root, _sha) = record(root) && false
+    def fetch(root) = record(root)
+
+    def record(root)
+      @roots << root
+      true
+    end
+  end
+
   # A refusal is REPORTED, not merely printed: Platform must record the failed attempt so the
   # run page can explain why no verdict exists. Since MAPIAI-78 it travels as an explicit
   # failure body rather than as an outcome-less review, so the reason that explains it survives.
@@ -272,6 +381,27 @@ class ReviewFlowTest < Minitest::Test
 
     refute result.success?
     assert_includes result.message, "no reviewer provider is configured"
+    refute_includes result.message, "connect"
+  end
+
+  # MAPIAI-91 — a connection stored before the reviewer selection existed carries no provider.
+  # Nothing may guess one from the executor, PATH, Platform profile or a default: review fails
+  # with ONE actionable remedy, reported as a retryable failure rather than a verdict.
+  def test_a_connected_machine_with_no_stored_reviewer_provider_is_told_to_reconnect
+    build_repo
+    config = SpecrelayRunner::Config.from_connection(connection_without_a_reviewer,
+                                                    credential: FakePlatform::ISSUED_CREDENTIAL)
+
+    result = SpecrelayRunner::Review::Execution.call(
+      config: config, client: client, payload: review_payload,
+      settings: SpecrelayRunner::Review::Settings.from(config, env: {}), env: workspace_env, io: @io
+    )
+
+    refute result.success?
+    assert_includes result.message, "no reviewer provider is configured"
+    assert_includes result.message, "specrelay-runner connect"
+    assert_equal "provider_execution_failure", @platform.last_review_failure["kind"]
+    assert_empty @platform.review_results
   end
 
   def test_the_public_identity_carries_no_command_or_path
@@ -313,18 +443,50 @@ class ReviewFlowTest < Minitest::Test
 
   # A real git repository with a real commit, so Checkout's `git cat-file` runs for real.
   def build_repo(remote: "https://github.com/SpecRelay/tiny-demo-workspace.git", head: nil)
-    FileUtils.mkdir_p(@repo)
-    git "init --quiet --initial-branch=main"
-    git "config user.email review@example.com"
-    git "config user.name Reviewer"
-    git "remote add origin #{remote}"
-    File.write(File.join(@repo, "README.md"), "demo\n")
-    git "add README.md"
-    git "-c commit.gpgsign=false commit --quiet -m first"
-    @actual_head = head || `git -C #{@repo} rev-parse HEAD`.strip
+    real = build_repo_at(@repo, remote: remote)
+    @actual_head = head || real
   end
 
-  def git(args) = system("git -C #{@repo} #{args}", out: File::NULL, err: File::NULL)
+  # The same real repository, at any path — the reviewed repository may be the workspace root
+  # itself, its direct child, or (for a refusal) somewhere neither of those covers.
+  def build_repo_at(path, remote:)
+    FileUtils.mkdir_p(path)
+    git_in path, "init --quiet --initial-branch=main"
+    git_in path, "config user.email review@example.com"
+    git_in path, "config user.name Reviewer"
+    git_in path, "remote add origin #{remote}"
+    File.write(File.join(path, "README.md"), "demo\n")
+    git_in path, "add README.md"
+    git_in path, "-c commit.gpgsign=false commit --quiet -m first"
+    `git -C #{path} rev-parse HEAD`.strip
+  end
+
+  def git_in(path, args) = system("git -C #{path} #{args}", out: File::NULL, err: File::NULL)
+
+  def verify(workspace_root)
+    SpecrelayRunner::Review::Checkout.verify(
+      assignment: SpecrelayRunner::Review::Assignment.new(review_payload), workspace_root: workspace_root
+    )
+  end
+
+  def repository_entry(key, clone_url, head)
+    { "repository_key" => key, "slug" => "SpecRelay/#{key}", "clone_url" => clone_url,
+      "base_commit" => BASE, "head_commit" => head,
+      "pull_request_url" => "https://github.com/SpecRelay/#{key}/pull/1" }
+  end
+
+  # A guided connection made before the reviewer selection was stored: complete in every other
+  # respect, and pointing at this test's workspace root.
+  def connection_without_a_reviewer
+    SpecrelayRunner::ConnectionStore::Connection.new(
+      base_url: @platform.base_url, runner_id: "review-runner", runner_public_id: "rnr_fake",
+      runner_display_name: "Review Machine", project_slug: "tiny-demo",
+      workspace_key: "tiny-demo-workspace", project_key: "tiny-demo",
+      workspace_display_name: "Tiny Demo Workspace",
+      repository_url: "https://github.com/SpecRelay/tiny-demo-workspace", default_branch: "main",
+      local_path: @root, connected_at: "2026-08-01T00:00:00Z"
+    )
+  end
 
   def review_payload
     {

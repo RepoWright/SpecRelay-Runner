@@ -87,7 +87,9 @@ the operator nothing and the same code still works:
 7. store the durable credential in the **macOS Keychain** — skipped entirely when
    Platform replied `credential_unchanged`, because there is nothing new to store;
 8. write non-secret connection facts to `~/.specrelay/runner/connections.json`
-   (mode `0600`, and you never need to edit it);
+   (mode `0600`, and you never need to edit it) — including the **reviewer provider
+   identifier** this machine selected, when it advertised a reviewer at all, so review
+   later runs with the same provider it reported ready;
 9. report a bounded readiness result and print the state **Platform** decided.
 
 Exit `0` when Platform records this machine ready, `1` otherwise, `2` on a
@@ -154,9 +156,10 @@ bin/specrelay-runner claim-once                    # exactly one claim, then exi
 bin/specrelay-runner claim-once --workspace <key>
 ```
 
-Neither needs a config file, an exported credential, or a workspace-root
-environment variable: the credential is read from the Keychain and the workspace
-root is the checkout you validated.
+Neither needs a config file, an exported credential, a workspace-root environment
+variable, or a reviewer-provider environment variable: the credential is read from
+the Keychain, the workspace root is the checkout you validated, and the reviewer
+provider is the one recorded when you connected.
 
 Which connection an argument-free invocation uses, and why, is resolved in this
 order (MVP-0021): `--workspace`, then this machine's **explicit default**, then the
@@ -171,6 +174,35 @@ Source:   connected workspace tiny-demo-workspace (your explicit default workspa
 it, and uploads the report. Exit `0` on completion, no eligible work, or a generated
 specification package (below), `1` on a failed execution or a refused generation,
 `2` on a config/usage error.
+
+### Claiming an automated review (MVP-0033, MAPIAI-91)
+
+A claimed **review** runs on the same connected machine through the same commands, with
+no per-invocation configuration:
+
+- **The provider comes from the connection.** `connect` resolves the reviewer once, reports
+  that identity to Platform, and stores the provider identifier locally. `claim-once` rebuilds
+  `runner.reviewer.provider` from that record, so no `SPECRELAY_RUNNER_REVIEWER_PROVIDER` is
+  needed. Only the identifier is stored — never a command, argument list, timeout, environment
+  map, or account: the supported provider resolves its own executable, which is exactly why the
+  identifier is enough. (The deterministic development fixture has no default executable and still
+  takes `SPECRELAY_RUNNER_REVIEWER_COMMAND`.)
+- **The reviewed repository is resolved from exactly two places:** the connected workspace root
+  itself, or its direct `<repository_key>` child. Exactly one of them must be a Git repository *at
+  its own top level* whose `origin` matches the assignment's clone URL by identity
+  (`host/owner/repo`). Both shapes are normal: a single-repository machine connects the
+  repository itself, while a project workspace holds its repositories as direct children.
+- **Nothing else is ever inspected** — no parent, sibling, grandchild, registry, or search — and
+  a directory's name is never taken as repository identity.
+- **It fails closed.** No match, more than one match, a different remote, a missing pinned
+  commit, or an unreadable remote head all refuse *before* a reviewer is launched, and are
+  reported to Platform as a retryable failed attempt rather than a verdict. A head that moved on
+  the remote is reported as a stale target instead, both before the reviewer starts and again
+  immediately before any verdict is submitted.
+- **A connection made before MAPIAI-91 holds no reviewer selection.** It stays fully usable for
+  implementation and specification work; a review claim fails with one remedy — run `connect`
+  again for that workspace — and is never satisfied by guessing from the executor, `PATH`, the
+  Platform profile, or a default.
 
 ### Two lanes, and one of them writes files (MVP-0026, MVP-0027)
 

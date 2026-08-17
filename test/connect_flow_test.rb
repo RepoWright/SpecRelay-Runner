@@ -567,4 +567,116 @@ class ConnectFlowTest < Minitest::Test
 
     assert_equal "src_from-keychain", auth.token
   end
+
+  # --- the connection is enough to REVIEW (MAPIAI-91) ------------------------
+
+  # The MAPIAI-82 defect, reproduced: `connect` advertised a ready reviewer to Platform and then
+  # stored a record that said nothing about which provider that was, so the next `claim-once`
+  # reported no reviewer provider on a machine Platform had just been told could review.
+  def test_the_reviewer_provider_reported_as_ready_is_the_one_the_connection_stores
+    platform = start_platform
+    connect(code: platform.enrollment_code, checkout: git_checkout, env: reviewer_env)
+
+    report = platform.last_readiness_report.fetch(:body).fetch("report")
+
+    assert_equal "ready", report.fetch("reviewer_readiness")
+    assert_equal "fake", report.dig("reviewer_profile", "provider")
+    stored = store.connection_for("tiny-demo-workspace")
+
+    assert_equal "fake", stored.reviewer_provider
+    config = SpecrelayRunner::Config.from_connection(stored, credential: FakePlatform::ISSUED_CREDENTIAL)
+
+    assert_equal "fake", SpecrelayRunner::Review::Settings.from(config, env: {}).provider
+  end
+
+  # A machine that advertised no reviewer stores no selection. Nothing may be invented for it
+  # later, and its executor connection is unaffected.
+  def test_a_connection_that_advertised_no_reviewer_stores_no_selection
+    platform = start_platform
+    connect(code: platform.enrollment_code, checkout: git_checkout)
+
+    assert_equal "not_configured",
+                 platform.last_readiness_report.fetch(:body).fetch("report").fetch("reviewer_readiness")
+    assert_nil store.connection_for("tiny-demo-workspace").reviewer_provider
+  end
+
+  # The whole point of the ticket: after ONE guided connection, the ordinary claim command
+  # completes a review of the connected checkout itself with no reviewer-provider and no
+  # workspace-root environment override. The live MAPIAI-82 run needed both.
+  def test_claim_once_completes_a_review_of_the_connected_checkout_without_any_override
+    platform = start_platform
+    checkout = git_checkout
+    secret_store = FakeSecretStore.new
+    connect(code: platform.enrollment_code, checkout: checkout, secret_store: secret_store,
+            env: reviewer_env)
+    platform.claim_payload = review_claim_payload(checkout)
+    platform.offer_again!
+    out = StringIO.new
+
+    status = SpecrelayRunner::CLI.new(out: out, err: StringIO.new, env: claim_env(checkout),
+                                     secret_store: secret_store)
+                                 .run([ "claim-once", "--workspace", "tiny-demo-workspace" ])
+
+    assert_equal 0, status, out.string
+    assert_equal "ACCEPT", platform.last_review["outcome"]
+  end
+
+  private
+
+  # The guided connection's own environment: the operator's selection travels here, and only
+  # here. Every claim assertion above runs against `claim_env`, which carries neither.
+  def reviewer_env
+    { "PATH" => ENV["PATH"].to_s, SpecrelayRunner::Review::Settings::PROVIDER_ENV => "fake" }
+  end
+
+  # The claiming environment, asserted to contain NO provider and NO workspace-root override. The
+  # reviewer COMMAND is present because the deterministic stand-in has no default executable; the
+  # supported provider resolves its own, which is why only the provider is ever persisted.
+  def claim_env(checkout)
+    env = { "SPECRELAY_RUNNER_STATE_FILE" => @state_file, "PATH" => ENV["PATH"].to_s,
+            "HOME" => checkout,
+            SpecrelayRunner::Review::Settings::COMMAND_ENV => reviewer_script(checkout) }
+    refute env.key?(SpecrelayRunner::Review::Settings::PROVIDER_ENV)
+    refute env.keys.any? { |key| key.start_with?(SpecrelayRunner::Config::WORKSPACE_ROOT_ENV) }
+    env
+  end
+
+  # A real executable that prints one supported outcome and exits, so the runner's argv, timeout
+  # and capture behaviour are exercised by a real child process.
+  def reviewer_script(directory)
+    path = File.join(Dir.mktmpdir("reviewer"), "reviewer.rb")
+    File.write(path, <<~RUBY)
+      #!/usr/bin/env ruby
+      print '{"outcome":"ACCEPT","summary":"Read the pinned diff in #{File.basename(directory)}."}'
+    RUBY
+    FileUtils.chmod(0o755, path)
+    path
+  end
+
+  # A REVIEW assignment for the connected checkout itself — the single-repository shape a guided
+  # connection produces, where the workspace root IS the reviewed repository.
+  def review_claim_payload(checkout)
+    head = `git -C #{checkout} rev-parse HEAD`.strip
+    { "contract_version" => "mvp-0033", "assignment_type" => "review",
+      "claim" => { "runner_execution_id" => "rex_review123" },
+      # `rvt_fake` is the attempt identity the fake Platform answers with, and the client checks
+      # the answer against the attempt it sent.
+      "review" => { "attempt_id" => "rvt_fake", "attempt_ordinal" => 1,
+                    "input_manifest_digest" => "digest" },
+      "ticket" => { "external_id" => "DEMO-0091", "task_id" => "DEMO-0091" },
+      "workspace" => { "key" => "tiny-demo-workspace" },
+      "specification" => { "digest" => "specdigest", "documents" => [
+        { "role" => "approved_specification_source", "digest" => "abc123", "byte_size" => 10,
+          "content" => "# Approved" }
+      ] },
+      "implementation" => { "run_url" => "#{@platform.base_url}/runs/run_review123" },
+      "repositories" => [ { "repository_key" => "tiny-demo-workspace",
+                            "slug" => "SpecRelay/tiny-demo-workspace",
+                            "clone_url" => "https://github.com/SpecRelay/tiny-demo-workspace",
+                            "base_commit" => "1" * 40, "head_commit" => head,
+                            "pull_request_url" => "https://github.com/SpecRelay/tiny-demo-workspace/pull/1" } ],
+      "execution_evidence" => { "executor_summary" => "Did the work.", "files" => [] },
+      "execution_policy" => { "attempt_timeout_seconds" => 30, "lease_renewal_seconds" => 0 },
+      "result_contract" => { "outcomes" => %w[ACCEPT CHANGES_REQUESTED NEEDS_INPUT] } }
+  end
 end
