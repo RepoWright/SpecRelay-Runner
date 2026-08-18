@@ -90,6 +90,10 @@ module SpecrelayRunner
       workspace = assignment.fetch("workspace")
       checkout = validated_checkout!(workspace)
       readiness = executor_readiness(assignment.fetch("executor", {}))
+      # Resolved ONCE, before anything is stored or reported (MAPIAI-91). Deriving it separately
+      # for the readiness report and for later local execution is what let this machine advertise
+      # a reviewer it could not then launch.
+      reviewer = reviewer_settings(readiness)
 
       # What this machine already holds decides both whether a write will be needed and what
       # the exchange presents, so it is resolved before anything is consumed.
@@ -98,8 +102,8 @@ module SpecrelayRunner
 
       # Only now is anything consumed or changed.
       enrolled = exchange(origin, held)
-      persist(secret_store, enrolled, workspace, checkout)
-      report(enrolled, workspace, checkout, readiness)
+      persist(secret_store, enrolled, workspace, checkout, reviewer)
+      report(enrolled, workspace, checkout, readiness, reviewer)
     end
 
     private
@@ -293,7 +297,7 @@ module SpecrelayRunner
     # recoverable runner; local state pointing at a credential that was never stored would
     # not authenticate. A reconnect that kept its existing credential writes nothing to the
     # secret store, so it cannot fail on a Keychain prompt it does not need.
-    def persist(secret_store, assignment, workspace, checkout)
+    def persist(secret_store, assignment, workspace, checkout, reviewer)
       unless @credential_unchanged
         secret_store.write(account: SecretStore.account_for_runner(runner_public_id!(assignment)),
                            credential: @credential)
@@ -308,7 +312,11 @@ module SpecrelayRunner
                    workspace_display_name: workspace["display_name"],
                    repository_url: workspace.fetch("repository_url"),
                    default_branch: workspace.fetch("default_branch"),
-                   local_path: checkout.fetch(:path), connected_at: Time.now.utc.iso8601
+                   local_path: checkout.fetch(:path),
+                   # MAPIAI-91 — the provider identifier only, and only when a reviewer was really
+                   # advertised. Non-secret, and the least that reconstructs the same reviewer.
+                   reviewer_provider: (reviewer.provider if reviewer&.configured?),
+                   connected_at: Time.now.utc.iso8601
                  ))
       out.puts "Credential:         #{credential_line}"
     end
@@ -324,7 +332,7 @@ module SpecrelayRunner
     # Report facts, not a verdict. Platform re-checks the repository identity against its
     # own workspace definition and decides the state; the runner renders whatever came
     # back. Note the payload: no local path, no credential, no provider account.
-    def report(assignment, workspace, checkout, readiness)
+    def report(assignment, workspace, checkout, readiness, reviewer)
       response = client(@base_url, @credential).report_workspace_readiness(
         workspace_key: workspace.fetch("workspace_key"),
         report: {
@@ -334,7 +342,7 @@ module SpecrelayRunner
           executor_provider: readiness[:provider],
           executor_readiness: readiness[:classification],
           detail: readiness[:detail],
-          **reviewer_report(readiness)
+          **reviewer_report(reviewer)
         }
       )
       build_result(assignment, response)
@@ -349,12 +357,11 @@ module SpecrelayRunner
     # A machine with no `runner.reviewer:` block reports `not_configured` and nothing else.
     # That leaves review waiting for another machine and does not affect this one's executor
     # readiness in any way (S12).
-    def reviewer_report(readiness)
-      settings = reviewer_settings(readiness)
-      return { reviewer_readiness: NO_REVIEWER } unless settings&.configured?
+    def reviewer_report(reviewer)
+      return { reviewer_readiness: NO_REVIEWER } unless reviewer&.configured?
 
       { reviewer_readiness: READY,
-        reviewer_profile: settings.public_identity(version: SpecrelayRunner::VERSION) }
+        reviewer_profile: reviewer.public_identity(version: SpecrelayRunner::VERSION) }
     end
 
     # The guided path writes no YAML, so the reviewer is resolved the way the specification

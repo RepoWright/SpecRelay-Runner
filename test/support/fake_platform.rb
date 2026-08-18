@@ -50,6 +50,11 @@ class FakePlatform
   # strict validation refusing a submission the runner considered fine.
   attr_accessor :review_response
 
+  # Replace the whole scripted assignment, so one fake can serve a guided connection and then
+  # offer a claim of a DIFFERENT lane — the enrollment assignment and a review packet are
+  # different documents, and a machine only ever sees them in that order.
+  attr_writer :claim_payload
+
   # Lets a test model a SECOND workspace on the same Platform and the same machine, which is the
   # shape that used to orphan the first workspace's stored credential (review-002, F3 residual).
   def claim_payload_workspace_key=(key)

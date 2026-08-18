@@ -25,6 +25,12 @@ module SpecrelayRunner
       PROVIDER_EXECUTION_FAILURE = "provider_execution_failure"
       INVALID_REVIEWER_RESULT = "invalid_reviewer_result"
       NO_CONTRACT = "Platform sent no supported review outcomes, so no result could be checked"
+      NO_REVIEWER = "no reviewer provider is configured on this machine"
+      # The ONE remedy for a guided connection made before its reviewer selection was stored
+      # (MAPIAI-91). Reconnecting is the only supported way to record that selection; nothing here
+      # may infer it from the executor, PATH, the Platform profile, or a default.
+      RECONNECT_REMEDY = "reconnect this workspace with `specrelay-runner connect <enrollment-code>` " \
+                         "to store its reviewer selection"
 
       Result = Struct.new(:outcome, :message, keyword_init: true) do
         def success? = outcome == :submitted
@@ -47,7 +53,7 @@ module SpecrelayRunner
       end
 
       def call
-        return failure(PROVIDER_EXECUTION_FAILURE, "no reviewer provider is configured on this machine") unless settings.configured?
+        return failure(PROVIDER_EXECUTION_FAILURE, no_reviewer_reason) unless settings.configured?
         return failure(PROVIDER_EXECUTION_FAILURE, NO_CONTRACT) if assignment.supported_outcomes.empty?
 
         workspace_root = config.workspace_root(assignment.workspace_key, env: env)
@@ -66,6 +72,14 @@ module SpecrelayRunner
       private
 
       attr_reader :assignment, :config, :client, :settings, :env, :io, :runner
+
+      # A YAML-configured machine is left to its own `runner.reviewer:` block; a machine connected
+      # through guided setup is told to reconnect, because that is where its reviewer selection
+      # lives. Either way the attempt is reported as a retryable failure, never as a verdict, and
+      # neither message claims the setup is complete.
+      def no_reviewer_reason
+        config.connection.nil? ? NO_REVIEWER : "#{NO_REVIEWER}; #{RECONNECT_REMEDY}"
+      end
 
       def review(workspace_root)
         log "Reviewing #{assignment.ticket_id} at the pinned head (attempt #{assignment.attempt_ordinal})"

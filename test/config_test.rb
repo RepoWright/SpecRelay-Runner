@@ -158,6 +158,41 @@ class ConfigTest < Minitest::Test
     assert_equal 900, config.executor_override["timeout_seconds"]
   end
 
+  # --- reconstructing a guided connection (MAPIAI-91) ------------------------
+
+  def stored_connection(reviewer_provider: nil)
+    SpecrelayRunner::ConnectionStore::Connection.new(
+      base_url: "http://127.0.0.1:3100", runner_id: "host-runner", runner_public_id: "rnr_one",
+      runner_display_name: "host runner", project_slug: "tiny-demo",
+      workspace_key: "tiny-demo-workspace", project_key: "tiny-demo",
+      workspace_display_name: "Tiny Demo Workspace",
+      repository_url: "https://github.com/SpecRelay/tiny-demo-workspace", default_branch: "main",
+      local_path: Dir.mktmpdir("ws"), reviewer_provider: reviewer_provider,
+      connected_at: "2026-08-17T00:00:00Z"
+    )
+  end
+
+  # The stored selection is reconstructed into the EXISTING `runner.reviewer:` shape, so
+  # {Review::Settings} stays the single owner of provider precedence and launch defaults.
+  def test_a_guided_connection_reconstructs_the_stored_reviewer_provider
+    config = SpecrelayRunner::Config.from_connection(stored_connection(reviewer_provider: "claude"),
+                                                    credential: "src_from-keychain")
+
+    assert_equal({ "provider" => "claude" }, config.reviewer_settings)
+    assert_equal "claude", SpecrelayRunner::Review::Settings.from(config, env: {}).provider
+  end
+
+  # No stored selection means NO reviewer — never one inferred from the executor, PATH, or a
+  # default. The connection stays completely usable for non-review work.
+  def test_a_connection_without_a_stored_reviewer_provider_configures_no_reviewer
+    config = SpecrelayRunner::Config.from_connection(stored_connection, credential: "src_from-keychain")
+
+    assert_empty config.reviewer_settings
+    refute SpecrelayRunner::Review::Settings.from(config, env: {}).configured?
+    assert_equal :registered, config.resolve_auth(env: {}).mode
+    assert_equal config.connection.local_path, config.workspace_root("tiny-demo-workspace", env: {})
+  end
+
   # A selected profile the runner refuses to launch is an operator config error,
   # surfaced by the CLI before any Platform request.
   def test_an_unsafe_claude_override_raises

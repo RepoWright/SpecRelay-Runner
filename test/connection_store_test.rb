@@ -25,13 +25,15 @@ class ConnectionStoreTest < Minitest::Test
 
   def store = SpecrelayRunner::ConnectionStore.new(@path)
 
-  def connection(workspace_key:, runner_public_id: "rnr_one", connected_at: "2026-07-20T10:00:00Z")
+  def connection(workspace_key:, runner_public_id: "rnr_one", connected_at: "2026-07-20T10:00:00Z",
+                 reviewer_provider: nil)
     SpecrelayRunner::ConnectionStore::Connection.new(
       base_url: "http://127.0.0.1:3100", runner_id: "host-runner", runner_public_id: runner_public_id,
       runner_display_name: "host runner", project_slug: "tiny-demo", workspace_key: workspace_key,
       project_key: "tiny-demo", workspace_display_name: "Tiny Demo Workspace",
       repository_url: "https://github.com/SpecRelay/tiny-demo-workspace", default_branch: "main",
-      local_path: "/Users/someone/dev/tiny-demo-workspace", connected_at: connected_at
+      local_path: "/Users/someone/dev/tiny-demo-workspace", reviewer_provider: reviewer_provider,
+      connected_at: connected_at
     )
   end
 
@@ -238,6 +240,43 @@ class ConnectionStoreTest < Minitest::Test
 
     assert store.connection_for("whole").complete?
     assert_empty store.connection_for("whole").missing_fields
+  end
+
+  # --- the stored reviewer selection (MAPIAI-91) -----------------------------
+
+  # The reviewer provider a guided connection selected is a durable NON-SECRET fact, stored so a
+  # later claim can reconstruct it. Only the identifier is stored: how the provider is launched
+  # stays on this machine and out of this file.
+  def test_a_selected_reviewer_provider_round_trips_and_carries_no_launch_configuration
+    store.save(connection(workspace_key: "reviewing", reviewer_provider: "claude"))
+
+    assert_equal "claude", store.connection_for("reviewing").reviewer_provider
+    entry = document["connections"].first
+
+    assert_equal "claude", entry["reviewer_provider"]
+    refute_match(/command|args|timeout|env|credential|account|prompt/i, JSON.generate(entry))
+  end
+
+  # A connection made before the selection was stored — and one made on a machine that reviews
+  # nothing — must report the absence rather than a substituted value. Nothing downstream may
+  # guess from it.
+  def test_a_connection_with_no_selected_reviewer_provider_reports_none_and_stays_complete
+    store.save(connection(workspace_key: "executing"))
+
+    found = store.connection_for("executing")
+
+    assert_nil found.reviewer_provider
+    assert found.complete?
+  end
+
+  def test_a_document_written_before_the_reviewer_selection_existed_still_loads
+    write_raw("version" => 2,
+              "connections" => [ connection(workspace_key: "older").to_h_document.tap { |e| e.delete("reviewer_provider") } ])
+
+    found = store.connection_for("older")
+
+    assert_equal "older", found.workspace_key
+    assert_nil found.reviewer_provider
   end
 
   # --- write posture --------------------------------------------------------

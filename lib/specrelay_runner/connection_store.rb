@@ -49,10 +49,17 @@ module SpecrelayRunner
                                     repository_url default_branch local_path].freeze
 
     # One connected workspace. `workspace_key` is the identity every other lookup uses.
+    #
+    # MAPIAI-91 added `reviewer_provider`: the supported provider identifier the guided connection
+    # selected for the REVIEWER role, so `Config.from_connection` can reconstruct the same
+    # reviewer the machine advertised as ready. It is one more OPTIONAL non-secret key, exactly
+    # like `default_workspace_key`, and it is deliberately the only reviewer fact stored — the
+    # command, arguments, timeout and environment stay out of this file entirely. A record without
+    # it is complete: absence means this machine reviews nothing, and nothing may guess otherwise.
     Connection = Struct.new(
       :base_url, :runner_id, :runner_public_id, :runner_display_name,
       :project_slug, :workspace_key, :project_key, :workspace_display_name,
-      :repository_url, :default_branch, :local_path, :connected_at,
+      :repository_url, :default_branch, :local_path, :reviewer_provider, :connected_at,
       keyword_init: true
     ) do
       def to_h_document = to_h.transform_keys(&:to_s)
