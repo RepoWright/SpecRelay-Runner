@@ -14,7 +14,11 @@ require_relative "test_helper"
 # redaction in publication output.
 class PublicationFlowTest < Minitest::Test
   TASK = "MAPIAI-901"
-  BRANCH = "specrelay/#{TASK}"
+  # MAPIAI-84 — the publication branch IS the run's canonical branch. One task branch exists in
+  # every repository of the prepared task workspace, so a separately patterned branch would name
+  # something no repository is on.
+  BRANCH = TASK
+  SLUG = "SpecRelay/tiny-demo-workspace"
 
   def setup
     @root, @executor = DemoWorkspace.build
@@ -78,7 +82,8 @@ class PublicationFlowTest < Minitest::Test
 
     repo = repository_result
     assert repo["changed"], "the executor changed the repository"
-    assert_equal BRANCH, repo["branch"], "the runner must publish the Platform-assigned branch"
+    assert_equal SLUG, repo["id"], "a repository is identified by its own normalized remote"
+    assert_equal BRANCH, repo["branch"], "the runner publishes the canonical task branch"
     assert_match(/\A[0-9a-f]{40,64}\z/, repo["base_commit"])
     assert_match(/\A[0-9a-f]{40,64}\z/, repo["head_commit"])
     refute_equal repo["base_commit"], repo["head_commit"], "publication must create a real commit"
@@ -142,19 +147,20 @@ class PublicationFlowTest < Minitest::Test
     assert_equal [ BRANCH ], FakeGithub.remote_branches(@bare).keys
   end
 
-  # Re-run publication against the worktree the first attempt left behind, with the
-  # same observed changes the first publication saw.
+  # Re-run publication against the worktree the first attempt left behind, with the same
+  # verified repository the first publication saw.
   def republish(first, gh_dir: @gh_dir)
-    worktree = File.join(@root, ".runs", "worktrees", TASK)
-    changes = SpecrelayRunner::Workspace::Changes.new(
-      changed_files: [ "demo-app/index.html" ], diff: "", head_commit: first["head_commit"]
+    repository = SpecrelayRunner::Workspace::Repository.new(
+      id: SLUG, relative_path: ".", path: File.join(@root, ".runs", "worktrees", TASK),
+      clone_url: "https://github.com/#{SLUG}.git", default_branch: "main", branch: BRANCH,
+      base_commit: first["base_commit"], head_commit: first["head_commit"],
+      changed_files: [ "demo-app/index.html" ], diff: ""
     )
     SpecrelayRunner::Publication.new(
       payload: claim_payload_for(task_id: TASK, executor_command: @executor, publication: {}),
-      worktree_path: worktree, changes: changes, base_commit: first["base_commit"],
-      test: { command: "./bin/test", exit_code: 0 },
+      repository: repository, test: { command: "./bin/test", exit_code: 0 },
       env: { "PATH" => "#{gh_dir}:#{ENV['PATH']}", "HOME" => ENV["HOME"].to_s }, io: StringIO.new
-    ).call.first
+    ).call
   end
 
   # --- unchanged and read-only --------------------------------------------
@@ -168,12 +174,10 @@ class PublicationFlowTest < Minitest::Test
     code, output = run_cli
     assert_equal SpecrelayRunner::CLI::SUCCESS, code, output
 
-    repo = repository_result
-    refute repo["changed"], "nothing changed, so changed must be false"
-    assert_nil repo["head_commit"], "an unchanged repository must not claim a head commit"
-    assert_nil repo["branch"]
-    assert_nil repo["pull_request_url"]
-    assert_nil repo["publication_error"]
+    # MAPIAI-84 — the result carries only repositories with a current implementation pull
+    # request, so an unchanged repository is ABSENT rather than reported as `changed: false`.
+    assert_empty @platform.last_terminal_result["repositories"],
+                 "nothing changed, so no repository row may be fabricated"
     assert_empty FakeGithub.remote_branches(@bare), "no branch may be pushed for an unchanged repository"
     assert_equal 0, FakeGithub.pr_creates(@gh_log)
     refute_includes event_types, "publication.started", "publication is not attempted with no changes"
@@ -531,7 +535,7 @@ class PublicationFlowTest < Minitest::Test
 
   def predicate_publication(repo)
     SpecrelayRunner::Publication.new(
-      payload: {}, worktree_path: repo, changes: nil, base_commit: nil, test: {},
+      payload: {}, repository: SpecrelayRunner::Workspace::Repository.new(path: repo), test: {},
       env: { "PATH" => ENV["PATH"].to_s, "HOME" => ENV["HOME"].to_s }, io: StringIO.new
     )
   end
@@ -568,24 +572,45 @@ class PublicationFlowTest < Minitest::Test
     assert_equal 0, FakeGithub.pr_creates(gh_log)
   end
 
-  # CR-001 criterion 6. The runner keeps its own half of "never push the default
-  # branch", independent of Platform's branch policy.
-  def test_runner_refuses_an_assignment_targeting_the_default_branch
-    start(publication: { branch: "main" })
+  # CR-001 criterion 6, under MAPIAI-84. The runner still keeps its own half of "never push the
+  # default branch", but it now establishes the default branch from the REPOSITORY rather than
+  # from an assignment entry — so the refusal moved earlier, into local verification, and happens
+  # before any external write at all. The repository whose default branch IS the canonical task
+  # branch is the case that must never publish.
+  def test_runner_refuses_to_publish_a_repository_whose_default_branch_is_the_task_branch
+    FileUtils.rm_rf(@root)
+    @root, @executor = DemoWorkspace.build
+    @bare = FakeGithub.add_remote(@root, default_branch: TASK)
+    start
     run_cli
 
     terminal = @platform.last_terminal_result
     assert_equal "failed", terminal["outcome"]
-    assert_equal "publication_failed", terminal.dig("core", "error_classification")
-
-    repo = repository_result
-    assert_nil repo["branch"], "the default branch must never be reported as published"
-    assert_match(/default branch/, repo["publication_error"])
-    assert_empty FakeGithub.remote_branches(@bare), "nothing may be pushed, least of all main"
+    assert_empty terminal["repositories"], "a refused selection persists no partial repository set"
+    assert_empty FakeGithub.remote_branches(@bare), "nothing may be pushed, least of all the base"
     assert_equal 0, FakeGithub.pr_creates(@gh_log)
-    # CR-001 criterion 4: the phase that failed must be visible on the timeline.
-    assert_includes event_types, "publication.started"
-    assert_includes event_types, "publication.completed"
+    refute_includes event_types, "publication.started",
+                    "verification refuses before the publication phase begins"
+  end
+
+  # The runner-side guard itself, at its own boundary: even if verification were bypassed,
+  # Publication must still refuse to push a repository's default branch (review-001 finding 4).
+  def test_publication_refuses_the_default_branch_at_its_own_boundary
+    repository = SpecrelayRunner::Workspace::Repository.new(
+      id: SLUG, path: @root, clone_url: "https://github.com/#{SLUG}.git",
+      default_branch: BRANCH, branch: BRANCH, base_commit: "a" * 40,
+      changed_files: [ "demo-app/index.html" ], diff: ""
+    )
+    publication = SpecrelayRunner::Publication.new(
+      payload: claim_payload_for(task_id: TASK, executor_command: "/bin/true", publication: {}),
+      repository: repository, test: {},
+      env: { "PATH" => "#{@gh_dir}:#{ENV['PATH']}", "HOME" => ENV["HOME"].to_s }, io: StringIO.new
+    )
+
+    result = publication.call
+    assert_nil result.branch
+    assert_match(/default branch/, result.publication_error)
+    assert_equal 0, FakeGithub.pr_creates(@gh_log)
   end
 
   # --- publication failure -------------------------------------------------
@@ -702,7 +727,7 @@ class PublicationFlowTest < Minitest::Test
       exit_code: nil, stdout: "", stderr: "", duration_seconds: 300.0, timed_out: true
     )
     publication = SpecrelayRunner::Publication.new(
-      payload: {}, worktree_path: @root, changes: nil, base_commit: nil, test: {}
+      payload: {}, repository: SpecrelayRunner::Workspace::Repository.new(path: @root), test: {}
     )
 
     reason = publication.send(:push_error, timed_out)
@@ -733,22 +758,26 @@ class PublicationFlowTest < Minitest::Test
                  "an unmeasurable worktree must fail the run, not pass as unchanged"
     assert_equal "worktree_unmeasurable", terminal.dig("core", "error_classification")
 
-    repo = repository_result
-    refute repo["branch"], "nothing may be published when the diff is unknown"
-    assert_match(/change detection failed/, repo["publication_error"].to_s,
-                 "changed: false must never be presented as a clean fact here")
-    # review-003 finding 2 (reporting this as unknown rather than false) is NOT done:
-    # Platform's envelope validator requires a boolean. What must hold is that the false
-    # is never readable as a clean fact, so the reason is asserted above and the head
-    # commit is absent.
-    refute repo["changed"]
-    assert_nil repo["head_commit"]
+    # MAPIAI-84 closes review-003 finding 2 by removal rather than by a nullable field: an
+    # unmeasurable attempt now reports NO repository rows at all, so there is no `changed: false`
+    # left to be misread as a clean fact. The cause travels in the error classification above and
+    # in the report's failure narrative.
+    assert_empty terminal["repositories"],
+                 "with the diff unknown there is no repository fact this attempt can assert"
+    assert_match(/could not determine what the executor changed/, failure_narrative)
     assert_empty FakeGithub.remote_branches(@bare)
     assert_equal 0, FakeGithub.pr_creates(@gh_log)
 
     # The executor's change really was made — this is exactly the false-success setup.
     worktree = File.join(@root, ".runs", "worktrees", TASK)
     assert_match(/Hello SpecRelay Demo/, File.read(File.join(worktree, "demo-app", "index.html")))
+  end
+
+  # The operator-facing failure narrative, read from the uploaded report rather than reconstructed.
+  def failure_narrative
+    report = @platform.last_report[:body].fetch("report")
+    file = report["files"].find { |f| f["relative_path"] == "manifest.yml" }
+    YAML.safe_load(Base64.strict_decode64(file["content_base64"])).to_s
   end
 
   # Raise Errno::EMFILE once, on the first CommandRunner spawn after the executor has

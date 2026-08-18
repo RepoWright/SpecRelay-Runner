@@ -11,7 +11,9 @@ require_relative "test_helper"
 # a deleted branch, an unreadable remote, a foreign origin, a dirty worktree — never by a stub.
 class ReworkFlowTest < Minitest::Test
   TASK = "MAPIAI-902"
-  BRANCH = "specrelay/#{TASK}"
+  # MAPIAI-84 — the publication branch is the run's canonical branch, so the reviewed round's
+  # branch is that one too.
+  BRANCH = TASK
   PR_URL = "https://github.com/SpecRelay/tiny-demo-workspace/pull/9"
   # The ssh form of the https `clone_url` the assignment carries, so the identity check is
   # proven against the two remote spellings of one repository rather than one literal string.
@@ -49,9 +51,9 @@ class ReworkFlowTest < Minitest::Test
     git(clone, "rev-parse", "HEAD").strip
   end
 
-  def start(rework: nil, restart: nil, executor_command: nil, seed: nil, gh_mode: "ok", publication_branch: BRANCH)
+  def start(rework: nil, restart: nil, executor_command: nil, seed: nil, gh_mode: "ok")
     payload = claim_payload_for(task_id: TASK, executor_command: executor_command || recording_executor,
-                                publication: { branch: publication_branch }, rework: rework, restart: restart)
+                                publication: {}, rework: rework, restart: restart)
     @platform = FakePlatform.new(claim_payload: payload).start
     @gh_dir, @gh_log, = FakeGithub.gh_bin(mode: gh_mode, pull_request_url: PR_URL, bare: @bare,
                                           seed: seed || [ { "url" => PR_URL, "state" => "OPEN",
@@ -61,7 +63,7 @@ class ReworkFlowTest < Minitest::Test
 
   # The reviewed target Platform pins, with only the fields under test overridden.
   def reviewed_repository(**overrides)
-    { "repository_key" => "tiny-demo-workspace", "branch" => BRANCH,
+    { "repository_key" => "tiny-demo-workspace", "clone_url" => ORIGIN_URL, "branch" => BRANCH,
       "head_commit" => @reviewed_head, "pull_request_url" => PR_URL }.merge(overrides.transform_keys(&:to_s))
   end
 
@@ -207,8 +209,12 @@ class ReworkFlowTest < Minitest::Test
   # assignment names the branch publication will actually push to. Verifying one and pushing the
   # other would put the correction on a branch nobody reviewed, on a pull request nobody is
   # waiting for — and the reviewed branch would keep showing the code that was rejected.
-  def test_a_publication_branch_other_than_the_reviewed_branch_refuses_before_the_executor
-    start(rework: { "repositories" => [ reviewed_repository ] }, publication_branch: "specrelay/redirected")
+  # MVP-0035 CR-002, under MAPIAI-84. The branch this claim publishes to is the run's canonical
+  # branch, so the redirect this refuses is a RECORDED branch that is not it — a review settled on
+  # a branch the current claim would not push to. Continuing there would land the correction on a
+  # branch nobody is waiting for.
+  def test_a_recorded_branch_other_than_the_publication_branch_refuses_before_the_executor
+    start(rework: { "repositories" => [ reviewed_repository(branch: "specrelay/redirected") ] })
     code, output = run_cli
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, code, output
@@ -341,6 +347,7 @@ class ReworkFlowTest < Minitest::Test
       content = File.read("demo-app/index.html")
       File.write("demo-app/index.html", content.sub("Hello Demo", "Hello SpecRelay Demo")) unless content.include?("SpecRelay")
       File.write("demo-app/fix.txt", "corrected\\n")
+      #{DemoWorkspace.selection_snippet}
       exit 0
     RUBY
     FileUtils.chmod(0o755, path)

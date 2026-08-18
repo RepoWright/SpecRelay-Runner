@@ -38,19 +38,24 @@ module SpecrelayRunner
     # would go looking for a review that does not exist.
     NOUNS = { "rework" => "reviewed", "restart" => "recorded" }.freeze
 
-    # The recorded target this claim must continue, or nil when it carries none. The assignment's
-    # own repository list comes along because it holds the authoritative `clone_url`, which
-    # neither block repeats.
+    # The recorded target this claim must continue, or nil when it carries none.
+    #
+    # MAPIAI-84 — the target block now carries its own `clone_url`, and the branch this claim
+    # publishes to is the run's CANONICAL branch. Both used to be read from the assignment's
+    # pre-execution `repositories` list, which no longer exists: which repositories a run publishes
+    # is the executor's decision, so Platform declares none. Nothing about the proof changed —
+    # identity and branch are still checked before any commit is checked out — only where the two
+    # facts it checks against come from.
     def self.for(payload, key)
       block = payload[key]
       return nil unless block.is_a?(Hash)
 
-      new(Array(block["repositories"]), Array(payload["repositories"]), noun: NOUNS.fetch(key))
+      new(Array(block["repositories"]), payload.dig("run", "canonical_branch"), noun: NOUNS.fetch(key))
     end
 
-    def initialize(targets, assignment_repositories = [], noun: "recorded")
+    def initialize(targets, publication_branch = nil, noun: "recorded")
       @targets = targets
-      @assignment_repositories = assignment_repositories
+      @publication_branch = publication_branch.to_s
       @noun = noun
     end
 
@@ -73,7 +78,7 @@ module SpecrelayRunner
 
     private
 
-    attr_reader :targets, :assignment_repositories, :noun
+    attr_reader :targets, :publication_branch, :noun
 
     # Publication commits and pushes from ONE worktree, so a second target names something this
     # runner cannot act on. Implementing the first and dropping the rest would answer half the
@@ -100,32 +105,30 @@ module SpecrelayRunner
 
     # WHICH repository and WHICH branch, before which commit.
     #
-    # Two facts have to agree before anything is checked out. The assignment entry this claim
-    # will PUBLISH to must be the repository and branch Platform recorded — Platform serializes
-    # both from its own records, and a claim where they still differ is one whose result would
-    # land on a branch nobody is waiting for (MVP-0035 CR-002). And the worktree's `origin` must
-    # be that repository: a commit id is portable, so a fork or mirror can carry the recorded
-    # branch at the byte-identical recorded sha, and the head check below cannot tell a repointed
-    # origin from the real one (CR-001 F2).
+    # Two facts have to agree before anything is checked out. The branch this claim will PUBLISH to
+    # must be the branch Platform recorded, because a claim where they differ is one whose result
+    # would land on a branch nobody is waiting for (MVP-0035 CR-002). And the worktree's `origin`
+    # must be the recorded repository: a commit id is portable, so a fork or mirror can carry the
+    # recorded branch at the byte-identical recorded sha, and the head check below cannot tell a
+    # repointed origin from the real one (CR-001 F2).
     #
     # The comparison is {Review::Checkout.identity}, the normalizer the reviewer's own checkout
-    # proof uses, so an https remote and its scp-like ssh spelling are one repository here too.
-    # An assignment that names no entry for this key leaves nothing to prove identity against,
-    # and that is a refusal rather than a pass.
+    # proof uses, so an https remote and its scp-like ssh spelling are one repository here too. A
+    # recorded target that names no remote leaves nothing to prove identity against, and that is a
+    # refusal rather than a pass.
     def target_refusal(repository, worktree_path, git)
       key = repository["repository_key"].to_s
-      published = assignment_repository(key)
-      expected = Review::Checkout.identity(published&.fetch("clone_url", nil))
-      return refuse("this claim publishes no repository named '#{key}', which is the #{noun} one") if expected.empty?
+      expected = Review::Checkout.identity(repository["clone_url"])
+      return refuse("the #{noun} repository '#{key}' records no remote to prove identity against") if expected.empty?
 
-      branch_refusal(key, published, repository) ||
+      branch_refusal(key, repository) ||
         remote_identity_refusal(key, expected, worktree_path, git)
     end
 
-    def branch_refusal(key, published, repository)
-      return nil if published["branch"].to_s == repository["branch"].to_s
+    def branch_refusal(key, repository)
+      return nil if publication_branch == repository["branch"].to_s
 
-      refuse("this claim publishes '#{key}' to '#{published['branch']}', " \
+      refuse("this claim publishes '#{key}' to '#{publication_branch}', " \
              "not to the #{noun} branch '#{repository['branch']}'")
     end
 
@@ -133,10 +136,6 @@ module SpecrelayRunner
       return nil if expected == Review::Checkout.identity(git.remote_url(worktree_path))
 
       refuse("the worktree for '#{key}' points at a different remote than the #{noun} repository")
-    end
-
-    def assignment_repository(key)
-      assignment_repositories.find { |repository| repository["id"].to_s == key }
     end
 
     # FRESHNESS, once identity is settled: the recorded commit must still BE the head of that

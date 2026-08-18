@@ -32,7 +32,7 @@ class QuestionResumeTest < Minitest::Test
     # Every real SpecRelay workspace is a clone, and the checkpoint's normalized origin is what
     # proves a resume is landing on the same repository rather than on a look-alike, so the
     # fixture carries one. Nothing is ever pushed to it.
-    git(@root, "remote", "add", "origin", "https://github.com/SpecRelay/tiny-demo-workspace.git")
+    git(@root, "remote", "set-url", "origin", "https://github.com/SpecRelay/tiny-demo-workspace.git")
     @platform = nil
   end
 

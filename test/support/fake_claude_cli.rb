@@ -104,7 +104,11 @@ module FakeClaudeCli
     when :fail then %(warn "the model produced no usable change"; exit 4)
     when :auth_failure then %(warn "Not logged in. Please run `claude auth login`."; exit 1)
     when :hang then %(sleep #{HANG_SECONDS}; exit 0)
-    when :no_change then %(puts "considered the task and changed nothing"; exit 0)
+    when :no_change
+      # MAPIAI-84 — a provider that changed nothing still reports an EMPTY selection. Writing
+      # no document at all is a different fact (the executor did not answer), and the runner
+      # refuses that rather than guessing it meant "nothing".
+      %(puts "considered the task and changed nothing"\n#{DemoWorkspace.selection_snippet(changed: 'false')}\nexit 0)
     else edit_branch(from_heading, to_heading)
     end
   end
@@ -152,6 +156,7 @@ module FakeClaudeCli
       say("type" => "result", "subtype" => "success", "is_error" => false,
           "result" => (applied ? "applied the heading change" : "the heading change is already applied; nothing to do") +
                       " (transcript echoed #{LEAKED_TOKEN})")
+      #{DemoWorkspace.selection_snippet(changed: 'applied')}
       exit 0
     RUBY
   end

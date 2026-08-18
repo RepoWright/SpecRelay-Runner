@@ -13,6 +13,7 @@ require "specrelay_runner"
 require_relative "support/fake_platform"
 require_relative "support/fake_secret_store"
 require_relative "support/demo_workspace"
+require_relative "support/multi_repository_workspace"
 require_relative "support/fake_github"
 require_relative "support/fake_claude_cli"
 require_relative "support/specification_workspace"
@@ -148,24 +149,23 @@ end
 # rework: when given, adds the MVP-0035 change-request block and advances the assigned report
 # round, exactly as Platform does for a claim that follows a CHANGES_REQUESTED review. Omit it
 # to model a first execution, which carries no rework block at all.
-def claim_payload_for(task_id:, executor_command:, publication: nil, rework: nil, restart: nil)
-  payload = base_claim_payload(task_id: task_id, executor_command: executor_command)
+def claim_payload_for(task_id:, executor_command:, publication: nil, rework: nil, restart: nil,
+                      worktree_create_command: nil)
+  payload = base_claim_payload(task_id: task_id, executor_command: executor_command,
+                               worktree_create_command: worktree_create_command)
   payload = payload.merge("rework" => rework_block(rework), "report_contract" => rework_round(task_id)) if rework
   # MVP-0036 Stage 2b — a REPLACEMENT run's recorded target. Its report round stays the first
   # one, because the replacement is a new run rather than another round of the old one.
   payload = payload.merge("restart" => restart) if restart
   return payload if publication.nil?
 
+  # MAPIAI-84 — the assignment carries NO repository list. Platform states the global publication
+  # policy (access, whether a pull request is required, whether it is a draft) and nothing about
+  # WHICH repositories are eligible: that is the executor's semantic choice, read back from its
+  # own selection document and verified locally by the runner.
   payload.merge(
-    "repositories" => [ {
-      "id" => "tiny-demo-workspace",
-      "clone_url" => publication.fetch(:clone_url, "https://github.com/SpecRelay/tiny-demo-workspace"),
-      "default_branch" => "main",
-      "access" => publication.fetch(:access, "write"),
-      "branch" => publication.fetch(:branch, "specrelay/#{task_id}")
-    } ],
     "repository_policy" => {
-      "branch_pattern" => "specrelay/<TASK-ID>",
+      "access" => publication.fetch(:access, "write"),
       "create_pull_requests" => publication.fetch(:create_pull_requests, true),
       "pull_request_draft" => publication.fetch(:pull_request_draft, true)
     },
@@ -222,7 +222,7 @@ def rework_round(task_id)
     "report_path" => "specs/#{task_id}/execution-reports/002-review-fixes" }
 end
 
-def base_claim_payload(task_id:, executor_command:)
+def base_claim_payload(task_id:, executor_command:, worktree_create_command: nil)
   {
     "contract_version" => "mvp-0010",
     "claim" => { "runner_execution_id" => "rex_test123", "claim_policy_mode" => "all_eligible" },
@@ -231,7 +231,7 @@ def base_claim_payload(task_id:, executor_command:)
       "project_key" => "tiny-demo", "workspace_key" => "tiny-demo-workspace",
       "display_name" => "Tiny Demo Workspace", "repository_url" => "https://github.com/SpecRelay/tiny-demo-workspace",
       "default_branch" => "main",
-      "worktree_create_command" => "./bin/worktree create #{task_id}",
+      "worktree_create_command" => worktree_create_command || "./bin/worktree create #{task_id}",
       "worktree_release_command" => "./bin/worktree release #{task_id}",
       "test_command" => "./bin/test"
     },

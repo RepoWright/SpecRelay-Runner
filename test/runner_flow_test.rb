@@ -173,10 +173,10 @@ class RunnerFlowTest < Minitest::Test
     assert_equal "failed", terminal["outcome"]
     assert_equal "executor_failed", terminal.dig("core", "error_classification")
     assert_equal 3, terminal.dig("core", "exit_code")
-    # Nothing was published, and the repository is still reported truthfully.
-    repositories = terminal.fetch("repositories")
-    refute_empty repositories
-    assert(repositories.none? { |repo| repo["pull_request_url"] }, "an executor failure must publish nothing")
+    # MAPIAI-84 — an attempt that never reached publication reports NO repositories. It has no
+    # verified selection, so it has no repository identity or base commit it could honestly assert;
+    # the cause is the error classification above, not a fabricated repository row.
+    assert_empty terminal.fetch("repositories"), "an executor failure must publish nothing and claim nothing"
     manifest = decode_manifest(@platform.last_report)
     assert_equal "failed", manifest["execution_status"]
     refute manifest["final_jira_update_ready"], "a failed attempt must not mark Jira ready"
