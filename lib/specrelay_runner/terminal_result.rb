@@ -5,12 +5,17 @@ module SpecrelayRunner
   # (contracts/runner/v1/terminal-result.schema.json) the runner submits WITH its
   # report bundle. It carries the durable terminal facts Platform validates before
   # finalization: the outcome, the final sequence, Core exit info with a sanitized
-  # error classification, a repository result for every relevant repository
-  # (including unchanged ones), artifact references, and the cleanup result.
+  # error classification, a repository result for every repository this run
+  # published, artifact references, and the cleanup result.
   #
   # It is a pure builder over values the Execution already computed; it makes no
   # decisions and holds no Platform authority. Free-text fields are redacted
   # client-side (Platform re-redacts on ingest — defense in depth).
+  #
+  # MAPIAI-84: the repository list is now DYNAMIC and carries only the repositories this run
+  # actually changed. An attempt that never reached publication reports NO repositories, because a
+  # run with no verified selection has no repository facts to assert — and a partial or guessed set
+  # is exactly what Platform must not be handed.
   class TerminalResult
     CONTRACT_VERSION = "1"
     SUCCEEDED = "succeeded"
@@ -53,28 +58,29 @@ module SpecrelayRunner
     attr_reader :run_id, :attempt_id, :outcome, :final_sequence, :exit_code,
                 :repositories, :artifacts, :error_classification, :cleanup_error
 
-    # One repository publication result (MVP-0014). `changed` is reported truthfully
-    # even when false so Platform records an unchanged repository, `head_commit` is
-    # omitted (null) when nothing changed, and `branch`/`pull_request_url` are present
-    # only when publication actually succeeded — Platform validates all of this before
-    # it will call the run successful. `publication_error` is redacted client-side too
-    # (Platform re-redacts on ingest).
+    # One repository publication result (MVP-0014, dynamic since MAPIAI-84).
+    #
+    # `clone_url` and `default_branch` are part of the result because Platform no longer declares
+    # the repository: the runner read both from the repository's own `origin` and must report them
+    # for Platform to validate the pull-request URL against and to record the run's repository
+    # rows from. `branch`/`pull_request_url` are present only when publication actually succeeded —
+    # Platform validates all of this before it will call the run successful. `publication_error` is
+    # redacted client-side too (Platform re-redacts on ingest).
+    #
+    # Every item here is a repository the executor CHANGED and the runner verified, so `changed` is
+    # always true. It stays in the shape as an explicit, validated assertion rather than being
+    # dropped, because Platform refuses a row that claims otherwise — which is what stops an
+    # unchanged repository from appearing in an implementation-publication result at all.
     def repository_result(repository)
-      # review-003 finding 2 wants an unmeasured change set reported as unknown rather
-      # than as `false`. NOT DONE, deliberately: Platform's terminal-envelope validator
-      # rejects a non-boolean here ("repositories[0].changed must be a boolean"), so
-      # honouring it needs a Platform change, which CR-002 declares a non-goal. The
-      # untruth is contained — the repository carries a "change detection failed" reason
-      # and the attempt is terminal-failed — and the blocker is recorded for the next
-      # round rather than worked around here.
-      changed = !!repository[:changed]
       error = repository[:publication_error]
       skipped = repository[:publication_skipped_reason]
       {
         "id" => repository[:id].to_s,
-        "changed" => changed,
+        "clone_url" => repository[:clone_url].to_s,
+        "default_branch" => repository[:default_branch].to_s,
+        "changed" => !!repository[:changed],
         "base_commit" => repository[:base_commit].to_s,
-        "head_commit" => changed ? nilify(repository[:head_commit]) : nil,
+        "head_commit" => nilify(repository[:head_commit]),
         "branch" => nilify(repository[:branch]),
         "pull_request_url" => nilify(repository[:pull_request_url]),
         "publication_error" => error && Redaction.redact(error.to_s),

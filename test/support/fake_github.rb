@@ -14,18 +14,27 @@ require "open3"
 module FakeGithub
   module_function
 
-  # Create a bare remote and register it as `origin` on the workspace root.
+  # Create a bare remote and register it as `origin` on the repository root.
   #
-  # `url:` addresses that same bare repository by the GitHub url the assignment carries, for a
-  # test whose subject is repository identity rather than the remote's contents. Without it the
-  # remote is a local path, which no assignment `clone_url` can honestly name.
-  def add_remote(root, name: "tiny-demo-workspace", url: nil)
+  # MAPIAI-84 — the url is ALWAYS the GitHub one, because the runner now reads a repository's
+  # identity from its own `origin` rather than from an assignment entry. A local bare path would
+  # give the fixture no GitHub identity at all, so every publication test would fail closed on a
+  # fact about the fixture rather than about the runner. The bytes still never leave the machine:
+  # `serve_locally` keeps the transport real and answers it from the bare repository.
+  def add_remote(root, name: "tiny-demo-workspace", url: nil, default_branch: "main")
     remote = Dir.mktmpdir("specrelay-runner-remote-")
     bare = File.join(remote, "#{name}.git")
     system("git", "init", "-q", "--bare", bare, exception: true)
-    git(root, "remote", "add", "origin", url || bare)
-    serve_locally(root, bare) if url
+    git(root, "remote", "remove", "origin") if remote?(root)
+    git(root, "remote", "add", "origin", url || "git@github.com:SpecRelay/#{name}.git")
+    git(root, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/#{default_branch}")
+    serve_locally(root, bare)
     bare
+  end
+
+  def remote?(root)
+    _out, status = Open3.capture2e("git", "-C", root, "remote", "get-url", "origin")
+    status.success?
   end
 
   # Git runs `ssh <host> '<service> <path>'` for an ssh remote. Replacing ssh with a shim that
@@ -62,15 +71,20 @@ module FakeGithub
   # is a fact rather than a fixture. `seed` pre-populates pull requests (each a hash of
   # url/state/headRefName/headRefOid) so a closed or merged pull request from an earlier
   # round can be represented — the review-001 finding-2 scenario.
+  # MAPIAI-84 — `urls` gives one pull-request URL per `owner/repo`, and `bares` one bare
+  # repository per `owner/repo`, so a run publishing several repositories gets distinct pull
+  # requests resolved against the right remote. `fail_create_for` makes creation fail for exactly
+  # one repository, which is what a PARTIAL publication failure is.
   def gh_bin(mode: "ok", pull_request_url: "https://github.com/SpecRelay/tiny-demo-workspace/pull/7",
-             bare: nil, seed: [])
+             bare: nil, seed: [], urls: {}, bares: {}, fail_create_for: nil)
     dir = Dir.mktmpdir("specrelay-runner-gh-")
     log = File.join(dir, "gh.log")
     state = File.join(dir, "prs.json")
     File.write(state, JSON.generate(seed))
     path = File.join(dir, "gh")
-    File.write(path, script(mode: mode, pull_request_url: pull_request_url, log: log,
-                            state: state, bare: bare, counter: File.join(dir, "list.count")))
+    File.write(path, script(mode: mode, pull_request_url: pull_request_url, log: log, state: state,
+                            bare: bare, counter: File.join(dir, "list.count"), urls: urls,
+                            bares: bares, fail_create_for: fail_create_for))
     FileUtils.chmod(0o755, path)
     [ dir, log, state ]
   end
@@ -78,7 +92,8 @@ module FakeGithub
   # The fake honours `--head` and `--state` because those flags are exactly what the
   # reuse semantics depend on: ignoring them made the old tests approximate the
   # behaviour instead of exercising it (review-001 finding 7).
-  def script(mode:, pull_request_url:, log:, state:, bare:, counter:)
+  def script(mode:, pull_request_url:, log:, state:, bare:, counter:, urls: {}, bares: {},
+             fail_create_for: nil)
     <<~RUBY
       #!/usr/bin/env ruby
       # frozen_string_literal: true
@@ -89,6 +104,9 @@ module FakeGithub
       URL = #{pull_request_url.inspect}
       BARE = #{bare.inspect}
       COUNTER = #{counter.inspect}
+      URLS = #{urls.inspect}
+      BARES = #{bares.inspect}
+      FAIL_CREATE_FOR = #{fail_create_for.inspect}
       File.open(LOG, "a") { |f| f.puts(ARGV.join(" ")) }
 
       def prs = JSON.parse(File.read(STATE))
@@ -98,11 +116,13 @@ module FakeGithub
         index && ARGV[index + 1]
       end
 
-      # Real sha for a branch in the bare remote, so headRefOid matches what was pushed.
-      def head_oid(branch)
-        return "" if BARE.nil? || branch.nil?
+      # Real sha for a branch in the bare remote of the repository being asked about, so
+      # headRefOid matches what was pushed to THAT repository.
+      def head_oid(branch, repo = nil)
+        remote = BARES[repo.to_s] || BARE
+        return "" if remote.nil? || branch.nil?
 
-        out = IO.popen([ "git", "-C", BARE, "rev-parse", "refs/heads/\#{branch}" ], err: :close, &:read).to_s.strip
+        out = IO.popen([ "git", "-C", remote, "rev-parse", "refs/heads/\#{branch}" ], err: :close, &:read).to_s.strip
         $?.success? ? out : ""
       end
 
@@ -131,13 +151,18 @@ module FakeGithub
             exit 0
           end
           head = flag("--head")
+          repo = flag("--repo")
           wanted = (flag("--state") || "open").downcase
           rows = prs
           rows = rows.select { |pr| pr["headRefName"].to_s == head } unless head.nil?
           rows = rows.select { |pr| pr["state"].to_s.downcase == wanted } unless wanted == "all"
+          # `--repo` is honoured for the same reason `--head` and `--state` are: one task branch
+          # exists in several independent repositories, so a fake that ignored it would let one
+          # repository's pull request be reused as another's (MAPIAI-84 S08/S09).
+          rows = rows.reject { |pr| pr.key?("repo") && pr["repo"].to_s != repo.to_s }
           # A live pull request tracks its branch; refresh its head from the remote.
           rows = rows.map do |pr|
-            pr["headRefOid"].to_s == "live" ? pr.merge("headRefOid" => head_oid(pr["headRefName"])) : pr
+            pr["headRefOid"].to_s == "live" ? pr.merge("headRefOid" => head_oid(pr["headRefName"], pr["repo"] || repo)) : pr
           end
           puts JSON.generate(rows)
           exit 0
@@ -159,19 +184,22 @@ module FakeGithub
         when "create"
           abort("gh: pull request creation failed (simulated)") if MODE == "create_fails"
           head = flag("--head")
+          repo = flag("--repo")
+          abort("gh: pull request creation failed (simulated)") if FAIL_CREATE_FOR == repo
           # A second create for the same branch would be a duplicate; the runner is
           # expected to reuse instead, so record it and let the test assert on it.
           # `isDraft` mirrors what real `gh pr list --json isDraft` returns, and it is a FACT
           # about the invocation rather than a constant: MVP-0027 refuses to report a pull
           # request as this run's specification unless GitHub says it is a draft, so a fake that
           # always answered `true` would make that check untestable.
-          File.write(STATE, JSON.generate(prs + [ { "url" => URL, "state" => "OPEN",
-                                                    "headRefName" => head,
+          created = URLS.fetch(repo.to_s, URL)
+          File.write(STATE, JSON.generate(prs + [ { "url" => created, "state" => "OPEN",
+                                                    "headRefName" => head, "repo" => repo,
                                                     "isDraft" => ARGV.include?("--draft"),
-                                                    "headRefOid" => head_oid(head) } ]))
+                                                    "headRefOid" => head_oid(head, repo) } ]))
           # "create_silent": creation succeeds but prints no URL, so the runner has to
           # fall back to a lookup. Real gh can be quiet under some output settings.
-          puts URL unless MODE == "create_silent"
+          puts created unless MODE == "create_silent"
           exit 0
         end
       end

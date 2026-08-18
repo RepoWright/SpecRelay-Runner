@@ -42,6 +42,10 @@ require_relative "specrelay_runner/terminal_menu"
 require_relative "specrelay_runner/terminal_presenter"
 require_relative "specrelay_runner/workspace_view"
 require_relative "specrelay_runner/dashboard"
+# MAPIAI-84: the one GitHub-identity normalizer, and the executor's bounded repository selection.
+# Both are loaded before `workspace`, which verifies a selection against the repositories on disk.
+require_relative "specrelay_runner/github_remote"
+require_relative "specrelay_runner/repository_selection"
 require_relative "specrelay_runner/workspace"
 require_relative "specrelay_runner/executor"
 require_relative "specrelay_runner/report_bundle"

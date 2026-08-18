@@ -1,0 +1,390 @@
+# frozen_string_literal: true
+
+require_relative "test_helper"
+require "yaml"
+require "open3"
+
+# MAPIAI-84 proof for AI-DIRECTED multi-repository implementation publication, against a real
+# project-owned task workspace, real independent git repositories, real bare remotes and a real
+# `gh` argv boundary.
+#
+# The subject is the replacement of one Platform-declared repository input by the executor's own
+# semantic selection: the assignment carries no repository list, the executor writes one bounded
+# structured document naming what it changed, and the runner verifies every entry locally before
+# it performs any external write.
+#
+# Scenarios: S01 (no declared list, independent measurement), S02 (two changed repositories),
+# S03 (subset), S04 (no changes), S05 (project-owned worktree), S07 (path escape and false root),
+# S08 (duplicate identity), S09 (pull-request idempotency per repository), S10 (partial
+# publication failure).
+class MultiRepositoryPublicationTest < Minitest::Test
+  TASK = "MAPIAI-84"
+  BRANCH = TASK
+  WORKSPACE_SLUG = "SpecRelay/multi-demo-workspace"
+  PR_URLS = {
+    "SpecRelay/component-a" => "https://github.com/SpecRelay/component-a/pull/21",
+    "SpecRelay/component-b" => "https://github.com/SpecRelay/component-b/pull/22",
+    "SpecRelay/component-c" => "https://github.com/SpecRelay/component-c/pull/23",
+    WORKSPACE_SLUG => "https://github.com/SpecRelay/multi-demo-workspace/pull/24"
+  }.freeze
+
+  def setup
+    @built = MultiRepositoryWorkspace.build
+    @root = @built.root
+    @bares = { "SpecRelay/component-a" => @built.bares["component-a"],
+               "SpecRelay/component-b" => @built.bares["component-b"],
+               "SpecRelay/component-c" => @built.bares["component-c"],
+               WORKSPACE_SLUG => @built.bares["."] }
+    @gh_dir, @gh_log, = FakeGithub.gh_bin(urls: PR_URLS, bares: @bares)
+  end
+
+  def teardown
+    @platform&.stop
+    FileUtils.remove_entry(@root) if @root && File.directory?(@root)
+  end
+
+  # --- harness -------------------------------------------------------------
+
+  # `executor_env` reaches the fake executor the way a real provider's environment does: through
+  # the assignment's own `executor.env`, which is the only channel Platform has.
+  def start(publication: {}, executor_command: nil, executor_env: {})
+    payload = claim_payload_for(task_id: TASK, executor_command: executor_command || @built.executor,
+                               publication: publication)
+    payload["executor"]["env"] = { "FAKE_EDITED" => "component-a,component-b" }.merge(executor_env)
+    @platform = FakePlatform.new(claim_payload: payload).start
+    @config_path = write_config
+    payload
+  end
+
+  def write_config
+    path = File.join(Dir.mktmpdir("cfg"), "runner.yml")
+    File.write(path, <<~YAML)
+      platform:
+        base_url: #{@platform.base_url}
+        token_env: TEST_TOKEN
+      runner:
+        id: test-runner
+        display_name: Test Runner
+        claim_policy:
+          mode: all_eligible
+      workspace_roots:
+        tiny-demo-workspace: #{@root}
+    YAML
+    path
+  end
+
+  def run_cli(gh_dir: @gh_dir)
+    io = StringIO.new
+    env = { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN,
+            "PATH" => "#{gh_dir}:#{ENV['PATH']}",
+            "HOME" => ENV["HOME"].to_s }
+    code = SpecrelayRunner::CLI.run(%W[claim-once --config #{@config_path}], out: io, err: io, env: env)
+    [ code, io.string ]
+  end
+
+  def results = @platform.last_terminal_result["repositories"]
+  def result_ids = results.map { |repo| repo["id"] }.sort
+  def terminal = @platform.last_terminal_result
+  def branches_of(slug) = FakeGithub.remote_branches(@bares.fetch(slug))
+
+  # --- S01 / S02: two changed repositories, measured independently ---------
+
+  def test_the_assignment_declares_no_eligible_repository_list
+    payload = start
+    refute payload.key?("repositories"),
+           "the executor selects repositories semantically; Platform declares none"
+    assert_equal %w[access create_pull_requests pull_request_draft],
+                 payload.fetch("repository_policy").keys.sort,
+                 "policy may state HOW to publish, never WHICH repositories are eligible"
+  end
+
+  def test_two_changed_repositories_each_receive_one_draft_pull_request
+    start
+    code, output = run_cli
+    assert_equal SpecrelayRunner::CLI::SUCCESS, code, output
+
+    assert_equal "succeeded", terminal["outcome"]
+    assert_equal [ "SpecRelay/component-a", "SpecRelay/component-b" ], result_ids
+
+    results.each do |repo|
+      assert repo["changed"], "#{repo['id']} is in the result only because it changed"
+      assert_equal BRANCH, repo["branch"], "every repository publishes the canonical task branch"
+      assert_equal "main", repo["default_branch"]
+      assert_equal "git@github.com:#{repo['id']}.git", repo["clone_url"]
+      assert_match(/\A[0-9a-f]{40,64}\z/, repo["base_commit"])
+      assert_match(/\A[0-9a-f]{40,64}\z/, repo["head_commit"])
+      refute_equal repo["base_commit"], repo["head_commit"]
+      assert_equal PR_URLS.fetch(repo["id"]), repo["pull_request_url"]
+      assert_nil repo["publication_error"]
+      # The branch really exists in THAT repository's own remote, at its own head.
+      assert_equal repo["head_commit"], branches_of(repo["id"])[BRANCH]
+      refute_includes branches_of(repo["id"]).keys, "main"
+    end
+
+    # Independent measurement: two repositories with unrelated histories cannot share a base.
+    assert_equal 2, results.map { |repo| repo["base_commit"] }.uniq.length
+    assert_equal 2, FakeGithub.pr_creates(@gh_log)
+    assert_empty branches_of("SpecRelay/component-c"), "an unselected repository is never pushed"
+  end
+
+  def test_the_workspace_repository_itself_can_be_the_selected_repository
+    start(executor_env: { "FAKE_EDITED" => "." })
+    code, output = run_cli
+    assert_equal SpecrelayRunner::CLI::SUCCESS, code, output
+
+    assert_equal [ WORKSPACE_SLUG ], result_ids
+    assert_equal PR_URLS.fetch(WORKSPACE_SLUG), results.first["pull_request_url"]
+    assert_equal results.first["head_commit"], branches_of(WORKSPACE_SLUG)[BRANCH]
+  end
+
+  # --- S03: subset selection ----------------------------------------------
+
+  def test_only_the_selected_subset_is_published
+    start(executor_env: { "FAKE_EDITED" => "component-a,component-c" })
+    code, output = run_cli
+    assert_equal SpecrelayRunner::CLI::SUCCESS, code, output
+
+    assert_equal [ "SpecRelay/component-a", "SpecRelay/component-c" ], result_ids
+    assert_empty branches_of("SpecRelay/component-b")
+    assert_empty branches_of(WORKSPACE_SLUG)
+    assert_equal 2, FakeGithub.pr_creates(@gh_log)
+  end
+
+  # A repository the executor changed but did NOT report is not published. The selection
+  # document is the only input considered — prose and terminal output are never parsed.
+  def test_an_unreported_changed_repository_is_not_published
+    start(executor_env: { "FAKE_SELECTED" => "component-a" })
+    code, = run_cli
+    assert_equal SpecrelayRunner::CLI::SUCCESS, code
+
+    assert_equal [ "SpecRelay/component-a" ], result_ids
+    assert_empty branches_of("SpecRelay/component-b")
+  end
+
+  # --- S04: no changes ----------------------------------------------------
+
+  def test_an_empty_selection_on_a_clean_workspace_succeeds_without_publishing
+    start(executor_env: { "FAKE_EDITED" => "" })
+    code, output = run_cli
+    assert_equal SpecrelayRunner::CLI::SUCCESS, code, output
+
+    assert_equal "succeeded", terminal["outcome"]
+    assert_empty results, "no repository changed, so no repository row may be fabricated"
+    assert_equal 0, FakeGithub.pr_creates(@gh_log)
+    assert_equal 0, FakeGithub.pr_lists(@gh_log)
+    @bares.each_key { |slug| assert_empty branches_of(slug) }
+  end
+
+  # An ABSENT document is not an empty selection: it means the executor never answered. Guessing
+  # "nothing changed" there would publish nothing while a diff sits on disk.
+  def test_a_missing_selection_document_fails_closed
+    start(executor_env: { "FAKE_SELECTION_SKIP" => "1" })
+    run_cli
+
+    assert_equal "failed", terminal["outcome"]
+    assert_match(/selection/i, terminal.dig("core", "error_classification").to_s +
+                               @platform.last_report[:body].to_s)
+    assert_equal 0, FakeGithub.pr_creates(@gh_log)
+  end
+
+  # --- S05: the project-owned worktree command ----------------------------
+
+  def test_the_project_owned_worktree_command_is_invoked_once_with_create
+    start(executor_env: { "FAKE_EDITED" => "component-a" })
+    run_cli
+
+    assert_equal [ "create #{TASK}" ], MultiRepositoryWorkspace.worktree_invocations(@built.worktree_log),
+                 "the project-owned command constructs the task environment exactly once"
+    assert Dir.exist?(MultiRepositoryWorkspace.task_workspace(@root, TASK)),
+           "the runner must use the task workspace that command created"
+  end
+
+  # --- S06: the native single-repository fallback -------------------------
+
+  # A checkout with no project-owned command still works: the runner runs the native worktree
+  # command the assignment names, publishes normally, and never touches `bin/dev`.
+  def test_a_checkout_without_the_project_command_uses_the_native_worktree_path
+    FileUtils.remove_entry(@root)
+    @root, executor = DemoWorkspace.build
+    dev_log = DemoWorkspace.without_project_command(@root)
+    bare = FakeGithub.add_remote(@root)
+    gh_dir, gh_log, = FakeGithub.gh_bin(bare: bare)
+
+    payload = claim_payload_for(task_id: TASK, executor_command: executor, publication: {},
+                                worktree_create_command: "git worktree add .runs/worktrees/#{TASK} -b #{TASK}")
+    @platform = FakePlatform.new(claim_payload: payload).start
+    @config_path = write_config
+    code, output = run_cli(gh_dir: gh_dir)
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, code, output
+    assert_equal [ "SpecRelay/tiny-demo-workspace" ], result_ids
+    assert_equal 1, FakeGithub.pr_creates(gh_log)
+    assert_equal results.first["head_commit"], FakeGithub.remote_branches(bare)[BRANCH]
+    refute File.exist?(dev_log), "bin/dev must never be used for workspace discovery or creation"
+  end
+
+  # --- S07: path escape and false roots -----------------------------------
+
+  def test_an_absolute_path_is_refused_before_any_github_mutation
+    assert_selection_refused(%([ { "path" => "/etc" } ]), /relative/i)
+  end
+
+  def test_a_traversal_path_is_refused_before_any_github_mutation
+    assert_selection_refused(%([ { "path" => "../.." } ]), /inside the task workspace/i)
+  end
+
+  def test_a_symlink_escaping_the_task_workspace_is_refused
+    outside = Dir.mktmpdir("outside-repo-")
+    File.write(File.join(outside, "app.txt"), "outside\n")
+    DemoWorkspace.git_init(outside)
+    workspace = MultiRepositoryWorkspace.task_workspace(@root, TASK)
+    # The link is planted by the executor itself, inside the workspace, before it reports it.
+    assert_selection_refused(%([ { "path" => "escape" } ]), /inside the task workspace/i) do
+      FileUtils.mkdir_p(workspace)
+      File.symlink(outside, File.join(workspace, "escape"))
+    end
+  ensure
+    FileUtils.remove_entry(outside) if outside && File.directory?(outside)
+  end
+
+  def test_a_nonexistent_path_is_refused
+    assert_selection_refused(%([ { "path" => "component-z" } ]), /no git repository/i)
+  end
+
+  def test_a_directory_that_is_not_a_repository_root_is_refused
+    assert_selection_refused(%([ { "path" => "component-a/nested" } ]), /repository root/i) do
+      FileUtils.mkdir_p(File.join(MultiRepositoryWorkspace.task_workspace(@root, TASK),
+                                  "component-a", "nested"))
+    end
+  end
+
+  def test_a_repository_not_on_the_canonical_task_branch_is_refused
+    assert_selection_refused(%([ { "path" => "component-a" } ]), /canonical branch/i) do
+      FakeGithub.git(File.join(MultiRepositoryWorkspace.task_workspace(@root, TASK), "component-a"),
+                     "checkout", "-q", "--detach", "HEAD")
+    end
+  end
+
+  def test_a_reported_repository_with_no_measurable_change_is_refused
+    assert_selection_refused(%([ { "path" => "component-c" } ]), /no change/i)
+  end
+
+  # --- S08: duplicate identity -------------------------------------------
+
+  def test_two_paths_resolving_to_one_git_root_are_refused_as_duplicates
+    assert_selection_refused(%([ { "path" => "component-a" }, { "path" => "./component-a" } ]),
+                             /same repository|duplicate/i)
+  end
+
+  def test_two_paths_with_one_normalized_remote_are_refused_as_duplicates
+    # component-b is re-pointed at component-a's GitHub identity in its scp-like spelling: two
+    # different working trees, one repository as far as GitHub is concerned.
+    assert_selection_refused(%([ { "path" => "component-a" }, { "path" => "component-b" } ]),
+                             /same repository|duplicate/i) do
+      FakeGithub.git(File.join(@root, "component-b"), "remote", "set-url", "origin",
+                     "https://github.com/SpecRelay/component-a.git")
+    end
+  end
+
+  # Every refusal must happen BEFORE any external write: no branch on any remote, and no `gh`
+  # invocation at all.
+  def assert_selection_refused(selection_ruby, reason_pattern)
+    start(executor_env: { "FAKE_SELECTION_JSON" => selection_json(selection_ruby) })
+    prepare_task_workspace
+    yield if block_given?
+    run_cli
+
+    assert_equal "failed", terminal["outcome"], "an unsafe selection must fail the attempt"
+    assert_empty results, "a refused selection persists no partial repository set"
+    @bares.each_key { |slug| assert_empty branches_of(slug), "#{slug} must not be pushed" }
+    assert_equal 0, FakeGithub.pr_creates(@gh_log)
+    assert_equal 0, FakeGithub.pr_lists(@gh_log)
+    assert_match reason_pattern, failure_reason, "the refusal must name the actual fact that failed"
+  end
+
+  # Build the task workspace up front, so a test can plant the unsafe state its selection then
+  # reports. The runner's own preparation finds the clean workspace already on the canonical
+  # branch and continues it, which is the existing retry/resume behaviour rather than a test hook.
+  def prepare_task_workspace
+    out, status = Open3.capture2e(File.join(@root, "bin", "worktree"), "create", TASK)
+    raise out unless status.success?
+
+    File.write(@built.worktree_log, "")
+  end
+
+  # The raw document bytes, built from a Ruby literal so a test can express a shape the
+  # production parser must refuse.
+  def selection_json(ruby_literal)
+    JSON.generate({ "repositories" => eval(ruby_literal) }) # rubocop:disable Security/Eval
+  end
+
+  # The operator-facing reason, read from the failed report rather than reconstructed.
+  def failure_reason
+    report = @platform.last_report[:body].fetch("report")
+    file = report["files"].find { |f| f["relative_path"] == "manifest.yml" }
+    YAML.safe_load(Base64.strict_decode64(file["content_base64"])).to_s
+  end
+
+  # --- S09: pull-request idempotency, per repository ----------------------
+
+  def test_an_existing_open_pull_request_is_reused_per_repository
+    start
+    seed = [ { "url" => PR_URLS.fetch("SpecRelay/component-a"), "state" => "OPEN",
+               "headRefName" => BRANCH, "repo" => "SpecRelay/component-a", "headRefOid" => "live" } ]
+    gh_dir, gh_log, = FakeGithub.gh_bin(urls: PR_URLS, bares: @bares, seed: seed)
+
+    code, output = run_cli(gh_dir: gh_dir)
+    assert_equal SpecrelayRunner::CLI::SUCCESS, code, output
+
+    by_id = results.to_h { |repo| [ repo["id"], repo ] }
+    assert_equal PR_URLS.fetch("SpecRelay/component-a"),
+                 by_id.fetch("SpecRelay/component-a")["pull_request_url"],
+                 "the pull request that tracks component-a's branch must be reused"
+    assert_equal PR_URLS.fetch("SpecRelay/component-b"),
+                 by_id.fetch("SpecRelay/component-b")["pull_request_url"]
+    assert_equal 1, FakeGithub.pr_creates(gh_log),
+                 "one repository reused its pull request; only the other may create one"
+    assert(FakeGithub.invocations(gh_log).any? { |line| line.include?("--repo SpecRelay/component-b") },
+           "every lookup must name the repository it is about")
+  end
+
+  # One task branch exists in several repositories, so a pull request on ANOTHER repository's
+  # branch of the same name is not this repository's current pull request.
+  def test_a_pull_request_on_a_different_repository_is_never_reused
+    start(executor_env: { "FAKE_EDITED" => "component-a" })
+    seed = [ { "url" => "https://github.com/SpecRelay/component-c/pull/99", "state" => "OPEN",
+               "headRefName" => BRANCH, "repo" => "SpecRelay/component-c", "headRefOid" => "live" } ]
+    gh_dir, gh_log, = FakeGithub.gh_bin(urls: PR_URLS, bares: @bares, seed: seed)
+
+    run_cli(gh_dir: gh_dir)
+
+    assert_equal PR_URLS.fetch("SpecRelay/component-a"), results.first["pull_request_url"]
+    assert_equal 1, FakeGithub.pr_creates(gh_log)
+  end
+
+  # --- S10: partial publication failure ----------------------------------
+
+  def test_one_failed_repository_publication_fails_the_whole_attempt
+    start
+    gh_dir, gh_log, = FakeGithub.gh_bin(urls: PR_URLS, bares: @bares,
+                                        fail_create_for: "SpecRelay/component-b")
+
+    run_cli(gh_dir: gh_dir)
+
+    assert_equal "failed", terminal["outcome"], "an incomplete publication is not a success"
+    assert_equal "publication_failed", terminal.dig("core", "error_classification")
+
+    by_id = results.to_h { |repo| [ repo["id"], repo ] }
+    succeeded = by_id.fetch("SpecRelay/component-a")
+    failed = by_id.fetch("SpecRelay/component-b")
+
+    assert_equal PR_URLS.fetch("SpecRelay/component-a"), succeeded["pull_request_url"],
+                 "an already-published fact is retained truthfully, not rolled back"
+    assert_nil succeeded["publication_error"]
+    assert_nil failed["pull_request_url"]
+    assert_match(/gh pr create failed/, failed["publication_error"])
+    assert_equal BRANCH, failed["branch"], "the branch it did push is still reported"
+    assert_equal 2, FakeGithub.pr_creates(gh_log),
+                 "each repository attempted its own creation; one succeeded and one failed"
+  end
+end

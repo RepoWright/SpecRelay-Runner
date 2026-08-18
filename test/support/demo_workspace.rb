@@ -48,6 +48,22 @@ module DemoWorkspace
     FileUtils.chmod(0o755, path)
   end
 
+  # MAPIAI-84 S06 — a checkout with NO project-owned `bin/worktree`, so the runner falls back to
+  # the native single-repository git worktree the assignment names. `bin/dev` exists and records
+  # every invocation, because "the runner never uses bin/dev to discover or create a workspace" is
+  # only provable against a `bin/dev` that would have logged it.
+  def without_project_command(root)
+    FileUtils.rm_f(File.join(root, "bin", "worktree"))
+    dev = File.join(root, "bin", "dev")
+    File.write(dev, <<~SH)
+      #!/usr/bin/env sh
+      echo "$*" >> "$(cd "$(dirname "$0")/.." && pwd)/.runs/dev.log"
+    SH
+    FileUtils.chmod(0o755, dev)
+    FileUtils.mkdir_p(File.join(root, ".runs"))
+    File.join(root, ".runs", "dev.log")
+  end
+
   def write_test(root, expected_heading)
     path = File.join(root, "bin", "test")
     File.write(path, <<~SH)
@@ -85,15 +101,46 @@ module DemoWorkspace
       end
       file = "demo-app/index.html"
       content = File.read(file)
-      if content.include?("Hello Demo")
+      changed = content.include?("Hello Demo")
+      if changed
         File.write(file, content.gsub("Hello Demo", "Hello SpecRelay Demo"))
         puts "[fake-executor] applied edit"
       end
+      #{selection_snippet(changed: "changed")}
       exit 0
     RUBY
     FileUtils.chmod(0o755, path)
     path
   end
+
+  # MAPIAI-84 — the executor's structured repository selection, written exactly where the prompt
+  # names it. Every fake executor writes it, because a run whose executor reports nothing is a
+  # run the runner refuses: the document IS how a repository becomes publishable.
+  #
+  # `changed` is the caller's own expression, so each executor reports what it actually did.
+  # `FAKE_SELECTION_JSON` replaces the whole document with raw bytes, so a test can send a
+  # malformed, escaping, or duplicated selection without this script sanitizing it first, and
+  # `FAKE_SELECTION_SKIP` writes none at all.
+  def selection_snippet(changed: "true", paths: nil)
+    reported = paths || %([ { "path" => "." } ])
+    <<~RUBY.strip
+      unless ENV["FAKE_SELECTION_SKIP"]
+        require "json"
+        _prompt = ARGV.last.to_s
+        _prompt = File.read(_prompt) if File.file?(_prompt)
+        _selection = _prompt[%r{`([^`]*/#{SELECTION_FILENAME})`}, 1]
+        abort "the prompt named no repository selection document" if _selection.nil?
+        _document = ENV["FAKE_SELECTION_JSON"] ||
+                    JSON.generate({ "repositories" => ((#{changed}) ? #{reported} : []) })
+        File.write(_selection + ".partial", _document)
+        File.rename(_selection + ".partial", _selection)
+      end
+    RUBY
+  end
+
+  # The document's name, stated once here so a fixture can never drift from the production
+  # constant without this file being the thing that fails.
+  SELECTION_FILENAME = "changed-repositories\\.json"
 
   # MVP-0036 — a fake executor that uses the QUESTION BRIDGE. It reads the bridge path out of
   # the prompt exactly as a real provider must (the prompt is the only place it is named),
@@ -148,8 +195,8 @@ module DemoWorkspace
       content = File.read(file)
       File.write(file, content.gsub("Hello Demo", "Hello SpecRelay Demo")) if content.include?("Hello Demo")
       puts "[question-executor] applied edit"
-      exit 0
     RUBY
+    File.write(path, File.read(path) + selection_snippet + "\nexit 0\n")
     FileUtils.chmod(0o755, path)
     path
   end
@@ -169,8 +216,8 @@ module DemoWorkspace
       file = "demo-app/index.html"
       File.write(file, File.read(file).sub("Hello Interrupted Demo", "Hello Resumed Demo"))
       puts "[resume-executor] applied edit"
-      exit 0
     RUBY
+    File.write(path, File.read(path) + selection_snippet + "\nexit 0\n")
     FileUtils.chmod(0o755, path)
     path
   end
@@ -200,8 +247,8 @@ module DemoWorkspace
 
       file = "demo-app/index.html"
       File.write(file, File.read(file).sub("Hello Interrupted Demo", "Hello SpecRelay Demo"))
-      exit 0
     RUBY
+    File.write(path, File.read(path) + selection_snippet + "\nexit 0\n")
     FileUtils.chmod(0o755, path)
     path
   end
@@ -236,6 +283,17 @@ module DemoWorkspace
     git(root, "config", "commit.gpgsign", "false")
     git(root, "add", "-A")
     git(root, "commit", "-q", "-m", "initial")
+    identify(root, "tiny-demo-workspace")
+  end
+
+  # MAPIAI-84 — the runner now reads a repository's identity and default branch from the
+  # repository itself rather than from an assignment entry, so every fixture repository must
+  # carry both. No network and no bare remote are involved: `origin` is a url and
+  # `refs/remotes/origin/HEAD` is a symbolic ref, and a test that also PUSHES replaces the url
+  # with one FakeGithub serves locally.
+  def identify(root, name, default_branch: "main")
+    git(root, "remote", "add", "origin", "git@github.com:SpecRelay/#{name}.git")
+    git(root, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/#{default_branch}")
   end
 
   def git(root, *args)

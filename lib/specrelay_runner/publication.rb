@@ -1,14 +1,20 @@
 # frozen_string_literal: true
 
 module SpecrelayRunner
-  # MVP-0014 — publishes the executor's repository output to GitHub: commit, push the
-  # Platform-assigned branch, and create or reuse a draft pull request.
+  # MVP-0014 — publishes ONE verified repository's output to GitHub: commit, push the canonical
+  # task branch, and create or reuse a draft pull request.
   #
-  # Ownership boundary. Platform decides WHICH repository is published, on WHAT
-  # branch, with WHAT access, and whether a pull request is required; all of that
-  # arrives in the assignment (`repositories`, `repository_policy`). This class only
-  # executes local git/gh operations and reports facts back. It holds no policy, no
-  # Jira authority, and no credentials of its own.
+  # Ownership boundary. MAPIAI-84 moved WHICH repositories are published out of Platform and into
+  # the executor's own selection, verified locally by {Workspace#select}. What still arrives in
+  # the assignment is HOW to publish — access, whether a pull request is required, whether it is a
+  # draft (`repository_policy`) — and the canonical branch every repository of the task workspace
+  # is on. This class executes one repository's local git/gh operations and reports facts back. It
+  # holds no policy, no Jira authority, no credentials of its own, and no opinion about whether
+  # the executor chose the right repositories.
+  #
+  # It is ONE INSTANCE PER REPOSITORY. That is what makes independent per-repository mechanics
+  # true by construction rather than by care: nothing in here can leak one repository's worktree,
+  # change set, commit or pull request into another's, because it only ever has one.
   #
   # Credentials stay on this host. Pushing uses the operator's existing git
   # credential setup (SSH agent, credential helper, or `gh` git protocol); pull
@@ -46,90 +52,70 @@ module SpecrelayRunner
     #   publication_skipped_reason publication was NOT ATTEMPTED BY POLICY (read-only
     #                              repository) -> a normal, non-fatal outcome that
     #                              must not fail the run (review-001 finding 3).
-    Result = Struct.new(:id, :changed, :base_commit, :head_commit, :branch,
-                        :pull_request_url, :publication_error, :publication_skipped_reason,
+    Result = Struct.new(:id, :clone_url, :default_branch, :changed, :base_commit, :head_commit,
+                        :branch, :pull_request_url, :publication_error, :publication_skipped_reason,
                         keyword_init: true)
 
-    def initialize(payload:, worktree_path:, changes:, base_commit:, test:, env: {}, io: $stdout, publish: true)
+    def initialize(payload:, repository:, test:, env: {}, io: $stdout, publish: true)
       @payload = payload
-      @worktree_path = worktree_path.to_s
-      @changes = changes
-      @base_commit = base_commit
+      @repository = repository
       @test = test || {}
       @env = env
       @io = io
       @publish = publish
     end
 
-    # Publishes every assigned repository and returns one Result each. The assignment
-    # is authoritative: with no `repositories` block (a pre-MVP-0014 Platform) it
-    # falls back to reporting the workspace repository as unpublished, so an older
-    # Platform keeps working instead of failing.
-    def call
-      repositories.map { |repository| publish(repository) }
-    end
-
-    # True when at least one assigned repository is a changed, writable repository —
-    # i.e. when publication is expected to do real work and deserves its events.
-    def expected?
-      repositories.any? { |repository| writable?(repository) } && changed?
-    end
+    # Publishes this repository and returns its one Result.
+    def call = publish
 
     private
 
-    attr_reader :payload, :worktree_path, :changes, :base_commit, :test, :env, :io
+    attr_reader :payload, :repository, :test, :env, :io
 
-    # A failed attempt reports its repositories but publishes nothing: there is no
+    # A failed attempt reports its repository but publishes nothing: there is no
     # reviewable output to offer, and pushing a failing tree would be noise.
     def publish? = @publish
 
-    def policy_assigned? = !Array(payload["repositories"]).empty?
+    def worktree_path = repository.path.to_s
 
-    def repositories
-      policy_assigned? ? Array(payload["repositories"]) : [ fallback_repository ]
-    end
-
-    # A Platform that does not yet send publication policy: report the repository
-    # truthfully as changed/unchanged with no publication attempted.
-    def fallback_repository
-      { "id" => payload.dig("workspace", "workspace_key"), "access" => READ_ACCESS, "branch" => nil,
-        "clone_url" => payload.dig("workspace", "repository_url"),
-        "default_branch" => payload.dig("workspace", "default_branch") }
-    end
-
+    # HOW to publish, never WHICH repository. A Platform that sends no policy at all did not ask
+    # for publication; that is a policy outcome, not a failure (see #skipped).
     def policy = payload["repository_policy"].to_h
+    def policy_assigned? = policy.any?
     def create_pull_requests? = policy.fetch("create_pull_requests", false)
     def draft_pull_request? = policy.fetch("pull_request_draft", true)
-    def changed? = Array(changes&.changed_files).any?
-    def writable?(repository) = repository["access"].to_s == WRITE_ACCESS
+
+    # Access is now a property of the RUN's policy rather than of a per-repository assignment
+    # entry, because there are no assignment entries. Withdrawing write access still publishes
+    # nothing, which is the property that mattered.
+    def writable? = policy.fetch("access", READ_ACCESS).to_s == WRITE_ACCESS
     def task_id = payload.dig("run", "task_id").to_s
     def run_id = payload.dig("run", "id").to_s
+    def changed_files = Array(repository.changed_files)
 
-    def publish(repository)
-      # The observed head is reported for a changed repository even when nothing is
-      # published, so the evidence never loses the commit the executor produced.
-      result = Result.new(id: repository["id"].to_s, changed: changed?, base_commit: base_commit,
-                          head_commit: changed? ? changes&.head_commit : nil,
-                          branch: nil, pull_request_url: nil, publication_error: nil,
+    def publish
+      # Every repository that reaches publication is one the executor changed and the runner
+      # verified, so `changed` is true by construction rather than by measurement here.
+      result = Result.new(id: repository.id.to_s, clone_url: repository.clone_url,
+                          default_branch: repository.default_branch, changed: true,
+                          base_commit: repository.base_commit, head_commit: nil, branch: nil,
+                          pull_request_url: nil, publication_error: nil,
                           publication_skipped_reason: nil)
-      return result unless changed?
       return result unless publish?
-      # A Platform that sends no publication policy simply did not ask for publication;
-      # that is not a failure and must not be reported as one.
-      return result unless policy_assigned?
-      return read_only(result) unless writable?(repository)
+      return skipped(result) unless policy_assigned? && writable?
 
-      branch = repository["branch"].to_s
-      return blocked(result, "Platform assigned no publication branch for this repository") if branch.empty?
-      return blocked(result, default_branch_refusal(branch)) if default_branch?(repository, branch)
+      branch = repository.branch.to_s
+      return blocked(result, "no canonical branch was assigned for this run") if branch.empty?
+      return blocked(result, default_branch_refusal(branch)) if default_branch?(branch)
 
-      publish_changed(result, repository, branch)
+      publish_changed(result, branch)
     end
 
-    # A read-only repository was never meant to be published. That is a POLICY
-    # decision, not a failure: it is reported with the observed change state and a
-    # descriptive reason, and it must not fail the run (review-001 finding 3).
-    def read_only(result)
+    # Policy never asked for this repository to be published — read-only access, or a Platform
+    # that sends no publication policy at all. That is a POLICY decision, not a failure: it is
+    # reported with the observed change state and a descriptive reason, and it must not fail the
+    # run (review-001 finding 3).
+    def skipped(result)
       result.publication_skipped_reason =
         "repository is configured read-only; SpecRelay reported the change without publishing it"
       log("Did not publish #{result.id}: repository is read-only by policy (not a failure).")
@@ -140,8 +126,8 @@ module SpecrelayRunner
     # not only on Platform's branch policy. This is the runner-side half of that
     # guarantee: a Platform regression, or a hand-crafted or replayed assignment, can
     # still never make the runner push onto the default branch (review-001 finding 4).
-    def default_branch?(repository, branch)
-      default = repository["default_branch"].to_s.strip
+    def default_branch?(branch)
+      default = repository.default_branch.to_s.strip
       return false if default.empty?
 
       branch == default
@@ -158,7 +144,7 @@ module SpecrelayRunner
       result
     end
 
-    def publish_changed(result, repository, branch)
+    def publish_changed(result, branch)
       commit = ensure_commit(branch)
       return blocked(result, commit.error) if commit.error
 
@@ -169,7 +155,7 @@ module SpecrelayRunner
       result.branch = branch
       return result unless create_pull_requests?
 
-      pull_request = ensure_pull_request(repository, branch, result)
+      pull_request = ensure_pull_request(branch, result)
       return blocked(result, pull_request.error) if pull_request.error
 
       result.pull_request_url = pull_request.url
@@ -260,9 +246,12 @@ module SpecrelayRunner
     # same branch. The lookup FAILS CLOSED: if we cannot establish whether a pull
     # request already exists, we report that and stop, because guessing "none" and
     # creating is how a retry produced a duplicate (review-001 finding 1).
-    def ensure_pull_request(repository, branch, result)
-      slug = repository_slug(repository)
-      return Step.new(error: "cannot resolve the GitHub repository for #{result.id}") if slug.nil?
+    def ensure_pull_request(branch, result)
+      # The identity was normalized once, by the verifier that read it from this repository's own
+      # `origin` ({GithubRemote}). There is no second parse here, so `gh` can never be asked about
+      # a different repository than the one whose pull-request URL is validated.
+      slug = repository.id.to_s
+      return Step.new(error: "cannot resolve the GitHub repository for #{result.id}") if slug.empty?
       return Step.new(error: gh_unavailable_reason) unless gh_available?
 
       # result.head_commit is the commit this run actually committed and pushed, which is
@@ -272,7 +261,7 @@ module SpecrelayRunner
       return Step.new(error: lookup.error) if lookup.error
       return Step.new(url: lookup.url) if lookup.url
 
-      create_pull_request(slug, repository, branch, result)
+      create_pull_request(slug, branch, result)
     end
 
     # The outcome of asking GitHub whether a reusable pull request exists. `url` set
@@ -433,9 +422,9 @@ module SpecrelayRunner
         "pushed #{pushed}; refusing to report a pull request that may not contain this run's commit"
     end
 
-    def create_pull_request(slug, repository, branch, result)
+    def create_pull_request(slug, branch, result)
       argv = [ "pr", "create", "--repo", slug, "--head", branch,
-               "--base", repository["default_branch"].to_s, "--title", pull_request_title,
+               "--base", repository.default_branch.to_s, "--title", pull_request_title,
                "--body", pull_request_body(branch) ]
       argv << "--draft" if draft_pull_request?
       created = gh(argv)
@@ -463,7 +452,7 @@ module SpecrelayRunner
     # validation result. It deliberately contains no prompt text, provider transcript,
     # model reasoning, or credential material.
     def pull_request_body(branch)
-      files = Array(changes&.changed_files)
+      files = changed_files
       lines = [
         "SpecRelay executed this change automatically from an approved specification.",
         "", "- Task: #{task_id}", "- Run: #{run_id}", "- Branch: #{branch}"
@@ -479,23 +468,6 @@ module SpecrelayRunner
     end
 
     def links = payload["links"].to_h
-
-    # Accepts the https and scp-like ssh remote forms and returns "owner/repo".
-    # Credential userinfo in an https remote is dropped, never carried into a
-    # command line or a log.
-    def repository_slug(repository)
-      url = repository["clone_url"].to_s.strip
-      return nil if url.empty?
-
-      slug =
-        if url.start_with?("git@github.com:")
-          url.delete_prefix("git@github.com:")
-        else
-          url.sub(%r{\Ahttps?://(?:[^@/]+@)?github\.com/}, "")
-        end
-      slug = slug.delete_suffix(".git")
-      slug.match?(%r{\A[A-Za-z0-9._-]+/[A-Za-z0-9._-]+\z}) ? slug : nil
-    end
 
     # `gh` is optional infrastructure on the runner host. When it is missing or
     # unauthenticated the branch is still published and the failure is reported as a

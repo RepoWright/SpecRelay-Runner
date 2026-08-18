@@ -83,10 +83,19 @@ class ProtocolFlowTest < Minitest::Test
     assert_equal @platform.protocol_events.map { |e| e["sequence"] }.max, terminal["final_sequence"]
     assert_equal 0, terminal.dig("core", "exit_code")
     repo = terminal["repositories"].first
-    assert_equal "tiny-demo-workspace", repo["id"]
+    # MAPIAI-84 — a repository is identified by its own normalized GitHub remote, read from the
+    # repository, not by a workspace key Platform declared.
+    assert_equal "SpecRelay/tiny-demo-workspace", repo["id"]
+    assert_equal "git@github.com:SpecRelay/tiny-demo-workspace.git", repo["clone_url"]
+    assert_equal "main", repo["default_branch"]
     assert repo["changed"]
     assert_match(/\A[0-9a-f]{40,64}\z/, repo["base_commit"])
-    assert_match(/\A[0-9a-f]{40,64}\z/, repo["head_commit"])
+    # This assignment carries no publication policy at all, so nothing was published: the change is
+    # reported truthfully with the reason it was not, and no commit is claimed for a commit that
+    # was never made.
+    assert_nil repo["head_commit"]
+    assert_nil repo["branch"]
+    assert_match(/read-only/, repo["publication_skipped_reason"])
     assert terminal.dig("cleanup", "succeeded")
     refute_empty terminal["artifacts"]
   end

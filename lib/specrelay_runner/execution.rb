@@ -287,6 +287,17 @@ module SpecrelayRunner
       # sits on disk, so this fails closed instead (review-002 finding N1).
       return unmeasured_report(worktree, executor_result, changes) unless changes.measured?
 
+      # MAPIAI-84 — the executor's semantic repository selection, read back and then VERIFIED
+      # against the repositories on disk. It happens here, before the tests and before any
+      # external write, for the same reason change measurement does: an unsafe or incoherent
+      # selection means there is nothing this attempt can honestly publish, so running the
+      # project's tests against it would only add noise to a refusal.
+      selection = selected_repositories(root, worktree, staging)
+      return selection_refused(root, worktree, executor_result, selection.error) unless selection.ok?
+
+      repositories = selection.repositories
+      changes = combined_changes(repositories, changes)
+
       emit("verification.started", "Running project tests for #{run['task_id']}", phase: "verification")
       test = run_tests(worktree, root)
       emit("verification.completed", "Project tests exited #{test[:exit_code]} for #{run['task_id']}",
@@ -297,7 +308,7 @@ module SpecrelayRunner
       check_stop!
       demonstrate_protocol_controls
       status = terminal_status(test)
-      publication = publish(worktree, changes, test, status)
+      publication = publish(repositories, test, status)
       # An incomplete publication is a FAILED attempt, not a success with a warning:
       # the tests passed but the output never became reviewable. Reporting it as
       # failed is what makes Platform record a durable, operator-visible reason and
@@ -307,7 +318,52 @@ module SpecrelayRunner
       submit(worktree, executor_result, test, changes, status, publication, failure)
     end
 
-    # The first publication error across the assigned repositories, or nil.
+    # MAPIAI-84 — what the executor reported, verified. One refusal for the whole selection: the
+    # verifier stops at the first entry it cannot prove, because publication is all-or-fail and a
+    # partially publishable selection must not become a partially published run.
+    def selected_repositories(root, worktree, staging)
+      reported = RepositorySelection.read(staging)
+      return Workspace::Selection.new(repositories: [], error: reported.error) unless reported.ok?
+
+      measuring_workspace(root).select(worktree.path, reported.paths)
+    end
+
+    # The executor answered, but with something the runner will not act on: a path outside the task
+    # workspace, a directory that is not a repository root, a repository on the wrong branch or with
+    # no supported remote, two entries naming one repository, or a repository with nothing to
+    # publish. Reported as a FAILED attempt with its own classification and NO repository rows —
+    # a refused selection must not leave a partial authoritative repository set anywhere.
+    def selection_refused(root, worktree, executor_result, reason)
+      failed_report(root, worktree, executor_result,
+                    "Refusing to publish #{run['task_id']}: #{Redaction.redact(reason.to_s)}",
+                    classification: "repository_selection_refused")
+    end
+
+    # The report bundle's single diff view over every selected repository. Each repository measures
+    # its own change set, so paths are prefixed with the repository they belong to: a bare
+    # `app/x.rb` from two repositories would read as one file changed twice.
+    #
+    # `measured` is the task workspace's own measurement. Its `head_commit` is kept, because the
+    # report's worktree identity is about the task workspace rather than about any one repository
+    # inside it, and it is the whole answer for an empty selection — a clean run still reports a
+    # measured (and empty) change set rather than an absent one.
+    def combined_changes(repositories, measured)
+      return measured if repositories.empty?
+
+      Workspace::Changes.new(
+        changed_files: repositories.flat_map { |repository| prefixed_files(repository) }.first(500),
+        diff: repositories.map(&:diff).join("\n"),
+        head_commit: measured.head_commit, measurement_error: nil
+      )
+    end
+
+    def prefixed_files(repository)
+      Array(repository.changed_files).map do |file|
+        repository.relative_path == "." ? file : File.join(repository.relative_path, file)
+      end
+    end
+
+    # The first publication error across the published repositories, or nil.
     #
     # Only `publication_error` — publication that was ATTEMPTED and FAILED — may fail
     # the attempt. `publication_skipped_reason` (a read-only repository Platform never
@@ -344,19 +400,27 @@ module SpecrelayRunner
     # publication_error on the repository result, which Platform validates and refuses
     # to treat as success — so an incomplete publication blocks the run instead of
     # silently passing.
-    def publish(worktree, changes, test, status)
+    def publish(repositories, test, status)
       publishing = status == ReportBundle::STATUS_SUCCEEDED
-      publication = Publication.new(payload: payload, worktree_path: worktree.path, changes: changes,
-                                    base_commit: worktree.base_commit, test: test, env: env, io: io,
-                                    publish: publishing)
-      return publication.call unless publishing && publication.expected?
+      publications = repositories.map do |repository|
+        Publication.new(payload: payload, repository: repository, test: test, env: env, io: io,
+                        publish: publishing)
+      end
+      return publications.map(&:call) unless publishing && expected?(repositories)
 
       emit("publication.started", "Publishing repository output for #{run['task_id']}", phase: "publication")
-      results = publication.call
+      results = publications.map(&:call)
       emit("publication.completed", publication_summary(results), phase: "publication",
            published_branch: results.map(&:branch).compact.first,
            pull_request_url: results.map(&:pull_request_url).compact.first)
       results
+    end
+
+    # Publication is expected to do real work — and so deserves its events — when the executor
+    # selected at least one repository and policy grants write access. Access is the run's policy
+    # rather than a per-repository entry, so it is one question for the whole selection.
+    def expected?(repositories)
+      repositories.any? && payload["repository_policy"].to_h.fetch("access", "read").to_s == "write"
     end
 
     # The report's failure narrative names the real cause: a publication failure is
@@ -377,7 +441,7 @@ module SpecrelayRunner
     end
 
     def create_worktree(root)
-      Workspace.new(root: root, canonical_branch: run["canonical_branch"],
+      Workspace.new(root: root, canonical_branch: run["canonical_branch"], task_id: run["task_id"],
                     create_command: workspace.fetch("worktree_create_command")).create
     end
 
@@ -405,7 +469,7 @@ module SpecrelayRunner
                                    resume_question_id: @resume&.question_id).start
       result = Executor.new(config: payload.fetch("executor"), worktree_path: worktree.path,
                             staging_dir: staging, env: env)
-                       .run(prompt_text(worktree.path, @bridge.path),
+                       .run(prompt_text(worktree.path, @bridge.path, RepositorySelection.path(staging)),
                             on_output: (@claude_stream || @log_stream).sink,
                             on_start: -> { @bridge.confirm_resume },
                             stop_check: -> { @bridge.stop_provider? })
@@ -576,30 +640,14 @@ module SpecrelayRunner
         outcome: succeeded ? TerminalResult::SUCCEEDED : TerminalResult::FAILED,
         final_sequence: final_sequence, exit_code: exit_code,
         error_classification: succeeded ? nil : (error_classification || "tests_failed"),
-        repositories: publication || unpublished_repositories(base_commit, changes),
+        # MAPIAI-84 — an attempt that never reached publication reports NO repositories. It has
+        # no verified selection, so it has no repository identity, remote or base commit it can
+        # honestly assert; inventing a row from the workspace key is what let a run whose change
+        # detection failed announce a repository state nobody had measured (review-003 finding 2).
+        # The cause travels in the error classification and the report's failure narrative instead.
+        repositories: publication || [],
         artifacts: terminal_artifacts
       )
-    end
-
-    # Repository results for a path that never reached publication (an executor
-    # failure). They report the observed change state truthfully with nothing
-    # published, so Platform records the repository without a false publication.
-    def unpublished_repositories(base_commit, changes)
-      ids = Array(payload["repositories"]).map { |repository| repository["id"].to_s }
-      ids = [ workspace.fetch("workspace_key") ] if ids.empty?
-      # When measurement failed, `changed: false` is not a fact — it is the absence of one
-      # (review-003 finding 2). Reporting it as unknown requires a nullable `changed`,
-      # which Platform's envelope validator rejects and CR-002 puts out of scope; see
-      # TerminalResult#repository_result. The reason therefore travels with the repository
-      # so no reader can mistake this for a clean "nothing changed".
-      changed = Array(changes.changed_files).any?
-      error = changes.measurement_error && "change detection failed: #{changes.measurement_error}"
-      ids.map do |id|
-        Publication::Result.new(id: id, changed: changed, base_commit: base_commit,
-                                head_commit: changed ? changes.head_commit : nil,
-                                branch: nil, pull_request_url: nil, publication_error: error,
-                                publication_skipped_reason: nil)
-      end
     end
 
     # Deterministic, default-off protocol controls (MVP-0013) that reproduce the
@@ -625,26 +673,50 @@ module SpecrelayRunner
       check_stop!
     end
 
-    def prompt_text(worktree_path, bridge_path)
+    def prompt_text(worktree_path, bridge_path, selection_path)
       preamble = <<~MD.strip
         # Automated execution task — #{run['task_id']}
 
         You are an automated, non-interactive executor. Implement the approved
-        specification in the dedicated worktree below, then stop.
+        specification in the task workspace below, then stop.
 
-        - Worktree (your working directory): `#{worktree_path}`
+        - Task workspace (your working directory): `#{worktree_path}`
         - Task id: `#{run['task_id']}`
         - Canonical branch: `#{run['canonical_branch']}`
         #{package_lines.join("\n")}
 
         Rules:
-        - Change ONLY files inside the worktree above, per the approved specification.
+        - Change ONLY files inside the task workspace above, per the approved specification.
         - Do NOT edit any `spec.md`/`spec_persian.md`, push, open a PR, or write to Platform.
         - Make the change idempotently.
+
+        #{selection_lines(selection_path)}
 
         #{question_lines(bridge_path)}
       MD
       "#{preamble}\n\n---\n\n#{payload.dig('specification_package', 'handoff_prompt')}#{rework_prompt}#{resume_prompt}"
+    end
+
+    # MAPIAI-84 — the ONE way the executor's repository choice reaches the runner.
+    #
+    # The task workspace may contain several independent git repositories, and WHICH of them an
+    # approved specification needs is a decision only the executor can make. Nothing else is read:
+    # the runner never infers a repository from prose, terminal output or provider reasoning, so an
+    # unreported repository is simply not published. The document is required even when nothing
+    # changed, because silence and "nothing changed" are different facts.
+    def selection_lines(selection_path)
+      <<~MD.strip
+        Before you exit successfully, report which repositories you changed:
+
+        - Write `#{selection_path}` as one JSON object with `repositories`, an array of
+          `{ "path": "<repository path relative to the task workspace>" }`. Use `"."` for the task
+          workspace repository itself. Write `{ "repositories": [] }` if you changed nothing.
+        - List a repository ONLY if you changed it, and give each one once. Paths only: no absolute
+          paths, no pull-request URLs, no credentials, no explanation of your reasoning.
+        - SpecRelay verifies every entry and publishes one draft pull request per repository. An
+          entry it cannot verify fails the attempt, and a repository you do not list is not
+          published at all.
+      MD
     end
 
     # MVP-0036 Stage 2a — the answered batch, appended once after the unchanged approved package.
