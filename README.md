@@ -1092,16 +1092,41 @@ SPECRELAY_RUNNER_FORCE_TERMINAL_FAILURE=true  # submit a failed terminal envelop
 ## GitHub publication
 
 After the project tests pass and before the report upload, the runner publishes
-the changed repository output to GitHub — commit, push the Platform-assigned
-branch, and create or reuse a draft pull request
+the changed repository output to GitHub — commit, push the run's canonical task
+branch, and create or reuse a draft pull request, **once per selected repository**
 ([`lib/specrelay_runner/publication.rb`](lib/specrelay_runner/publication.rb)).
 
-Ownership stays where it belongs: **Platform decides**, in the assignment's
-`repositories` / `repository_policy` / `links` blocks, which repository is
-published, on which branch, with which access, and whether a pull request is
-required. The runner only runs local git/gh commands and reports facts. It never
-invents a branch name — a reported branch that differs from the assigned one is
-rejected by Platform.
+Ownership is split, and MAPIAI-84 is where the split moved. **Platform decides HOW**
+(`repository_policy` / `links`: access, whether a pull request is required, whether it
+is a draft) and sends **no eligible-repository list**. **The executor decides WHICH**,
+because a task workspace may hold several independent repositories and only the executor
+knows what its change touched. **The runner decides nothing** — it verifies the
+executor's selection locally, runs git/gh, and reports facts.
+
+The executor states its selection in one bounded document,
+`changed-repositories.json`, written into the attempt's staging directory (outside the
+task workspace). It holds relative paths and nothing else — `"."` names the task
+workspace repository itself:
+
+```json
+{ "repositories": [ { "path": "." }, { "path": "component-a" } ] }
+```
+
+Prose and terminal output are never parsed, and the document is closed: an entry with any
+key other than `path` is refused. A missing document fails the attempt; an empty list is a
+valid "nothing changed" answer that publishes nothing.
+
+[`Workspace#select`](lib/specrelay_runner/workspace.rb) then proves every entry before any
+external write — relative, inside the task workspace, a git repository **root**, a
+supported GitHub `origin`, on the run's canonical branch, holding a change of its own, and
+unique by both resolved path and normalized remote. Any failure refuses the WHOLE
+selection: publication is all-or-fail, so a partially publishable selection never becomes
+a partially published run.
+
+Each repository is then published by its own `Publication` instance, so one repository's
+worktree, commit or pull request cannot leak into another's. The branch is always the run's
+canonical branch; the runner never invents one, and Platform rejects a reported branch that
+is anything else.
 
 Commands used, all as argv arrays through `CommandRunner` (never a shell string,
 so provider or work-item text can never be interpolated into a command line):
@@ -1109,7 +1134,7 @@ so provider or work-item text can never be interpolated into a command line):
 ```bash
 git -C <worktree> add -A
 git -C <worktree> -c user.name=… -c user.email=… commit --no-verify -m "<TASK-ID>: …"
-git -C <worktree> push origin HEAD:refs/heads/<assigned-branch>   # never --force
+git -C <worktree> push origin HEAD:refs/heads/<canonical-branch>  # never --force
 # Reuse first, and only an OPEN pull request on this branch:
 gh pr list   --repo <owner/repo> --head <branch> --state open --limit 10 \
              --json url,state,headRefName,headRefOid
@@ -1126,13 +1151,17 @@ Every decision point reports a blocking reason rather than a success-shaped gues
   lookup error as "none" is how a retry opened a duplicate pull request.
 - **Only an open pull request whose head is the commit just pushed may be
   reused.** `--state open` (never `--state all`) means a closed or merged pull
-  request from an earlier round on the same deterministic `specrelay/<KEY>` branch
+  request from an earlier round on the same canonical task branch
   is never reported as this round's output — it no longer tracks the branch, so it
   may not contain the change. Such a round opens a **new** pull request instead.
 - **The runner refuses to push the repository's `default_branch`**, comparing the
-  assigned `branch` against the `default_branch` in the same assignment. Platform's
-  branch policy already refuses to render it; this is the runner-side half, so a
-  Platform regression or a replayed assignment still cannot push onto `main`.
+  canonical branch against the `default_branch` read from that repository's own
+  `origin/HEAD`. Verification refuses it first; this is the runner-side half at the
+  publication boundary, so a regression upstream still cannot push onto `main`.
+- **A remote credential is never transmitted.** A configured `origin` may carry
+  credential userinfo. It is read in exactly one place, to identify the repository, and
+  what travels onward is the canonical `https://github.com/<owner>/<repo>.git` derived
+  from the validated slug.
 - **No failure reason is ever empty.** A timeout reports the elapsed seconds and a
   non-zero exit with no output reports the exit status.
 - **A failed `git status` is never read as a clean tree**, which would silently
@@ -1151,7 +1180,15 @@ Every decision point reports a blocking reason rather than a success-shaped gues
   the next step. SpecRelay does not force-push.
 - **Read-only** repositories are reported with `publication_skipped_reason` and
   never pushed. This is a **policy outcome, not a failure**.
-- **Unchanged** repositories get no commit, no branch, and no pull request.
+- **Unchanged** repositories get no commit, no branch, and no pull request. A reported
+  repository with nothing to publish refuses the selection rather than publishing an
+  empty change.
+- **A retry in the same workspace recovers.** After a partial failure the selected
+  repositories are already committed and their working trees are clean, so the change is
+  measured from the task branch against the repository's default branch instead —
+  exactly what the pull request contains. The existing commit, branch and pull request
+  are reused and only the missing pull request is created. Nothing is retained on disk
+  between attempts to make that work.
 - **An unmeasurable worktree is not an unchanged one.** If the change set cannot
   be established, the attempt fails with `worktree_unmeasurable` rather than
   announcing "no code changes" to Jira while the executor's diff sits on disk.

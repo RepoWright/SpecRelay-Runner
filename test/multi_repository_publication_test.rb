@@ -474,9 +474,17 @@ class MultiRepositoryPublicationTest < Minitest::Test
                  "the repository still publishes normally through its own origin"
 
     assert_includes url, secret, "the fixture's origin really carries the credential"
-    submitted = JSON.generate(@platform.requests)
-    refute_includes submitted, secret, "no request Platform receives may carry the credential"
+    refute_includes JSON.generate(@platform.requests), secret,
+                    "no request Platform receives may carry the credential"
     refute_includes output, secret, "no console line may carry the credential"
+    # The report's files travel base64-encoded, so a raw search over the request body would
+    # not see a credential inside the generated manifest, summary or captured diff.
+    decoded = @platform.last_report[:body].dig("report", "files").map { |f| report_file(f["relative_path"]) }
+    assert_operator decoded.length, :>=, 5, "the report really carries its generated artifacts"
+    decoded.each_with_index do |content, index|
+      refute_includes content, secret,
+                      "execution-report artifact #{@platform.last_report[:body].dig('report', 'files')[index]['relative_path']} carries the credential"
+    end
   end
 
   # The same guarantee on the refusal path, where an unexpected repository state is described back

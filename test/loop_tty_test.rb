@@ -294,6 +294,7 @@ class LoopTtyTest < Minitest::Test
       content = File.read(file)
       File.write(file, content.gsub("Hello Demo", "Hello SpecRelay Demo")) if content.include?("Hello Demo")
       puts "[executor] applied the edit"
+      #{DemoWorkspace.selection_snippet}
       exit 0
     RUBY
     FileUtils.chmod(0o755, path)
