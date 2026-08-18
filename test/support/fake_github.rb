@@ -32,6 +32,16 @@ module FakeGithub
     bare
   end
 
+  # MAPIAI-84 — an `origin` whose url carries credential userinfo, as a token-authenticated https
+  # remote does. `pushInsteadOf` keeps the push local while `git remote get-url origin` still
+  # returns the credential-bearing url the runner actually reads, so the value that must never be
+  # transmitted is really present rather than approximated.
+  def credential_remote(root, bare, url)
+    git(root, "remote", "set-url", "origin", url)
+    git(root, "config", "url.#{bare}.pushInsteadOf", url)
+    url
+  end
+
   def remote?(root)
     _out, status = Open3.capture2e("git", "-C", root, "remote", "get-url", "origin")
     status.success?
@@ -75,12 +85,16 @@ module FakeGithub
   # repository per `owner/repo`, so a run publishing several repositories gets distinct pull
   # requests resolved against the right remote. `fail_create_for` makes creation fail for exactly
   # one repository, which is what a PARTIAL publication failure is.
+  # `state` reuses another fake gh's pull-request state file, which is what a RETRY sees: the
+  # pull request an earlier attempt really created is still open on GitHub, while this attempt
+  # gets its own invocation log so "created nothing new" is directly observable.
   def gh_bin(mode: "ok", pull_request_url: "https://github.com/SpecRelay/tiny-demo-workspace/pull/7",
-             bare: nil, seed: [], urls: {}, bares: {}, fail_create_for: nil)
+             bare: nil, seed: [], urls: {}, bares: {}, fail_create_for: nil, state: nil)
     dir = Dir.mktmpdir("specrelay-runner-gh-")
     log = File.join(dir, "gh.log")
-    state = File.join(dir, "prs.json")
-    File.write(state, JSON.generate(seed))
+    shared = !state.nil?
+    state ||= File.join(dir, "prs.json")
+    File.write(state, JSON.generate(seed)) unless shared
     path = File.join(dir, "gh")
     File.write(path, script(mode: mode, pull_request_url: pull_request_url, log: log, state: state,
                             bare: bare, counter: File.join(dir, "list.count"), urls: urls,

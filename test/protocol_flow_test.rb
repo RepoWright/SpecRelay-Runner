@@ -86,7 +86,7 @@ class ProtocolFlowTest < Minitest::Test
     # MAPIAI-84 — a repository is identified by its own normalized GitHub remote, read from the
     # repository, not by a workspace key Platform declared.
     assert_equal "SpecRelay/tiny-demo-workspace", repo["id"]
-    assert_equal "git@github.com:SpecRelay/tiny-demo-workspace.git", repo["clone_url"]
+    assert_equal "https://github.com/SpecRelay/tiny-demo-workspace.git", repo["clone_url"]
     assert_equal "main", repo["default_branch"]
     assert repo["changed"]
     assert_match(/\A[0-9a-f]{40,64}\z/, repo["base_commit"])

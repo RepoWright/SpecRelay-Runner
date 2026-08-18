@@ -184,10 +184,13 @@ module SpecrelayRunner
     end
 
     def identify(relative, resolved)
-      clone_url = capture(resolved, %w[remote get-url origin])
-      id = GithubRemote.slug(clone_url)
+      # The configured remote is read HERE and nowhere else. It may carry credential userinfo, so
+      # what travels on is {GithubRemote}'s canonical url, derived from the validated slug.
+      origin = capture(resolved, %w[remote get-url origin])
+      id = GithubRemote.slug(origin)
       return "the selected repository #{quoted(relative)} has no supported GitHub 'origin' remote" if id.nil?
 
+      clone_url = GithubRemote.clone_url(origin)
       default_branch = default_branch_of(resolved)
       return "could not establish the default branch of #{quoted(relative)}; run `git remote set-head origin --auto` there" if default_branch.nil?
       return "refusing to publish #{quoted(relative)} onto #{default_branch}, which is that repository's default branch" if default_branch == canonical_branch
@@ -199,12 +202,45 @@ module SpecrelayRunner
     def measure(relative, resolved, id, clone_url, default_branch)
       changes = capture_changes(resolved)
       return "could not determine what changed in #{quoted(relative)}: #{changes.measurement_error}" unless changes.measured?
-      return "the selected repository #{quoted(relative)} reports no change to publish" if changes.changed_files.empty?
+
+      changes = committed_changes(resolved, default_branch) if changes.changed_files.empty?
+      if changes.nil? || changes.changed_files.empty?
+        return "the selected repository #{quoted(relative)} reports no change to publish"
+      end
 
       Repository.new(id: id, relative_path: relative, path: resolved, clone_url: clone_url,
                      default_branch: default_branch, branch: canonical_branch,
                      base_commit: changes.head_commit, changed_files: changes.changed_files,
                      diff: changes.diff)
+    end
+
+    # The SAME-WORKSPACE RETRY path. After a partial publication failure every selected repository
+    # is already committed, so its working tree is clean and worktree-versus-HEAD measurement sees
+    # nothing — and without this the missing pull request could never be completed here.
+    #
+    # The change has not disappeared; it moved into the branch. What this reads is exactly what
+    # the pull request contains: the task branch measured against the repository's default branch,
+    # which is the base `gh pr create` is given. No runner-side state is retained to make that
+    # possible, and nothing is re-established that git did not already know.
+    #
+    # It does not weaken the ordinary rule. A repository the executor never touched is level with
+    # its default branch, so base and head are the same commit and it is still refused.
+    def committed_changes(path, default_branch)
+      base = merge_base(path, default_branch)
+      return nil if base.nil? || base == rev_parse(path, "HEAD")
+
+      range = "#{base}..HEAD"
+      Changes.new(changed_files: limit(capture(path, [ "diff", "--name-only", range ]).to_s.each_line.map(&:chomp)),
+                  diff: capture(path, [ "diff", range ]).to_s, head_commit: base, measurement_error: nil)
+    end
+
+    # The commit this branch and the repository's default branch last shared. The default branch
+    # is resolved from the repository's own refs — its remote-tracking ref when it has one, its
+    # local branch otherwise — because a task worktree may have either and neither is a guess.
+    def merge_base(path, default_branch)
+      default = [ "refs/remotes/origin/#{default_branch}", "refs/heads/#{default_branch}" ]
+                .lazy.filter_map { |ref| capture(path, [ "rev-parse", "--verify", "--quiet", ref ]) }.first
+      default && capture(path, [ "merge-base", default, "HEAD" ])
     end
 
     # Two entries naming ONE repository, by either measure. The git root catches two spellings of
@@ -214,7 +250,10 @@ module SpecrelayRunner
       same_tree = accepted.find { |other| other.path == repository.path }
       return "selected repositories #{quoted(same_tree.relative_path)} and #{quoted(repository.relative_path)} are the same repository" if same_tree
 
-      same_remote = accepted.find { |other| GithubRemote.identity(other.clone_url) == GithubRemote.identity(repository.clone_url) }
+      # GitHub owner and repository names are case-insensitive, so two remotes differing only in
+      # case are ONE repository. Compared on the normalized id rather than by re-parsing the url,
+      # so this answer cannot disagree with the one `gh` was given.
+      same_remote = accepted.find { |other| other.id.casecmp?(repository.id) }
       return nil if same_remote.nil?
 
       "selected repositories #{quoted(same_remote.relative_path)} and #{quoted(repository.relative_path)} " \
@@ -291,14 +330,17 @@ module SpecrelayRunner
     end
 
     def parse_changed(porcelain)
-      porcelain.to_s.each_line.filter_map do |line|
+      limit(porcelain.to_s.each_line.filter_map do |line|
         line = line.chomp
         next if line.empty?
 
         path = line[3..].to_s
         path.include?(" -> ") ? path.split(" -> ").last : path
-      end.uniq.first(500)
+      end)
     end
+
+    # One bound on a reported change set, wherever it was measured from.
+    def limit(files) = files.reject(&:empty?).uniq.first(500)
 
     def rev_parse(path, ref)
       result = git(path, [ "rev-parse", ref ])

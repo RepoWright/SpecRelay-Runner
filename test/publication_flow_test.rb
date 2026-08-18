@@ -152,7 +152,7 @@ class PublicationFlowTest < Minitest::Test
   def republish(first, gh_dir: @gh_dir)
     repository = SpecrelayRunner::Workspace::Repository.new(
       id: SLUG, relative_path: ".", path: File.join(@root, ".runs", "worktrees", TASK),
-      clone_url: "git@github.com:#{SLUG}.git", default_branch: "main", branch: BRANCH,
+      clone_url: "https://github.com/#{SLUG}.git", default_branch: "main", branch: BRANCH,
       base_commit: first["base_commit"], head_commit: first["head_commit"],
       changed_files: [ "demo-app/index.html" ], diff: ""
     )
@@ -597,7 +597,7 @@ class PublicationFlowTest < Minitest::Test
   # Publication must still refuse to push a repository's default branch (review-001 finding 4).
   def test_publication_refuses_the_default_branch_at_its_own_boundary
     repository = SpecrelayRunner::Workspace::Repository.new(
-      id: SLUG, path: @root, clone_url: "git@github.com:#{SLUG}.git",
+      id: SLUG, path: @root, clone_url: "https://github.com/#{SLUG}.git",
       default_branch: BRANCH, branch: BRANCH, base_commit: "a" * 40,
       changed_files: [ "demo-app/index.html" ], diff: ""
     )

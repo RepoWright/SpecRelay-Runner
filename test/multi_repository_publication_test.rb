@@ -110,7 +110,7 @@ class MultiRepositoryPublicationTest < Minitest::Test
       assert repo["changed"], "#{repo['id']} is in the result only because it changed"
       assert_equal BRANCH, repo["branch"], "every repository publishes the canonical task branch"
       assert_equal "main", repo["default_branch"]
-      assert_equal "git@github.com:#{repo['id']}.git", repo["clone_url"]
+      assert_equal "https://github.com/#{repo['id']}.git", repo["clone_url"]
       assert_match(/\A[0-9a-f]{40,64}\z/, repo["base_commit"])
       assert_match(/\A[0-9a-f]{40,64}\z/, repo["head_commit"])
       refute_equal repo["base_commit"], repo["head_commit"]
@@ -386,5 +386,126 @@ class MultiRepositoryPublicationTest < Minitest::Test
     assert_equal BRANCH, failed["branch"], "the branch it did push is still reported"
     assert_equal 2, FakeGithub.pr_creates(gh_log),
                  "each repository attempted its own creation; one succeeded and one failed"
+  end
+
+  # --- S10 continued: RETRYING a partial publication ----------------------
+
+  # The recovery half of S10, through the real CLI/Execution/selection path rather than by
+  # constructing a verified repository by hand.
+  #
+  # After the first attempt every selected repository is already COMMITTED, so its working tree
+  # is clean and worktree-versus-HEAD measurement sees nothing. The change is still there — it is
+  # the task branch's own commits, ahead of the repository's default branch — and the retry has to
+  # find it, or the missing pull request can never be completed on this workspace.
+  def test_a_retry_recovers_the_committed_repositories_and_completes_the_missing_publication
+    payload = start
+    gh_dir, first_log, state = FakeGithub.gh_bin(urls: PR_URLS, bares: @bares,
+                                                 fail_create_for: "SpecRelay/component-b")
+    run_cli(gh_dir: gh_dir)
+    assert_equal "failed", terminal["outcome"], "the first attempt published only one of two"
+    heads = { "SpecRelay/component-a" => branches_of("SpecRelay/component-a")[BRANCH],
+              "SpecRelay/component-b" => branches_of("SpecRelay/component-b")[BRANCH] }
+
+    # The retry edits NOTHING: it reports the repositories the previous attempt already
+    # committed. `gh` shares the earlier state file, so component-a's pull request is still open.
+    payload["executor"]["env"].merge!("FAKE_EDITED" => "", "FAKE_SELECTED" => "component-a,component-b")
+    retry_dir, retry_log, = FakeGithub.gh_bin(urls: PR_URLS, bares: @bares, state: state)
+    @platform.offer_claim_again
+    code, output = run_cli(gh_dir: retry_dir)
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, code, output
+    assert_equal "succeeded", terminal["outcome"], "the retry completed the publication"
+    assert_equal [ "SpecRelay/component-a", "SpecRelay/component-b" ], result_ids,
+                 "a clean but already-committed repository is still this task's output"
+
+    results.each do |repo|
+      assert repo["changed"], "the committed task work is a change to publish, not an unchanged repository"
+      assert_equal PR_URLS.fetch(repo["id"]), repo["pull_request_url"]
+      assert_nil repo["publication_error"]
+      assert_equal heads.fetch(repo["id"]), repo["head_commit"],
+                   "the existing commit is reused; the retry creates no second commit"
+      assert_equal heads.fetch(repo["id"]), branches_of(repo["id"])[BRANCH],
+                   "the pushed branch still points at the same commit, so nothing was force-pushed"
+      refute_equal repo["base_commit"], repo["head_commit"],
+                   "the recovered base is the commit the task work started from"
+      assert_equal 1, commits_ahead(repo["id"]), "exactly one commit was ever made for this task"
+    end
+
+    assert_equal PR_URLS.fetch("SpecRelay/component-a"), results.find { |r| r["id"] == "SpecRelay/component-a" }["pull_request_url"]
+    assert_equal 1, FakeGithub.pr_creates(retry_log),
+                 "only the repository that lacked a pull request creates one"
+    assert_equal 2, FakeGithub.pr_lists(retry_log), "each repository looked its own pull request up first"
+    assert_equal [ "create #{TASK}" ], MultiRepositoryWorkspace.worktree_invocations(@built.worktree_log),
+                 "the retry continues the same task workspace instead of building a second one"
+    assert_includes report_file("manifest.yml"), "component-a/app.txt",
+                    "the recovered change set is reported, not an empty diff"
+  end
+
+  # The ordinary rule survives the recovery path: a repository the executor never touched has no
+  # commit of its own ahead of its default branch, so reporting it is still refused.
+  def test_an_untouched_repository_is_still_refused_after_the_recovery_path_exists
+    start(executor_env: { "FAKE_EDITED" => "component-a", "FAKE_SELECTED" => "component-a,component-c" })
+    run_cli
+
+    assert_equal "failed", terminal["outcome"]
+    assert_equal "repository_selection_refused", terminal.dig("core", "error_classification")
+    assert_empty results
+    assert_equal 0, FakeGithub.pr_creates(@gh_log)
+  end
+
+  # --- credential safety --------------------------------------------------
+
+  # A token-authenticated https remote puts a credential in the url `git remote get-url origin`
+  # returns. It is safe to READ locally and never safe to transmit: the runner derives the
+  # canonical credential-free url from the validated slug and carries only that.
+  def test_a_credential_bearing_origin_never_leaves_this_host
+    secret = "dummy-secret"
+    url = FakeGithub.credential_remote(File.join(@root, "component-a"),
+                                       @built.bares["component-a"],
+                                       "https://#{secret}@github.com/SpecRelay/component-a.git")
+    start(executor_env: { "FAKE_EDITED" => "component-a" })
+    code, output = run_cli
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, code, output
+    assert_equal [ "SpecRelay/component-a" ], result_ids
+    assert_equal "https://github.com/SpecRelay/component-a.git", results.first["clone_url"],
+                 "the transmitted url is derived from the validated slug, not the configured remote"
+    assert_equal PR_URLS.fetch("SpecRelay/component-a"), results.first["pull_request_url"],
+                 "the repository still publishes normally through its own origin"
+
+    assert_includes url, secret, "the fixture's origin really carries the credential"
+    submitted = JSON.generate(@platform.requests)
+    refute_includes submitted, secret, "no request Platform receives may carry the credential"
+    refute_includes output, secret, "no console line may carry the credential"
+  end
+
+  # The same guarantee on the refusal path, where an unexpected repository state is described back
+  # to an operator: a refusal names the repository, never its remote's credential.
+  def test_a_credential_bearing_origin_is_absent_from_a_refusal
+    secret = "dummy-secret"
+    FakeGithub.credential_remote(File.join(@root, "component-c"), @built.bares["component-c"],
+                                 "https://#{secret}@github.com/SpecRelay/component-c.git")
+    start(executor_env: { "FAKE_EDITED" => "component-a", "FAKE_SELECTED" => "component-a,component-c" })
+    _code, output = run_cli
+
+    assert_equal "repository_selection_refused", terminal.dig("core", "error_classification")
+    refute_includes JSON.generate(@platform.requests), secret
+    refute_includes output, secret
+  end
+
+  def report_file(name)
+    file = @platform.last_report[:body].dig("report", "files").find { |f| f["relative_path"] == name }
+    Base64.decode64(file.fetch("content_base64"))
+  end
+
+  # Commits this repository's task branch holds that its default branch does not — the retry's
+  # whole recovery signal, and the proof that no duplicate commit was made.
+  def commits_ahead(slug)
+    path = File.join(MultiRepositoryWorkspace.task_workspace(@root, TASK),
+                     slug.split("/").last)
+    out, status = Open3.capture2e("git", "-C", path, "rev-list", "--count", "main..HEAD")
+    raise out unless status.success?
+
+    out.strip.to_i
   end
 end

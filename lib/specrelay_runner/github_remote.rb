@@ -11,14 +11,17 @@ module SpecrelayRunner
   # answers disagree, which is exactly how one repository receives two current pull requests.
   #
   # It is deliberately narrow. Only the https and scp-like ssh forms SpecRelay configures are
-  # accepted, only on github.com, and credential userinfo in an https remote is DROPPED rather
-  # than carried into a command line or a log. Anything else is `nil` — not a guess.
+  # accepted, and only on github.com. Anything else is `nil` — not a guess.
+  #
+  # It is also the boundary a credential stops at. Both answers are DERIVED from the slug, so a
+  # remote's credential userinfo is read here and never leaves: see #clone_url.
   module GithubRemote
     HOST = "github.com"
     SLUG = %r{\A[A-Za-z0-9._-]+/[A-Za-z0-9._-]+\z}
     SSH_PREFIX = "git@#{HOST}:"
     HTTPS_PREFIX = %r{\Ahttps?://(?:[^@/]+@)?#{Regexp.escape(HOST)}/}
     GIT_SUFFIX = ".git"
+    CLONE_URL = "https://%s/%s#{GIT_SUFFIX}"
 
     module_function
 
@@ -37,12 +40,16 @@ module SpecrelayRunner
       SLUG.match?(candidate) ? candidate : nil
     end
 
-    # The comparison key for "is this the same GitHub repository". GitHub owner and repository
-    # names are case-insensitive, so two remotes differing only in case are ONE repository and
-    # must be rejected as duplicates rather than published twice.
-    def identity(url)
+    # The canonical, CREDENTIAL-FREE clone url for a supported remote, or nil.
+    #
+    # A repository's configured `origin` may carry credential userinfo — a token-authenticated
+    # https remote is exactly that shape. Reading it locally is necessary; transmitting it is not,
+    # and a result, a report, a log or a Platform request is forever. So identity inspection ends
+    # at this call: everything downstream carries this derived url, which holds nothing but the
+    # host and the slug already validated above.
+    def clone_url(url)
       resolved = slug(url)
-      resolved&.downcase
+      resolved && format(CLONE_URL, HOST, resolved)
     end
   end
 end

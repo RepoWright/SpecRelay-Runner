@@ -68,6 +68,11 @@ class FakePlatform
     @claim_payload["executor"] = executor
   end
 
+  # MAPIAI-84 — a SECOND attempt at the same task, which is what an operator retry of a partially
+  # published run is. The fake serves the same assignment again, so the retry is a genuine second
+  # pass over one task workspace rather than a different run that happens to look similar.
+  def offer_claim_again = tap { @claimed = false }
+
   attr_reader :requests
 
   # `token` is the shared development token (fallback mode). `registration_token`
