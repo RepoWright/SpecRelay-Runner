@@ -121,8 +121,12 @@ module DemoWorkspace
   # `FAKE_SELECTION_JSON` replaces the whole document with raw bytes, so a test can send a
   # malformed, escaping, or duplicated selection without this script sanitizing it first, and
   # `FAKE_SELECTION_SKIP` writes none at all.
+  #
+  # MAPIAI-93 — each entry also names the verification the executor selected for that repository.
+  # This fixture selects the workspace's own `bin/test`, so the single-repository flow keeps
+  # proving a REAL command run against the final files rather than an empty plan.
   def selection_snippet(changed: "true", paths: nil)
-    reported = paths || %([ { "path" => "." } ])
+    reported = paths || %([ { "path" => ".", "commands" => [ [ "bin/test" ] ] } ])
     <<~RUBY.strip
       unless ENV["FAKE_SELECTION_SKIP"]
         require "json"

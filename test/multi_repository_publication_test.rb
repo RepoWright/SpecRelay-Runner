@@ -314,8 +314,12 @@ class MultiRepositoryPublicationTest < Minitest::Test
 
   # The raw document bytes, built from a Ruby literal so a test can express a shape the
   # production parser must refuse.
+  #
+  # An entry that names no `commands` gets an empty list, so each literal below stays about the
+  # one repository fact it is testing rather than restating the MAPIAI-93 verification shape.
   def selection_json(ruby_literal)
-    JSON.generate({ "repositories" => eval(ruby_literal) }) # rubocop:disable Security/Eval
+    entries = eval(ruby_literal).map { |entry| entry.is_a?(Hash) ? { "commands" => [] }.merge(entry) : entry } # rubocop:disable Security/Eval
+    JSON.generate({ "repositories" => entries })
   end
 
   # The operator-facing reason, read from the failed report rather than reconstructed.

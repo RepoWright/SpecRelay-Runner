@@ -665,7 +665,7 @@ live log events, so a working run never looks like a hung one:
   [claude:status] Running test command: bundle exec rspec
   [claude:status] claude executor running for 15s on MAPIAI-40 (no new output yet)
   [claude:status] Provider completed
-[verification.started] Running project tests for MAPIAI-40
+[verification.started] Verifying 1 changed repository(ies) for MAPIAI-40
 ```
 
 **Structured provider output.** The supported Claude profile is structured-output
@@ -1089,9 +1089,52 @@ SPECRELAY_RUNNER_EVENT_CONFLICT=true          # re-send a used sequence with a d
 SPECRELAY_RUNNER_FORCE_TERMINAL_FAILURE=true  # submit a failed terminal envelope
 ```
 
+## Proportional repository verification (MAPIAI-93)
+
+No project configures a test command. For every repository it changed, the executor
+selects the smallest relevant verification by reading that repository's own instructions,
+scripts, manifests and CI configuration, runs it, repairs what it can, and reports the
+final argv in `changed-repositories.json`.
+
+The runner then **replays** every reported command itself, after change measurement and
+before any external write:
+
+- from the verified repository root as `chdir`, never the workspace above it;
+- as an argv array through `CommandRunner`, never a shell string;
+- against the executor's final files, with the existing timeout, cancellation checks,
+  output bounds and redaction.
+
+`RepositoryVerification` derives one outcome per repository from what those processes
+actually did — nothing the executor claims is evidence:
+
+| Outcome | Meaning |
+|---|---|
+| `passed` | Every reported command exited zero. |
+| `not_found` | The executor reported no applicable command. Valid and non-blocking. |
+| `failed` | A command exited non-zero, timed out, or could not be launched. |
+
+An ordinary failure does not stop the remaining bounded commands, so every changed
+repository receives a complete outcome. One `failed` repository blocks the whole run: no
+commit, push, pull request, or successful terminal result, and the failed report carries
+the repository identity, safe argv, exit/timeout/launch result and bounded redacted
+output. Cancellation and a lost claim keep their existing endings instead of becoming a
+verification result, and the runner never re-invokes the executor to repair — the
+executor's own session was the repair opportunity.
+
+Because a command can change the tree it just verified, the runner re-measures the
+publishable state of every prepared repository after replay and compares it with the
+state that was measured before it. Tracked or untracked publishable drift, HEAD movement,
+a changed selected-repository set, or a selected repository that became clean fails the
+run closed with zero GitHub mutation — the report can never describe a different tree from
+the one publication would push. Ignored command output is harmless.
+
+An empty selection stays a valid no-change success and reports an empty verification
+collection, which is a different thing from one changed repository reporting `not_found`.
+
 ## GitHub publication
 
-After the project tests pass and before the report upload, the runner publishes
+After every changed repository passes verification and before the report upload,
+the runner publishes
 the changed repository output to GitHub — commit, push the run's canonical task
 branch, and create or reuse a draft pull request, **once per selected repository**
 ([`lib/specrelay_runner/publication.rb`](lib/specrelay_runner/publication.rb)).
@@ -1105,16 +1148,23 @@ executor's selection locally, runs git/gh, and reports facts.
 
 The executor states its selection in one bounded document,
 `changed-repositories.json`, written into the attempt's staging directory (outside the
-task workspace). It holds relative paths and nothing else — `"."` names the task
-workspace repository itself:
+task workspace). Each entry holds a relative path — `"."` names the task workspace
+repository itself — and the verification the executor selected for that repository, as
+argv arrays:
 
 ```json
-{ "repositories": [ { "path": "." }, { "path": "component-a" } ] }
+{ "repositories": [ { "path": ".", "commands": [ [ "bin/test" ] ] },
+                    { "path": "component-a", "commands": [] } ] }
 ```
 
-Prose and terminal output are never parsed, and the document is closed: an entry with any
-key other than `path` is refused. A missing document fails the attempt; an empty list is a
-valid "nothing changed" answer that publishes nothing.
+Prose and terminal output are never parsed, and the document is closed: `path` and
+`commands` are both required, any other key is refused, and a shell string where an argv
+array belongs is refused. A missing document fails the attempt; an empty list is a valid
+"nothing changed" answer that publishes nothing.
+
+`"commands": []` is the executor's answer that this repository has no applicable
+verification. It is valid and non-blocking — see
+[Proportional repository verification](#proportional-repository-verification-mapiai-93).
 
 [`Workspace#select`](lib/specrelay_runner/workspace.rb) then proves every entry before any
 external write — relative, inside the task workspace, a git repository **root**, a
@@ -1361,7 +1411,7 @@ What each suite proves:
   failure classifications.
 - **`real_executor_flow_test.rb`** (MVP-0016) drives the real profile through the
   whole runner against an on-disk executable named `claude`, so PATH resolution,
-  readiness, argv assembly, worktree creation, the real test command, and report
+  readiness, argv assembly, worktree creation, verification replay, and report
   upload are all the runner's real code. It proves a readiness failure performs
   **zero** Platform requests and creates no worktree; that the fake-executor path
   never invokes the CLI at all; that a claimed payload which is not the selected

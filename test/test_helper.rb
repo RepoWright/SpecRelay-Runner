@@ -232,8 +232,7 @@ def base_claim_payload(task_id:, executor_command:, worktree_create_command: nil
       "display_name" => "Tiny Demo Workspace", "repository_url" => "https://github.com/SpecRelay/tiny-demo-workspace",
       "default_branch" => "main",
       "worktree_create_command" => worktree_create_command || "./bin/worktree create #{task_id}",
-      "worktree_release_command" => "./bin/worktree release #{task_id}",
-      "test_command" => "./bin/test"
+      "worktree_release_command" => "./bin/worktree release #{task_id}"
     },
     "executor" => {
       "provider" => "fake", "command" => executor_command, "args" => [],

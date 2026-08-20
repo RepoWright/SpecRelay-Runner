@@ -33,7 +33,20 @@ module SpecrelayRunner
     # repository itself rather than declared by Platform: this struct is the whole of what
     # publication is allowed to know about a repository.
     Repository = Struct.new(:id, :relative_path, :path, :clone_url, :default_branch, :branch,
-                            :base_commit, :head_commit, :changed_files, :diff, keyword_init: true)
+                            :base_commit, :head_commit, :changed_files, :diff, keyword_init: true) do
+      # MAPIAI-93 — everything about this repository that publication will WRITE and the report
+      # will DESCRIBE, as one comparable value.
+      #
+      # It exists because verification runs between measurement and publication: a selected
+      # command can succeed and still rewrite a tracked file, move HEAD, or undo the change it
+      # was verifying. Comparing this before and after replay is what proves the tree that was
+      # verified is the tree that gets published (CR-001 F1).
+      #
+      # `base_commit` carries the measured HEAD, so commit movement is included. `head_commit` is
+      # deliberately absent: publication assigns it afterwards, so it is nil on both sides and
+      # comparing it would prove nothing.
+      def publishable_state = [ id, relative_path, base_commit, Array(changed_files), diff.to_s ]
+    end
 
     # The verified selection, or ONE refusal. It is deliberately not a per-entry result list:
     # publication is all-or-fail, so a selection with any unsafe entry must stop the attempt

@@ -56,10 +56,9 @@ module SpecrelayRunner
                         :branch, :pull_request_url, :publication_error, :publication_skipped_reason,
                         keyword_init: true)
 
-    def initialize(payload:, repository:, test:, env: {}, io: $stdout, publish: true)
+    def initialize(payload:, repository:, env: {}, io: $stdout, publish: true)
       @payload = payload
       @repository = repository
-      @test = test || {}
       @env = env
       @io = io
       @publish = publish
@@ -70,7 +69,7 @@ module SpecrelayRunner
 
     private
 
-    attr_reader :payload, :repository, :test, :env, :io
+    attr_reader :payload, :repository, :env, :io
 
     # A failed attempt reports its repository but publishes nothing: there is no
     # reviewable output to offer, and pushing a failing tree would be noise.
@@ -448,9 +447,12 @@ module SpecrelayRunner
     def pull_request_title = "#{task_id}: SpecRelay automated execution output"
 
     # Stable, secret-safe body. It links the Platform run and the work item using the
-    # URLs Platform supplied (never runner-invented), and summarizes the diff and the
-    # validation result. It deliberately contains no prompt text, provider transcript,
-    # model reasoning, or credential material.
+    # URLs Platform supplied (never runner-invented), and summarizes the diff. It deliberately
+    # contains no prompt text, provider transcript, model reasoning, or credential material.
+    #
+    # MAPIAI-93 — it no longer restates a verification result. A pull request only exists because
+    # every changed repository was `passed` or `not_found`, and the per-repository detail lives in
+    # the Platform run this body already links to.
     def pull_request_body(branch)
       files = changed_files
       lines = [
@@ -459,7 +461,6 @@ module SpecrelayRunner
       ]
       lines << "- Platform run: #{links['run_url']}" unless links["run_url"].to_s.empty?
       lines << "- Work item: #{links['work_item_url']}" unless links["work_item_url"].to_s.empty?
-      lines << "- Validation: `#{test[:command]}` exited #{test[:exit_code]}"
       lines.concat([ "", "## Changed files (#{files.length})", "" ])
       lines.concat(files.first(MAX_BODY_FILES).map { |file| "- `#{file}`" })
       lines << "- …and #{files.length - MAX_BODY_FILES} more" if files.length > MAX_BODY_FILES

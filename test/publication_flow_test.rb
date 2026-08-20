@@ -158,7 +158,7 @@ class PublicationFlowTest < Minitest::Test
     )
     SpecrelayRunner::Publication.new(
       payload: claim_payload_for(task_id: TASK, executor_command: @executor, publication: {}),
-      repository: repository, test: { command: "./bin/test", exit_code: 0 },
+      repository: repository,
       env: { "PATH" => "#{gh_dir}:#{ENV['PATH']}", "HOME" => ENV["HOME"].to_s }, io: StringIO.new
     ).call
   end
@@ -535,7 +535,7 @@ class PublicationFlowTest < Minitest::Test
 
   def predicate_publication(repo)
     SpecrelayRunner::Publication.new(
-      payload: {}, repository: SpecrelayRunner::Workspace::Repository.new(path: repo), test: {},
+      payload: {}, repository: SpecrelayRunner::Workspace::Repository.new(path: repo),
       env: { "PATH" => ENV["PATH"].to_s, "HOME" => ENV["HOME"].to_s }, io: StringIO.new
     )
   end
@@ -603,7 +603,7 @@ class PublicationFlowTest < Minitest::Test
     )
     publication = SpecrelayRunner::Publication.new(
       payload: claim_payload_for(task_id: TASK, executor_command: "/bin/true", publication: {}),
-      repository: repository, test: {},
+      repository: repository,
       env: { "PATH" => "#{@gh_dir}:#{ENV['PATH']}", "HOME" => ENV["HOME"].to_s }, io: StringIO.new
     )
 
@@ -727,7 +727,7 @@ class PublicationFlowTest < Minitest::Test
       exit_code: nil, stdout: "", stderr: "", duration_seconds: 300.0, timed_out: true
     )
     publication = SpecrelayRunner::Publication.new(
-      payload: {}, repository: SpecrelayRunner::Workspace::Repository.new(path: @root), test: {}
+      payload: {}, repository: SpecrelayRunner::Workspace::Repository.new(path: @root)
     )
 
     reason = publication.send(:push_error, timed_out)
