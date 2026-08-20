@@ -165,11 +165,22 @@ module SpecrelayRunner
           #{evidence['executor_summary']}
 
           #{changed_files_block(evidence)}
-          Validation commands the executor says it ran: #{Array(evidence['validation_commands']).join(', ')}
+          #{verification_line(evidence)}
           Report: #{assignment.report_url}
           Attached evidence:
           #{files.empty? ? '(none)' : files.join("\n")}
         TEXT
+      end
+
+      # MAPIAI-93 — verification is no longer something the executor "says it ran". SpecRelay
+      # re-ran every command from the changed repository itself, so this is the same measured
+      # outcome the Run page shows, and the reviewer reads it as evidence rather than as a claim.
+      def verification_line(evidence)
+        results = Array(evidence["repository_verifications"])
+        return "SpecRelay verification: no repository changed." if results.empty?
+
+        listed = results.map { |result| "#{result['repository_path']} #{result['status']}" }
+        "SpecRelay verification (re-run by SpecRelay, not claimed): #{listed.join(', ')}"
       end
 
       # The MEASURED change set, listed rather than summarized. The executor's own

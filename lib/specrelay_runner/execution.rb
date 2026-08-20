@@ -2,13 +2,12 @@
 
 require "fileutils"
 require "tmpdir"
-require "shellwords"
 
 module SpecrelayRunner
   # Orchestrates ONE claimed run end to end on the developer machine (MVP-0010),
   # talking to Platform only over the API client. It performs the same Tiny Demo
-  # execution flow proven in MVP-0009 — worktree create, executor launch, test
-  # command, diff/log capture — but as a separate process, and streams ORDERED v1
+  # execution flow proven in MVP-0009 — worktree create, executor launch,
+  # verification, diff/log capture — but as a separate process, and streams ORDERED v1
   # protocol events (MVP-0013) + heartbeats and uploads the final report bundle
   # together with a terminal-result envelope through the API.
   #
@@ -288,44 +287,110 @@ module SpecrelayRunner
       return unmeasured_report(worktree, executor_result, changes) unless changes.measured?
 
       # MAPIAI-84 — the executor's semantic repository selection, read back and then VERIFIED
-      # against the repositories on disk. It happens here, before the tests and before any
+      # against the repositories on disk. It happens here, before verification and before any
       # external write, for the same reason change measurement does: an unsafe or incoherent
-      # selection means there is nothing this attempt can honestly publish, so running the
-      # project's tests against it would only add noise to a refusal.
-      selection = selected_repositories(root, worktree, staging)
+      # selection means there is nothing this attempt can honestly publish, so running its
+      # commands would only add noise to a refusal.
+      reported = RepositorySelection.read(staging)
+      return selection_refused(root, worktree, executor_result, reported.error) unless reported.ok?
+
+      selection = measuring_workspace(root).select(worktree.path, reported.entries.map(&:path))
       return selection_refused(root, worktree, executor_result, selection.error) unless selection.ok?
 
       repositories = selection.repositories
       changes = combined_changes(repositories, changes)
 
-      emit("verification.started", "Running project tests for #{run['task_id']}", phase: "verification")
-      test = run_tests(worktree, root)
-      emit("verification.completed", "Project tests exited #{test[:exit_code]} for #{run['task_id']}",
-           phase: "verification", test_command: test[:command], test_exit_code: test[:exit_code])
+      emit("verification.started", "Verifying #{repositories.length} changed repository(ies) for #{run['task_id']}",
+           phase: "verification")
+      verifications = verify_repositories(repositories, reported)
+      emit("verification.completed", verification_summary(verifications), phase: "verification")
 
       # Final gate before finalizing: never upload a success report for a claim
       # Platform no longer considers live.
       check_stop!
       demonstrate_protocol_controls
-      status = terminal_status(test)
-      publication = publish(repositories, test, status)
+      status = terminal_status(verifications)
+      # MAPIAI-93 CR-001 F1 — the last gate before anything external. Asked only on the path that
+      # would otherwise publish: every other ending already blocks publication and already names a
+      # more specific cause, and replacing that cause with a drift reason would hide it.
+      if status == ReportBundle::STATUS_SUCCEEDED && (drift = verification_drift(root, worktree, reported, repositories))
+        return drift_refused(root, worktree, executor_result, verifications, drift)
+      end
+
+      publication = publish(repositories, status)
       # An incomplete publication is a FAILED attempt, not a success with a warning:
-      # the tests passed but the output never became reviewable. Reporting it as
+      # verification passed but the output never became reviewable. Reporting it as
       # failed is what makes Platform record a durable, operator-visible reason and
       # leave Jira where it is (MVP-0014).
       failure = publication_failure(publication)
       status = ReportBundle::STATUS_FAILED if failure
-      submit(worktree, executor_result, test, changes, status, publication, failure)
+      submit(worktree, executor_result, verifications, changes, status, publication, failure)
     end
 
-    # MAPIAI-84 — what the executor reported, verified. One refusal for the whole selection: the
-    # verifier stops at the first entry it cannot prove, because publication is all-or-fail and a
-    # partially publishable selection must not become a partially published run.
-    def selected_repositories(root, worktree, staging)
-      reported = RepositorySelection.read(staging)
-      return Workspace::Selection.new(repositories: [], error: reported.error) unless reported.ok?
+    # MAPIAI-93 — the runner's own replay of what the executor selected, one verified repository
+    # at a time. {RepositoryVerification} owns the commands and the outcome; the lease check
+    # between repositories stays here, with every other stop check in this class, so a cancelled
+    # claim ends through the one owner rather than through a second rule inside verification.
+    def verify_repositories(repositories, reported)
+      commands = reported.entries.to_h { |entry| [ entry.path, entry.commands ] }
+      repositories.map do |repository|
+        check_stop!
+        RepositoryVerification.call(repository: repository,
+                                    commands: commands.fetch(repository.relative_path, []), env: env)
+      end
+    end
 
-      measuring_workspace(root).select(worktree.path, reported.paths)
+    # MAPIAI-93 CR-001 F1 — the reason this attempt must not publish, or nil when the tree that
+    # was verified is still the tree that would be published.
+    #
+    # It RE-ASKS the existing verifier rather than introducing a second measurement model: the
+    # same containment, git-root, branch, remote, uniqueness and change-measurement rules that
+    # produced the selection produce the comparison, so there is one definition of publishable
+    # state and one definition of a publishable repository. A repository that verification left
+    # clean, unbranched or ambiguous fails HERE through that verifier's own refusal.
+    #
+    # Ignored files are absent from the comparison because they are absent from the measurement
+    # (`git status --porcelain`), so a command that writes only scratch output is harmless.
+    #
+    # Nothing is adopted, remeasured into the package, or retried. The whole answer is whether the
+    # attempt may proceed.
+    def verification_drift(root, worktree, reported, verified)
+      current = measuring_workspace(root).select(worktree.path, reported.entries.map(&:path))
+      unless current.ok?
+        return "the selected repositories could not be re-verified after verification ran: #{current.error}"
+      end
+
+      drifted = drifted_paths(verified, current.repositories)
+      return nil if drifted.empty?
+
+      "verification changed the publishable state of #{drifted.join(', ')} after it was measured; " \
+        "nothing was published because the report would describe a different tree than the commit"
+    end
+
+    # The repositories whose publishable state moved, by relative path only. A drift reason travels
+    # into a report, a Platform event and an operator's terminal, so it names WHICH repository
+    # changed and never what changed in it.
+    def drifted_paths(verified, current)
+      before = verified.to_h { |repository| [ repository.relative_path, repository.publishable_state ] }
+      after = current.to_h { |repository| [ repository.relative_path, repository.publishable_state ] }
+      (before.keys | after.keys).reject { |path| before[path] == after[path] }
+    end
+
+    # Reported as a FAILED attempt with its own classification, carrying the verification results
+    # that really were observed: the commands ran, and what they returned is a fact worth keeping
+    # even though their side effect is what ended the attempt.
+    def drift_refused(root, worktree, executor_result, verifications, reason)
+      failed_report(root, worktree, executor_result,
+                    "Refusing to publish #{run['task_id']}: #{Redaction.redact(reason)}",
+                    classification: "verification_changed_publishable_state",
+                    verifications: verifications)
+    end
+
+    def verification_summary(verifications)
+      return "No repository changed for #{run['task_id']}; there was nothing to verify" if verifications.empty?
+
+      counts = verifications.group_by(&:status).transform_values(&:length)
+      "Verification for #{run['task_id']}: #{counts.map { |status, count| "#{count} #{status}" }.join(', ')}"
     end
 
     # The executor answered, but with something the runner will not act on: a path outside the task
@@ -380,10 +445,9 @@ module SpecrelayRunner
     def unmeasured_report(worktree, executor_result, changes)
       reason = "could not determine what the executor changed: #{changes.measurement_error}"
       log("Publication aborted for #{run['task_id']}: #{Redaction.redact(reason)}")
-      test = { command: workspace.fetch("test_command"), exit_code: nil, output: "" }
       emit("attempt.completed", "Uploading failed execution report for #{run['task_id']}", phase: "completed")
       bundle = ReportBundle.build(payload: payload, status: ReportBundle::STATUS_FAILED, executor: executor_result,
-                                  test: test, changes: changes, base_commit: worktree.base_commit,
+                                  verifications: [], changes: changes, base_commit: worktree.base_commit,
                                   worktree_path: worktree.path, failure_details: reason)
       terminal = terminal_result(status: ReportBundle::STATUS_FAILED, final_sequence: emitter.sequence,
                                  exit_code: executor_result.exit_code, base_commit: worktree.base_commit,
@@ -400,11 +464,10 @@ module SpecrelayRunner
     # publication_error on the repository result, which Platform validates and refuses
     # to treat as success — so an incomplete publication blocks the run instead of
     # silently passing.
-    def publish(repositories, test, status)
+    def publish(repositories, status)
       publishing = status == ReportBundle::STATUS_SUCCEEDED
       publications = repositories.map do |repository|
-        Publication.new(payload: payload, repository: repository, test: test, env: env, io: io,
-                        publish: publishing)
+        Publication.new(payload: payload, repository: repository, env: env, io: io, publish: publishing)
       end
       return publications.map(&:call) unless publishing && expected?(repositories)
 
@@ -423,13 +486,16 @@ module SpecrelayRunner
       repositories.any? && payload["repository_policy"].to_h.fetch("access", "read").to_s == "write"
     end
 
-    # The report's failure narrative names the real cause: a publication failure is
-    # reported as such rather than blamed on the tests, which passed.
-    def failure_details(status, test, publication_failure)
+    # The report's failure narrative names the real cause: a publication failure is reported as
+    # such rather than blamed on the verification, which passed.
+    def failure_details(status, verifications, publication_failure)
       return nil unless status == ReportBundle::STATUS_FAILED
       return "repository publication failed: #{publication_failure}" if publication_failure
 
-      "project test command exited #{test[:exit_code]}"
+      failed = verifications.select(&:failed?).map(&:repository_path)
+      return "verification failed in #{failed.join(', ')}" if failed.any?
+
+      "the attempt was recorded as failed"
     end
 
     def publication_summary(results)
@@ -554,32 +620,31 @@ module SpecrelayRunner
 
     # The report-relative artifacts named in the terminal-result envelope.
     def terminal_artifacts
-      %w[README.md manifest.yml evidence/stdout.log evidence/tests.log evidence/diff.txt]
+      %w[README.md manifest.yml evidence/stdout.log evidence/verification.log evidence/diff.txt]
     end
 
-    def run_tests(worktree, root)
-      command = workspace.fetch("test_command")
-      result = CommandRunner.run(Shellwords.split(command), chdir: worktree.path,
-                                 env: { "PATH" => env["PATH"].to_s }, timeout_seconds: 900)
-      { command: command, exit_code: result.exit_code, output: [ result.stdout, result.stderr ].join("\n") }
-    end
-
-    # Forced terminal failure (deterministic control) records a failed outcome even
-    # when the tests passed, so the terminal-failure/non-review scenario can be
-    # proven without an artificial broken test.
-    def terminal_status(test)
+    # MAPIAI-93 — publication is allowed only when EVERY changed repository is `passed` or
+    # `not_found`. A repository with no applicable verification is a valid, non-blocking outcome;
+    # one that failed makes the whole attempt fail, because a partially verified run must not
+    # leave a half-published output for review.
+    #
+    # Forced terminal failure (deterministic control) still records a failed outcome even when
+    # every repository passed, so the terminal-failure/non-review scenario can be proven without
+    # an artificial broken command.
+    def terminal_status(verifications)
       return ReportBundle::STATUS_FAILED if controls.force_terminal_failure?
 
-      test[:exit_code].to_i.zero? ? ReportBundle::STATUS_SUCCEEDED : ReportBundle::STATUS_FAILED
+      verifications.any?(&:failed?) ? ReportBundle::STATUS_FAILED : ReportBundle::STATUS_SUCCEEDED
     end
 
-    def submit(worktree, executor_result, test, changes, status, publication, publication_failure = nil)
+    def submit(worktree, executor_result, verifications, changes, status, publication, publication_failure = nil)
       emit("attempt.completed", "Uploading execution report for #{run['task_id']} (#{status})",
-           phase: "completed", exit_code: test[:exit_code])
-      bundle = ReportBundle.build(payload: payload, status: status, executor: executor_result, test: test,
+           phase: "completed", exit_code: executor_result.exit_code)
+      bundle = ReportBundle.build(payload: payload, status: status, executor: executor_result,
+                                  verifications: verifications,
                                   changes: changes, base_commit: worktree.base_commit, worktree_path: worktree.path,
-                                  failure_details: failure_details(status, test, publication_failure))
-      terminal = terminal_result(status: status, final_sequence: emitter.sequence, exit_code: test[:exit_code],
+                                  failure_details: failure_details(status, verifications, publication_failure))
+      terminal = terminal_result(status: status, final_sequence: emitter.sequence, exit_code: executor_result.exit_code,
                                  base_commit: worktree.base_commit, changes: changes, publication: publication,
                                  error_classification: publication_failure ? "publication_failed" : nil)
       response = client.submit_report(claim: claim, bundle: bundle, terminal_result: terminal)
@@ -603,13 +668,13 @@ module SpecrelayRunner
     # A failed executor: emit the terminal event and upload a failed report + a
     # failed terminal envelope so Platform records the attempt (run marked FAILED;
     # Jira is not advanced).
-    def failed_report(root, worktree, executor_result, message, classification: ClaudeProfile::EXECUTOR_FAILED)
+    def failed_report(root, worktree, executor_result, message, classification: ClaudeProfile::EXECUTOR_FAILED,
+                      verifications: [])
       log(message)
       changes = measuring_workspace(root).capture_changes(worktree.path)
-      test = { command: workspace.fetch("test_command"), exit_code: nil, output: "" }
       emit("attempt.completed", "Uploading failed execution report for #{run['task_id']}", phase: "completed")
       bundle = ReportBundle.build(payload: payload, status: ReportBundle::STATUS_FAILED, executor: executor_result,
-                                  test: test, changes: changes, base_commit: worktree.base_commit,
+                                  verifications: verifications, changes: changes, base_commit: worktree.base_commit,
                                   worktree_path: worktree.path, failure_details: message)
       terminal = terminal_result(status: ReportBundle::STATUS_FAILED, final_sequence: emitter.sequence,
                                  exit_code: executor_result.exit_code, base_commit: worktree.base_commit,
@@ -639,7 +704,7 @@ module SpecrelayRunner
         run_id: run.fetch("id"), attempt_id: claim,
         outcome: succeeded ? TerminalResult::SUCCEEDED : TerminalResult::FAILED,
         final_sequence: final_sequence, exit_code: exit_code,
-        error_classification: succeeded ? nil : (error_classification || "tests_failed"),
+        error_classification: succeeded ? nil : (error_classification || "verification_failed"),
         # MAPIAI-84 — an attempt that never reached publication reports NO repositories. It has
         # no verified selection, so it has no repository identity, remote or base commit it can
         # honestly assert; inventing a row from the workspace key is what let a run whose change
@@ -697,25 +762,38 @@ module SpecrelayRunner
       "#{preamble}\n\n---\n\n#{payload.dig('specification_package', 'handoff_prompt')}#{rework_prompt}#{resume_prompt}"
     end
 
-    # MAPIAI-84 — the ONE way the executor's repository choice reaches the runner.
+    # MAPIAI-84/MAPIAI-93 — the ONE way the executor's repository choice AND its verification
+    # choice reach the runner.
     #
-    # The task workspace may contain several independent git repositories, and WHICH of them an
-    # approved specification needs is a decision only the executor can make. Nothing else is read:
-    # the runner never infers a repository from prose, terminal output or provider reasoning, so an
-    # unreported repository is simply not published. The document is required even when nothing
-    # changed, because silence and "nothing changed" are different facts.
+    # The task workspace may contain several independent git repositories; WHICH of them an
+    # approved specification needs, and which verification is relevant to what changed in each, are
+    # decisions only the executor can make. Nothing else is read: the runner never infers a
+    # repository or a command from prose, terminal output or provider reasoning, so an unreported
+    # repository is simply not published. The document is required even when nothing changed,
+    # because silence and "nothing changed" are different facts — and so is an empty command list,
+    # which says "I found no verification here" rather than "I did not look".
     def selection_lines(selection_path)
       <<~MD.strip
-        Before you exit successfully, report which repositories you changed:
+        Before you exit successfully, report which repositories you changed and how each one is
+        verified:
 
         - Write `#{selection_path}` as one JSON object with `repositories`, an array of
-          `{ "path": "<repository path relative to the task workspace>" }`. Use `"."` for the task
-          workspace repository itself. Write `{ "repositories": [] }` if you changed nothing.
+          `{ "path": "<repository path relative to the task workspace>", "commands": [ ["<argv>", "..."] ] }`.
+          Use `"."` for the task workspace repository itself. Write `{ "repositories": [] }` if you
+          changed nothing.
         - List a repository ONLY if you changed it, and give each one once. Paths only: no absolute
-          paths, no pull-request URLs, no credentials, no explanation of your reasoning.
-        - SpecRelay verifies every entry and publishes one draft pull request per repository. An
-          entry it cannot verify fails the attempt, and a repository you do not list is not
-          published at all.
+          paths, no pull-request URLs, no credentials, no explanation of your reasoning, and no
+          claimed exit code or result.
+        - For each repository, select the SMALLEST verification relevant to what you changed there:
+          read that repository's own instructions, scripts, manifests and CI configuration. Each
+          command is an argv array, run from that repository's root — never a shell string.
+        - Run what you select, diagnose any failure, fix it, and rerun it before you exit. If you
+          cannot fix it, still report the final commands so SpecRelay records the real failure.
+        - Write `"commands": []` when a repository has no applicable verification. That is a valid
+          answer; do not invent a command or a passing result.
+        - SpecRelay verifies every entry, re-runs every command you report against your final files,
+          and publishes one draft pull request per repository. Its own result decides the outcome:
+          an entry it cannot verify or a repository whose verification fails is not published.
       MD
     end
 
