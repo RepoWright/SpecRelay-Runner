@@ -68,6 +68,11 @@ require_relative "specrelay_runner/review"
 # MVP-0035 / MVP-0036 Stage 2b: proving a worktree holds the exact recorded head, and the change
 # request that is one of the two reasons to require it. `continued_target` first — `rework` is
 # built on it.
+# MAPIAI-87 — the PREVIOUS accepted package's own materializer, beside `continued_target` because
+# the two are siblings rather than variants: this one reconstructs several repositories an earlier
+# run had accepted, and yields to that one's same-run authority whenever both could apply.
+require_relative "specrelay_runner/contained_repositories"
+require_relative "specrelay_runner/previous_accepted_package"
 require_relative "specrelay_runner/continued_target"
 require_relative "specrelay_runner/rework"
 # MVP-0036 Stage 2a: the offline resume round — continuing from this machine's own uncommitted

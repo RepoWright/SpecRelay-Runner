@@ -186,11 +186,19 @@ module FakeGithub
           # fact rather than two that can disagree.
           abort("gh: could not resolve to a PullRequest (simulated)") if MODE == "view_fails"
           wanted = ARGV[2]
-          row = prs.find { |pr| pr["url"].to_s == wanted }
+          # `--repo` is honoured for the same reason `pr list` honours it (MAPIAI-87): one task
+          # branch exists in several independent repositories, so a fake that ignored it would let
+          # one repository's pull request answer for another.
+          asked = flag("--repo")
+          row = prs.find { |pr| pr["url"].to_s == wanted && (asked.nil? || !pr.key?("repo") || pr["repo"].to_s == asked) }
           abort("gh: no pull request found for \#{wanted}") if row.nil?
-          row = row.merge("headRefOid" => head_oid(row["headRefName"])) if row["headRefOid"].to_s == "live"
+          row = row.merge("headRefOid" => head_oid(row["headRefName"], row["repo"] || asked)) if row["headRefOid"].to_s == "live"
+          # `headRefOid` is answered here for the same reason `pr list` answers it: MAPIAI-87 asks
+          # `pr view` for the exact head an accepted pull request is on, and a fake that omitted
+          # it would make every head comparison compare against an empty string.
           puts JSON.generate({ "url" => row["url"], "state" => row["state"],
                                "headRefName" => row["headRefName"],
+                               "headRefOid" => row.fetch("headRefOid", ""),
                                "baseRefName" => row.fetch("baseRefName", "main"),
                                "isDraft" => row.fetch("isDraft", true),
                                "isCrossRepository" => row.fetch("isCrossRepository", false) })
