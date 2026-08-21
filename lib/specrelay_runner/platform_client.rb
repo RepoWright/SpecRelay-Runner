@@ -69,6 +69,12 @@ module SpecrelayRunner
     # The one outcome that does not COMPLETE its attempt: NEEDS_INPUT ends the delivery and the
     # reviewer process, and leaves the review itself waiting on a Product Owner answer.
     AWAITING_ANSWER_OUTCOME = "NEEDS_INPUT"
+    # MAPIAI-88 — the one answer to an ACCEPT that is NOT an ending: Platform validated the verdict,
+    # recorded none of it, and authorized this runner to close a bounded set of obsolete pull
+    # requests first. Accepted only for an ACCEPT, because it is the only outcome that can produce
+    # a replacement package.
+    ACCEPT_OUTCOME = "ACCEPT"
+    RETIRING_ANSWER = { "state" => "RETIRING", "outcome" => nil }.freeze
 
     # A claimed run payload, or a not-claimed signal.
     ClaimResult = Struct.new(:claimed, :payload, keyword_init: true) do
@@ -273,9 +279,27 @@ module SpecrelayRunner
     # `attempt_id` and the expected ENDING are what the acknowledgement is checked against: a 201
     # only means "delivered" when the answer names the attempt this runner holds and the durable
     # ending this particular delivery produces.
+    # An ACCEPT may be answered with the verdict OR with `RETIRING` plus a retirement plan, so both
+    # are acknowledgeable answers and the CALLER reads the response to tell which it got. The
+    # runner never infers that it may close anything from having submitted successfully.
     def submit_review_result(claim:, attempt_id:, review:)
-      deliver_review(claim, { review: review },
-                     attempt_id: attempt_id, ending: verdict_ending(review["outcome"]))
+      answers = [ verdict_ending(review["outcome"]) ]
+      answers << RETIRING_ANSWER if review["outcome"] == ACCEPT_OUTCOME
+      deliver_review(claim, { review: review }, attempt_id: attempt_id, answers: answers)
+    end
+
+    # POST /api/runner/review_results again — the completion of an authorized retirement (MAPIAI-88
+    # design 4).
+    #
+    # `review` is the IDENTICAL body the prepare carried, never a rebuilt one: Platform recomputes
+    # the plan from durable authority and compares digests, and a body that differs in any stored
+    # field is a plan this runner's closes were not authorized by. Only the verdict acknowledges
+    # this delivery — a second `RETIRING` answer would mean Platform never read the completion.
+    def complete_review_retirement(claim:, attempt_id:, review:, digest:, pull_requests:)
+      deliver_review(claim,
+                     { review: review,
+                       retirement: { digest: digest, pull_requests: pull_requests } },
+                     attempt_id: attempt_id, answers: [ verdict_ending(review["outcome"]) ])
     end
 
     # The same endpoint, a DIFFERENT body: the reviewer produced no usable result at all, so
@@ -284,7 +308,7 @@ module SpecrelayRunner
     # replacing it with its generic outcome-validation refusal.
     def report_review_failure(claim:, attempt_id:, kind:, reason:)
       deliver_review(claim, { failure: { kind: kind, reason: reason } },
-                     attempt_id: attempt_id, ending: FAILED_ENDING)
+                     attempt_id: attempt_id, answers: [ FAILED_ENDING ])
     end
 
     # The same endpoint, a DIFFERENT body: the pull request's branch no longer points at the
@@ -293,7 +317,7 @@ module SpecrelayRunner
     # a fresh attempt for a failed reviewer (MVP-0033 CR-001 F3).
     def report_stale_target(claim:, attempt_id:, reason:)
       deliver_review(claim, { stale: { reason: reason } },
-                     attempt_id: attempt_id, ending: STALE_ENDING)
+                     attempt_id: attempt_id, answers: [ STALE_ENDING ])
     end
 
     # POST /api/runner/claim_releases — abandon THIS claim before anything executed (MVP-0035).
@@ -390,21 +414,22 @@ module SpecrelayRunner
     # An UNCONFIRMED answer is the same fact as a lost one and is retried the same way: a 201
     # from a proxy, a captive portal or a truncated response is not Platform recording anything
     # (review-001 F5).
-    def deliver_review(claim, body, attempt_id:, ending:, max_attempts: 3)
+    def deliver_review(claim, body, attempt_id:, answers:, max_attempts: 3)
       with_transport_retries(max_attempts) do
         status, response = post_json("/api/runner/review_results", { claim: claim }.merge(body))
         raise_for(status, response) unless status == 201
         raise Error, "Platform's answer did not record this attempt's ending" unless
-          acknowledged?(response, attempt_id, ending)
+          answers.any? { |answer| acknowledged?(response, attempt_id, answer) }
 
         response
       end
     end
 
-    # What makes a 201 a DELIVERY: Platform answered about the attempt this runner holds, and
-    # the ending it reports is the one this delivery produces. Both halves are load-bearing —
-    # the right ending for the wrong attempt, and the wrong ending for the right attempt, are
-    # each a delivery this machine cannot claim landed.
+    # What makes a 201 a DELIVERY: Platform answered about the attempt this runner holds, and the
+    # state it reports is one this delivery can produce. Both halves are load-bearing — the right
+    # answer for the wrong attempt, and the wrong answer for the right attempt, are each a delivery
+    # this machine cannot claim landed. The set of acceptable answers is the caller's, because only
+    # the caller knows which delivery this is.
     def acknowledged?(response, attempt_id, ending)
       recorded = response.is_a?(Hash) ? response["review"] : nil
       return false unless recorded.is_a?(Hash)

@@ -12,16 +12,22 @@ module SpecrelayRunner
     #      from this runner's implementation work — no resumed session, no shared context
     #      (S24);
     #   3. parse its stdout strictly and redact it;
-    #   4. submit exactly one structured outcome.
+    #   4. submit exactly one structured outcome;
+    #   5. if Platform answers an ACCEPT with a retirement plan instead of a verdict, close exactly
+    #      the pull requests it authorized and deliver the identical result again (MAPIAI-88).
     #
     # A failure at any step is reported to Platform as a failed attempt with a safe reason
     # rather than swallowed, so the operator sees why review did not happen and Platform can
     # offer a new attempt (S30). The implementation result is never touched.
     class Execution
-      # The two ways a review attempt can end with no verdict, reported explicitly (MAPIAI-78
-      # design 2). They are different facts with different remedies: a provider that never
-      # produced a usable result is a machine or configuration problem, while an unusable result
-      # is a reviewer problem — and neither is a verdict about the implementation.
+      # The two ways the REVIEW can end with no verdict, reported explicitly (MAPIAI-78 design 2).
+      # They are different facts with different remedies: a provider that never produced a usable
+      # result is a machine or configuration problem, while an unusable result is a reviewer
+      # problem — and neither is a verdict about the implementation.
+      #
+      # MAPIAI-88 adds two more no-verdict endings that this class reports but does not classify:
+      # they are {Retirement}'s, because only the GitHub boundary can tell a retryable close
+      # failure from a merged pull request a human has to decide about.
       PROVIDER_EXECUTION_FAILURE = "provider_execution_failure"
       INVALID_REVIEWER_RESULT = "invalid_reviewer_result"
       NO_CONTRACT = "Platform sent no supported review outcomes, so no result could be checked"
@@ -56,12 +62,12 @@ module SpecrelayRunner
         return failure(PROVIDER_EXECUTION_FAILURE, no_reviewer_reason) unless settings.configured?
         return failure(PROVIDER_EXECUTION_FAILURE, NO_CONTRACT) if assignment.supported_outcomes.empty?
 
-        workspace_root = config.workspace_root(assignment.workspace_key, env: env)
+        @workspace_root = config.workspace_root(assignment.workspace_key, env: env)
         checkout = Checkout.verify(assignment: assignment, workspace_root: workspace_root)
         return stale(checkout.reason) if checkout.stale?
         return failure(PROVIDER_EXECUTION_FAILURE, checkout.reason) unless checkout.ok?
 
-        review(workspace_root)
+        review
       rescue Config::Error, Settings::Error => e
         # Both mean the reviewer could not be launched at all: an unusable workspace root, or a
         # local configuration that would put the provider in an output mode whose result is not
@@ -71,7 +77,7 @@ module SpecrelayRunner
 
       private
 
-      attr_reader :assignment, :config, :client, :settings, :env, :io, :runner
+      attr_reader :assignment, :config, :client, :settings, :env, :io, :runner, :workspace_root
 
       # A YAML-configured machine is left to its own `runner.reviewer:` block; a machine connected
       # through guided setup is told to reconnect, because that is where its reviewer selection
@@ -81,10 +87,10 @@ module SpecrelayRunner
         config.connection.nil? ? NO_REVIEWER : "#{NO_REVIEWER}; #{RECONNECT_REMEDY}"
       end
 
-      def review(workspace_root)
+      def review
         log "Reviewing #{assignment.ticket_id} at the pinned head (attempt #{assignment.attempt_ordinal})"
         heartbeater = start_heartbeater
-        launched = launch(workspace_root)
+        launched = launch
         # A timeout and a non-zero exit are provider FAILURES, not results: whatever the process
         # printed before dying is not a verdict, so it is never parsed for one.
         return failure(PROVIDER_EXECUTION_FAILURE, "the reviewer timed out") if launched.timed_out?
@@ -93,7 +99,7 @@ module SpecrelayRunner
         parsed = Review::Result.parse(launched.stdout, outcomes: assignment.supported_outcomes)
         return failure(INVALID_REVIEWER_RESULT, parsed.error) unless parsed.ok?
 
-        verdict(parsed.review, workspace_root)
+        verdict(parsed.review)
       ensure
         heartbeater&.stop
       end
@@ -101,7 +107,7 @@ module SpecrelayRunner
       # The head can move WHILE the reviewer works — a review takes minutes and a push takes
       # seconds. Re-verified here, immediately before the only call that can record a verdict,
       # so a move during the review can never produce acceptance (CR-001 F3).
-      def verdict(review, workspace_root)
+      def verdict(review)
         recheck = Checkout.verify(assignment: assignment, workspace_root: workspace_root)
         return stale(recheck.reason) if recheck.stale?
         return failure(PROVIDER_EXECUTION_FAILURE, recheck.reason) unless recheck.ok?
@@ -112,7 +118,7 @@ module SpecrelayRunner
       # ONE fresh process. The child environment is the operator's own PATH and HOME only —
       # this runner passes no session id, no resume flag and no context of its own, which is
       # what makes the reviewer independent of any executor work this same machine did (S24).
-      def launch(workspace_root)
+      def launch
         runner.run(settings.argv(Packet.new(assignment).prompt),
                    chdir: workspace_root, env: child_env,
                    timeout_seconds: settings.timeout_seconds)
@@ -131,10 +137,12 @@ module SpecrelayRunner
       end
 
       def submit(review)
-        client.submit_review_result(claim: assignment.claim_token, attempt_id: assignment.attempt_id,
-                                    review: review)
-        log "Submitted #{review['outcome']} for #{assignment.ticket_id}"
-        Result.new(outcome: :submitted, message: "Review submitted: #{review['outcome']}.")
+        answer = client.submit_review_result(claim: assignment.claim_token,
+                                            attempt_id: assignment.attempt_id, review: review)
+        plan = answer.to_h["retirement_plan"]
+        return submitted(review) if plan.nil?
+
+        retire(review, plan)
       rescue PlatformClient::Error => e
         # A 4xx is Platform having READ this result and refused it, so the attempt already
         # carries Platform's own reason and a failure report on top of it would be a second,
@@ -167,6 +175,37 @@ module SpecrelayRunner
         Result.new(outcome: :failed, message: "Review failed: #{safe}")
       rescue PlatformClient::Error => e
         unrecorded("Review failed (#{safe}), and Platform refused the failure report", e)
+      end
+
+      # MAPIAI-88 — Platform validated this ACCEPT, recorded none of it, and authorized a bounded
+      # set of obsolete pull requests to be closed first (design 3 and 4).
+      #
+      # The closing happens HERE, in the parent, and never in the reviewer process: the reviewer
+      # judged the change and must not also be able to mutate GitHub. A classified failure is
+      # reported as a failure rather than as a verdict, which is what leaves the previous package
+      # authoritative — and a retry re-reads live GitHub state rather than trusting anything local.
+      def retire(review, plan)
+        log "Retiring #{Array(plan['pull_requests']).size} obsolete pull request(s) before this " \
+            "ACCEPT is recorded"
+        outcome = Retirement.new(plan: plan, chdir: workspace_root, env: env, io: io).call
+        return failure(outcome.failure_kind, outcome.reason) unless outcome.ok?
+
+        # The IDENTICAL review body, plus the digest and one result per closed pair. Platform
+        # recomputes the plan and refuses anything that is not exactly what it authorized.
+        client.complete_review_retirement(claim: assignment.claim_token,
+                                          attempt_id: assignment.attempt_id, review: review,
+                                          digest: plan["digest"],
+                                          pull_requests: completed(outcome.retired))
+        submitted(review)
+      end
+
+      def completed(retired)
+        retired.map { |entry| { "repository" => entry[:repository], "pull_request_url" => entry[:url] } }
+      end
+
+      def submitted(review)
+        log "Submitted #{review['outcome']} for #{assignment.ticket_id}"
+        Result.new(outcome: :submitted, message: "Review submitted: #{review['outcome']}.")
       end
 
       # Platform's answer, or its silence, about a delivery this machine cannot resolve.
