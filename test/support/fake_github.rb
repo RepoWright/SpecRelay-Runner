@@ -76,6 +76,10 @@ module FakeGithub
   #         "list_garbage"    — `pr list` exits 0 with unparseable stdout
   #         "view_fails"      — `pr view` fails (the pull request is gone, or the API is
   #                             unreachable); MVP-0028's "cannot be inspected safely" case
+  #         "view_garbage"    — `pr view` exits 0 with unparseable stdout
+  #         "view_hangs"      — `pr view` hangs, so a real CommandRunner timeout can be exercised
+  #         "close_fails"     — `pr close` fails (auth, rate limit, transport)
+  #         "close_ineffective" — `pr close` succeeds and the pull request still reports OPEN
   #
   # `bare` lets the fake resolve REAL head shas from the bare remote, so `headRefOid`
   # is a fact rather than a fixture. `seed` pre-populates pull requests (each a hash of
@@ -84,12 +88,14 @@ module FakeGithub
   # MAPIAI-84 — `urls` gives one pull-request URL per `owner/repo`, and `bares` one bare
   # repository per `owner/repo`, so a run publishing several repositories gets distinct pull
   # requests resolved against the right remote. `fail_create_for` makes creation fail for exactly
-  # one repository, which is what a PARTIAL publication failure is.
+  # one repository, which is what a PARTIAL publication failure is; `fail_view_for` does the same
+  # for inspection, which is what a PARTIAL retirement failure is (MAPIAI-88).
   # `state` reuses another fake gh's pull-request state file, which is what a RETRY sees: the
   # pull request an earlier attempt really created is still open on GitHub, while this attempt
   # gets its own invocation log so "created nothing new" is directly observable.
   def gh_bin(mode: "ok", pull_request_url: "https://github.com/SpecRelay/tiny-demo-workspace/pull/7",
-             bare: nil, seed: [], urls: {}, bares: {}, fail_create_for: nil, state: nil)
+             bare: nil, seed: [], urls: {}, bares: {}, fail_create_for: nil, fail_view_for: nil,
+             state: nil)
     dir = Dir.mktmpdir("specrelay-runner-gh-")
     log = File.join(dir, "gh.log")
     shared = !state.nil?
@@ -98,7 +104,8 @@ module FakeGithub
     path = File.join(dir, "gh")
     File.write(path, script(mode: mode, pull_request_url: pull_request_url, log: log, state: state,
                             bare: bare, counter: File.join(dir, "list.count"), urls: urls,
-                            bares: bares, fail_create_for: fail_create_for))
+                            bares: bares, fail_create_for: fail_create_for,
+                            fail_view_for: fail_view_for))
     FileUtils.chmod(0o755, path)
     [ dir, log, state ]
   end
@@ -107,7 +114,7 @@ module FakeGithub
   # reuse semantics depend on: ignoring them made the old tests approximate the
   # behaviour instead of exercising it (review-001 finding 7).
   def script(mode:, pull_request_url:, log:, state:, bare:, counter:, urls: {}, bares: {},
-             fail_create_for: nil)
+             fail_create_for: nil, fail_view_for: nil)
     <<~RUBY
       #!/usr/bin/env ruby
       # frozen_string_literal: true
@@ -121,6 +128,7 @@ module FakeGithub
       URLS = #{urls.inspect}
       BARES = #{bares.inspect}
       FAIL_CREATE_FOR = #{fail_create_for.inspect}
+      FAIL_VIEW_FOR = #{fail_view_for.inspect}
       File.open(LOG, "a") { |f| f.puts(ARGV.join(" ")) }
 
       def prs = JSON.parse(File.read(STATE))
@@ -184,24 +192,51 @@ module FakeGithub
           # MVP-0028: `gh pr view <url> --json ...`. Answered from the SAME state file `pr list`
           # reads, so a pull request seeded as closed, on the wrong base, or from a fork is one
           # fact rather than two that can disagree.
+          # Hangs so a REAL CommandRunner timeout can be exercised end to end.
+          sleep 30 if MODE == "view_hangs"
           abort("gh: could not resolve to a PullRequest (simulated)") if MODE == "view_fails"
           wanted = ARGV[2]
           # `--repo` is honoured for the same reason `pr list` honours it (MAPIAI-87): one task
           # branch exists in several independent repositories, so a fake that ignored it would let
           # one repository's pull request answer for another.
           asked = flag("--repo")
+          # Refused BEFORE the lookup: a PARTIAL retirement failure is one repository's inspection
+          # failing, whether or not that repository has a matching row (MAPIAI-88).
+          abort("gh: could not resolve to a PullRequest (simulated)") if FAIL_VIEW_FOR && asked == FAIL_VIEW_FOR
           row = prs.find { |pr| pr["url"].to_s == wanted && (asked.nil? || !pr.key?("repo") || pr["repo"].to_s == asked) }
           abort("gh: no pull request found for \#{wanted}") if row.nil?
+          # `headRefOid` is resolved and returned for the same reason `pr list` resolves it:
+          # MAPIAI-87 asks `pr view` for the exact head an accepted pull request is on, and a fake
+          # that omitted it would make every head comparison compare against an empty string.
           row = row.merge("headRefOid" => head_oid(row["headRefName"], row["repo"] || asked)) if row["headRefOid"].to_s == "live"
-          # `headRefOid` is answered here for the same reason `pr list` answers it: MAPIAI-87 asks
-          # `pr view` for the exact head an accepted pull request is on, and a fake that omitted
-          # it would make every head comparison compare against an empty string.
+          if MODE == "view_garbage"
+            puts "not json at all"
+            exit 0
+          end
+          merged_at = row.fetch("mergedAt", row["state"].to_s == "MERGED" ? "2026-01-01T00:00:00Z" : nil)
           puts JSON.generate({ "url" => row["url"], "state" => row["state"],
                                "headRefName" => row["headRefName"],
                                "headRefOid" => row.fetch("headRefOid", ""),
                                "baseRefName" => row.fetch("baseRefName", "main"),
+                               "mergedAt" => merged_at,
                                "isDraft" => row.fetch("isDraft", true),
                                "isCrossRepository" => row.fetch("isCrossRepository", false) })
+          exit 0
+        # MAPIAI-88: `gh pr close <url> --repo <slug>`. It flips the SAME state file `pr view`
+        # reads, so "closed" is one observable fact rather than a scripted return value — which
+        # is what makes an idempotent retry and a post-close confirmation real here.
+        when "close"
+          abort("gh: could not close the pull request (simulated)") if MODE == "close_fails"
+          wanted = ARGV[2]
+          row = prs.find { |pr| pr["url"].to_s == wanted }
+          abort("gh: no pull request found for \#{wanted}") if row.nil?
+          abort("gh: pull request is already merged") if row["state"].to_s == "MERGED"
+          # "close_ineffective": the command succeeds and GitHub still reports OPEN, which is the
+          # only case a post-close confirmation exists to catch.
+          unless MODE == "close_ineffective"
+            File.write(STATE, JSON.generate(prs.map { |pr| pr["url"].to_s == wanted ? pr.merge("state" => "CLOSED") : pr }))
+          end
+          puts "Closed pull request \#{wanted}"
           exit 0
         when "create"
           abort("gh: pull request creation failed (simulated)") if MODE == "create_fails"
@@ -231,6 +266,7 @@ module FakeGithub
 
   def pr_lists(log) = invocations(log).count { |line| line.start_with?("pr list") }
   def pr_views(log) = invocations(log).count { |line| line.start_with?("pr view") }
+  def pr_closes(log) = invocations(log).select { |line| line.start_with?("pr close") }
 
   def invocations(log) = File.exist?(log) ? File.read(log).lines.map(&:strip).reject(&:empty?) : []
   def pr_creates(log) = invocations(log).count { |line| line.start_with?("pr create") }

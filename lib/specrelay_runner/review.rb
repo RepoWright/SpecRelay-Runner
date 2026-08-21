@@ -14,6 +14,7 @@ module SpecrelayRunner
   #   Checkout  - proof that this machine really holds the pinned remote and head
   #   Packet    - the reviewer's entire input, rendered once
   #   Result    - strict parsing and redaction of the provider's stdout
+  #   Retirement- closing exactly the obsolete pull requests Platform authorized (MAPIAI-88)
   #   Execution - the orchestration, and the only place that submits
   module Review
   end
@@ -24,4 +25,5 @@ require_relative "review/assignment"
 require_relative "review/checkout"
 require_relative "review/packet"
 require_relative "review/result"
+require_relative "review/retirement"
 require_relative "review/execution"

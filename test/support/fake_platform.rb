@@ -50,6 +50,13 @@ class FakePlatform
   # strict validation refusing a submission the runner considered fine.
   attr_accessor :review_response
 
+  # MAPIAI-88: the closed retirement plan Platform returns instead of a verdict for the FIRST
+  # ACCEPT delivery. Set to `{ "digest" => ..., "pull_requests" => [...] }` to model a candidate
+  # that omits current pull requests; nil keeps the ordinary one-request acceptance. The
+  # completion delivery (the one carrying `retirement`) is always answered with the verdict, so
+  # a test asserts on what the runner did between the two rather than on the fake's opinion.
+  attr_accessor :retirement_plan
+
   # Replace the whole scripted assignment, so one fake can serve a guided connection and then
   # offer a claim of a DIFFERENT lane — the enrollment assignment and a review packet are
   # different documents, and a machine only ever sees them in that order.
@@ -161,6 +168,12 @@ class FakePlatform
   def review_failures = review_submissions.filter_map { |request| request[:body].to_h["failure"] }
   def last_review = review_results.last&.dig(:body, "review")
   def last_review_failure = review_failures.last
+
+  # MAPIAI-88 — the completion half of a two-phase ACCEPT. `retirement_completions` being EMPTY
+  # while `review_results` is not is the shape of "the prepare landed and the closes did not", so
+  # the two are counted separately rather than folded into one list.
+  def retirement_completions = review_submissions.filter_map { |request| request[:body].to_h["retirement"] }
+  def last_retirement_completion = retirement_completions.last
 
   # MVP-0036 — what the provider actually asked through the bridge. An EMPTY list is as
   # load-bearing as its contents: a locally refused request must never reach Platform.
@@ -420,9 +433,19 @@ class FakePlatform
     # the attempt awaiting a Product Owner answer, and the runner checks the acknowledgement
     # against the ending its delivery produces (MAPIAI-78 review-002 F1).
     review = request[:body].to_h["review"].to_h
+    return retiring_answer if retirement_plan && review["outcome"] == "ACCEPT" && !request[:body].to_h.key?("retirement")
+
     state = review["outcome"] == "NEEDS_INPUT" ? "AWAITING_ANSWER" : "COMPLETED"
     [ 201, { contract_version: "mvp-0033",
              review: { attempt_id: "rvt_fake", state: state, outcome: review["outcome"] } } ]
+  end
+
+  # MAPIAI-88 — the prepare answer: no verdict yet, and the exact pull requests the runner is
+  # authorized to close.
+  def retiring_answer
+    [ 201, { contract_version: "mvp-0033",
+             review: { attempt_id: "rvt_fake", state: "RETIRING", outcome: nil },
+             retirement_plan: retirement_plan } ]
   end
 
   def specification_publication(request)

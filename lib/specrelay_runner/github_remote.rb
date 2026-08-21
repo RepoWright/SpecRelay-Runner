@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require "uri"
+
 module SpecrelayRunner
   # MAPIAI-84 — THE normalizer for a repository's GitHub identity, and the only place in this
   # runner that turns a git remote url into `owner/repo`.
@@ -22,6 +24,7 @@ module SpecrelayRunner
     HTTPS_PREFIX = %r{\Ahttps?://(?:[^@/]+@)?#{Regexp.escape(HOST)}/}
     GIT_SUFFIX = ".git"
     CLONE_URL = "https://%s/%s#{GIT_SUFFIX}"
+    PULL_REQUEST_PATH = %r{\A/(?<slug>[A-Za-z0-9._-]+/[A-Za-z0-9._-]+)/pull/\d+\z}
 
     module_function
 
@@ -50,6 +53,25 @@ module SpecrelayRunner
     def clone_url(url)
       resolved = slug(url)
       resolved && format(CLONE_URL, HOST, resolved)
+    end
+
+    # MAPIAI-88 — the repository a github.com PULL-REQUEST url belongs to, or nil.
+    #
+    # Here rather than beside its caller for the reason this module exists at all: "which repository
+    # is this?" must have one answer. The retirement boundary compares this against the repository
+    # Platform planned, so a url that resolves to a different repository — or to nothing — never
+    # reaches `gh`.
+    #
+    # Deliberately stricter than {#slug}: HTTPS only, no credential userinfo, and the path must be
+    # EXACTLY `/owner/repo/pull/<number>`. A near miss is nil, not a guess.
+    def pull_request_slug(url)
+      uri = URI.parse(url.to_s.strip)
+      return nil unless uri.is_a?(URI::HTTPS) && uri.host&.downcase == HOST && uri.userinfo.nil?
+
+      match = PULL_REQUEST_PATH.match(uri.path.to_s)
+      match && SLUG.match?(match[:slug]) ? match[:slug] : nil
+    rescue URI::InvalidURIError
+      nil
     end
   end
 end
