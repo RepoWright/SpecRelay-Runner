@@ -321,6 +321,17 @@ module SpecrelayRunner
               revision raises no material question either, omit the file exactly as a first
               generation would.
 
+            PREVIOUS ACCEPTED IMPLEMENTATION (only when the evidence below has a
+            "previous_accepted_package" key) — this ticket's specification has already been
+            implemented and that implementation was ACCEPTED. The block names the accepted
+            package, the specification it implemented, and the pull requests that carry it with
+            their exact heads. It is READ-ONLY CONTEXT: write the revision so it is coherent with
+            what already exists — say what changes relative to it, and do not re-specify work that
+            is already shipped — and never state that the implementation is missing when the block
+            says it exists. You are writing documents only: never check out, clone, modify, push
+            to, or open a pull request against an implementation repository, and never treat a
+            local checkout as the authority for what those pull requests contain.
+
             BREVITY — this is an acceptance rule, not a style preference. Include a sentence,
             bullet, or row only when it changes a requirement, observation, decision, risk,
             dependency, validation action, blocker, or open question. Delete process narration,

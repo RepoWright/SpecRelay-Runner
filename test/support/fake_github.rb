@@ -196,10 +196,19 @@ module FakeGithub
           sleep 30 if MODE == "view_hangs"
           abort("gh: could not resolve to a PullRequest (simulated)") if MODE == "view_fails"
           wanted = ARGV[2]
-          abort("gh: could not resolve to a PullRequest (simulated)") if FAIL_VIEW_FOR && flag("--repo") == FAIL_VIEW_FOR
-          row = prs.find { |pr| pr["url"].to_s == wanted }
+          # `--repo` is honoured for the same reason `pr list` honours it (MAPIAI-87): one task
+          # branch exists in several independent repositories, so a fake that ignored it would let
+          # one repository's pull request answer for another.
+          asked = flag("--repo")
+          # Refused BEFORE the lookup: a PARTIAL retirement failure is one repository's inspection
+          # failing, whether or not that repository has a matching row (MAPIAI-88).
+          abort("gh: could not resolve to a PullRequest (simulated)") if FAIL_VIEW_FOR && asked == FAIL_VIEW_FOR
+          row = prs.find { |pr| pr["url"].to_s == wanted && (asked.nil? || !pr.key?("repo") || pr["repo"].to_s == asked) }
           abort("gh: no pull request found for \#{wanted}") if row.nil?
-          row = row.merge("headRefOid" => head_oid(row["headRefName"])) if row["headRefOid"].to_s == "live"
+          # `headRefOid` is resolved and returned for the same reason `pr list` resolves it:
+          # MAPIAI-87 asks `pr view` for the exact head an accepted pull request is on, and a fake
+          # that omitted it would make every head comparison compare against an empty string.
+          row = row.merge("headRefOid" => head_oid(row["headRefName"], row["repo"] || asked)) if row["headRefOid"].to_s == "live"
           if MODE == "view_garbage"
             puts "not json at all"
             exit 0
@@ -207,6 +216,7 @@ module FakeGithub
           merged_at = row.fetch("mergedAt", row["state"].to_s == "MERGED" ? "2026-01-01T00:00:00Z" : nil)
           puts JSON.generate({ "url" => row["url"], "state" => row["state"],
                                "headRefName" => row["headRefName"],
+                               "headRefOid" => row.fetch("headRefOid", ""),
                                "baseRefName" => row.fetch("baseRefName", "main"),
                                "mergedAt" => merged_at,
                                "isDraft" => row.fetch("isDraft", true),

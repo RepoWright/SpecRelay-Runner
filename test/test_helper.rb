@@ -53,6 +53,10 @@ def spec_creation_payload_for(issue_key:, title: "Add an export button", inputs:
     # MVP-0028 decision D6 — nil for a first specification, present on EVERY spec_creation
     # assignment (unlike `publication`, which only exists once a package has been generated).
     "specification_revision" => { "existing_pull_request_url" => existing_pull_request_url },
+    # MAPIAI-87 — required on EVERY assignment and null only when the ticket has no accepted
+    # implementation. Null here so the fixture is the document Platform now produces; the tests
+    # that care about a populated block set one.
+    "previous_accepted_package" => nil,
     # MVP-0028 remediation defect 4 — the profile Project Setup selected. Null here by default so
     # the existing tests keep selecting their provider through `runner.specification.provider.kind`
     # as they always have; specification_provider_propagation_test.rb populates it.
@@ -240,6 +244,9 @@ def base_claim_payload(task_id:, executor_command:, worktree_create_command: nil
       "timeout_seconds" => 120, "env" => {}
     },
     "specification_package" => specification_package_block(task_id),
+    # MAPIAI-87 — required on EVERY assignment and null only when the ticket has no accepted
+    # implementation. Absence is malformed input, not a first run, so the fixture states it.
+    "previous_accepted_package" => nil,
     # MVP-0036 — the question contract exactly as Runner::Api::RunPayload builds it. Captured
     # rather than approximated, because the runner RENDERS these values into the provider's
     # fixed bridge instructions: a fixture that omitted the block would let the runner ship

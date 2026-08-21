@@ -15,7 +15,13 @@ module SpecrelayRunner
   class Workspace
     Error = Class.new(StandardError)
 
-    Info = Struct.new(:path, :base_commit, keyword_init: true)
+    # MAPIAI-87 — `created` says whether THIS call built the task workspace or found the exact
+    # clean one already there. Reconstructing from an older accepted package is only ever correct
+    # for a workspace that did not exist a moment ago: a reused one may already hold this run's
+    # own partial publication, rework, restart or answered-resume state.
+    Info = Struct.new(:path, :base_commit, :created, keyword_init: true) do
+      def created? = created ? true : false
+    end
 
     # `measurement_error` is set when the change set could not be established at all.
     # It is NOT the same as "no files changed", and callers must not conflate them:
@@ -75,7 +81,7 @@ module SpecrelayRunner
                        "preserve or release it before retrying"
         end
 
-        return Info.new(path: existing, base_commit: rev_parse(existing, "HEAD"))
+        return Info.new(path: existing, base_commit: rev_parse(existing, "HEAD"), created: false)
       end
 
       result = run(create_argv)
@@ -84,7 +90,7 @@ module SpecrelayRunner
       end
 
       path = locate
-      Info.new(path: path, base_commit: rev_parse(path, "HEAD"))
+      Info.new(path: path, base_commit: rev_parse(path, "HEAD"), created: true)
     end
 
     # MAPIAI-84 — HOW the one task workspace is constructed.
@@ -117,7 +123,7 @@ module SpecrelayRunner
       path = locate(required: false)
       return nil if path.to_s.empty?
 
-      Info.new(path: path, base_commit: rev_parse(path, "HEAD"))
+      Info.new(path: path, base_commit: rev_parse(path, "HEAD"), created: false)
     end
 
     # Capture changed files (tracked + untracked via intent-to-add) and a unified
