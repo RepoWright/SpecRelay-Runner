@@ -47,6 +47,51 @@ class SpecificationPreflightTest < Minitest::Test
     assert_includes @io.string, "not complete"
   end
 
+  # MAPIAI-87 CR-001 F1 — `previous_accepted_package` is required and nullable, so an absent or
+  # open-shaped one is a malformed ASSIGNMENT rather than "no previous implementation". It refuses
+  # on this same path: before evidence, before the writer, before an isolated workspace, and
+  # before any output file exists.
+  def test_an_absent_previous_accepted_package_refuses_before_writing
+    payload = spec_creation_payload_for(issue_key: ISSUE)
+    payload.delete("previous_accepted_package")
+
+    assert_refusal "assignment_malformed", payload: payload
+    assert_includes @io.string, "previous_accepted_package"
+  end
+
+  def test_an_incomplete_previous_accepted_package_refuses_before_writing
+    payload = spec_creation_payload_for(issue_key: ISSUE)
+    payload["previous_accepted_package"] = { "package_id" => "art_previous123" }
+
+    assert_refusal "assignment_malformed", payload: payload
+    assert_includes @io.string, "is missing"
+  end
+
+  # MAPIAI-87 CR-002 F1 — an unknown key is attacker-controlled text, and THIS lane sends the raw
+  # refusal message to Platform as durable evidence. A secret placed in a JSON key must therefore
+  # not survive validation: nothing here may echo it into the operator log, the refusal payload,
+  # or any other request this attempt makes.
+  #
+  # The key is deliberately not token-shaped, so this proves the validator never named it rather
+  # than that {Redaction} masked it afterwards.
+  SECRET_KEY = "x-SECRETVALUE-a3f9c1"
+
+  def test_an_unknown_continuation_field_never_reaches_platform_or_the_operator
+    payload = spec_creation_payload_for(issue_key: ISSUE)
+    payload["previous_accepted_package"] = {
+      "package_id" => "art_previous123", "checksum" => "c" * 64, "source_run_id" => "run_previous",
+      "approved_specification" => { "reference" => "https://github.com/SpecRelay/SpecRelay-Specs/pull/6",
+                                    "digest" => "d" * 64 },
+      "implementation_pull_requests" => [], SECRET_KEY => "ghp_livetoken"
+    }
+
+    assert_refusal "assignment_malformed", payload: payload
+
+    refute_includes @io.string, "SECRETVALUE"
+    refute_includes @platform.requests.to_json, "SECRETVALUE"
+    assert_includes @platform.last_specification_generation["message"], "previous_accepted_package"
+  end
+
   def test_an_unconfigured_specification_repository_refuses_and_names_the_variable
     assert_refusal "specification_repository_unresolved", repository_roots: false
 

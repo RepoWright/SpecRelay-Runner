@@ -46,7 +46,8 @@ module SpecrelayRunner
           "input_bundle" => bundle_block,
           "source" => source_block,
           "tool_evidence" => tool_evidence_block,
-          "revision" => revision_block
+          "revision" => revision_block,
+          "previous_accepted_package" => previous_accepted_package_block
         }
       end
 
@@ -128,6 +129,34 @@ module SpecrelayRunner
         return nil if revision.nil?
 
         { "previous_files" => revision.files.transform_values { |content| clean(content) } }
+      end
+
+      # nil for a first specification. For a ticket that already has an ACCEPTED implementation
+      # (MAPIAI-87), the bounded READ-ONLY record of what was shipped from the previous
+      # specification: which package, which specification it implemented, and the current pull
+      # requests with their pinned heads.
+      #
+      # `clone_url` is deliberately dropped even though the assignment carries one. The writer is
+      # being told what exists, not given somewhere to write, and the smallest document that
+      # answers the first question cannot be misread as the second.
+      #
+      # {Assignment} validated the closed block, so this only PROJECTS: nothing to bound, coerce
+      # or trim here. A partial or oversized block was already a refused assignment (CR-001 F1),
+      # which is what keeps this from handing the writer a document that merely looks complete.
+      def previous_accepted_package_block
+        block = assignment.previous_accepted_package
+        return nil if block.nil?
+
+        { "package_id" => clean(block["package_id"]),
+          "approved_specification" => clean(block["approved_specification"]["reference"]),
+          "implementation_pull_requests" =>
+            block["implementation_pull_requests"].map { |row| accepted_pull_request(row) } }
+      end
+
+      def accepted_pull_request(row)
+        { "repository" => clean(row["repository"]), "branch" => clean(row["branch"]),
+          "head_commit" => clean(row["head_commit"]),
+          "pull_request_url" => clean(row["pull_request_url"]) }
       end
 
       # Every string in the packet passes through here. Applying redaction at the boundary

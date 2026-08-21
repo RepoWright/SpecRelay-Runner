@@ -75,6 +75,11 @@ module SpecrelayRunner
       # MVP-0036 Stage 2a — nil unless this claim continues an answered offline question on the
       # machine that still holds its uncommitted work.
       @resume = Resume.for(payload)
+      # MAPIAI-87 — what the claim says about the ticket's previous accepted implementation. The
+      # field is required and nullable, so this reads it rather than guessing at it: a malformed
+      # or absent one is refused at the top of {#run_flow}, and a valid package is read-only
+      # CONTEXT materialized only into a task workspace this attempt had to create.
+      @continuation = PreviousAcceptedPackage.read(payload, env: env)
       @bridge = nil
       @controls = ProtocolControls.new(env: env)
       @emitter = EventEmitter.new(client: client, run_id: @run.fetch("id"), attempt_id: @claim)
@@ -221,6 +226,13 @@ module SpecrelayRunner
     end
 
     def run_flow(root, staging)
+      # MAPIAI-87 CR-001 F1 — the continuation field is authority, so an absent or malformed one
+      # is refused HERE: before a worktree is created or reused, before any git or GitHub read,
+      # before the provider, and before any external write. Reading it as "no previous accepted
+      # implementation" would start a continued run from the default branch and silently discard
+      # accepted work.
+      return continuation_refused(@continuation.reason) unless @continuation.ok?
+
       emit("attempt.started", "Runner #{runner_name} started an attempt for #{run['task_id']}", phase: "attempt")
 
       emit("workspace.preparing", "Preparing worktree for #{run['task_id']}", phase: "workspace")
@@ -242,7 +254,16 @@ module SpecrelayRunner
         continuation = continued.materialize(worktree_path: worktree.path)
         return continuation_refused(continuation.reason) unless continuation.ok?
 
-        worktree = Workspace::Info.new(path: worktree.path, base_commit: continuation.head_commit || worktree.base_commit)
+        worktree = Workspace::Info.new(path: worktree.path, created: worktree.created?,
+                                       base_commit: continuation.head_commit || worktree.base_commit)
+      elsif @continuation.package && worktree.created?
+        # MAPIAI-87 — the ticket's PREVIOUS accepted implementation, and only into a workspace
+        # this attempt just built. Same-run authority wins: a rework or restart target is handled
+        # above and never reaches here, and a resume reuses the worktree its question was asked
+        # from, so `created?` is false for it. A refusal stops before the provider, before the
+        # package, and before any external write.
+        reconstructed = @continuation.package.materialize(task_root: worktree.path)
+        return continuation_refused(reconstructed.reason) unless reconstructed.ok?
       end
 
       # MVP-0034 contract 4 — the pinned package is verified and written read-only BEFORE the

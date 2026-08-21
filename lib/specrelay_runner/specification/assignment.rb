@@ -60,7 +60,17 @@ module SpecrelayRunner
         raise Malformed, "assignment is missing required generation data: #{missing.join(', ')}" if missing.any?
 
         validate_bundle_complete!
+        validate_previous_accepted_package!
         self
+      end
+
+      # MAPIAI-87 CR-001 F1 — the continuation field is required and nullable on every assignment,
+      # and this lane refuses a malformed one for the same reason the implementation lane does:
+      # absence is not "no previous implementation", and a partial block would reach the writer as
+      # apparently complete context. One shared validator, so the two lanes cannot drift.
+      def validate_previous_accepted_package!
+        reason = PreviousAcceptedPackage::Input.refusal(payload)
+        raise Malformed, reason if reason
       end
 
       # An INCOMPLETE bundle is refused here rather than generated from with warnings.
@@ -109,6 +119,19 @@ module SpecrelayRunner
       # {ExistingPullRequest} validates a publication's, then reads the previous package from its
       # branch as revision context.
       def revision_pull_request_url = section("specification_revision")["existing_pull_request_url"].to_s
+
+      # MAPIAI-87 — the ticket's latest ACCEPTED implementation output package, or nil when
+      # Platform sent the explicit null a first specification carries. Read here and handed to
+      # {Packet} as bounded read-only CONTEXT: it says what was actually shipped from the previous
+      # specification, which a revision otherwise rewrites requirements without knowing.
+      #
+      # Validated by {#validate!}, so it is the explicit null or the exact closed block — never a
+      # partial one a later stage would have to second-guess.
+      #
+      # It authorizes nothing. This lane creates no worktree, checks out no implementation branch
+      # and pushes to no implementation repository, and the packet deliberately carries no clone
+      # url so a provider has nothing to act on even if it tried.
+      def previous_accepted_package = payload["previous_accepted_package"]
 
       # The real provider profile the operator selected in Platform's Project Setup, or nil when
       # they selected the deterministic fixture — which this lane cannot use, and which
