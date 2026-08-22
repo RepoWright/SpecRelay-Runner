@@ -50,6 +50,12 @@ class FakePlatform
   # strict validation refusing a submission the runner considered fine.
   attr_accessor :review_response
 
+  # MAPIAI-90: a SEQUENCE of scripted answers, consumed one per delivery, so a test can model
+  # Platform recording the verdict and then reporting that the ticket's Jira description update did
+  # not complete — followed by whatever the identical retry earns. Takes precedence over
+  # `review_response`, which stays the always-the-same script.
+  attr_accessor :review_responses
+
   # MAPIAI-88: the closed retirement plan Platform returns instead of a verdict for the FIRST
   # ACCEPT delivery. Set to `{ "digest" => ..., "pull_requests" => [...] }` to model a candidate
   # that omits current pull requests; nil keeps the ordinary one-request acceptance. The
@@ -423,6 +429,7 @@ class FakePlatform
   # about the run state it reports back, because the runner prints it and a fake that always
   # said "published" would let a fail-closed path look identical to a success in the output.
   def review_result(request)
+    return review_responses.shift if review_responses&.any?
     return review_response if review_response
     return [ 201, { contract_version: "mvp-0033",
                     review: { attempt_id: "rvt_fake", state: "STALE", outcome: nil } } ] if request[:body].to_h.key?("stale")
