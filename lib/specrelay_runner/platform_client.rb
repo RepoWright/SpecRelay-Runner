@@ -76,6 +76,12 @@ module SpecrelayRunner
     ACCEPT_OUTCOME = "ACCEPT"
     RETIRING_ANSWER = { "state" => "RETIRING", "outcome" => nil }.freeze
 
+    # MAPIAI-90 — the status Platform answers a review delivery with when it RECORDED the verdict
+    # and the ticket's Jira description update did not complete. Neither a refusal (the body was
+    # accepted) nor a success this machine may report, so the identical delivery is what finishes
+    # it, inside the same bound.
+    INCOMPLETE_DELIVERY_STATUS = 503
+
     # A claimed run payload, or a not-claimed signal.
     ClaimResult = Struct.new(:claimed, :payload, keyword_init: true) do
       def claimed? = claimed
@@ -415,7 +421,7 @@ module SpecrelayRunner
     # from a proxy, a captive portal or a truncated response is not Platform recording anything
     # (review-001 F5).
     def deliver_review(claim, body, attempt_id:, answers:, max_attempts: 3)
-      with_transport_retries(max_attempts) do
+      with_transport_retries(max_attempts, unfinished_status: INCOMPLETE_DELIVERY_STATUS) do
         status, response = post_json("/api/runner/review_results", { claim: claim }.merge(body))
         raise_for(status, response) unless status == 201
         raise Error, "Platform's answer did not record this attempt's ending" unless
@@ -444,17 +450,23 @@ module SpecrelayRunner
         "outcome" => outcome }
     end
 
-    # Retry a request whose fate is UNKNOWN, and only that. A refusal (Unauthorized/NotFound/
-    # RequestFailed) means Platform read the body and answered, so re-sending it would only ask
-    # the same question again; the bare transport Error is the one that leaves a caller unable
-    # to say whether anything was recorded.
-    def with_transport_retries(max_attempts)
+    # Retry a request a retry can still change the outcome of, and only that. A refusal
+    # (Unauthorized/NotFound/RequestFailed) means Platform read the body and answered, so
+    # re-sending it would only ask the same question again; the bare transport Error is the one
+    # that leaves a caller unable to say whether anything was recorded.
+    #
+    # `unfinished_status` names a SECOND such case the caller knows about: Platform answered that
+    # it recorded the delivery and could not finish it (MAPIAI-90). Only a caller whose body is
+    # safe to re-deliver byte-for-byte may pass one, which is why it is the caller's decision and
+    # not a rule about every 5xx.
+    def with_transport_retries(max_attempts, unfinished_status: nil)
       attempt = 0
       begin
         attempt += 1
         yield
       rescue Error => e
-        raise if !e.instance_of?(Error) || attempt >= max_attempts
+        raise if attempt >= max_attempts
+        raise unless e.instance_of?(Error) || e.status.to_i == unfinished_status
 
         retry
       end

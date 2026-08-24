@@ -434,6 +434,42 @@ class ReviewRecoveryTest < Minitest::Test
     assert_empty @platform.review_failures
   end
 
+  # --- a delivery Platform recorded but could not finish --------------------
+
+  # MAPIAI-90: Platform recorded the accepted verdict and then could not finish the delivery —
+  # the ticket's Jira description update did not complete. That is not a refusal of this body, so
+  # the remedy is the SAME body again: it is the only way this machine can finish the delivery, and
+  # Platform makes the replay idempotent.
+  def test_a_review_delivery_platform_could_not_finish_is_retried_with_the_identical_body
+    @platform.review_responses = [ [ 503, { error: "the Jira description update did not complete (timeout)" } ] ]
+
+    deliver(:accept)
+
+    bodies = @platform.review_submissions.map { |request| request[:body] }
+    assert_equal 2, bodies.size
+    assert_equal [ bodies.first ], bodies.uniq
+  end
+
+  # Bounded by the same limit every review delivery has. An outage that outlasts it surfaces as a
+  # failure rather than looping.
+  def test_a_delivery_platform_never_finishes_is_bounded_and_then_surfaces
+    @platform.review_response = [ 503, { error: "the Jira description update did not complete (timeout)" } ]
+
+    assert_raises(SpecrelayRunner::PlatformClient::RequestFailed) { deliver(:accept) }
+
+    assert_equal 3, @platform.review_submissions.size
+  end
+
+  # A 4xx is Platform having READ the body and refused it. Re-sending it would only ask the same
+  # question again, so a refusal must never consume the retry bound.
+  def test_a_refused_review_delivery_is_never_retried
+    @platform.review_response = [ 422, { accepted: false, errors: [ "ACCEPT requires zero blocking findings" ] } ]
+
+    assert_raises(SpecrelayRunner::PlatformClient::RequestFailed) { deliver(:accept) }
+
+    assert_equal 1, @platform.review_submissions.size
+  end
+
   private
 
   def parse(output, outcomes: %w[ACCEPT CHANGES_REQUESTED NEEDS_INPUT])
