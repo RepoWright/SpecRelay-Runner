@@ -345,7 +345,22 @@ module SpecrelayRunner
       # leave Jira where it is (MVP-0014).
       failure = publication_failure(publication)
       status = ReportBundle::STATUS_FAILED if failure
-      submit(worktree, executor_result, verifications, changes, status, publication, failure)
+      submit(worktree, executor_result, verifications, changes, status, publication, failure,
+             preview: start_preview(root, status))
+    end
+
+    # MAPIAI-97 — the task environment left running for the reviewer, started HERE: after
+    # verification and publication have already decided this attempt's outcome, and only for the
+    # outcome that produces something to review. Every other ending — a refusal, an executor
+    # failure, a failed publication — reports no preview, so nothing can read a link as evidence
+    # of work that did not succeed.
+    #
+    # {TaskPreview} returns an unsupported or failed value rather than raising, which is what keeps
+    # this one line free of a rescue: there is no preview outcome that may change `status`.
+    def start_preview(root, status)
+      return nil unless status == ReportBundle::STATUS_SUCCEEDED
+
+      TaskPreview.call(root: root, task_id: run["task_id"].to_s, env: env)
     end
 
     # MAPIAI-93 — the runner's own replay of what the executor selected, one verified repository
@@ -658,7 +673,8 @@ module SpecrelayRunner
       verifications.any?(&:failed?) ? ReportBundle::STATUS_FAILED : ReportBundle::STATUS_SUCCEEDED
     end
 
-    def submit(worktree, executor_result, verifications, changes, status, publication, publication_failure = nil)
+    def submit(worktree, executor_result, verifications, changes, status, publication,
+               publication_failure = nil, preview: nil)
       emit("attempt.completed", "Uploading execution report for #{run['task_id']} (#{status})",
            phase: "completed", exit_code: executor_result.exit_code)
       bundle = ReportBundle.build(payload: payload, status: status, executor: executor_result,
@@ -667,7 +683,8 @@ module SpecrelayRunner
                                   failure_details: failure_details(status, verifications, publication_failure))
       terminal = terminal_result(status: status, final_sequence: emitter.sequence, exit_code: executor_result.exit_code,
                                  base_commit: worktree.base_commit, changes: changes, publication: publication,
-                                 error_classification: publication_failure ? "publication_failed" : nil)
+                                 error_classification: publication_failure ? "publication_failed" : nil,
+                                 preview: preview)
       response = client.submit_report(claim: claim, bundle: bundle, terminal_result: terminal)
       outcome = response["outcome"].to_s
       log("Report stored: #{response.dig('report', 'url')} (run #{response['run_state']})")
@@ -719,7 +736,7 @@ module SpecrelayRunner
     end
 
     def terminal_result(status:, final_sequence:, exit_code:, base_commit:, changes:,
-                        publication: nil, error_classification: nil)
+                        publication: nil, error_classification: nil, preview: nil)
       succeeded = status == ReportBundle::STATUS_SUCCEEDED
       TerminalResult.build(
         run_id: run.fetch("id"), attempt_id: claim,
@@ -732,7 +749,8 @@ module SpecrelayRunner
         # detection failed announce a repository state nobody had measured (review-003 finding 2).
         # The cause travels in the error classification and the report's failure narrative instead.
         repositories: publication || [],
-        artifacts: terminal_artifacts
+        artifacts: terminal_artifacts,
+        preview: preview
       )
     end
 

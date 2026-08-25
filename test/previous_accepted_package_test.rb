@@ -282,7 +282,8 @@ class PreviousAcceptedPackageTest < Minitest::Test
     code, = run_cli(gh_dir)
 
     assert_equal 0, code
-    assert_equal [ "create #{TASK}" ], worktree_invocations
+    assert_equal [ "create #{TASK}" ], worktree_invocations.grep(/\Acreate /),
+                 "the project-owned command constructs the task environment exactly once"
     task_root = File.join(@root, ".runs", "worktrees", TASK)
     ACCEPTED.each { |component| assert_path_exists File.join(task_root, component, ACCEPTED_FILE) }
     assert_equal ACCEPTED.length, FakeGithub.pr_views(gh_log)

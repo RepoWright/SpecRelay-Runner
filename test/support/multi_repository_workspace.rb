@@ -231,4 +231,9 @@ module MultiRepositoryWorkspace
   def task_workspace(root, task_id) = File.join(root, ".runs", "worktrees", task_id)
 
   def worktree_invocations(log) = File.exist?(log) ? File.read(log).lines.map(&:strip).reject(&:empty?) : []
+
+  # Only the task-environment CONSTRUCTIONS. Filtered rather than compared against the whole log,
+  # because MAPIAI-97 added other project-owned verbs to the same command and "the workspace was
+  # built once" is a claim about `create` alone.
+  def worktree_creations(log) = worktree_invocations(log).grep(/\Acreate /)
 end

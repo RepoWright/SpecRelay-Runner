@@ -193,7 +193,7 @@ class MultiRepositoryPublicationTest < Minitest::Test
     start(executor_env: { "FAKE_EDITED" => "component-a" })
     run_cli
 
-    assert_equal [ "create #{TASK}" ], MultiRepositoryWorkspace.worktree_invocations(@built.worktree_log),
+    assert_equal [ "create #{TASK}" ], MultiRepositoryWorkspace.worktree_creations(@built.worktree_log),
                  "the project-owned command constructs the task environment exactly once"
     assert Dir.exist?(MultiRepositoryWorkspace.task_workspace(@root, TASK)),
            "the runner must use the task workspace that command created"
@@ -439,7 +439,7 @@ class MultiRepositoryPublicationTest < Minitest::Test
     assert_equal 1, FakeGithub.pr_creates(retry_log),
                  "only the repository that lacked a pull request creates one"
     assert_equal 2, FakeGithub.pr_lists(retry_log), "each repository looked its own pull request up first"
-    assert_equal [ "create #{TASK}" ], MultiRepositoryWorkspace.worktree_invocations(@built.worktree_log),
+    assert_equal [ "create #{TASK}" ], MultiRepositoryWorkspace.worktree_creations(@built.worktree_log),
                  "the retry continues the same task workspace instead of building a second one"
     assert_includes report_file("manifest.yml"), "component-a/app.txt",
                     "the recovered change set is reported, not an empty diff"

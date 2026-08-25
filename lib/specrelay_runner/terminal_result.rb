@@ -24,7 +24,8 @@ module SpecrelayRunner
     def self.build(**kwargs) = new(**kwargs).build
 
     def initialize(run_id:, attempt_id:, outcome:, final_sequence:, exit_code:,
-                   repositories:, artifacts:, error_classification: nil, cleanup_error: nil)
+                   repositories:, artifacts:, error_classification: nil, cleanup_error: nil,
+                   preview: nil)
       @run_id = run_id
       @attempt_id = attempt_id
       @outcome = outcome
@@ -34,6 +35,7 @@ module SpecrelayRunner
       @artifacts = artifacts
       @error_classification = error_classification
       @cleanup_error = cleanup_error
+      @preview = preview
     end
 
     def build
@@ -49,14 +51,17 @@ module SpecrelayRunner
         },
         "repositories" => repositories.map { |repository| repository_result(repository) },
         "artifacts" => Array(artifacts).map(&:to_s),
-        "cleanup" => { "succeeded" => cleanup_error.nil?, "error" => cleanup_error && Redaction.redact(cleanup_error.to_s) }
+        "cleanup" => { "succeeded" => cleanup_error.nil?, "error" => cleanup_error && Redaction.redact(cleanup_error.to_s) },
+        # MAPIAI-97 — the implementation preview {TaskPreview} produced, or null. The key is always
+        # present: an attempt that reports no preview is stating that, not omitting it.
+        "preview" => preview
       }
     end
 
     private
 
     attr_reader :run_id, :attempt_id, :outcome, :final_sequence, :exit_code,
-                :repositories, :artifacts, :error_classification, :cleanup_error
+                :repositories, :artifacts, :error_classification, :cleanup_error, :preview
 
     # One repository publication result (MVP-0014, dynamic since MAPIAI-84).
     #

@@ -47,6 +47,9 @@ require_relative "specrelay_runner/dashboard"
 require_relative "specrelay_runner/github_remote"
 require_relative "specrelay_runner/repository_selection"
 require_relative "specrelay_runner/workspace"
+# MAPIAI-97: the implementation preview, which runs the same project-owned task-environment
+# command `workspace` locates, so it is loaded directly after it.
+require_relative "specrelay_runner/task_preview"
 require_relative "specrelay_runner/repository_verification"
 require_relative "specrelay_runner/executor"
 require_relative "specrelay_runner/report_bundle"

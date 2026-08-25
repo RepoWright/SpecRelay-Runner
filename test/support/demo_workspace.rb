@@ -24,13 +24,33 @@ module DemoWorkspace
     [ root, executor ]
   end
 
+  # The project-owned task-environment command. MAPIAI-97 adds the two lifecycle verbs the
+  # implementation preview uses — `up` and `status --json` — and records every invocation, so a
+  # test can prove exactly which argv the runner ran and in what order.
+  #
+  # `SPECRELAY_TEST_PREVIEW_UP_EXIT` and `SPECRELAY_TEST_PREVIEW_STATUS_JSON` let one test drive a
+  # failing startup or an unusable status without a second fixture workspace.
+  #
+  # A `break-after-<verb>` marker file makes the NEXT invocation UNLAUNCHABLE: the command replaces
+  # itself with an executable file whose shebang names a missing interpreter. `File.executable?`
+  # still answers true, so the failure lands at the spawn rather than at capability detection
+  # (CR-001 F1). A marker file rather than an environment variable, because the runner builds its
+  # measuring/creating `Workspace` with only PATH — an env switch would never reach `create`.
   def write_worktree(root)
     path = File.join(root, "bin", "worktree")
-    File.write(path, <<~SH)
+    File.write(path, <<~'SH')
       #!/usr/bin/env sh
       set -eu
       ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
       WT_ROOT="$ROOT_DIR/.runs/worktrees"
+      mkdir -p "$ROOT_DIR/.runs"
+      echo "$*" >> "$ROOT_DIR/.runs/worktree.log"
+      break_launch() {
+        printf '#!/nonexistent/interpreter\nexit 0\n' > "$0.broken"
+        chmod +x "$0.broken"
+        mv "$0.broken" "$0"
+      }
+      if [ -f "$ROOT_DIR/break-after-${1:-}" ]; then break_launch; fi
       case "${1:-}" in
         create)
           mkdir -p "$WT_ROOT"
@@ -40,12 +60,33 @@ module DemoWorkspace
             git -C "$ROOT_DIR" worktree add -b "$2" "$WT_ROOT/$2" HEAD
           fi
           ;;
+        up) exit "${SPECRELAY_TEST_PREVIEW_UP_EXIT:-0}" ;;
+        status)
+          if [ -n "${SPECRELAY_TEST_PREVIEW_STATUS_JSON:-}" ]; then
+            printf '%s' "$SPECRELAY_TEST_PREVIEW_STATUS_JSON"
+          else
+            printf '{"task_id":"%s","branch":"b","state":"RUNNING","slot":2,"port_block":[3700,3799],' "$2"
+            printf '"compose_project":"srt-demo","primary_url":"http://127.0.0.1:3700",'
+            printf '"services":[{"service":"platform","state":"running","health":"healthy","host_port":3700,"url":"http://127.0.0.1:3700"},'
+            printf '{"service":"runner","state":"running","health":"none","host_port":3701,"url":"http://127.0.0.1:3701"}],'
+            printf '"repositories":[{"name":"platform","worktree_path":"%s"}],"missing_repositories":[]}' "$WT_ROOT"
+          fi
+          ;;
         release) git -C "$ROOT_DIR" worktree remove "$WT_ROOT/$2" ;;
         list) git -C "$ROOT_DIR" worktree list ;;
-        *) echo "usage: worktree create|release|list <task>" >&2; exit 1 ;;
+        *) echo "usage: worktree create|up|status|release|list <task>" >&2; exit 1 ;;
       esac
     SH
     FileUtils.chmod(0o755, path)
+  end
+
+  # Make the invocation that FOLLOWS `command` unlaunchable (CR-001 F1).
+  def break_launch_after(root, command) = File.write(File.join(root, "break-after-#{command}"), "")
+
+  # Every project-owned command this workspace was asked to run, in order.
+  def worktree_invocations(root)
+    log = File.join(root, ".runs", "worktree.log")
+    File.file?(log) ? File.read(log).lines.map(&:strip) : []
   end
 
   # MAPIAI-84 S06 — a checkout with NO project-owned `bin/worktree`, so the runner falls back to

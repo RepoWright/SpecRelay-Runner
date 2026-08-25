@@ -64,6 +64,10 @@ module SpecrelayRunner
     # The project's own task-environment command, relative to the connected checkout root.
     PROJECT_COMMAND = File.join("bin", "worktree")
 
+    # The bound on any single workspace command. Named because {TaskPreview} runs the same
+    # project-owned command family under the same bound, and two literals would be two policies.
+    COMMAND_TIMEOUT_SECONDS = 300
+
     def initialize(root:, canonical_branch:, create_command:, task_id: nil, env: {})
       @root = root.to_s
       @canonical_branch = canonical_branch.to_s
@@ -370,7 +374,7 @@ module SpecrelayRunner
     # worktree never depends on the workspace root being usable.
     def git(dir, args) = run([ "git", "-C", dir.to_s, *args ], chdir: dir)
 
-    def run(argv, chdir: root) = CommandRunner.run(argv, chdir: chdir, env: env, timeout_seconds: 300)
+    def run(argv, chdir: root) = CommandRunner.run(argv, chdir: chdir, env: env, timeout_seconds: COMMAND_TIMEOUT_SECONDS)
 
     def first_line(*candidates)
       candidates.map { |c| c.to_s.strip }.find { |s| !s.empty? }.to_s.each_line.first.to_s.strip
