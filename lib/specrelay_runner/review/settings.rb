@@ -142,6 +142,7 @@ module SpecrelayRunner
       # rather than being refused, because the operator's intent is unambiguous.
       def effective_args
         return args unless claude?
+        return %w[--print --dangerously-skip-permissions] if args.empty?
         return args if args.any? { |arg| ClaudeProfile::PRINT_FLAGS.include?(arg.to_s.split("=", 2).first) }
 
         [ *args, "--print" ]
