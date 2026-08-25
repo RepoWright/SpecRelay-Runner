@@ -187,11 +187,18 @@ no per-invocation configuration:
   map, or account: the supported provider resolves its own executable, which is exactly why the
   identifier is enough. (The deterministic development fixture has no default executable and still
   takes `SPECRELAY_RUNNER_REVIEWER_COMMAND`.)
-- **The reviewed repository is resolved from exactly two places:** the connected workspace root
-  itself, or its direct `<repository_key>` child. Exactly one of them must be a Git repository *at
-  its own top level* whose `origin` matches the assignment's clone URL by identity
+- **The reviewed repository is resolved from at most two places:** the connected workspace root
+  itself, or one direct child named by the **repository segment** of the pinned key. Platform pins
+  `owner/repository`, so `RepoWright/tiny-demo-crm` is looked for at `<root>/tiny-demo-crm` — never
+  at a nested `<root>/RepoWright/tiny-demo-crm` (MAPIAI-98). Exactly one of them must be a Git
+  repository *at its own top level* whose `origin` matches the assignment's clone URL by identity
   (`host/owner/repo`). Both shapes are normal: a single-repository machine connects the
   repository itself, while a project workspace holds its repositories as direct children.
+- **The child must be physically contained.** Its real path must have the real workspace root as
+  its parent, checked *before* git is asked anything about it, so a correctly named symlink cannot
+  select a repository outside the connected workspace. The configured root itself may still be
+  reached through a symlink. A child that resolves to nothing — absent, or a broken link — is
+  simply not a location and produces the ordinary refusal.
 - **Nothing else is ever inspected** — no parent, sibling, grandchild, registry, or search — and
   a directory's name is never taken as repository identity.
 - **It fails closed.** No match, more than one match, a different remote, a missing pinned

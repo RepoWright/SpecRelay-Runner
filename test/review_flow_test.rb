@@ -12,9 +12,13 @@ require "test_helper"
 class ReviewFlowTest < Minitest::Test
   BASE = "1111111111111111111111111111111111111111"
   HEAD = "2222222222222222222222222222222222222222"
+  BRANCH = "main"
 
   def setup
     @root = Dir.mktmpdir("review-workspace")
+    # Bare origins live OUTSIDE the workspace root, so a pinned remote can never also be one of
+    # the locations the resolver is allowed to consider.
+    @remotes = Dir.mktmpdir("review-remotes")
     @repo = File.join(@root, "specrelay-platform")
     @io = StringIO.new
     # A review is never obtained through the claim payload in these tests — it is handed to
@@ -26,6 +30,7 @@ class ReviewFlowTest < Minitest::Test
   def teardown
     @platform&.stop
     FileUtils.remove_entry(@root, true)
+    FileUtils.remove_entry(@remotes, true)
   end
 
   # --- the pinned checkout -------------------------------------------------
@@ -196,6 +201,264 @@ class ReviewFlowTest < Minitest::Test
     assert_empty @platform.review_results
     assert_equal "provider_execution_failure", @platform.last_review_failure["kind"]
     assert_includes @platform.last_review_failure["reason"], "different remote"
+  end
+
+  # --- owner-qualified repository keys (MAPIAI-98) --------------------------
+  #
+  # Platform pins a repository by its normalized GitHub identity, so `repository_key` is
+  # `owner/repository`. The direct-child candidate is named by the REPOSITORY SEGMENT of that key:
+  # `RepoWright/tiny-demo-crm` is reviewed at `<root>/tiny-demo-crm`. Appending the whole key asked
+  # for the nested `<root>/RepoWright/tiny-demo-crm`, which never exists — so the live MAPIAI-95
+  # review saw only the workspace root and reported its different remote as the mismatch.
+
+  # The reproduction, in the live shape: the workspace root is a real repository with its OWN
+  # remote, and the reviewed repository is the direct child. Remote-head and pinned-commit
+  # verification then run for real against a local bare origin.
+  def test_an_owner_qualified_key_resolves_its_repository_name_child_and_verifies_the_pin
+    pin_repository("tiny-demo-workspace", at: @root)
+    crm = pin_repository("tiny-demo-crm", at: File.join(@root, "tiny-demo-crm"))
+
+    verified = verify_repositories([ crm ])
+
+    assert verified.ok?, verified.reason
+    assert_equal File.join(@root, "tiny-demo-crm"), verified.roots["RepoWright/tiny-demo-crm"]
+  end
+
+  # The whole MAPIAI-95 layout in one assignment. Each key keeps its own selected root, and
+  # assignment order survives.
+  def test_a_three_repository_assignment_resolves_every_owner_qualified_key_independently
+    verified = verify_repositories(three_repository_assignment)
+
+    assert verified.ok?, verified.reason
+    assert_equal [ "RepoWright/tiny-demo-workspace", "RepoWright/tiny-demo-dashboard",
+                   "RepoWright/tiny-demo-crm" ], verified.roots.keys
+    assert_equal @root, verified.roots["RepoWright/tiny-demo-workspace"]
+    assert_equal File.join(@root, "tiny-demo-dashboard"),
+                 verified.roots["RepoWright/tiny-demo-dashboard"]
+    assert_equal File.join(@root, "tiny-demo-crm"), verified.roots["RepoWright/tiny-demo-crm"]
+  end
+
+  # The directory name is only a location hint; IDENTITY decides. An https clone URL and an
+  # scp-like ssh origin for the same repository still compare equal.
+  def test_https_and_scp_like_ssh_forms_of_one_owner_qualified_repository_still_match
+    head = build_repo_at(File.join(@root, "tiny-demo-crm"),
+                         remote: "git@github.com:RepoWright/tiny-demo-crm.git")
+
+    verified = verify_repositories(
+      [ repository_entry("RepoWright/tiny-demo-crm",
+                         "https://github.com/RepoWright/tiny-demo-crm.git", head) ]
+    )
+
+    assert verified.ok?, verified.reason
+    assert_equal File.join(@root, "tiny-demo-crm"), verified.roots["RepoWright/tiny-demo-crm"]
+  end
+
+  # The right NAME is not enough. This child is a real repository in the one allowed child
+  # location with a different origin, so the whole assignment refuses and no reviewer starts.
+  def test_a_repository_name_child_with_a_different_remote_refuses_before_the_reviewer_starts
+    entries = three_repository_assignment
+    git_in File.join(@root, "tiny-demo-crm"),
+           "remote set-url origin #{File.join(@remotes, 'RepoWright', 'tiny-demo-dashboard.git')}"
+    capture = File.join(@root, "launched.txt")
+
+    result = run_review(command: reviewer_script(%({"outcome":"ACCEPT","summary":"ok"}), capture: capture),
+                        payload: review_payload.merge("repositories" => entries))
+
+    refute File.exist?(capture), "the reviewer must not be launched while a pin does not verify"
+    refute result.success?
+    assert_includes result.message, "'RepoWright/tiny-demo-crm' points at a different remote"
+    assert_empty @platform.review_results
+  end
+
+  # Nothing is checked out. The refusal names the directory that was actually looked for —
+  # `tiny-demo-crm`, not the nested `RepoWright/tiny-demo-crm` the old rule asked for.
+  def test_a_missing_owner_qualified_checkout_names_the_repository_directory_it_looked_for
+    result = run_review(payload: review_payload.merge(
+      "repositories" => [ repository_entry("RepoWright/tiny-demo-crm",
+                                           "https://github.com/RepoWright/tiny-demo-crm.git", HEAD) ]
+    ))
+
+    refute result.success?
+    assert_includes result.message, "no local checkout for 'RepoWright/tiny-demo-crm'"
+    assert_includes result.message, "its 'tiny-demo-crm' directory"
+    refute_includes result.message, "its 'RepoWright/tiny-demo-crm' directory"
+    assert_empty @platform.review_results
+  end
+
+  # Both allowed locations are the reviewed repository, and there is no precedence to apply.
+  def test_refuses_when_the_root_and_the_repository_name_child_are_both_the_reviewed_repository
+    remote = "https://github.com/RepoWright/tiny-demo-crm.git"
+    head = build_repo_at(@root, remote: remote)
+    build_repo_at(File.join(@root, "tiny-demo-crm"), remote: remote)
+
+    result = verify_repositories([ repository_entry("RepoWright/tiny-demo-crm", remote, head) ])
+
+    refute result.ok?
+    refute result.stale?
+    assert_includes result.reason, "ambiguous"
+    assert_includes result.reason, "its 'tiny-demo-crm' directory"
+  end
+
+  # Not merely the right answer: for EVERY repository the only paths git is asked about are the
+  # workspace root and the one direct child named by the repository segment, and only when that
+  # child physically is one. The nested owner-qualified path is never among them, and set equality
+  # excludes parents, siblings and grandchildren. The workspace repository IS the root here, so
+  # `<root>/tiny-demo-workspace` does not exist and there is no second location to ask about.
+  def test_only_the_root_and_the_repository_name_child_are_inspected_for_each_repository
+    inspected_for = { "RepoWright/tiny-demo-workspace" => [ @root ],
+                      "RepoWright/tiny-demo-dashboard" => [ @root, File.join(@root, "tiny-demo-dashboard") ],
+                      "RepoWright/tiny-demo-crm" => [ @root, File.join(@root, "tiny-demo-crm") ] }
+
+    three_repository_assignment.each do |entry|
+      recorder = RecordingGit.new
+
+      SpecrelayRunner::Review::Checkout.verify(
+        assignment: SpecrelayRunner::Review::Assignment.new(
+          review_payload.merge("repositories" => [ entry ])
+        ), workspace_root: @root, git: recorder
+      )
+
+      assert_equal inspected_for.fetch(entry["repository_key"]).sort, recorder.roots.uniq.sort
+      refute_includes recorder.roots, File.join(@root, entry["repository_key"])
+    end
+  end
+
+  # Malformed key material is a REFUSAL at worst, never a wider search. Empty, dot, dot-dot and
+  # absolute segments can only ever produce the workspace root itself or one contained child.
+  MALFORMED_KEYS = [ "", ".", "..", "../..", "/etc", "RepoWright/", "RepoWright/..",
+                     "RepoWright/../../etc" ].freeze
+
+  def test_malformed_repository_keys_never_reach_a_path_outside_the_workspace_root
+    MALFORMED_KEYS.each do |key|
+      recorder = RecordingGit.new
+
+      result = SpecrelayRunner::Review::Checkout.verify(
+        assignment: SpecrelayRunner::Review::Assignment.new(review_payload.merge(
+          "repositories" => [ repository_entry(key, "https://github.com/RepoWright/tiny-demo-crm.git", HEAD) ]
+        )), workspace_root: @root, git: recorder
+      )
+
+      refute result.ok?, "#{key.inspect} must not resolve"
+      inspected = recorder.roots.uniq
+      assert_operator inspected.size, :<=, 2, "#{key.inspect} inspected #{inspected.inspect}"
+      inspected.each { |path| assert contained_location?(path), "#{key.inspect} inspected #{path}" }
+    end
+  end
+
+  # --- physical containment of the direct child (CR-001 F1) -----------------
+  #
+  # `same_directory?` compares a candidate and git's answer through `File.realpath`, which is what
+  # lets the CONFIGURED ROOT be reached through a symlink. A symlinked CHILD exploited the same
+  # tolerance: git resolved the outside repository, both sides then agreed, and a repository
+  # physically outside the connected workspace verified as the reviewed one. Lexical containment
+  # could not see it.
+
+  # The escaped target is never handed to the git seam at all: the only location asked about is the
+  # workspace root, so nothing that resolves outside the workspace is ever inspected.
+  def test_a_repository_name_child_symlinked_outside_the_workspace_never_reaches_git
+    outside = File.join(@remotes, "outside-workspace", "tiny-demo-crm")
+    crm = pin_repository("tiny-demo-crm", at: outside)
+    link = File.join(@root, "tiny-demo-crm")
+    File.symlink(outside, link)
+    refute File.realpath(link).start_with?(File.realpath(@root) + File::SEPARATOR),
+           "the fixture must really point outside the connected workspace"
+    recorder = RecordingGit.new
+
+    result = SpecrelayRunner::Review::Checkout.verify(
+      assignment: SpecrelayRunner::Review::Assignment.new(
+        review_payload.merge("repositories" => [ crm ])
+      ), workspace_root: @root, git: recorder
+    )
+
+    refute result.ok?
+    assert_equal [ @root ], recorder.roots.uniq
+    refute_includes recorder.roots, link
+    refute_includes recorder.roots, File.realpath(outside)
+  end
+
+  # ... and with the real git seam the whole review ends before a reviewer is launched and before
+  # anything could be submitted.
+  def test_a_repository_name_child_symlinked_outside_the_workspace_refuses_before_the_reviewer_starts
+    outside = File.join(@remotes, "outside-workspace", "tiny-demo-crm")
+    crm = pin_repository("tiny-demo-crm", at: outside)
+    File.symlink(outside, File.join(@root, "tiny-demo-crm"))
+    capture = File.join(@root, "launched.txt")
+
+    result = run_review(command: reviewer_script(%({"outcome":"ACCEPT","summary":"ok"}), capture: capture),
+                        payload: review_payload.merge("repositories" => [ crm ]))
+
+    refute File.exist?(capture), "a checkout outside the workspace must not reach a reviewer"
+    refute result.success?
+    assert_includes result.message, "no local checkout for 'RepoWright/tiny-demo-crm'"
+    assert_empty @platform.review_results
+  end
+
+  # An unresolvable child is an ORDINARY safe refusal — not a crash, and not a new classification.
+  def test_a_broken_repository_name_symlink_refuses_without_reaching_git
+    File.symlink(File.join(@remotes, "absent-crm"), File.join(@root, "tiny-demo-crm"))
+    recorder = RecordingGit.new
+
+    result = SpecrelayRunner::Review::Checkout.verify(
+      assignment: SpecrelayRunner::Review::Assignment.new(review_payload.merge(
+        "repositories" => [ repository_entry("RepoWright/tiny-demo-crm",
+                                             "https://github.com/RepoWright/tiny-demo-crm.git", HEAD) ]
+      )), workspace_root: @root, git: recorder
+    )
+
+    refute result.ok?
+    assert_includes result.reason, "no local checkout for 'RepoWright/tiny-demo-crm'"
+    assert_equal [ @root ], recorder.roots.uniq
+  end
+
+  # The correction applies to the DERIVED CHILD, never to the established root behavior: a
+  # configured workspace root reached through a symlink is still the reviewed repository, and its
+  # direct child still resolves beneath it.
+  def test_a_workspace_root_reached_through_a_symlink_still_resolves_itself_and_its_child
+    workspace = pin_repository("tiny-demo-workspace", at: @root)
+    crm = pin_repository("tiny-demo-crm", at: File.join(@root, "tiny-demo-crm"))
+    linked_root = File.join(@remotes, "linked-workspace")
+    File.symlink(@root, linked_root)
+
+    verified = SpecrelayRunner::Review::Checkout.verify(
+      assignment: SpecrelayRunner::Review::Assignment.new(
+        review_payload.merge("repositories" => [ workspace, crm ])
+      ), workspace_root: linked_root
+    )
+
+    assert verified.ok?, verified.reason
+    assert_equal linked_root, verified.roots["RepoWright/tiny-demo-workspace"]
+    assert_equal File.join(linked_root, "tiny-demo-crm"), verified.roots["RepoWright/tiny-demo-crm"]
+  end
+
+  # The whole review boundary over the three-repository assignment: the reviewer starts only once
+  # every pin verifies, and its verdict is submitted.
+  def test_a_three_repository_review_launches_the_reviewer_and_submits_its_verdict
+    entries = three_repository_assignment
+    capture = File.join(@root, "launched.txt")
+
+    result = run_review(command: reviewer_script(%({"outcome":"ACCEPT","summary":"Read the diff."}),
+                                                 capture: capture),
+                        payload: review_payload.merge("repositories" => entries))
+
+    assert result.success?, result.message
+    assert File.exist?(capture), "the reviewer must run once every pin verifies"
+    assert_equal "ACCEPT", @platform.last_review["outcome"]
+  end
+
+  # Pre-submission re-verification resolves the SAME anchored locations again: a push to one
+  # repository's branch while the reviewer works stops the verdict instead of recording it.
+  def test_a_head_that_moves_during_a_three_repository_review_stops_the_verdict
+    entries = three_repository_assignment
+    capture = File.join(@root, "launched.txt")
+    script = reviewer_script(%({"outcome":"ACCEPT","summary":"Looked fine."}),
+                             capture: capture, advance: File.join(@root, "tiny-demo-crm"))
+
+    result = run_review(command: script, payload: review_payload.merge("repositories" => entries))
+
+    assert File.exist?(capture), "the reviewer did run"
+    assert_equal :stale, result.outcome
+    assert_empty @platform.review_results
+    assert_equal 1, @platform.stale_reports.size
   end
 
   # --- the fresh reviewer process ------------------------------------------
@@ -463,6 +726,40 @@ class ReviewFlowTest < Minitest::Test
 
   def git_in(path, args) = system("git -C #{path} #{args}", out: File::NULL, err: File::NULL)
 
+  # A real bare origin at `remotes/<owner>/<name>.git` plus a real checkout at `at`, pushed to it.
+  # The pinned clone URL therefore carries the owner-qualified identity while the checkout is
+  # anchored by the repository segment alone — which is exactly the distinction under test — and
+  # `ls-remote` and `cat-file` both run for real, offline.
+  def pin_repository(name, at:, owner: "RepoWright")
+    remote = File.join(@remotes, owner, "#{name}.git")
+    FileUtils.mkdir_p(File.dirname(remote))
+    system("git init --quiet --bare --initial-branch=#{BRANCH} #{remote}", out: File::NULL, err: File::NULL)
+    head = build_repo_at(at, remote: remote)
+    git_in at, "push --quiet origin HEAD:refs/heads/#{BRANCH}"
+    { "repository_key" => "#{owner}/#{name}", "slug" => "#{owner}/#{name}", "clone_url" => remote,
+      "base_commit" => BASE, "branch" => BRANCH, "head_commit" => head,
+      "pull_request_url" => "https://github.com/#{owner}/#{name}/pull/1" }
+  end
+
+  # The MAPIAI-95 layout: the workspace root itself, then two direct children, every key
+  # owner-qualified.
+  def three_repository_assignment
+    [ pin_repository("tiny-demo-workspace", at: @root),
+      pin_repository("tiny-demo-dashboard", at: File.join(@root, "tiny-demo-dashboard")),
+      pin_repository("tiny-demo-crm", at: File.join(@root, "tiny-demo-crm")) ]
+  end
+
+  def verify_repositories(entries)
+    SpecrelayRunner::Review::Checkout.verify(
+      assignment: SpecrelayRunner::Review::Assignment.new(
+        review_payload.merge("repositories" => entries)
+      ), workspace_root: @root
+    )
+  end
+
+  # The workspace root itself, or one of its direct children — the only two anchored locations.
+  def contained_location?(path) = path == @root || File.dirname(path) == @root
+
   def verify(workspace_root)
     SpecrelayRunner::Review::Checkout.verify(
       assignment: SpecrelayRunner::Review::Assignment.new(review_payload), workspace_root: workspace_root
@@ -519,11 +816,21 @@ class ReviewFlowTest < Minitest::Test
 
   # A reviewer stand-in that prints `body` and exits. It is a real executable launched as a
   # real child process, so the runner's argv, timeout and capture behaviour are all exercised.
-  def reviewer_script(body, exit_code: 0, capture: nil)
+  # `advance` pushes a commit from that checkout WHILE the reviewer works, which is how a head
+  # that moves during a review is reproduced.
+  def reviewer_script(body, exit_code: 0, capture: nil, advance: nil)
     path = File.join(@root, "reviewer-#{rand(1_000_000)}.rb")
     File.write(path, <<~RUBY)
       #!/usr/bin/env ruby
       File.write(#{capture.inspect}, ARGV.last) if #{capture.inspect}
+      if (moving = #{advance.inspect})
+        File.write(File.join(moving, "LATER.md"), "added during the review\\n")
+        system("git -C \#{moving} add LATER.md", out: File::NULL, err: File::NULL)
+        system("git -C \#{moving} -c commit.gpgsign=false commit --quiet -m during",
+               out: File::NULL, err: File::NULL)
+        system("git -C \#{moving} push --quiet origin HEAD:refs/heads/#{BRANCH}",
+               out: File::NULL, err: File::NULL)
+      end
       print #{body.inspect}
       exit #{exit_code}
     RUBY
