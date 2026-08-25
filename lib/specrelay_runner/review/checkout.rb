@@ -45,7 +45,8 @@ module SpecrelayRunner
       Resolution = Struct.new(:root, :refusal, keyword_init: true)
 
       # WHERE the reviewed repository is, chosen from exactly TWO anchored candidates: the
-      # configured workspace root itself, and its direct `repository_key` child (MAPIAI-91).
+      # configured workspace root itself, and the one direct child named by {child_name}
+      # (MAPIAI-91, corrected by MAPIAI-98).
       #
       # Both shapes are real and neither is configuration trickery. A guided connection stores the
       # validated CHECKOUT as its root, so on a single-repository machine the root IS the reviewed
@@ -56,28 +57,79 @@ module SpecrelayRunner
       # Identity — not position, and never the directory's name — decides. Exactly one candidate
       # may match the assignment's remote: zero is "not here", and two is genuinely ambiguous, so
       # both refuse rather than pick. Nothing else is ever considered: no parent, no sibling, no
-      # grandchild, no registry, no search.
+      # grandchild, no registry, no search, and nothing a symlink points at outside the workspace.
       def resolve(repository, workspace_root, git)
         key = repository["repository_key"].to_s
-        checkouts = candidates(workspace_root, key).select { |root| checkout?(root, git) }
+        child = child_name(key)
+        checkouts = candidates(workspace_root, child).select { |root| checkout?(root, git) }
         expected = identity(repository["clone_url"])
         matching = checkouts.select { |root| !expected.empty? && identity(git.remote_url(root)) == expected }
 
-        return Resolution.new(refusal: refuse("no local checkout for '#{key}' at the connected " \
-                                              "workspace root or its '#{key}' directory")) if checkouts.empty?
+        return Resolution.new(refusal: refuse("no local checkout for '#{key}' at " \
+                                              "#{locations(child)}")) if checkouts.empty?
         return Resolution.new(refusal: refuse("'#{key}' points at a different remote than the " \
                                               "reviewed repository")) if matching.empty?
-        return Resolution.new(refusal: refuse("both the connected workspace root and its '#{key}' " \
-                                              "directory are the reviewed repository; refusing an " \
-                                              "ambiguous checkout")) if matching.size > 1
+        return Resolution.new(refusal: refuse("both the connected workspace root and its " \
+                                              "'#{child}' directory are the reviewed repository; " \
+                                              "refusing an ambiguous checkout")) if matching.size > 1
 
         Resolution.new(root: matching.first)
       end
 
-      def candidates(workspace_root, key)
+      # A key that names no usable directory: the child candidate is then simply absent, and the
+      # root is the only place that was looked at.
+      UNUSABLE_CHILD = [ "", ".", ".." ].freeze
+
+      # The direct child's NAME — never a path. A pinned key is Platform's normalized GitHub
+      # identity, so it is `owner/repository` and the checkout is the `repository` segment:
+      # `RepoWright/tiny-demo-crm` is reviewed at `<root>/tiny-demo-crm`. Joining the whole key
+      # asked for the nested `<root>/RepoWright/tiny-demo-crm`, which never exists, and the live
+      # MAPIAI-95 review therefore saw only the workspace root and reported its remote as the
+      # mismatch (MAPIAI-98). A single-segment key is unchanged: it IS its own repository segment.
+      #
+      # Because the result is one path component, `File.join` can only ever produce a LEXICALLY
+      # direct child. Empty, `.` and `..` segments produce no candidate at all, so malformed key
+      # material refuses instead of reaching a parent, a sibling or an arbitrary path.
+      # {contained_child} proves the PHYSICAL half of the same boundary.
+      def child_name(key)
+        name = key.to_s.rpartition("/").last
+        name unless UNUSABLE_CHILD.include?(name)
+      end
+
+      def candidates(workspace_root, child)
         roots = [ workspace_root.to_s ]
-        roots << File.join(workspace_root.to_s, key) unless key.empty?
+        contained = contained_child(workspace_root.to_s, child)
+        roots << contained if contained
         roots.uniq
+      end
+
+      # The child candidate, but only once its PHYSICAL location is proven to still be one direct
+      # child of the physical workspace root — before git is asked anything about it.
+      #
+      # {checkout?} compares a candidate with git's own top level through `File.realpath`, which is
+      # what lets the configured ROOT be reached through a symlink. A symlinked CHILD exploited that
+      # same tolerance: git resolved the repository the link pointed at, both sides then agreed, and
+      # a repository physically outside the connected workspace verified as the reviewed one
+      # (CR-001 F1). A lexically contained path is not a contained location.
+      #
+      # A candidate that resolves to nothing — absent, or a broken link — is not a location either,
+      # so it is dropped and the ordinary "no local checkout" refusal follows.
+      def contained_child(workspace_root, child)
+        return nil if child.nil?
+
+        path = File.join(workspace_root, child)
+        return nil unless File.dirname(File.realpath(path)) == File.realpath(workspace_root)
+
+        path
+      rescue SystemCallError
+        nil
+      end
+
+      # What a refusal may honestly claim was looked at.
+      def locations(child)
+        return "the connected workspace root" if child.nil?
+
+        "the connected workspace root or its '#{child}' directory"
       end
 
       # A candidate must be the TOP LEVEL of a repository, not merely inside one. `git rev-parse`
