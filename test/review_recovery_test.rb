@@ -88,6 +88,20 @@ class ReviewRecoveryTest < Minitest::Test
     assert_includes settings.argv("prompt"), "--print"
   end
 
+  def test_the_default_claude_reviewer_can_execute_tools_non_interactively
+    settings = SpecrelayRunner::Review::Settings.new({ "provider" => "claude" }, env: {})
+
+    assert_equal %w[claude --print --dangerously-skip-permissions prompt], settings.argv("prompt")
+  end
+
+  def test_explicit_claude_reviewer_arguments_remain_authoritative
+    settings = SpecrelayRunner::Review::Settings.new(
+      { "provider" => "claude", "args" => %w[--print] }, env: {}
+    )
+
+    assert_equal %w[claude --print prompt], settings.argv("prompt")
+  end
+
   # review-001 F6: only the FIRST occurrence used to be inspected, so a direct-text flag in
   # front of a wrapped one passed the check and left the provider wrapped. Every occurrence is
   # read, in both spellings, and anything but one unambiguous text selection is refused.
