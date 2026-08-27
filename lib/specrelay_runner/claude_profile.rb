@@ -120,6 +120,45 @@ module SpecrelayRunner
       end
     end
 
+    # MAPIAI-103 — "this argv asks the CLI for the supported structured stream", asked by BOTH
+    # readers of that stream: this profile's own validation below, and the REVIEW lane, which
+    # decodes the same bytes with the same {ClaudeStream}. One predicate rather than a copy per
+    # lane, so no lane can drift into accepting output the decoder cannot read.
+    def self.structured_stream?(args) = non_interactive?(args) && structured?(args)
+
+    def self.non_interactive?(args)
+      Array(args).any? { |arg| PRINT_FLAGS.include?(flag_name(arg)) }
+    end
+
+    def self.structured?(args)
+      list = Array(args).map(&:to_s)
+      REQUIRED_FLAGS.all? { |flag, value| requested?(list, flag, value) }
+    end
+
+    # The requirement as an operator would have to write it, so a refusal says what to add.
+    def self.required_description
+      REQUIRED_FLAGS.map { |flag, value| [ flag, value ].compact.join(" ") }.join(", ")
+    end
+
+    # `--output-format=stream-json` and `--output-format stream-json` are the same flag.
+    def self.flag_name(arg) = arg.to_s.split("=", 2).first.to_s
+
+    # A required flag appears EXACTLY once and — when it takes one — carries the required value,
+    # written either as `--flag value` or as `--flag=value`.
+    #
+    # Exactly once, because which of two occurrences the CLI honours is the CLI's business
+    # (review-001 F6): a list whose effective output mode has to be reasoned about is not the
+    # deterministic one this boundary exists to guarantee, even when the two values agree.
+    def self.requested?(args, flag, value)
+      occurrences = args.each_index.select { |index| flag_name(args[index]) == flag }
+      return false unless occurrences.length == 1
+      return true if value.nil?
+
+      index = occurrences.first
+      (args[index].to_s.split("=", 2)[1] || args[index + 1].to_s) == value
+    end
+    private_class_method :requested?
+
     # True when an executor config selects this real provider. Non-raising, so the
     # deterministic fake-executor path can ask without risking an exception.
     def self.selected?(executor_config)
@@ -253,9 +292,8 @@ module SpecrelayRunner
       raise Error, "executor.command must be the Claude Code CLI ('#{EXECUTABLE}')" unless claude_executable?
       raise Error, "executor.prompt_delivery must be '#{PROMPT_DELIVERY}' so the prompt stays a distinct argv element" unless prompt_delivery == PROMPT_DELIVERY
       raise Error, "executor.args must request non-interactive output (#{PRINT_FLAGS.join(' or ')})" unless non_interactive?
-
-      missing = REQUIRED_FLAGS.find { |flag, value| !passes?(flag, value) }
-      raise Error, "executor.args must request structured output (#{required_description})" if missing
+      raise Error, "executor.args must request structured output (#{self.class.required_description})" unless
+        self.class.structured?(args)
 
       forbidden = args.find { |arg| FORBIDDEN_FLAGS.key?(flag_name(arg)) }
       raise Error, "executor.args must not pass #{flag_name(forbidden)}: #{FORBIDDEN_FLAGS.fetch(flag_name(forbidden))}" if forbidden
@@ -271,24 +309,8 @@ module SpecrelayRunner
     # payload that would launch a different executable is `identity`/`mismatch_reason`
     # (review-001 finding F1 — the previous comment here overclaimed).
     def claude_executable? = File.basename(command) == EXECUTABLE
-    def non_interactive? = args.any? { |arg| PRINT_FLAGS.include?(flag_name(arg)) }
-
-    # A required flag is present, and — when it takes one — carries the required value, written
-    # either as `--flag value` or as `--flag=value`.
-    def passes?(flag, value)
-      index = args.index { |arg| flag_name(arg) == flag }
-      return false if index.nil?
-      return true if value.nil?
-
-      (args[index].to_s.split("=", 2)[1] || args[index + 1].to_s) == value
-    end
-
-    def required_description
-      REQUIRED_FLAGS.map { |flag, value| [ flag, value ].compact.join(" ") }.join(", ")
-    end
-
-    # `--output-format=stream-json` and `--output-format stream-json` are the same flag.
-    def flag_name(arg) = arg.to_s.split("=", 2).first.to_s
+    def non_interactive? = self.class.non_interactive?(args)
+    def flag_name(arg) = self.class.flag_name(arg)
 
     def classify_version(result)
       return UNAVAILABLE if result.nil?
