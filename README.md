@@ -187,6 +187,14 @@ no per-invocation configuration:
   map, or account: the supported provider resolves its own executable, which is exactly why the
   identifier is enough. (The deterministic development fixture has no default executable and still
   takes `SPECRELAY_RUNNER_REVIEWER_COMMAND`.)
+- **A real Claude review streams (MAPIAI-103).** The reviewer runs in the same supported
+  structured mode the executor does, so its safe public activity — narration, tool calls,
+  commands, file reads and edits, tests, delegated tasks — appears in this terminal as it
+  happens, and the verdict comes from the same decoder's terminal result. That stream is local
+  only: nothing of it is sent to Platform or persisted. An `args:` list you write yourself must
+  therefore request `--print`, `--output-format stream-json` and `--verbose`; a list that does not
+  is refused before the provider is launched, and writing no `args:` at all gets the supported
+  default.
 - **The reviewed repository is resolved from at most two places:** the connected workspace root
   itself, or one direct child named by the **repository segment** of the pinned key. Platform pins
   `owner/repository`, so `RepoWright/tiny-demo-crm` is looked for at `<root>/tiny-demo-crm` — never

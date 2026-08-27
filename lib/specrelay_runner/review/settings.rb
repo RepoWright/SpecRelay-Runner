@@ -11,7 +11,8 @@ module SpecrelayRunner
     #       name: Local Reviewer          # a label for the operator's own machine list
     #       provider: claude              # claude | fake
     #       command: claude               # optional; defaults to the profile's executable
-    #       args: [--print, --dangerously-skip-permissions]
+    #       args: [--print, --output-format, stream-json, --verbose,
+    #              --dangerously-skip-permissions]
     #       timeout_seconds: 1800
     #
     # Two things live here and they are deliberately different shapes:
@@ -41,20 +42,29 @@ module SpecrelayRunner
       PROVIDER_ENV = "SPECRELAY_RUNNER_REVIEWER_PROVIDER"
       COMMAND_ENV = "SPECRELAY_RUNNER_REVIEWER_COMMAND"
 
-      # The reviewer's ONE supported output mode (MAPIAI-78 design 1).
+      # The reviewer's ONE supported output mode (MAPIAI-103, replacing MAPIAI-78 design 1).
       #
-      # The review document IS the provider's stdout, so the provider must be in its direct text
-      # mode. `--output-format json` wraps that document in a provider envelope whose top level
-      # carries no `outcome`: it parses, and it is not a review — the shape that stranded the
-      # live MAPIAI-73 review. It is REFUSED rather than decoded, because a second accepted
-      # output shape means a second result parser and no way to prove which one produced a
-      # verdict. The executor lane makes the opposite choice for the opposite reason: it reads a
-      # turn STREAM, so structured output is mandatory there (ClaudeProfile::REQUIRED_FLAGS).
-      OUTPUT_FORMAT_FLAG = "--output-format"
-      TEXT_OUTPUT = "text"
-      UNSUPPORTED_OUTPUT = "runner.reviewer.args must leave the reviewer in its direct text " \
-                           "output mode: remove #{OUTPUT_FORMAT_FLAG}, or state it exactly once " \
-                           "as '#{TEXT_OUTPUT}'"
+      # The reviewer now reads the SAME structured stream the implementation and specification
+      # lanes read, decoded by the SAME {ClaudeStream}: that is what makes its public activity
+      # visible while it works, and its review document that decoder's one terminal result. Direct
+      # text is gone rather than kept as a second accepted shape — two shapes would mean two
+      # result parsers and no way to prove which one produced a verdict, which is exactly how the
+      # live MAPIAI-73 review was stranded.
+      #
+      # {ClaudeProfile} owns WHICH flags request that stream and is asked rather than copied. An
+      # explicit operator list stays authoritative and is REFUSED rather than corrected when it
+      # does not request the stream: a flag added silently here would mean the effective
+      # invocation is not the one the operator can read in their own YAML.
+      UNSUPPORTED_OUTPUT = "runner.reviewer.args must request the supported structured reviewer " \
+                           "stream (#{ClaudeProfile::PRINT_FLAGS.first} with " \
+                           "#{ClaudeProfile.required_description}); the review document is " \
+                           "decoded from that stream"
+
+      # The supported invocation when the operator wrote no `args:` at all — the guided-setup
+      # path, which stores a provider identifier and no launch configuration (MAPIAI-91).
+      # `--dangerously-skip-permissions` is MAPIAI-100's tool-enabled reviewer default.
+      DEFAULT_ARGS = [ "--print", "--output-format", ClaudeProfile::STREAM_FORMAT, "--verbose",
+                       "--dangerously-skip-permissions" ].freeze
 
       attr_reader :name, :provider, :command, :args, :timeout_seconds
 
@@ -93,43 +103,21 @@ module SpecrelayRunner
         Digest::SHA256.hexdigest(material)[0, 32]
       end
 
-      # The argv that launches ONE fresh reviewer process. Built here so the reviewer's
-      # non-interactive flags are this object's decision rather than something an operator can
-      # accidentally omit.
+      # The argv that launches ONE fresh reviewer process. An operator who wrote no `args:` gets
+      # the supported default; one who wrote an unsupported list is told what is missing here,
+      # before an expensive provider runs against output nothing can decode.
       def argv(prompt)
         raise Error, "no reviewer provider is configured (set runner.reviewer.provider)" unless configured?
-        raise Error, UNSUPPORTED_OUTPUT if claude? && wrapped_output?
 
-        [ resolved_command, *effective_args, prompt ]
+        launch = effective_args
+        raise Error, UNSUPPORTED_OUTPUT if claude? && !ClaudeProfile.structured_stream?(launch)
+
+        [ resolved_command, *launch, prompt ]
       end
 
       private
 
       attr_reader :env
-
-      # EVERY occurrence, in both spellings. Reading only the first one let `--output-format text
-      # --output-format json` pass while leaving the provider wrapped (review-001 F6).
-      #
-      # Exactly one selection, and it must be text. A repeated flag is refused even when its
-      # values agree: which occurrence the provider honours is the provider's business, and a
-      # configuration whose effective output mode has to be reasoned about is not the
-      # deterministic one this boundary exists to guarantee. A flag with no value reads as an
-      # empty selection and is refused by the same comparison.
-      def wrapped_output?
-        selections = output_format_selections
-        return false if selections.empty?
-
-        selections != [ TEXT_OUTPUT ]
-      end
-
-      def output_format_selections
-        args.each_with_index.filter_map do |arg, index|
-          flag, inline = arg.to_s.split("=", 2)
-          next unless flag == OUTPUT_FORMAT_FLAG
-
-          inline || args[index + 1].to_s
-        end
-      end
 
       def resolved_command
         return command if command
@@ -137,16 +125,10 @@ module SpecrelayRunner
         claude? ? ClaudeProfile::EXECUTABLE : (raise Error, "runner.reviewer.command is required for the fake provider")
       end
 
-      # `--print` is mandatory for the real provider: it is what makes Claude Code answer once
-      # and exit rather than opening a session. A configuration that omits it gets it added
-      # rather than being refused, because the operator's intent is unambiguous.
-      def effective_args
-        return args unless claude?
-        return %w[--print --dangerously-skip-permissions] if args.empty?
-        return args if args.any? { |arg| ClaudeProfile::PRINT_FLAGS.include?(arg.to_s.split("=", 2).first) }
-
-        [ *args, "--print" ]
-      end
+      # An empty list gets the supported default; anything the operator wrote is launched exactly
+      # as written (MAPIAI-100 acceptance 2) and refused above when it does not request the
+      # supported stream.
+      def effective_args = claude? && args.empty? ? DEFAULT_ARGS : args
 
       def presence(value)
         text = value.to_s.strip

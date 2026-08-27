@@ -61,63 +61,79 @@ class ReviewRecoveryTest < Minitest::Test
   end
 
   # The configuration that can produce that envelope is refused before a provider is launched,
-  # rather than decoded afterwards: a second accepted output shape would mean a second result
-  # parser, and no way to prove which one produced a verdict.
+  # rather than decoded afterwards: `--output-format json` is not the stream {ClaudeStream}
+  # decodes, and a second accepted output shape would mean a second result parser with no way to
+  # prove which one produced a verdict.
   def test_a_reviewer_configured_for_wrapped_output_is_refused_before_launch
     settings = SpecrelayRunner::Review::Settings.new(
-      { "provider" => "claude", "args" => %w[--print --output-format json] }, env: {}
+      { "provider" => "claude", "args" => %w[--print --output-format json --verbose] }, env: {}
     )
 
     error = assert_raises(SpecrelayRunner::Review::Settings::Error) { settings.argv("prompt") }
     assert_includes error.message, "--output-format"
   end
 
-  def test_the_supported_text_output_mode_is_accepted
-    settings = SpecrelayRunner::Review::Settings.new(
-      { "provider" => "claude", "args" => %w[--print --output-format=text] }, env: {}
-    )
+  # MAPIAI-103 — the reviewer's ONE supported mode is now the structured stream this runner
+  # already decodes, and the list that requests it is launched exactly as written.
+  def test_the_supported_structured_stream_is_accepted_and_launched_verbatim
+    args = %w[--print --output-format stream-json --verbose]
+    settings = SpecrelayRunner::Review::Settings.new({ "provider" => "claude", "args" => args }, env: {})
 
-    assert_includes settings.argv("prompt"), "--output-format=text"
+    assert_equal [ "claude", *args, "prompt" ], settings.argv("prompt")
   end
 
-  def test_no_output_format_flag_at_all_is_the_ordinary_supported_configuration
+  # Direct text was the supported reviewer mode until MAPIAI-103. It is REPLACED rather than kept
+  # as a fallback: its stdout carries no public activity at all, and two accepted shapes would put
+  # the runner back to two result parsers.
+  def test_the_superseded_direct_text_output_mode_is_refused
     settings = SpecrelayRunner::Review::Settings.new(
-      { "provider" => "claude", "args" => %w[--print --dangerously-skip-permissions] }, env: {}
+      { "provider" => "claude", "args" => %w[--print --output-format=text --verbose] }, env: {}
     )
 
-    assert_includes settings.argv("prompt"), "--print"
+    error = assert_raises(SpecrelayRunner::Review::Settings::Error) { settings.argv("prompt") }
+    assert_includes error.message, "--output-format"
   end
 
-  def test_the_default_claude_reviewer_can_execute_tools_non_interactively
+  def test_the_default_claude_reviewer_requests_the_structured_stream_and_can_execute_tools
     settings = SpecrelayRunner::Review::Settings.new({ "provider" => "claude" }, env: {})
 
-    assert_equal %w[claude --print --dangerously-skip-permissions prompt], settings.argv("prompt")
+    assert_equal %w[claude --print --output-format stream-json --verbose
+                    --dangerously-skip-permissions prompt], settings.argv("prompt")
   end
 
+  # The default cannot drift away from the requirement, because the profile that owns the
+  # requirement is what is asked about it.
+  def test_the_default_reviewer_arguments_satisfy_the_profile_requirement
+    assert SpecrelayRunner::ClaudeProfile.structured_stream?(SpecrelayRunner::Review::Settings::DEFAULT_ARGS)
+  end
+
+  # An explicit list stays authoritative: it is launched exactly as written, with nothing added.
   def test_explicit_claude_reviewer_arguments_remain_authoritative
-    settings = SpecrelayRunner::Review::Settings.new(
-      { "provider" => "claude", "args" => %w[--print] }, env: {}
-    )
+    args = %w[--print --output-format stream-json --verbose --model opus]
+    settings = SpecrelayRunner::Review::Settings.new({ "provider" => "claude", "args" => args }, env: {})
 
-    assert_equal %w[claude --print prompt], settings.argv("prompt")
+    assert_equal [ "claude", *args, "prompt" ], settings.argv("prompt")
   end
 
-  # review-001 F6: only the FIRST occurrence used to be inspected, so a direct-text flag in
-  # front of a wrapped one passed the check and left the provider wrapped. Every occurrence is
-  # read, in both spellings, and anything but one unambiguous text selection is refused.
+  # A list that does not request the supported stream fails closed with a local, actionable
+  # configuration error rather than being silently rewritten into a supported one: a flag added
+  # here would mean the effective invocation is not the one the operator can read in their YAML.
   #
-  # A repeated flag is refused even when both values agree: which one the provider honours is
-  # its business, and a configuration whose effective output mode has to be reasoned about is
-  # not the deterministic one this boundary exists to guarantee.
+  # review-001 F6 still holds through the shared requirement: every occurrence is read, in both
+  # spellings, and a value-carrying flag stated twice is refused even when the two values agree —
+  # which occurrence the provider honours is its business, not something to reason about.
   UNSUPPORTED_ARG_SETS = {
-    "a text flag in front of a wrapped one" => %w[--print --output-format text --output-format json],
-    "a wrapped flag in front of a text one" => %w[--print --output-format json --output-format text],
-    "the equals spelling, repeated and conflicting" => %w[--print --output-format=text --output-format=stream-json],
-    "the two spellings mixed" => %w[--print --output-format text --output-format=json],
-    "a repeated flag that agrees with itself" => %w[--print --output-format text --output-format text],
-    "stream-json" => %w[--print --output-format stream-json],
-    "the equals spelling with no value" => %w[--print --output-format=],
-    "the split spelling with no value" => %w[--print --output-format]
+    "no output format at all" => %w[--print --dangerously-skip-permissions],
+    "the structured format without the verbose flag the CLI requires" => %w[--print --output-format stream-json],
+    "the structured format with no non-interactive flag" => %w[--output-format stream-json --verbose],
+    "the superseded direct text mode" => %w[--print --output-format text --verbose],
+    "the provider envelope" => %w[--print --output-format json --verbose],
+    "a text flag in front of a structured one" => %w[--print --output-format text --output-format stream-json --verbose],
+    "a structured flag in front of a text one" => %w[--print --output-format stream-json --output-format text --verbose],
+    "the equals spelling, repeated and conflicting" => %w[--print --output-format=stream-json --output-format=json --verbose],
+    "a repeated flag that agrees with itself" => %w[--print --output-format stream-json --output-format stream-json --verbose],
+    "the equals spelling with no value" => %w[--print --output-format= --verbose],
+    "the split spelling with no value" => %w[--print --output-format --verbose]
   }.freeze
 
   UNSUPPORTED_ARG_SETS.each do |description, args|
@@ -134,7 +150,8 @@ class ReviewRecoveryTest < Minitest::Test
   def test_wrapped_output_configuration_reaches_platform_as_a_provider_execution_failure
     build_repo
     settings = SpecrelayRunner::Review::Settings.new(
-      { "provider" => "claude", "command" => reviewer_script("{}"), "args" => %w[--output-format json] }, env: {}
+      { "provider" => "claude", "command" => reviewer_script("{}"),
+        "args" => %w[--print --output-format json --verbose] }, env: {}
     )
 
     result = execute(settings: settings)

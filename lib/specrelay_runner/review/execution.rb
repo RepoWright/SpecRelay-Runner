@@ -11,7 +11,9 @@ module SpecrelayRunner
     #   2. launch ONE FRESH provider process with the fixed Reviewer instructions and nothing
     #      from this runner's implementation work — no resumed session, no shared context
     #      (S24);
-    #   3. parse its stdout strictly and redact it;
+    #   3. decode its structured output as it arrives — safe public activity to this machine's
+    #      own terminal and nowhere else — then parse the ONE terminal result strictly and redact
+    #      it (MAPIAI-103);
     #   4. submit exactly one structured outcome;
     #   5. if Platform answers an ACCEPT with a retirement plan instead of a verdict, close exactly
     #      the pull requests it authorized and deliver the identical result again (MAPIAI-88).
@@ -90,18 +92,44 @@ module SpecrelayRunner
       def review
         log "Reviewing #{assignment.ticket_id} at the pinned head (attempt #{assignment.attempt_ordinal})"
         heartbeater = start_heartbeater
+        @stream = claude_stream
         launched = launch
         # A timeout and a non-zero exit are provider FAILURES, not results: whatever the process
         # printed before dying is not a verdict, so it is never parsed for one.
         return failure(PROVIDER_EXECUTION_FAILURE, "the reviewer timed out") if launched.timed_out?
         return failure(PROVIDER_EXECUTION_FAILURE, "the reviewer exited #{launched.exit_code}") unless launched.exit_code.to_i.zero?
 
-        parsed = Review::Result.parse(launched.stdout, outcomes: assignment.supported_outcomes)
+        # MAPIAI-103 — the decoder is closed BEFORE anything is parsed, because "no terminal
+        # result" and "two terminal results" are facts only the END of the stream establishes.
+        # Its reason never carries provider bytes, and a stream it refused hands the parser
+        # nothing at all.
+        unreadable = @stream&.close&.failure
+        return failure(PROVIDER_EXECUTION_FAILURE, "the reviewer's output could not be read: #{unreadable}") if unreadable
+
+        parsed = Review::Result.parse(document(launched), outcomes: assignment.supported_outcomes)
         return failure(INVALID_REVIEWER_RESULT, parsed.error) unless parsed.ok?
 
         verdict(parsed.review)
       ensure
         heartbeater&.stop
+      end
+
+      # The ONE document a verdict may be parsed from: the decoder's terminal result for the real
+      # structured reviewer, and the deterministic fake's own stdout, which IS its review
+      # document. Raw structured frames never reach the parser.
+      def document(launched) = @stream ? @stream.final_text : launched.stdout
+
+      # MAPIAI-103 — the decoder for the real Claude reviewer, or nil for the deterministic fake.
+      #
+      # Its safe public progress goes to the terminal this run already writes to, and NOWHERE
+      # else: no Platform event, no persistence, no buffer of this class's own. `repository_path`
+      # is the verified workspace root, so a public path inside it is shown repository-relative
+      # while every other absolute path is withheld by the decoder's existing projection rule.
+      def claude_stream
+        return nil unless settings.claude?
+
+        ClaudeStream.new(sink: ->(source, text) { log("  [reviewer:#{source}] #{text}") },
+                         repository_path: workspace_root)
       end
 
       # The head can move WHILE the reviewer works — a review takes minutes and a push takes
@@ -121,7 +149,7 @@ module SpecrelayRunner
       def launch
         runner.run(settings.argv(Packet.new(assignment).prompt),
                    chdir: workspace_root, env: child_env,
-                   timeout_seconds: settings.timeout_seconds)
+                   timeout_seconds: settings.timeout_seconds, on_output: @stream&.sink)
       end
 
       def child_env
