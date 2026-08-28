@@ -127,10 +127,10 @@ class PreviewSessionTest < Minitest::Test
   end
 
   def payload(**overrides)
-    { "contract_version" => "mapiai-97", "assignment_kind" => "task_preview",
+    { "contract_version" => "2", "assignment_kind" => "task_preview",
       "claim" => { "execution_id" => "rex_abc", "claimed_at" => nil, "lease_expires_at" => nil },
       "preview" => { "id" => "prv_abc", "ticket_key" => "MAPIAI-97", "project_slug" => "tiny-demo",
-                     "task_id" => TASK, "canonical_branch" => TASK },
+                     "task_id" => TASK, "canonical_branch" => TASK, "mode" => "start" },
       "workspace" => { "key" => "multi-demo-workspace", "repository_url" => nil, "default_branch" => "main" },
       "sources" => [ { "repository" => "SpecRelay/component-a", "pull_request_url" => URL_A } ] }
       .merge(overrides)
@@ -205,7 +205,7 @@ class PreviewSessionTest < Minitest::Test
   end
 
   # A lease this runner no longer holds is not a Stop. Releasing on it would be a cleanup nobody
-  # recorded, so it names the environment and the command instead.
+  # recorded — so it stops, and says what Platform will do about it instead.
   def test_a_lost_lease_never_fabricates_a_release
     client = FakeClient.new(after: "started", then_lease: EXPIRED)
 
@@ -213,8 +213,39 @@ class PreviewSessionTest < Minitest::Test
 
     assert_equal %w[sources started], client.results.map { |result| result[:kind] }
     assert_equal %w[create up status], @workspace.verbs
-    assert_includes @io.string, "bin/worktree release #{TASK}"
+    assert_includes @io.string, "handed back for release"
+    refute_includes @io.string, "bin/worktree release #{TASK}"
   end
+
+
+  # ---- The release Platform hands back on reconnect -------------------------------------
+
+  # `call` runs `execution.start` unconditionally, so a release assignment that did not branch
+  # would resolve the pull requests and rebuild the very environment it was sent to delete.
+  # Nothing is held afterwards: the lease is already gone and there is no signal to wait on.
+  def test_a_release_assignment_runs_only_the_project_owned_release
+    client = FakeClient.new
+
+    assert session(client, release_payload), @io.string
+
+    assert_equal [ "released" ], client.results.map { |result| result[:kind] }
+    assert_equal %w[release], @workspace.verbs
+    assert client.beats.empty?, "a release assignment started a heartbeater"
+  end
+
+  # An honest report is a successful claim. The obligation persists on Platform and the identical
+  # assignment returns on the next poll, so there is nothing for this process to retry.
+  def test_a_refused_release_is_reported_and_still_exits_zero
+    @workspace.fail!("release")
+    client = FakeClient.new
+
+    assert session(client, release_payload), @io.string
+
+    assert_equal [ "release_failed" ], client.results.map { |result| result[:kind] }
+    assert_equal %w[release], @workspace.verbs
+  end
+
+  def release_payload = payload("preview" => payload["preview"].merge("mode" => "release"))
 
 
   # ---- F1: the lease is this claim's responsibility from the moment it is bound ----------

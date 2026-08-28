@@ -12,12 +12,12 @@ class PreviewAssignmentTest < Minitest::Test
 
   def payload(**overrides)
     {
-      "contract_version" => "mapiai-97",
+      "contract_version" => "2",
       "assignment_kind" => "task_preview",
       "claim" => { "execution_id" => "rex_abc", "claimed_at" => "2026-08-27T00:00:00Z",
                    "lease_expires_at" => "2026-08-27T00:05:00Z" },
       "preview" => { "id" => "prv_abc", "ticket_key" => "MAPIAI-97", "project_slug" => "tiny-demo",
-                     "task_id" => TASK, "canonical_branch" => TASK },
+                     "task_id" => TASK, "canonical_branch" => TASK, "mode" => "start" },
       "workspace" => { "key" => "tiny-demo-workspace",
                        "repository_url" => "https://github.com/SpecRelay/tiny-demo-workspace",
                        "default_branch" => "main" },
@@ -96,6 +96,28 @@ class PreviewAssignmentTest < Minitest::Test
   def test_an_over_bound_value_is_refused
     long = "a" * (SpecrelayRunner::PreviewAssignment::MAX_VALUE_BYTES + 1)
     refuses(payload.merge("preview" => payload["preview"].merge("ticket_key" => long)), "longer than")
+  end
+
+  # The assignment's INTENT. `PreviewSession` runs the start path unconditionally, so a re-served
+  # release that did not say so would rebuild the environment it was sent to delete. The value is
+  # closed like every other one here: an unrecognised mode refuses the whole document.
+  def test_the_mode_decides_what_this_claim_is_for
+    assert_equal "start", read(payload).mode
+    refute read(payload).release?
+
+    release = read(payload.merge("preview" => payload["preview"].merge("mode" => "release")))
+
+    assert release.ok?, release.reason
+    assert release.release?
+  end
+
+  def test_an_unrecognised_or_missing_mode_is_refused
+    refuses(payload.merge("preview" => payload["preview"].merge("mode" => "restart")),
+            "is not a supported mode")
+    refuses(payload.merge("preview" => payload["preview"].merge("mode" => "")),
+            "preview block is missing \"mode\"")
+    refuses(payload.merge("preview" => payload["preview"].reject { |key, _| key == "mode" }),
+            "preview block is missing \"mode\"")
   end
 
   # A task id becomes a command argument, so it may not carry a path, an option or whitespace.

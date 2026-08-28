@@ -76,10 +76,10 @@ class PreviewPathPrivacyTest < Minitest::Test
   end
 
   def payload
-    { "contract_version" => "mapiai-97", "assignment_kind" => "task_preview",
+    { "contract_version" => "2", "assignment_kind" => "task_preview",
       "claim" => { "execution_id" => "rex_abc", "claimed_at" => nil, "lease_expires_at" => nil },
       "preview" => { "id" => "prv_abc", "ticket_key" => "MAPIAI-97", "project_slug" => "tiny-demo",
-                     "task_id" => TASK, "canonical_branch" => TASK },
+                     "task_id" => TASK, "canonical_branch" => TASK, "mode" => "start" },
       "workspace" => { "key" => "multi-demo-workspace", "repository_url" => nil, "default_branch" => "main" },
       "sources" => [ { "repository" => "SpecRelay/component-a", "pull_request_url" => URL_A } ] }
   end

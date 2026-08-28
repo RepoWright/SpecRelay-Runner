@@ -45,6 +45,8 @@ module SpecrelayRunner
 
       @claim = assignment.execution_id
       @task_id = assignment.task_id
+      return release_only if assignment.release?
+
       # BEFORE the first slow thing this claim does. Resolving the ticket's pull requests is a
       # remote read that can hang, and until it returned there was nothing renewing the lease and
       # nothing listening for Stop — so a healthy machine could lose a claim it was still holding,
@@ -108,6 +110,16 @@ module SpecrelayRunner
       false
     end
 
+    # The claim Platform handed back to the machine that went offline. It runs the
+    # project-owned release and NOTHING else: the start path would rebuild the environment this
+    # was sent to delete. No heartbeater either — the lease is already gone and nothing is waiting
+    # on a signal. Both outcomes are honest reports and therefore a successful claim; an
+    # obligation that persists returns on the next poll.
+    def release_only
+      release
+      true
+    end
+
     def report(outcome)
       case outcome.state
       when PreviewExecution::AVAILABLE then submit(kind: "started", status: outcome.document)
@@ -160,11 +172,12 @@ module SpecrelayRunner
     end
 
     # A lease this runner no longer holds. It does NOT release: without a live claim there is
-    # nothing to report the release to, and a cleanup nobody recorded is worse than none. What it
-    # can honestly do is name the environment and the command that removes it.
+    # nothing to report the release to, and a cleanup nobody recorded is worse than none. It does
+    # not ask for a manual command either — Platform holds the obligation and hands this exact
+    # release back on the next poll.
     def abandoned(signal)
       line "Platform ended this claim (#{signal}) while a task environment may still exist. " \
-           "Release it with: #{PreviewExecution::PROJECT_COMMAND} release #{@task_id}"
+           "It is handed back for release when this runner reconnects."
       false
     end
 

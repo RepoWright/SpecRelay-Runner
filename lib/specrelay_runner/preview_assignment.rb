@@ -16,13 +16,20 @@ module SpecrelayRunner
   # It performs no network access and creates nothing. Its whole job is to decide whether the
   # document is worth acting on.
   class PreviewAssignment
-    CONTRACT_VERSION = "mapiai-97"
+    CONTRACT_VERSION = "2"
     KIND = "task_preview"
+    # What this assignment is FOR. {PreviewSession} runs the start path unconditionally, so a
+    # re-served claim for an environment this machine already holds has to say it is a release or
+    # it would rebuild what it was sent to delete. Closed like every other value here: an
+    # unrecognised mode refuses the whole document.
+    MODE_START = "start"
+    MODE_RELEASE = "release"
+    MODES = [ MODE_START, MODE_RELEASE ].freeze
 
     BLOCKS = %w[contract_version assignment_kind claim preview workspace sources].freeze
     CLAIM_KEYS = %w[execution_id claimed_at lease_expires_at].freeze
     CLAIM_REQUIRED = %w[execution_id].freeze
-    PREVIEW_KEYS = %w[id ticket_key project_slug task_id canonical_branch].freeze
+    PREVIEW_KEYS = %w[id ticket_key project_slug task_id canonical_branch mode].freeze
     WORKSPACE_KEYS = %w[key repository_url default_branch].freeze
     WORKSPACE_REQUIRED = %w[key].freeze
 
@@ -32,8 +39,10 @@ module SpecrelayRunner
     SAFE_TOKEN = /\A[A-Za-z0-9][A-Za-z0-9._-]*\z/
 
     Result = Struct.new(:ok, :reason, :execution_id, :preview_id, :task_id, :canonical_branch,
-                        :ticket_key, :project_slug, :workspace_key, :sources, keyword_init: true) do
+                        :ticket_key, :project_slug, :workspace_key, :sources, :mode,
+                        keyword_init: true) do
       def ok? = ok
+      def release? = mode == MODE_RELEASE
     end
 
     # The DISPATCH question, answered from the discriminator alone: is this lane's job to read
@@ -79,6 +88,8 @@ module SpecrelayRunner
 
       token = token_refusal(preview)
       return refuse(token) if token
+      return refuse("the preview mode #{quoted(preview['mode'])} is not a supported mode") unless
+        MODES.include?(preview["mode"])
 
       accepted(claim, preview, workspace, hash["sources"])
     end
@@ -122,7 +133,7 @@ module SpecrelayRunner
       Result.new(ok: true, execution_id: claim["execution_id"], preview_id: preview["id"],
                  task_id: preview["task_id"], canonical_branch: preview["canonical_branch"],
                  ticket_key: preview["ticket_key"], project_slug: preview["project_slug"],
-                 workspace_key: workspace["key"], sources: sources)
+                 workspace_key: workspace["key"], sources: sources, mode: preview["mode"])
     end
 
     def quoted(value) = "\"#{value}\""

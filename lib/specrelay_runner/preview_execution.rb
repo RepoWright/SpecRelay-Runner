@@ -64,10 +64,8 @@ module SpecrelayRunner
 
     # Steps 1-13. Returns the closed preview document, or the mapped failure that owns cleanup.
     def start
-      assignment = PreviewAssignment.read(@payload)
       return clean(INVALID_ASSIGNMENT, assignment.reason) unless assignment.ok?
 
-      @assignment = assignment
       resolver = PreviewSources.new(assignment.sources, root, env: env, github: github)
       resolved = resolver.resolve
       return clean(SOURCE_UNAVAILABLE, resolved.reason) unless resolved.ok?
@@ -91,7 +89,12 @@ module SpecrelayRunner
 
     private
 
-    attr_reader :root, :env, :github, :assignment, :snapshot
+    attr_reader :root, :env, :github, :snapshot
+
+    # Read once and kept, because {#release} is reachable WITHOUT {#start}: Platform hands a
+    # machine back the release of an environment it already holds, and that assignment must never
+    # run the start path.
+    def assignment = @assignment ||= PreviewAssignment.read(@payload)
 
     def task_id = assignment.task_id
 
