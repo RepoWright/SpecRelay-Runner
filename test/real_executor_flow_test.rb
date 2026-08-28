@@ -303,7 +303,11 @@ class RealExecutorFlowTest < Minitest::Test
     exit_code = run_cli(claude_config, bin_dir: bin_dir)
 
     assert_equal SpecrelayRunner::CLI::SUCCESS, exit_code, @io.string
-    assert_includes edited_heading, "Hello SpecRelay Demo", "the executor really edited the worktree"
+    # Read from the uploaded diff rather than from disk: a successful implementation hands its
+    # task environment back before this machine claims again (MAPIAI-97), and the report is where
+    # the edit durably lives.
+    assert_includes decode_file("evidence/diff.txt"), "Hello SpecRelay Demo",
+                    "the executor really edited the worktree"
 
     # The prompt reached the CLI as ONE distinct argv element — no shell, no
     # interpolation, no splitting.

@@ -33,7 +33,7 @@ module SpecrelayRunner
     # window closed and the attempt paused (MVP-0036 CR-002 F2).
     PLATFORM_AWAITING_INPUT = "AWAITING_INPUT"
 
-    Result = Struct.new(:outcome, :message, keyword_init: true) do
+    Result = Struct.new(:outcome, :message, :reported_status, keyword_init: true) do
       def success? = outcome == :completed
 
       # An attempt that ended WELL, whether or not it finished the work (MVP-0036 CR-001 F4).
@@ -46,10 +46,44 @@ module SpecrelayRunner
       # `:input_capture_failed` is deliberately NOT here. That one is a real failure and must
       # still stop such a loop.
       def handled? = success? || outcome == :awaiting_input
+
+      # MAPIAI-97 — the attempt SUCCEEDED, both halves of it: the implementation reported success
+      # and Platform accepted that report.
+      #
+      # `success?` alone is not that. It reads Platform's answer to the upload, so a run whose
+      # verification or publication failed — and which said so in its own terminal result — is
+      # still `completed` here, because the report was received and stored. Releasing on it would
+      # delete the worktree holding the failure someone has to look at, and the retry that has to
+      # reuse it.
+      def completed_successfully? = success? && reported_status == ReportBundle::STATUS_SUCCEEDED
     end
 
     STOP_HEARTBEAT_ENV = "SPECRELAY_RUNNER_STOP_HEARTBEAT_AFTER_SECONDS"
     DEFAULT_RENEWAL_SECONDS = 30
+
+    # The lane discriminator Platform states on every assignment (MVP-0025).
+    RUN_TYPE = "implementation"
+
+    # The two fields an assignment uses to declare a SPECIALISED lane — a review, a package
+    # preflight, a live preview. An executable implementation assignment declares neither: its
+    # lane is the run's own, named by `run.type`.
+    LANE_FIELDS = %w[assignment_kind assignment_type].freeze
+
+    # MAPIAI-97 CR-005 — is this assignment the EXECUTABLE implementation lane, the one lane that
+    # builds a task environment and therefore owns releasing it?
+    #
+    # It reads the DECLARED discriminators, never the presence of an ordinary field. Both halves
+    # are load-bearing, and each was a real defect: deciding from `run.task_id` made a successful
+    # package preflight release an environment it had never created, and `run.type` alone is not
+    # enough either, because a REVIEW and a PREFLIGHT are both assignments about an implementation
+    # run and carry `implementation` too. An assignment that names a specialised kind is that
+    # kind — including one this build has never heard of, which is the safe way to be wrong.
+    def self.implementation?(payload)
+      return false unless payload.is_a?(Hash)
+      return false if LANE_FIELDS.any? { |field| payload[field].to_s.strip != "" }
+
+      payload["run"].to_h["type"].to_s == RUN_TYPE
+    end
 
     def initialize(config:, client:, payload:, env: ENV, io: $stdout)
       @config = config
@@ -671,7 +705,7 @@ module SpecrelayRunner
       response = client.submit_report(claim: claim, bundle: bundle, terminal_result: terminal)
       outcome = response["outcome"].to_s
       log("Report stored: #{response.dig('report', 'url')} (run #{response['run_state']})")
-      Result.new(outcome: outcome.to_sym, message: "Runner outcome: #{outcome}.")
+      Result.new(outcome: outcome.to_sym, message: "Runner outcome: #{outcome}.", reported_status: status)
     end
 
     # MVP-0034 S23 — the assignment's package did not reproduce what Platform pinned. Reported as

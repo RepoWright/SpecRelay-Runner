@@ -40,7 +40,7 @@ module DemoWorkspace
             git -C "$ROOT_DIR" worktree add -b "$2" "$WT_ROOT/$2" HEAD
           fi
           ;;
-        release) git -C "$ROOT_DIR" worktree remove "$WT_ROOT/$2" ;;
+        release) git -C "$ROOT_DIR" worktree remove --force "$WT_ROOT/$2" ;;
         list) git -C "$ROOT_DIR" worktree list ;;
         *) echo "usage: worktree create|release|list <task>" >&2; exit 1 ;;
       esac

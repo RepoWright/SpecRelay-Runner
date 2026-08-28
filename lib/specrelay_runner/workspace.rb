@@ -64,12 +64,16 @@ module SpecrelayRunner
     # The project's own task-environment command, relative to the connected checkout root.
     PROJECT_COMMAND = File.join("bin", "worktree")
 
-    def initialize(root:, canonical_branch:, create_command:, task_id: nil, env: {})
+    # MAPIAI-97 — `on_output` is the live consumer of the CREATE command's own stdout/stderr, and
+    # only that command's: it is the one invocation here that belongs to an operator watching a
+    # page. The git reads below are this class's own bookkeeping and stay silent.
+    def initialize(root:, canonical_branch:, create_command:, task_id: nil, env: {}, on_output: nil)
       @root = root.to_s
       @canonical_branch = canonical_branch.to_s
       @create_command = create_command.to_s
       @task_id = task_id.to_s
       @env = { "PATH" => ENV["PATH"].to_s }.merge(env)
+      @on_output = on_output
     end
 
     def create
@@ -84,7 +88,7 @@ module SpecrelayRunner
         return Info.new(path: existing, base_commit: rev_parse(existing, "HEAD"), created: false)
       end
 
-      result = run(create_argv)
+      result = run(create_argv, on_output: on_output)
       unless result.success?
         raise Error, "worktree create failed (exit #{result.exit_code}): #{first_line(result.stderr, result.stdout)}"
       end
@@ -183,7 +187,7 @@ module SpecrelayRunner
 
     private
 
-    attr_reader :root, :canonical_branch, :create_command, :task_id, :env
+    attr_reader :root, :canonical_branch, :create_command, :task_id, :env, :on_output
 
     # One entry, or the first fact about it that failed. The order is deliberate: containment
     # before git, git before the remote, and the change set last, so a refusal names the cheapest
@@ -370,7 +374,8 @@ module SpecrelayRunner
     # worktree never depends on the workspace root being usable.
     def git(dir, args) = run([ "git", "-C", dir.to_s, *args ], chdir: dir)
 
-    def run(argv, chdir: root) = CommandRunner.run(argv, chdir: chdir, env: env, timeout_seconds: 300)
+    def run(argv, chdir: root, on_output: nil) =
+      CommandRunner.run(argv, chdir: chdir, env: env, timeout_seconds: 300, on_output: on_output)
 
     def first_line(*candidates)
       candidates.map { |c| c.to_s.strip }.find { |s| !s.empty? }.to_s.each_line.first.to_s.strip

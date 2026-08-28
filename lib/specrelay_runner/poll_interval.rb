@@ -19,7 +19,7 @@ module SpecrelayRunner
   class PollInterval
     MINIMUM = 5
     MAXIMUM = 3600
-    DEFAULT = 60
+    DEFAULT = 10
 
     attr_reader :seconds, :notice, :error
 

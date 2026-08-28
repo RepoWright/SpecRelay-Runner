@@ -144,6 +144,10 @@ module SpecrelayRunner
       result = claim.call
       note_recovery
       result.claimed? ? run_claimed(result.payload) : idle(result)
+    rescue CleanupRequired => e
+      # MAPIAI-97 — this machine still holds a task environment it could not release. Claiming
+      # again would put the next run, or a preview of this same ticket, on top of it.
+      fatal(Redaction.redact(e.message), "Release it by hand, then start this runner again.")
     rescue PlatformClient::Unauthorized => e
       fatal("this runner's credential was rejected by Platform (#{Redaction.redact(e.message)})",
             "Reconnect this machine: specrelay-runner connect <enrollment-code>")

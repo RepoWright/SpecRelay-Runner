@@ -149,9 +149,22 @@ class PublicationFlowTest < Minitest::Test
 
   # Re-run publication against the worktree the first attempt left behind, with the same
   # verified repository the first publication saw.
+  # Where a replayed publication runs. A SUCCESSFUL run hands its task environment back before
+  # this machine claims again (MAPIAI-97), so the replay works on a checkout of the branch that
+  # run pushed — which is exactly the state a retry finds. A FAILED attempt kept its environment,
+  # and the replay continues in it.
+  def publication_worktree
+    path = File.join(@root, ".runs", "worktrees", TASK)
+    return path if Dir.exist?(path)
+
+    replay = File.join(Dir.mktmpdir("republish"), TASK)
+    FakeGithub.git(@root, "worktree", "add", replay, BRANCH)
+    replay
+  end
+
   def republish(first, gh_dir: @gh_dir)
     repository = SpecrelayRunner::Workspace::Repository.new(
-      id: SLUG, relative_path: ".", path: File.join(@root, ".runs", "worktrees", TASK),
+      id: SLUG, relative_path: ".", path: publication_worktree,
       clone_url: "https://github.com/#{SLUG}.git", default_branch: "main", branch: BRANCH,
       base_commit: first["base_commit"], head_commit: first["head_commit"],
       changed_files: [ "demo-app/index.html" ], diff: ""

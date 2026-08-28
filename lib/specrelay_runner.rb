@@ -12,10 +12,17 @@
 # See README.md for setup, the trust boundary, and the posture for a runner that
 # may later ship as a proprietary binary on a customer machine.
 module SpecrelayRunner
+  # MAPIAI-97 — raised when this machine finished its work but could not release the task
+  # environment it created. It ends the session rather than failing one run: the next claim would
+  # be built on top of an environment nobody accounted for.
+  CleanupRequired = Class.new(StandardError)
 end
 
 require_relative "specrelay_runner/version"
 require_relative "specrelay_runner/redaction"
+# MAPIAI-97 CR-006 — the one private-host-path rule, beside the one secret rule. Loaded here
+# because both the specification analyzer and the preview lane depend on it.
+require_relative "specrelay_runner/private_paths"
 require_relative "specrelay_runner/config"
 require_relative "specrelay_runner/platform_client"
 require_relative "specrelay_runner/command_runner"
@@ -73,6 +80,25 @@ require_relative "specrelay_runner/review"
 # run had accepted, and yields to that one's same-run authority whenever both could apply.
 require_relative "specrelay_runner/contained_repositories"
 require_relative "specrelay_runner/previous_accepted_package"
+# MAPIAI-97: the preview lane's own source resolver. After the accepted-package lane, because it
+# reuses that lane's bounded `gh` reader rather than declaring a second one.
+# MAPIAI-97: the closed preview assignment boundary, read before any source or command work.
+require_relative "specrelay_runner/preview_assignment"
+# MAPIAI-97 CR-006: the preview lane's own output boundary, which applies the private-path rule to
+# a project command's raw output before either surface sees it.
+require_relative "specrelay_runner/preview_output"
+require_relative "specrelay_runner/preview_sources"
+# MAPIAI-97: the project-owned status document, projected to the closed wire shape.
+require_relative "specrelay_runner/preview_status"
+# MAPIAI-97: the ordered preview lifecycle that drives the project's own worktree commands. Last
+# of the four, because it composes the other three.
+require_relative "specrelay_runner/preview_execution"
+# MAPIAI-97: the claim that holds a preview open — the lifecycle above, plus the heartbeat that
+# renews it and carries Stop back.
+require_relative "specrelay_runner/preview_session"
+# MAPIAI-97: releasing the task environment a finished run leaves behind, through the same
+# project-owned authority the preview lane uses.
+require_relative "specrelay_runner/task_environment"
 require_relative "specrelay_runner/continued_target"
 require_relative "specrelay_runner/rework"
 # MVP-0036 Stage 2a: the offline resume round — continuing from this machine's own uncommitted

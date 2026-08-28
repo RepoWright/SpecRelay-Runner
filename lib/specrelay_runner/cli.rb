@@ -54,6 +54,13 @@ module SpecrelayRunner
       when "version", "--version" then print_version
       else usage("unknown command: #{command}")
       end
+    rescue CleanupRequired => e
+      # MAPIAI-97 — the work itself succeeded and was reported; what failed is handing the task
+      # environment back. `loop` turns this into a stopped session at its own boundary, so this
+      # is the SINGLE-shot path: say what is still allocated, and exit non-zero so a script does
+      # not treat a machine holding an environment as a clean finish.
+      err.puts(Redaction.redact(e.message))
+      RUN_FAILED
     end
 
     private
@@ -207,6 +214,13 @@ module SpecrelayRunner
     rescue ClaudeProfile::Error => e
       err.puts "Invalid executor profile: #{e.message}"
       USAGE_ERROR
+    rescue CleanupRequired => e
+      # MAPIAI-97 — the report was accepted; the environment was not released. A single shot has
+      # no loop to stop, so the non-zero exit is what stops the operator's script from claiming
+      # again on a machine holding something unaccounted for.
+      presenter.error(Redaction.redact(e.message))
+      err.puts "Release it by hand, then run this runner again."
+      RUN_FAILED
     rescue Config::Error => e
       err.puts "Invalid runner config: #{e.message}"
       USAGE_ERROR
@@ -339,6 +353,10 @@ module SpecrelayRunner
       # MVP-0033 — a REVIEW assignment is recognised by its explicit `assignment_type`, never
       # by what it lacks, so a future assignment kind can never be executed as an
       # implementation run by an older runner build.
+      # MAPIAI-97 — a live preview leads, recognised by its own discriminated kind. It executes no
+      # provider and produces no report, so falling through to any other lane would be a category
+      # error rather than a degraded run.
+      return preview(config, client, payload) if PreviewAssignment.preview?(payload)
       return review(config, client, payload) if Review::Assignment.review?(payload)
       return specification(config, client, payload) if
         Specification::Assignment.specification?(payload)
@@ -351,6 +369,36 @@ module SpecrelayRunner
 
       announce_claim(payload)
       run_execution(config, client, payload)
+    end
+
+    # MAPIAI-97 — one claimed live preview, held open for as long as a human is testing it.
+    #
+    # It exits ZERO for every honest outcome, a refused assignment and a failed start included:
+    # the claim reported what happened and the machine is free. Only a task environment this
+    # runner could not account for is worth stopping a loop session over.
+    def preview(config, client, payload)
+      assignment = PreviewAssignment.read(payload)
+      root = assignment.ok? ? config.workspace_root(assignment.workspace_key, env: env) : nil
+      presenter.line(assignment.ok? ? "Claimed a live preview of #{assignment.ticket_key}." :
+                       "Refusing a preview assignment: #{assignment.reason}")
+      held = PreviewSession.call(payload: payload, client: client, root: root.to_s, io: presenter,
+                                 env: env)
+      held ? SUCCESS : RUN_FAILED
+    rescue Config::Error => e
+      # This machine holds a grant for the workspace but has no local root mapped for it. Nothing
+      # was created, so the preview fails CLEAN and the machine is free — the same answer
+      # {Execution} gives an implementation run in the same situation.
+      preview_refused(client, assignment, Redaction.redact(e.message))
+    end
+
+    def preview_refused(client, assignment, reason)
+      presenter.error(reason)
+      client.submit_preview_result(
+        claim: assignment.execution_id,
+        result: { kind: "failed", failure_kind: PreviewExecution::WORKTREE_FAILED,
+                  reason: reason, cleanup_required: false }
+      )
+      RUN_FAILED
     end
 
     # MVP-0033 — one claimed review, executed by a fresh provider process.
@@ -448,7 +496,32 @@ module SpecrelayRunner
       result = Execution.new(config: config, client: client, payload: payload, env: env,
                              io: presenter).call
       presenter.line result.message
-      result.handled? ? SUCCESS : RUN_FAILED
+      return RUN_FAILED unless result.handled?
+
+      release_task_environment(config, payload) if result.completed_successfully?
+      SUCCESS
+    end
+
+    # MAPIAI-97 — the environment a COMPLETED implementation leaves behind is released here, on
+    # the one path both `loop` and `claim-once` reach, because the preview lane addresses the same
+    # task id and would otherwise be built on top of it.
+    #
+    # `completed_successfully?`, not `handled?` and not `success?`. A question-paused attempt is an
+    # approved pause whose worktree holds the answer the operator has yet to give; and an attempt
+    # whose verification or publication FAILED reported that failure honestly and was accepted for
+    # it, so its environment is the evidence — and the thing a retry reuses.
+    #
+    # It does not retract the accepted result — the report is already uploaded — but a refused
+    # release raises {CleanupRequired}, because this machine is now holding something nobody has
+    # accounted for and must not claim anything else until a person resolves it.
+    def release_task_environment(config, payload)
+      return unless Execution.implementation?(payload)
+
+      task_id = payload.to_h["run"].to_h["task_id"].to_s
+      return if task_id.empty?
+
+      root = config.workspace_root(payload.to_h["workspace"].to_h["workspace_key"], env: env)
+      TaskEnvironment.release!(root: root, task_id: task_id, io: presenter)
     end
 
     def generate_specification(config, client, payload)

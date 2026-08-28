@@ -193,10 +193,16 @@ class MultiRepositoryPublicationTest < Minitest::Test
     start(executor_env: { "FAKE_EDITED" => "component-a" })
     run_cli
 
-    assert_equal [ "create #{TASK}" ], MultiRepositoryWorkspace.worktree_invocations(@built.worktree_log),
-                 "the project-owned command constructs the task environment exactly once"
-    assert Dir.exist?(MultiRepositoryWorkspace.task_workspace(@root, TASK)),
-           "the runner must use the task workspace that command created"
+    assert_equal [ "create #{TASK}", "release #{TASK}" ],
+                 MultiRepositoryWorkspace.worktree_invocations(@built.worktree_log),
+                 "the project-owned command constructs the task environment exactly once, and " \
+                 "MAPIAI-97 hands it back once the successful report is accepted"
+    # Which workspace the runner actually USED, read from the report it uploaded rather than from
+    # the disk: MAPIAI-97 releases that environment once the successful report is accepted, and
+    # the recorded identity is the durable evidence of the same fact.
+    assert_equal MultiRepositoryWorkspace.task_workspace(File.realpath(@root), TASK),
+                 YAML.safe_load(report_file("manifest.yml")).dig("worktree", "path"),
+                 "the runner must use the task workspace that command created"
   end
 
   # --- S06: the native single-repository fallback -------------------------
@@ -439,7 +445,8 @@ class MultiRepositoryPublicationTest < Minitest::Test
     assert_equal 1, FakeGithub.pr_creates(retry_log),
                  "only the repository that lacked a pull request creates one"
     assert_equal 2, FakeGithub.pr_lists(retry_log), "each repository looked its own pull request up first"
-    assert_equal [ "create #{TASK}" ], MultiRepositoryWorkspace.worktree_invocations(@built.worktree_log),
+    assert_equal 1, MultiRepositoryWorkspace.worktree_invocations(@built.worktree_log)
+      .count { |line| line.start_with?("create") },
                  "the retry continues the same task workspace instead of building a second one"
     assert_includes report_file("manifest.yml"), "component-a/app.txt",
                     "the recovered change set is reported, not an empty diff"
@@ -512,10 +519,12 @@ class MultiRepositoryPublicationTest < Minitest::Test
 
   # Commits this repository's task branch holds that its default branch does not — the retry's
   # whole recovery signal, and the proof that no duplicate commit was made.
+  # Read from the component repository itself rather than from the task worktree: MAPIAI-97
+  # releases the environment once the successful report is accepted, and the task branch this
+  # counts is the durable half of what the attempt produced.
   def commits_ahead(slug)
-    path = File.join(MultiRepositoryWorkspace.task_workspace(@root, TASK),
-                     slug.split("/").last)
-    out, status = Open3.capture2e("git", "-C", path, "rev-list", "--count", "main..HEAD")
+    path = File.join(@root, slug.split("/").last)
+    out, status = Open3.capture2e("git", "-C", path, "rev-list", "--count", "main..#{BRANCH}")
     raise out unless status.success?
 
     out.strip.to_i
