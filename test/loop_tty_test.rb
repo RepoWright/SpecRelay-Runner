@@ -186,6 +186,13 @@ class LoopTtyTest < Minitest::Test
     assert_includes output, "stopped by signal DURING an execution"
     assert_equal claims_at_interrupt, claims, "no further claim may be sent after the interrupt"
     refute_nil @platform.last_report, "the run reported its result before the loop stopped"
+    # MAPIAI-97 — the task environment is handed back at the LOOP boundary, before the loop could
+    # poll again. A preview of this same ticket addresses the same task id, so an environment left
+    # behind here is one the next claim would be built on top of.
+    assert_includes output, "Released the task environment DEMO-RUNNER-0001"
+    assert_operator output.index("Released the task environment"), :<,
+                    output.index("stopped by signal"),
+                    "the release must happen before the loop winds down, not after"
   end
 
   def test_ctrl_c_during_a_real_execution_still_leaves_the_terminal_cooked

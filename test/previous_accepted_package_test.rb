@@ -282,9 +282,17 @@ class PreviousAcceptedPackageTest < Minitest::Test
     code, = run_cli(gh_dir)
 
     assert_equal 0, code
-    assert_equal [ "create #{TASK}" ], worktree_invocations
-    task_root = File.join(@root, ".runs", "worktrees", TASK)
-    ACCEPTED.each { |component| assert_path_exists File.join(task_root, component, ACCEPTED_FILE) }
+    # MAPIAI-97 — a successful implementation hands its task environment back before this
+    # machine claims anything else, so `release` is part of the expected sequence.
+    assert_equal [ "create #{TASK}", "release #{TASK}" ], worktree_invocations
+    # Read from each component repository's canonical branch rather than from the task workspace:
+    # the successful run handed that environment back, and the branch it placed the accepted head
+    # on is the durable half of the same reconstruction.
+    ACCEPTED.each do |component|
+      assert_equal "accepted by the previous round",
+                   DemoWorkspace.git(File.join(@root, component), "show", "#{TASK}:#{ACCEPTED_FILE}").strip,
+                   "#{component} was not reconstructed at its accepted head"
+    end
     assert_equal ACCEPTED.length, FakeGithub.pr_views(gh_log)
   end
 

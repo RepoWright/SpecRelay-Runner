@@ -20,6 +20,11 @@ module SpecrelayRunner
   # `Result` remains the authoritative capture, the child's exit status is
   # observed independently of it, and a consumer that raises is swallowed — a
   # progress display must never be able to fail the execution it reports on.
+  #
+  # MAPIAI-97 CR-007 adds a THIRD argument to that callback for the consumers that
+  # ask for it: a {Piece} saying how the read ended. A consumer cannot work that out
+  # for itself — a complete line and the bounded fallback below are the same bytes —
+  # and one that guessed from length corrupted ordinary long output.
   class CommandRunner
     MAX_CAPTURE_BYTES = 1_000_000
     TERM_GRACE_SECONDS = 5
@@ -38,6 +43,25 @@ module SpecrelayRunner
     # never provider-supplied.
     STDOUT = "stdout"
     STDERR = "stderr"
+
+    # WHY the reader made a callback — a fact only the reader has, and one a consumer must never
+    # try to re-derive. A complete line and the bounded fallback above can carry identical bytes
+    # and identical length; the difference is in how the read ended, not in the text.
+    #
+    #   terminator — :newline for a complete line, :eof for the final one (the stream closed), and
+    #                :bound for the fallback, whose token CONTINUES in a later callback
+    #   continued  — this text BEGINS in the middle of a token an earlier :bound callback cut
+    #
+    # It reaches only a consumer that declared room for it (see {#emit_line}), so every existing
+    # `(source, line)` consumer keeps the exact contract it has always had.
+    Piece = Struct.new(:terminator, :continued) do
+      def cut? = terminator == :bound
+      def eof? = terminator == :eof
+      def continued? = continued ? true : false
+    end
+
+    # What a caller synthesising its own line should say: nothing was read, so nothing was cut.
+    COMPLETE_LINE = Piece.new(:newline, false).freeze
 
     Result = Struct.new(:exit_code, :stdout, :stderr, :duration_seconds, :timed_out, keyword_init: true) do
       def success? = !timed_out && exit_code == 0
@@ -63,6 +87,10 @@ module SpecrelayRunner
       @on_output = on_output
       @stop_check = stop_check
       @on_start = on_start
+      @piece_consumer = accepts_piece?(on_output)
+      # Pre-seeded so the two reader threads only ever assign to an existing key: each source has
+      # exactly one writer, and the hash itself is never structurally changed while they run.
+      @continued = { STDOUT => false, STDERR => false }
     end
 
     def run(argv)
@@ -149,7 +177,7 @@ module SpecrelayRunner
           data << chunk if data.bytesize < MAX_CAPTURE_BYTES
           pending = stream_lines(source, pending << chunk)
         end
-        emit_line(source, pending)
+        emit_line(source, pending, piece(source, :eof))
         io.close
         bounded(data).dup.force_encoding(Encoding::UTF_8).scrub("")
       end
@@ -169,8 +197,25 @@ module SpecrelayRunner
       return flush_pending(source, buffer) unless buffer.include?("\n")
 
       *lines, remainder = buffer.split("\n", -1)
-      lines.each { |line| emit_line(source, line) }
+      lines.each { |line| emit_line(source, line, piece(source, :newline)) }
       remainder.to_s.b
+    end
+
+    # The third argument is passed only to a consumer that declared room for it. The executor,
+    # specification and review lanes take two, and are called with two.
+    def accepts_piece?(consumer)
+      return false unless consumer.respond_to?(:call)
+
+      arity = consumer.respond_to?(:arity) ? consumer.arity : consumer.method(:call).arity
+      arity >= 3 || arity <= -3
+    end
+
+    # The reader's per-source memory of how its own last callback ended, which is the only place
+    # "this text continues the previous one" can honestly be decided.
+    def piece(source, terminator)
+      continued = @continued[source] ? true : false
+      @continued[source] = terminator == :bound
+      Piece.new(terminator, continued)
     end
 
     # A single line longer than the buffer cap is delivered as-is rather than
@@ -178,14 +223,19 @@ module SpecrelayRunner
     def flush_pending(source, buffer)
       return buffer if buffer.bytesize < MAX_PENDING_LINE_BYTES
 
-      emit_line(source, buffer)
+      emit_line(source, buffer, piece(source, :bound))
       +"".b
     end
 
-    def emit_line(source, line)
-      return if on_output.nil? || line.nil? || line.empty?
+    def emit_line(source, line, piece)
+      return if on_output.nil? || line.nil?
+      # An empty line is not output and is not delivered — except the one that says a stream
+      # ENDED, which a piece consumer needs even when nothing is left: it is the only signal that
+      # whatever it holds will never be continued. Two-argument consumers never see it.
+      return if line.empty? && !(@piece_consumer && piece.eof?)
 
-      on_output.call(source, line.dup.force_encoding(Encoding::UTF_8).scrub(""))
+      text = line.dup.force_encoding(Encoding::UTF_8).scrub("")
+      @piece_consumer ? on_output.call(source, text, piece) : on_output.call(source, text)
     rescue StandardError
       # A live progress consumer must never be able to fail the execution it is
       # reporting on. The buffered Result is the authoritative capture.

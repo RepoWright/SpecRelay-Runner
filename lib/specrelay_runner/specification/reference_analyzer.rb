@@ -29,17 +29,12 @@ module SpecrelayRunner
       # is Claude Code running on the operator's own machine and can see it while reading a
       # local demo page. `Redaction.redact` only recognizes credential shapes; a local path is
       # not a secret, but it is private host information that must never reach a generated
-      # document, a Platform payload, or a log. Matched only OUTSIDE an http(s) URL, so a safe
-      # reference URL that happens to contain one of these segments in its own path is never
-      # touched — only a real local filesystem reference is.
-      PRIVATE_PATH_REDACTION = "[PRIVATE_PATH_REDACTED]"
-      PRIVATE_PATH_PATTERN = %r{file://\S+|/(?:Users|home|tmp)/\S+}
-
-      # An internal marker used only while sanitizing one summary string, never persisted or
-      # returned. Tagged and improbable enough that it cannot collide with genuine analyzer
-      # prose, unlike a bare delimiter such as a digit between spaces.
-      URL_PLACEHOLDER_TAG = "SPECRELAY_URL_PLACEHOLDER"
-      URL_PLACEHOLDER_PATTERN = /#{URL_PLACEHOLDER_TAG}_(\d+)_/
+      # document, a Platform payload, or a log.
+      #
+      # MAPIAI-97 CR-006 — the rule itself moved to {PrivatePaths} when the preview lane needed the
+      # same answer for a project command's raw output. One rule, one placeholder, one set of
+      # shapes; this lane keeps its own name for it so its callers read unchanged.
+      PRIVATE_PATH_REDACTION = PrivatePaths::REDACTION
 
       Outcome = Struct.new(:verdict, :summary, keyword_init: true) do
         def contributed? = verdict == :contributed
@@ -101,27 +96,9 @@ module SpecrelayRunner
       # is what makes `file:///Users/hrmohsen/only/a/path.txt` (nothing else behind it) fail
       # closed instead of surviving as a "contributed" result whose entire content is
       # `[PRIVATE_PATH_REDACTED]`.
-      def self.meaningful?(summary) = summary.gsub(PRIVATE_PATH_REDACTION, "").match?(/[[:alnum:]]/)
+      def self.meaningful?(summary) = PrivatePaths.meaningful?(summary)
 
-      # A safe http(s) reference URL is protected from the path pattern below FIRST, so a Jam or
-      # Confluence URL whose own path happens to contain a matching segment is never altered —
-      # only a real local filesystem reference is. Trailing sentence punctuation immediately
-      # after a matched path (`)`, `,`, `.`, …) is kept outside the redaction placeholder, since
-      # `\S+` would otherwise swallow it as though it were part of the path.
-      def self.sanitize_private_paths(text)
-        urls = []
-        protected_text = text.to_s.gsub(%r{https?://\S+}) do |url|
-          urls << url
-          "#{URL_PLACEHOLDER_TAG}_#{urls.length - 1}_"
-        end
-
-        redacted = protected_text.gsub(PRIVATE_PATH_PATTERN) do |match|
-          core = match.sub(/[)\]}>,;:'".]+\z/, "")
-          "#{PRIVATE_PATH_REDACTION}#{match[core.length..]}"
-        end
-
-        redacted.gsub(URL_PLACEHOLDER_PATTERN) { urls[Regexp.last_match(1).to_i] }
-      end
+      def self.sanitize_private_paths(text) = PrivatePaths.sanitize(text)
 
       def self.parse_output(stdout)
         text = stdout.to_s

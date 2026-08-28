@@ -43,20 +43,61 @@ class RunnerFlowTest < Minitest::Test
                              out: @io, err: @io, env: { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN, "PATH" => ENV["PATH"] })
   end
 
+  def worktree = File.join(@root, ".runs", "worktrees", TASK)
+
   def test_full_claim_execute_report_flow_over_http
     exit_code = run_cli
 
     assert_equal SpecrelayRunner::CLI::SUCCESS, exit_code, @io.string
 
-    # The executor really edited the worktree and the tests really passed.
-    edited = File.read(File.join(@root, ".runs", "worktrees", TASK, "demo-app", "index.html"))
-    assert_includes edited, "Hello SpecRelay Demo"
+    # The executor really edited the worktree and the tests really passed. The edit is read from
+    # the uploaded report rather than from disk, because a successful implementation now releases
+    # its environment before this call returns — see the cleanup examples below.
+    diff = decode_file(@platform.last_report[:body].fetch("report"), "evidence/diff.txt")
+
+    assert_includes diff, "Hello SpecRelay Demo"
 
     # The runner called every API endpoint over real HTTP.
     assert_equal 1, @platform.requests_to("/api/runner/claim").size
     assert_operator @platform.requests_to("/api/runner/events").size, :>=, 3
     assert_operator @platform.requests_to("/api/runner/heartbeat").size, :>=, 3
     assert_equal 1, @platform.requests_to("/api/runner/reports").size
+  end
+
+
+  # ---- CR-005 F3: cleanup on the shared Implementation completion path ---------------------
+
+  # `claim-once` releases too. It used to be deliberately exempt, on the reasoning that a single
+  # controlled shot hands the machine back to its operator — but the approved rule is that a
+  # successfully reported implementation is released immediately, and a one-shot invocation is
+  # not permission to keep the environment. The preview lane addresses this same task id.
+  def test_a_successful_claim_once_releases_its_own_task_environment
+    assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
+    assert_includes @io.string, "Released the task environment #{TASK}"
+    refute File.directory?(worktree), "the task environment outlived the claim that created it"
+  end
+
+  # A release the project refused does NOT retract the accepted report — it is already uploaded —
+  # but it does stop this machine, because it is now holding something nobody has accounted for.
+  def test_a_refused_release_blocks_the_machine_without_rewriting_the_accepted_report
+    File.write(File.join(@root, "bin", "worktree"), <<~SH)
+      #!/usr/bin/env sh
+      case "${1:-}" in
+        release) echo "refusing to release $2" >&2; exit 1 ;;
+        create) git -C "$(cd "$(dirname "$0")/.." && pwd)" worktree add -b "$2" \
+                  "$(cd "$(dirname "$0")/.." && pwd)/.runs/worktrees/$2" HEAD ;;
+        *) exit 0 ;;
+      esac
+    SH
+
+    exit_code = run_cli
+
+    refute_equal SpecrelayRunner::CLI::SUCCESS, exit_code, @io.string
+    assert_equal 1, @platform.requests_to("/api/runner/reports").size,
+                 "the accepted implementation report was rewritten or re-sent"
+    assert_equal "succeeded", decode_manifest(@platform.last_report[:body].fetch("report"))["execution_status"]
+    assert_includes @io.string, "still allocated"
+    assert_equal 1, @platform.requests_to("/api/runner/claim").size, "the machine claimed again"
   end
 
   def test_uploaded_report_bundle_matches_the_run_identity

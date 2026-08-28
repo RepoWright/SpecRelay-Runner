@@ -224,6 +224,18 @@ module SpecrelayRunner
       status == 200 ? body : raise_for(status, body)
     end
 
+    # POST /api/runner/preview_results (MAPIAI-97). One step of the live preview this runner
+    # holds: the sources it resolved, the environment it started, the boundary that failed, or
+    # the outcome of releasing.
+    #
+    # Its own endpoint rather than another report shape, for the reason every result lane here is
+    # separate: Platform moves a different aggregate for each, and a shared endpoint would let a
+    # runner reach the wrong transition by posting the wrong body.
+    def submit_preview_result(claim:, result:)
+      status, body = post_json("/api/runner/preview_results", { claim: claim, result: result })
+      status == 201 ? body : raise_for(status, body)
+    end
+
     # POST /api/runner/specification_generations (MVP-0026). Reports the outcome of ONE
     # specification-generation attempt: a generated package with its repository-relative
     # paths and digests, or a refusal/failure with its stable failure class.
