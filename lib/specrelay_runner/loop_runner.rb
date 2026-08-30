@@ -60,6 +60,20 @@ module SpecrelayRunner
     OK = :ok
     FAILED = :failed
 
+    # MAPIAI-107 — the one execution disposition `execute` may return in place of a Boolean: a
+    # deterministic pre-provider refusal that ATTEMPTED to release its claim.
+    #
+    # It exists because "did the run succeed" cannot express it. An ordinary failed run has
+    # already been reported, so the run is terminal and the next poll is about different work. A
+    # pre-provider refusal leaves the run exactly as this machine found it, so the next poll
+    # reaches the identical refusal — a spin no wait would fix and that the failure policy is the
+    # wrong control for. The session records one actionable failure and ends instead.
+    #
+    # ATTEMPTED, not released (CR-001 F2). Whether Platform accepted the release is observable
+    # only inside the execution, which reports it there; this session must stop either way, and
+    # must not restate an outcome it cannot see.
+    RELEASE_ATTEMPTED_REFUSAL = :release_attempted_refusal
+
     def self.call(**kwargs) = new(**kwargs).call
 
     # `claim` and `execute` are injected so this class owns the LOOP and nothing
@@ -67,7 +81,7 @@ module SpecrelayRunner
     # in the CLI, and a test can drive the loop without a process or a socket.
     #
     #   claim   -> PlatformClient::ClaimResult
-    #   execute -> truthy when the claimed run succeeded
+    #   execute -> truthy when the claimed run succeeded, or RELEASE_ATTEMPTED_REFUSAL
     #
     # `presenter`, `clock`, and `sleeper` are the injection seams that make the
     # terminal behaviour testable: capability, time, and waiting are all explicit
@@ -188,7 +202,7 @@ module SpecrelayRunner
       # heartbeat is the authoritative liveness signal, and a second one would let a watcher
       # look like it owned the run rather than being the process executing it.
       presence.pause
-      succeeded = watching_for_stop { execute.call(payload) }
+      disposition = watching_for_stop { execute.call(payload) }
       # Remembered separately from @stop_requested: an operator who interrupts
       # DURING an execution needs to be told the run finished reporting first, which
       # is a materially different situation from an interrupt while idle.
@@ -199,7 +213,11 @@ module SpecrelayRunner
       @stopped_during_execution ||= @stop_requested
       resume_presence
       @executed += 1
-      succeeded ? run_succeeded : run_failed
+      # Read before the Boolean, because this is not a degree of failure: it is the one outcome
+      # whose correct answer is to stop, whatever `--on-failure` says.
+      return run_release_attempted_refusal if disposition == RELEASE_ATTEMPTED_REFUSAL
+
+      disposition ? run_succeeded : run_failed
     end
 
     # Ctrl-C during a long execution has to be ACKNOWLEDGED while the run is still
@@ -248,6 +266,23 @@ module SpecrelayRunner
 
       line "continuing to poll (--on-failure #{ON_FAILURE_CONTINUE})"
       :continue
+    end
+
+    # MAPIAI-107 — one actionable failure, and no second attempt at the same run from this
+    # session. The failure policy is deliberately not consulted: `continue` means "a failed run
+    # does not end the session", and this run has not failed in that sense — it was left exactly
+    # as it was found, so continuing means doing the identical thing again.
+    #
+    # It says nothing about the claim (CR-001 F2). The execution has already printed whether
+    # Platform released it or whether its lease must expire, and those are the two different
+    # things an operator has to act on; a session-level line repeating either would be guessing,
+    # and the one it used to guess contradicted the truthful line above it.
+    def run_release_attempted_refusal
+      @failures += 1
+      line "run REFUSED before the provider — nothing was executed and nothing was published"
+      line "stopping after a pre-provider refusal; polling again would only reach the same " \
+           "refusal. Fix what the refusal names, then start this runner again."
+      :stop
     end
 
     def continue_on_failure? = on_failure.to_s != ON_FAILURE_STOP

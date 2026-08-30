@@ -33,8 +33,25 @@ module SpecrelayRunner
     # window closed and the attempt paused (MVP-0036 CR-002 F2).
     PLATFORM_AWAITING_INPUT = "AWAITING_INPUT"
 
-    Result = Struct.new(:outcome, :message, :reported_status, keyword_init: true) do
+    Result = Struct.new(:outcome, :message, :reported_status, :release_attempted, keyword_init: true) do
       def success? = outcome == :completed
+
+      # MAPIAI-107 — the attempt refused deterministically BEFORE any provider, and ATTEMPTED to
+      # hand the claim back.
+      #
+      # It is the one failure a `loop` session must not poll past. Every other one has already
+      # travelled the terminal-result contract, which makes the run terminal and the next poll
+      # about different work; this one leaves the run exactly as this machine found it, so a
+      # session that claimed again would reach the identical refusal — the observed twelve-times
+      # spin. That is true whether or not Platform accepted the release: a rejected release leaves
+      # the run claimed here until its lease expires, and a retry from this session is no more
+      # useful then than it is after a successful one.
+      #
+      # Attempted, deliberately, and not "released" (CR-001 F2). Whether Platform actually
+      # released the claim is observable only inside {#release_claim}, which is the one place that
+      # reports it. A flag set beside a best-effort call cannot mean more than "we tried", and
+      # naming it as though it did let the loop contradict the line printed just above it.
+      def refused_after_release_attempt? = !!release_attempted
 
       # An attempt that ended WELL, whether or not it finished the work (MVP-0036 CR-001 F4).
       #
@@ -213,18 +230,26 @@ module SpecrelayRunner
       log("#{headline}: #{safe}")
       log("Nothing ran: no provider received this task, nothing was pushed, and Jira was not touched.")
       release_claim(safe)
-      Result.new(outcome: :preflight_failed,
+      Result.new(outcome: :preflight_failed, release_attempted: true,
                  message: "Runner outcome: preflight_failed (#{safe}); nothing executed.")
     end
 
-    # Give the machine's capacity back and leave the run claimable. ONLY a refused change-request
-    # target does this. The other pre-provider refusals keep their manual recovery step: each is
-    # a misconfiguration of this machine that the operator has to correct anyway, and releasing
-    # under the default `continue` loop policy would let the same runner reclaim and re-refuse
-    # the same run in a loop instead of holding one actionable failure (CR-001 F3).
+    # Give the machine's capacity back and leave the run claimable. ONLY a refused continuation or
+    # resume target does this. The other pre-provider refusals keep their manual recovery step:
+    # each is a misconfiguration of this machine that the operator has to correct anyway.
+    #
+    # Releasing does make the same run immediately eligible again, which under the default
+    # `continue` loop policy let one session reclaim and re-refuse it without end (CR-001 F3, and
+    # the live MAPIAI-106 spin). That is now answered where it belongs — the result reports
+    # `refused_after_release_attempt?` and {LoopRunner} ends the session — rather than by
+    # withholding capacity another machine could use.
     #
     # Best effort by design: a Platform that cannot be reached will expire the lease on its own,
     # and raising here would replace a precise local reason with a transport error.
+    #
+    # THIS is the only place that may say what actually happened to the claim, which is why the
+    # two outcomes are logged here and nowhere else. A caller holding the result knows a release
+    # was attempted and nothing more.
     def release_claim(reason)
       client.release_claim(claim: claim, reason: reason)
       log("Released this claim on Platform; the run is claimable again.")

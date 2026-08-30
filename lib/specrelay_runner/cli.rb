@@ -274,9 +274,24 @@ module SpecrelayRunner
         poll_seconds: interval.seconds, on_failure: policy,
         presence: loop_presence(config, client, interval),
         claim: -> { client.claim(config.claim_runner_params) },
-        execute: ->(payload) { execute(config, client, payload) == SUCCESS }
+        execute: ->(payload) { loop_disposition(config, client, payload) }
       )
       result == LoopRunner::OK ? SUCCESS : RUN_FAILED
+    end
+
+    # MAPIAI-107 — what one claimed assignment tells the SESSION, which is one fact more than its
+    # exit status.
+    #
+    # Every lane and every ordinary outcome reduces to the Boolean the loop has always read. The
+    # exception is a deterministic pre-provider refusal that attempted to release its claim: the
+    # run is left exactly as this machine found it, so a session told only "failed" polls again
+    # and reaches the identical refusal. The fact is yielded by the same {Execution::Result} the
+    # exit status is read from, so the two can never disagree, and `claim-once` is untouched — it
+    # passes no block and keeps its unchanged nonzero single attempt.
+    def loop_disposition(config, client, payload)
+      refused = false
+      code = execute(config, client, payload) { refused = true }
+      refused ? LoopRunner::RELEASE_ATTEMPTED_REFUSAL : code == SUCCESS
     end
 
     # MVP-0031 — the idle presence session for this loop.
@@ -349,7 +364,7 @@ module SpecrelayRunner
     # launched. The check is first, so the specification path never touches the executor
     # readiness assumptions, the worktree, or the report contract — and a specification
     # assignment reaching an older code path is impossible rather than merely unlikely.
-    def execute(config, client, payload)
+    def execute(config, client, payload, &released)
       # MVP-0033 — a REVIEW assignment is recognised by its explicit `assignment_type`, never
       # by what it lacks, so a future assignment kind can never be executed as an
       # implementation run by an older runner build.
@@ -364,11 +379,11 @@ module SpecrelayRunner
       # the implementation path because it is the gate in front of it: the run it belongs to has
       # no pinned specification yet, so falling through to `Execution` would launch a provider on
       # a specification nobody has verified.
-      return package_preflight(config, client, payload) if
+      return package_preflight(config, client, payload, &released) if
         PackagePreflight::Assignment.preflight?(payload)
 
       announce_claim(payload)
-      run_execution(config, client, payload)
+      run_execution(config, client, payload, &released)
     end
 
     # MAPIAI-97 — one claimed live preview, held open for as long as a human is testing it.
@@ -465,7 +480,7 @@ module SpecrelayRunner
     # A refusal exits non-zero for the same reason a refused generation does — the claim did not
     # produce what it was made for, and a `loop` session treating it as success would poll forever
     # against a machine whose GitHub access is misconfigured while reporting health.
-    def package_preflight(config, client, payload)
+    def package_preflight(config, client, payload, &released)
       assignment = PackagePreflight::Assignment.new(payload)
       presenter.line "Claimed a specification-package check for #{assignment.ticket_key}; " \
                      "claim #{assignment.claim_token}."
@@ -474,17 +489,17 @@ module SpecrelayRunner
       presenter.line result.message
       return RUN_FAILED unless result.authorized?
 
-      execute_authorized(config, client, result.assignment_payload)
+      execute_authorized(config, client, result.assignment_payload, &released)
     end
 
     # The executable assignment Platform returned with its authorization. Absent it there is
     # nothing to run — and inventing one from the preflight payload is exactly the shortcut this
     # protocol forbids, because that payload deliberately carries no executor block.
-    def execute_authorized(config, client, assignment_payload)
+    def execute_authorized(config, client, assignment_payload, &released)
       return RUN_FAILED if assignment_payload.nil?
 
       announce_claim(assignment_payload)
-      run_execution(config, client, assignment_payload)
+      run_execution(config, client, assignment_payload, &released)
     end
 
     # One implementation execution, and ONE mapping of its outcome to an exit status.
@@ -496,6 +511,10 @@ module SpecrelayRunner
       result = Execution.new(config: config, client: client, payload: payload, env: env,
                              io: presenter).call
       presenter.line result.message
+      # MAPIAI-107 — the one fact a `loop` session needs beyond this exit status, reported at the
+      # single place both entry points map an execution to one. `claim-once` passes no block, so
+      # its behaviour is unchanged.
+      yield if block_given? && result.refused_after_release_attempt?
       return RUN_FAILED unless result.handled?
 
       release_task_environment(config, payload) if result.completed_successfully?

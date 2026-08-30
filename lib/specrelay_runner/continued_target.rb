@@ -1,16 +1,29 @@
 # frozen_string_literal: true
 
 module SpecrelayRunner
-  # THE proof that this worktree holds the exact commit Platform recorded, and the one mutation
-  # that puts it there.
+  # THE proof that this task workspace holds the exact commits Platform recorded, and the one
+  # mutation that puts it there.
   #
   # Two assignments carry such a target and neither may start a provider without it: a
-  # change-request round continues the reviewed pull request (MVP-0035), and a Stage 2b
-  # replacement run continues the pull request an abandoned run had already published
+  # change-request round continues the reviewed pull requests (MVP-0035), and a Stage 2b
+  # replacement run continues the pull requests an abandoned run had already published
   # (MVP-0036). They differ in why the target exists and in what the executor is told about it —
   # that stays with {Rework} — but "is this the repository, branch and head we were given" is one
   # question, so it has one implementation. A second copy would be a second answer, and the
   # runner would act on whichever one the payload happened to route through.
+  #
+  # MAPIAI-107 — the recorded set is the COMPLETE one. Publication has selected and published any
+  # subset of the repositories in a prepared task workspace since MAPIAI-84, so a reviewed round
+  # legitimately spans several of them; continuing only the first would submit a correction the
+  # reviewer never asked for, and refusing the second stranded the round entirely. Each target is
+  # located by {Review::Checkout.resolve} — the connected root itself, or one physically contained
+  # direct child, chosen by remote identity and nothing else.
+  #
+  # Proof comes before mutation for ALL of them. Every non-destructive check runs against every
+  # target first, and only a set that passes completely is reset. A workspace with one repository
+  # moved to its recorded head and another refused is a half-built base no executor may start
+  # from, and there is no rollback to invent: the repositories that were never touched are still
+  # exactly as they were, so a retry converges.
   #
   # It fails CLOSED. A remote that cannot be read, a branch that moved or is gone, an origin that
   # is a different repository, a claim that would publish somewhere other than the recorded
@@ -59,72 +72,112 @@ module SpecrelayRunner
       @noun = noun
     end
 
-    # Put the worktree on the recorded head, or refuse.
+    # Put every recorded repository in this task workspace on its own recorded head, or refuse.
     #
     # With no recorded repository there is nothing to continue from and the ordinary initial
     # checkout IS the base, so this succeeds without touching git (MVP-0035 S06).
+    #
+    # `head_commit` is the task-workspace REPOSITORY's recorded head, when that repository is one
+    # of the targets, because that is what the report's base commit has always meant. A contained
+    # child is measured independently by `Workspace#select`, so it needs no entry here.
     def materialize(worktree_path:, git: Review::Checkout::Git)
-      return too_many if targets.length > 1
+      return Result.new(ok: true) if targets.empty?
 
-      repository = targets.first
-      return Result.new(ok: true) if repository.nil?
+      planned = plan(worktree_path, git)
+      return planned if planned.is_a?(Result)
 
-      head = repository["head_commit"].to_s
-      refusal = verify(repository, worktree_path, head, git)
-      return refusal if refusal
-
-      reset_to(worktree_path, head)
+      place(planned, worktree_path)
     end
 
     private
 
     attr_reader :targets, :publication_branch, :noun
 
-    # Publication commits and pushes from ONE worktree, so a second target names something this
-    # runner cannot act on. Implementing the first and dropping the rest would answer half the
-    # work and report it as done, so the whole claim is refused instead (MVP-0035 CR-001 F2).
-    # Widening this belongs to a specification that adds multi-repository publication, not to a
-    # target reader.
-    def too_many
-      refuse("this claim names #{targets.length} #{noun} repositories; " \
-             "this runner publishes from one worktree and will not implement part of it")
+    # Every target located and PROVED, before any of them is moved. All-or-nothing: the first
+    # fact that fails refuses the whole continuation, and until this returns a plan nothing on
+    # disk has changed.
+    def plan(worktree_path, git)
+      seen = []
+      planned = []
+      targets.each do |repository|
+        root = resolve(repository, worktree_path, git)
+        return root if root.is_a?(Result)
+
+        refusal = duplicate_refusal(repository, seen) ||
+                  verify(repository, root, repository["head_commit"].to_s, git)
+        return refusal if refusal
+
+        seen << Review::Checkout.identity(repository["clone_url"])
+        planned << [ repository, root ]
+      end
+      planned
+    end
+
+    # The mutation, once the whole set has passed. Each repository moves to its OWN recorded head:
+    # they are independent repositories with unrelated histories, and one shared commit would be
+    # meaningless in the others.
+    def place(planned, worktree_path)
+      root_head = nil
+      planned.each do |repository, root|
+        refusal = reset_to(repository, root)
+        return refusal if refusal
+
+        root_head = repository["head_commit"].to_s if same_directory?(root, worktree_path)
+      end
+      Result.new(ok: true, head_commit: root_head)
+    end
+
+    # WHERE each recorded repository is. {Review::Checkout.resolve} is the one owner of that
+    # question — the connected root itself or one physically contained direct child, matched by
+    # normalized remote identity, never by directory name and never by a search — and the reviewer
+    # already proves its own checkout with it. A target naming no remote leaves nothing to prove
+    # identity against, and that is refused here rather than reported as a remote mismatch.
+    def resolve(repository, worktree_path, git)
+      key = repository["repository_key"].to_s
+      return refuse("the #{noun} repository '#{key}' records no remote to prove identity against") if
+        Review::Checkout.identity(repository["clone_url"]).empty?
+
+      resolution = Review::Checkout.resolve(repository, worktree_path, git)
+      resolution.refusal ? refuse(resolution.refusal.reason) : resolution.root
+    end
+
+    # One repository, twice. Two entries for the same remote cannot both be continued and cannot
+    # be reconciled — they name two heads for one branch — so the set is refused rather than
+    # deduplicated (MAPIAI-107 S05).
+    #
+    # Unique identity is also what makes the resolved ROOTS unique, so there is no second check
+    # for that: {#resolve} accepts a checkout only when its own `origin` IS the target's remote,
+    # so two targets sharing one checkout would have to share one identity, which this refuses.
+    # Checked after resolution, where the identity is already known to be non-empty.
+    def duplicate_refusal(repository, seen)
+      return nil unless seen.include?(Review::Checkout.identity(repository["clone_url"]))
+
+      refuse("this claim names the #{noun} repository '#{repository['repository_key']}' twice")
     end
 
     # Every uncertainty is a refusal, and each one names the fact that failed so the operator can
-    # act on it. The local checks come first, so an unusable or dirty worktree is refused without
-    # a network call.
-    def verify(repository, worktree_path, head, git)
+    # act on it. The local checks come first, so an unusable, dirty or wrongly-branched checkout is
+    # refused without a network call.
+    def verify(repository, root, head, git)
       key = repository["repository_key"]
-      return refuse("no git repository at the worktree for '#{key}'") unless git.repository?(worktree_path)
-      return refuse("the worktree for '#{key}' has uncommitted changes; preserve or release it before retrying") unless clean?(worktree_path)
+      return refuse("the checkout of '#{key}' has uncommitted changes; preserve or release it before retrying") unless clean?(root)
 
-      target_refusal(repository, worktree_path, git) ||
-        remote_refusal(repository, worktree_path, head, git) ||
-        fetch_head(repository, worktree_path, head, git)
+      branch_refusal(key.to_s, repository) ||
+        checkout_branch_refusal(key.to_s, repository, root, git) ||
+        remote_refusal(repository, root, head, git) ||
+        fetch_head(repository, root, head, git)
     end
 
-    # WHICH repository and WHICH branch, before which commit.
+    # WHICH branch, before which commit.
     #
-    # Two facts have to agree before anything is checked out. The branch this claim will PUBLISH to
-    # must be the branch Platform recorded, because a claim where they differ is one whose result
-    # would land on a branch nobody is waiting for (MVP-0035 CR-002). And the worktree's `origin`
-    # must be the recorded repository: a commit id is portable, so a fork or mirror can carry the
-    # recorded branch at the byte-identical recorded sha, and the head check below cannot tell a
-    # repointed origin from the real one (CR-001 F2).
+    # The branch this claim will PUBLISH to must be the branch Platform recorded, because a claim
+    # where they differ is one whose result would land on a branch nobody is waiting for
+    # (MVP-0035 CR-002). One canonical branch is used in every repository of a task workspace, so
+    # this is asked of each target against the same recorded name.
     #
-    # The comparison is {Review::Checkout.identity}, the normalizer the reviewer's own checkout
-    # proof uses, so an https remote and its scp-like ssh spelling are one repository here too. A
-    # recorded target that names no remote leaves nothing to prove identity against, and that is a
-    # refusal rather than a pass.
-    def target_refusal(repository, worktree_path, git)
-      key = repository["repository_key"].to_s
-      expected = Review::Checkout.identity(repository["clone_url"])
-      return refuse("the #{noun} repository '#{key}' records no remote to prove identity against") if expected.empty?
-
-      branch_refusal(key, repository) ||
-        remote_identity_refusal(key, expected, worktree_path, git)
-    end
-
+    # WHICH repository is settled before this, by {#resolve}: a commit id is portable, so a fork
+    # or mirror can carry the recorded branch at the byte-identical recorded sha, and the head
+    # check below cannot tell a repointed origin from the real one (CR-001 F2).
     def branch_refusal(key, repository)
       return nil if publication_branch == repository["branch"].to_s
 
@@ -132,19 +185,43 @@ module SpecrelayRunner
              "not to the #{noun} branch '#{repository['branch']}'")
     end
 
-    def remote_identity_refusal(key, expected, worktree_path, git)
-      return nil if expected == Review::Checkout.identity(git.remote_url(worktree_path))
+    # The branch this checkout is ACTUALLY on — MAPIAI-107 CR-001 F1, and the last thing that has
+    # to agree before a reset is allowed.
+    #
+    # `reset --hard <head>` moves whatever branch is checked out; it never switches to another.
+    # The two payload values agreeing (above) therefore says nothing about where the reset would
+    # land: a contained repository left on some other local branch would have THAT branch moved to
+    # the recorded head and handed to the provider, and `Workspace#select` — which asks the same
+    # question of its own selection, much later — would only notice after the provider had run.
+    #
+    # Compared against the RECORDED branch, which {#branch_refusal} has already proved equal to
+    # the canonical publication branch, so passing both makes all three the same name without a
+    # third comparison. `Workspace#select` keeps its own later check: it answers a different
+    # question, about a repository the executor chose, at a moment this one has already passed.
+    #
+    # Applied to every resolved target, root included. The ROOT is additionally guaranteed by
+    # `Workspace`, which locates the task worktree BY the canonical branch, so in practice only a
+    # contained child can arrive here on the wrong one — but excluding the root would cost a
+    # conditional and buy a hole, and one rule over one set is the smaller shape.
+    def checkout_branch_refusal(key, repository, root, git)
+      observed = git.current_branch(root)
+      recorded = repository["branch"].to_s
+      return refuse("could not read which branch '#{key}' is checked out on; refusing to " \
+                    "continue a repository whose branch it cannot confirm") if observed.nil?
+      return nil if observed == recorded
+      return refuse("'#{key}' is not on a branch; check out the #{noun} branch " \
+                    "'#{recorded}' there before retrying") if observed.empty?
 
-      refuse("the worktree for '#{key}' points at a different remote than the #{noun} repository")
+      refuse("'#{key}' is checked out on '#{observed}', not the #{noun} branch '#{recorded}'")
     end
 
     # FRESHNESS, once identity is settled: the recorded commit must still BE the head of that
     # branch on that remote. Holding the object locally would only prove it once existed here; a
     # push moves the branch and leaves the old object behind forever, so a purely local check
     # would let this round build on code the pull request no longer shows.
-    def remote_refusal(repository, worktree_path, head, git)
+    def remote_refusal(repository, root, head, git)
       key = repository["repository_key"]
-      observed = git.remote_head(worktree_path, repository["branch"].to_s)
+      observed = git.remote_head(root, repository["branch"].to_s)
       return refuse("could not read the remote head of '#{key}'; refusing to start from a head it cannot confirm") if observed.nil?
       return nil if observed.casecmp?(head)
       return refuse("the #{noun} branch of '#{key}' no longer exists on the remote") if observed.empty?
@@ -152,34 +229,47 @@ module SpecrelayRunner
       refuse("the pull-request head of '#{key}' moved from #{head[0, 12]} to #{observed[0, 12]}")
     end
 
-    def fetch_head(repository, worktree_path, head, git)
-      return nil if git.commit?(worktree_path, head)
+    def fetch_head(repository, root, head, git)
+      return nil if git.commit?(root, head)
 
-      git.fetch(worktree_path)
-      return nil if git.commit?(worktree_path, head)
+      git.fetch(root)
+      return nil if git.commit?(root, head)
 
       refuse("'#{repository['repository_key']}' does not contain the #{noun} head #{head[0, 12]} after a fetch")
     end
 
-    # `reset --hard` onto the canonical task branch, so the branch the worktree is on — and that
-    # publication pushes from — IS the recorded head. A detached checkout would leave the next
-    # worktree lookup unable to find the branch, and a merge would produce a commit nobody
-    # reviewed. Guarded by the cleanliness check above: this only ever discards committed state
-    # the remote does not have, never an operator's uncommitted work.
-    def reset_to(worktree_path, head)
-      result = run(worktree_path, [ "reset", "--hard", head ])
-      return refuse("could not check out the #{noun} head in the worktree") unless result&.exit_code.to_i.zero?
+    # `reset --hard` onto the canonical task branch, so the branch each checkout is on — and that
+    # publication pushes from — IS that repository's recorded head. A detached checkout would
+    # leave the next worktree lookup unable to find the branch, and a merge would produce a commit
+    # nobody reviewed. Guarded by the cleanliness proof above: this only ever discards committed
+    # state the remote does not have, never an operator's uncommitted work.
+    #
+    # A failure here names the repository that failed and refuses the whole continuation, so a
+    # partially materialized workspace never reaches a provider. Returns nil on success, because
+    # the only thing a caller needs from it is the refusal.
+    #
+    # A `nil` result — git could not be spawned at all — is a refusal, not a pass. The predecessor
+    # of this line read `result&.exit_code.to_i.zero?`, which evaluates `nil.to_i.zero?` and
+    # reported an unrun reset as a successful one; `clean?` above has always answered the same
+    # question the closed way, and now so does this.
+    def reset_to(repository, root)
+      result = run(root, [ "reset", "--hard", repository["head_commit"].to_s ])
+      return nil if !result.nil? && result.exit_code.to_i.zero?
 
-      Result.new(ok: true, head_commit: head)
+      refuse("could not check out the #{noun} head of '#{repository['repository_key']}' in this task workspace")
     end
 
-    def clean?(worktree_path)
-      result = run(worktree_path, %w[status --porcelain])
+    def clean?(root)
+      result = run(root, %w[status --porcelain])
       !result.nil? && result.exit_code.to_i.zero? && result.stdout.to_s.strip.empty?
     end
 
-    def run(worktree_path, args)
-      CommandRunner.run([ "git", "-C", worktree_path, *args ], chdir: worktree_path,
+    # Compared through `realpath`, because git and the configured root may spell one directory
+    # differently. {Review::Checkout} answers the same question the same way.
+    def same_directory?(one, other) = Review::Checkout.same_directory?(one, other)
+
+    def run(root, args)
+      CommandRunner.run([ "git", "-C", root, *args ], chdir: root,
                         timeout_seconds: Review::Checkout::Git::TIMEOUT_SECONDS)
     rescue SystemCallError
       nil

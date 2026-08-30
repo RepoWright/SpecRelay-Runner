@@ -161,6 +161,45 @@ class LoopModeTest < Minitest::Test
     assert_includes output, "stopping after a failed run"
   end
 
+  # ---- MAPIAI-107 S11: a released pre-provider refusal ends the session ---
+  #
+  # The one execution outcome a session must not poll past. Every other failure has already been
+  # REPORTED, so the run is terminal and the next poll is about different work; a deterministic
+  # refusal hands the claim back instead, which makes the very same run eligible again. Under the
+  # default `continue` policy a loop that only learned "failed" reclaimed and re-refused it — the
+  # live session did so twelve times in a row.
+
+  def test_a_release_attempted_pre_provider_refusal_stops_the_session_even_under_default_continue
+    claims = 0
+    claim = lambda do
+      claims += 1
+      claimed("DEMO-REFUSED")
+    end
+    status = run_loop(claim: claim, execute: ->(_p) { Loop::RELEASE_ATTEMPTED_REFUSAL }, max_iterations: 5)
+
+    assert_equal Loop::FAILED, status
+    assert_equal 1, claims, "the released run is eligible again; claiming it a second time re-refuses it"
+    assert_equal 1, output.scan("run REFUSED before the provider").size
+    assert_includes output, "stopping after a pre-provider refusal"
+    refute_includes output, "continuing to poll", "the continue policy must not apply to this outcome"
+    assert_includes output, "session totals — 1 run(s) executed, 1 failed",
+                    "the attempt really happened and is counted once"
+    # Whether Platform accepted the release is Execution's to report; the loop may not assert it.
+    refute_includes output, "claimable again"
+    refute_includes output, "lease will expire"
+  end
+
+  # The disposition is about THIS outcome, not about the policy: `--on-failure stop` already
+  # stopped, and must still say so in its own words rather than acquire a second meaning.
+  def test_the_stop_policy_is_unchanged_by_the_release_attempted_refusal_disposition
+    status = run_loop(claim: -> { claimed("DEMO-BAD") }, execute: ->(_p) { false },
+                      max_iterations: 5, on_failure: Loop::ON_FAILURE_STOP)
+
+    assert_equal Loop::FAILED, status
+    assert_includes output, "stopping after a failed run"
+    refute_includes output, "pre-provider refusal"
+  end
+
   def test_a_transport_failure_backs_off_with_a_bound_and_keeps_polling
     attempts = 0
     claim = lambda do
@@ -266,8 +305,106 @@ class LoopModeTest < Minitest::Test
     FileUtils.remove_entry(root) if root && File.directory?(root)
   end
 
+  # The same property through the REAL Execution -> CLI -> LoopRunner path, because the unit test
+  # above can only prove what the loop does with the disposition, not that a genuine refusal
+  # produces one. The refusal is real: the reviewed head this claim names is not what the remote
+  # shows, so the runner hands the claim back before any provider — and Platform offers the same
+  # run again, exactly as it did in the live session this ticket exists to fix.
+  #
+  # `claim_limit` is the fake's bound rather than the loop's: a session that fails to stop would
+  # otherwise never return, and a hanging test proves nothing.
+  def test_a_real_pre_provider_refusal_stops_a_default_continue_loop_after_one_claim
+    code, output, platform, gh_log = run_refusing_loop
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, code, output
+    assert_equal 1, platform.requests_to("/api/runner/claim").size,
+                 "the released run is eligible again; a session that polls past this re-refuses it"
+    assert_equal 1, platform.requests_to("/api/runner/claim_releases").size,
+                 "the claim is still handed back, so another machine can try"
+    assert_empty platform.requests_to("/api/runner/reports"), "nothing was executed to report"
+    assert_includes output, "session totals — 1 run(s) executed, 1 failed"
+    assert_includes output, "stopping after a pre-provider refusal"
+    # The release RESULT is Execution's to state, and here it really did succeed.
+    assert_includes output, "Released this claim on Platform; the run is claimable again."
+    refute_includes output, "credential was rejected", "the session stopped on its own, not on the fake's bound"
+    assert_equal 0, FakeGithub.pr_creates(gh_log)
+  end
+
+  # CR-001 F2 — the same stop, when Platform REFUSED the release.
+  #
+  # The disposition is about a deterministic pre-provider refusal that attempted a release, not
+  # about the release having succeeded: either way this session must not try the same run again.
+  # What must differ is what the operator is told, and only `Execution#release_claim` may say it.
+  def test_a_refusal_whose_release_platform_rejected_stops_the_same_way_and_claims_no_success
+    code, output, platform, gh_log = run_refusing_loop(release_status: 500)
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, code, output
+    assert_equal 1, platform.requests_to("/api/runner/claim").size
+    assert_equal 1, platform.requests_to("/api/runner/claim_releases").size,
+                 "one release ATTEMPT and no retry of it"
+    assert_empty platform.requests_to("/api/runner/reports")
+    assert_includes output, "session totals — 1 run(s) executed, 1 failed"
+    assert_includes output, "stopping after a pre-provider refusal"
+    # What the operator must be told, and what must never be claimed.
+    assert_includes output, "its lease will expire on Platform"
+    refute_includes output, "the run is claimable again",
+                     "nothing released the claim, so nothing may say the run is claimable"
+    refute_includes output, "Released this claim on Platform"
+    assert_equal 0, FakeGithub.pr_creates(gh_log)
+  end
+
+  # One deterministic pre-provider refusal, driven through the REAL Execution -> CLI -> LoopRunner
+  # path rather than an injected lambda: the reviewed head this claim names is not what the remote
+  # shows, so the runner hands the claim back before any provider.
+  #
+  # `claim_limit` is the fake's bound rather than the loop's. A session that fails to stop would
+  # otherwise never return, and a hanging test proves nothing.
+  def run_refusing_loop(release_status: 201)
+    @loop_root, = DemoWorkspace.build
+    bare = FakeGithub.add_remote(@loop_root)
+    %w[main DEMO-LOOP].each do |branch|
+      system("git", "-C", @loop_root, "push", "-q", "origin", "HEAD:refs/heads/#{branch}", exception: true)
+    end
+    gh_dir, gh_log, = FakeGithub.gh_bin(bare: bare)
+
+    reviewed = { "repository_key" => "tiny-demo-workspace",
+                 "clone_url" => "git@github.com:SpecRelay/tiny-demo-workspace.git",
+                 "branch" => "DEMO-LOOP", "head_commit" => "a" * 40,
+                 "pull_request_url" => "https://github.com/SpecRelay/tiny-demo-workspace/pull/9" }
+    payload = claim_payload_for(task_id: "DEMO-LOOP", executor_command: "/bin/true",
+                                publication: {}, rework: { "repositories" => [ reviewed ] })
+    @loop_platform = FakePlatform.new(claim_payload: payload, claim_limit: 4,
+                                      release_status: release_status).start
+    path = File.join(Dir.mktmpdir("cfg"), "runner.yml")
+    File.write(path, <<~YAML)
+      platform:
+        base_url: #{@loop_platform.base_url}
+        token_env: TEST_TOKEN
+      runner:
+        id: loop-runner
+        display_name: Loop Runner
+        claim_policy:
+          mode: all_eligible
+      workspace_roots:
+        tiny-demo-workspace: #{@loop_root}
+    YAML
+
+    io = StringIO.new
+    code = SpecrelayRunner::CLI.run(%W[loop --config #{path} --on-failure continue], out: io, err: io,
+                                    env: { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN,
+                                           "PATH" => "#{gh_dir}:#{ENV['PATH']}", "HOME" => ENV["HOME"].to_s })
+    [ code, io.string, @loop_platform, gh_log ]
+  end
+
+
   def setup
     @pending_signal = nil
+  end
+
+  # Only the two tests that build a real loop harness set these.
+  def teardown
+    @loop_platform&.stop
+    FileUtils.remove_entry(@loop_root) if @loop_root && File.directory?(@loop_root)
   end
 
   private
