@@ -240,6 +240,25 @@ module SpecrelayRunner
           run(root, [ "remote", "get-url", REMOTE ])&.stdout.to_s.strip
         end
 
+        # WHICH branch this checkout is on, asked of the ref HEAD points at (MAPIAI-107 CR-001 F1).
+        #
+        # Only git can answer it, and only this question answers "where would a write here land":
+        # a `reset --hard` moves whatever branch is checked out and never switches to another, so
+        # a recorded branch name being correct says nothing about the branch that would actually
+        # move.
+        #
+        # Three-valued, the same convention as {remote_head} directly above, so a caller cannot
+        # read "cannot tell" as "fine": the short branch name, "" when HEAD is detached
+        # (`--quiet` makes that an ordinary empty answer rather than an error), and nil when the
+        # question could not be answered at all.
+        def current_branch(root)
+          result = run(root, %w[symbolic-ref --quiet --short HEAD])
+          return nil if result.nil?
+          return "" unless result.exit_code.to_i.zero?
+
+          result.stdout.to_s.strip
+        end
+
         # ONE read-only ref query. `ls-remote` asks the remote what a branch points at and
         # transfers no objects, writes nothing to the object store, and touches no working
         # tree — the whole freshness boundary is this single bounded call.

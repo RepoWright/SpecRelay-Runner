@@ -93,9 +93,12 @@ class FakePlatform
   # fake issues ISSUED_CREDENTIAL, which it then also accepts as a registered
   # bearer for the remaining endpoints (registered mode).
   def initialize(claim_payload:, token: EXPECTED_TOKEN, registration_token: EXPECTED_REGISTRATION_TOKEN,
-                 enrollment_code: nil,
+                 enrollment_code: nil, claim_limit: nil, release_status: 201,
                  lease_signal: { "state" => "active", "cancel_requested" => false })
     @claim_payload = claim_payload
+    @claim_limit = claim_limit
+    @claims_served = 0
+    @release_status = release_status
     @token = token
     @registration_token = registration_token
     @enrollment_code = enrollment_code
@@ -345,7 +348,7 @@ class FakePlatform
     # MVP-0035 — a runner abandoning its own claim before it executed anything. The fake answers
     # what Platform answers, because the runner PRINTS the run state back and a constant would
     # let a released claim and an unreleased one look identical in the operator's output.
-    when "/api/runner/claim_releases" then [ 201, { outcome: "released", run_state: "AWAITING_EXECUTION_REPORT" } ]
+    when "/api/runner/claim_releases" then claim_release
     when "/api/runner/specification_generations" then specification_generation(request)
     when "/api/runner/specification_publications" then specification_publication(request)
     when "/api/runner/review_results" then review_result(request)
@@ -586,12 +589,35 @@ class FakePlatform
   end
 
   def claim
+    return [ 401, { error: "claim_limit_reached" } ] if claim_limit_reached?
     if @claimed
       [ 200, { claimed: false, reason: "already claimed" } ]
     else
       @claimed = true
+      @claims_served += 1
       [ 201, @claim_payload ]
     end
+  end
+
+  # MAPIAI-107 — the BOUND a session-termination test needs. A released run really is offered
+  # again, forever, so a `loop` that fails to stop does not fail a test: it never returns. Past
+  # this limit the fake answers the one thing the loop treats as fatal, so a session that should
+  # have stopped by itself ends with a claim count that says it did not.
+  def claim_limit_reached? = !@claim_limit.nil? && @claims_served >= @claim_limit
+
+  # MAPIAI-107 — a released run is CLAIMABLE AGAIN, which is the whole point of releasing it and
+  # the reason a repeated claim loop was possible at all. The fake said "already claimed"
+  # afterwards, so a session that reclaimed its own refusal looked healthy here while the live
+  # runner refused the same run twelve times.
+  #
+  # `release_status` models the release Platform did NOT accept (CR-001 F2). The run then stays
+  # CLAIMED here, because that is what actually happens: nothing was released, and the lease has
+  # to expire before any machine sees the run again.
+  def claim_release
+    return [ @release_status, { error: "release_rejected" } ] unless @release_status == 201
+
+    @claimed = false
+    [ 201, { outcome: "released", run_state: "AWAITING_EXECUTION_REPORT" } ]
   end
 
   def report(request)

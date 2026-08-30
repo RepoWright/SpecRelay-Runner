@@ -224,17 +224,11 @@ class ReworkFlowTest < Minitest::Test
     assert_equal 0, FakeGithub.pr_creates(@gh_log)
   end
 
-  # CR-001 F2. Publication commits and pushes from ONE worktree, so a second reviewed target
-  # names something this runner cannot act on. Reading only the first entry would silently
-  # implement half a change request; the complete set is either usable or refused.
-  def test_more_than_one_reviewed_repository_refuses_before_the_executor
-    start(rework: { "repositories" => [ reviewed_repository,
-                                        reviewed_repository(repository_key: "other-workspace") ] })
-    code, output = run_cli
-
-    assert_equal SpecrelayRunner::CLI::RUN_FAILED, code, output
-    assert_refused(output, "names 2 reviewed repositories")
-  end
+  # MAPIAI-107 replaced CR-001 F2's refusal: publication has been multi-repository since
+  # MAPIAI-84, so the complete reviewed set is now materialized rather than rejected. This file
+  # stays the SINGLE-repository proof — the shape most rework rounds are — and
+  # `multi_repository_continuation_test.rb` proves the complete-set path against a workspace that
+  # genuinely has several remotes. A second target here would be one repository counted twice.
 
   # --- MVP-0036 Stage 2b B02/B04: the same proof, for a REPLACEMENT run -----
   #
