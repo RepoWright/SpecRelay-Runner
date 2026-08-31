@@ -59,12 +59,17 @@ module SpecrelayRunner
         break if stopping?
         break if simulated_loss?
 
-        beat_once
+        begin
+          beat_once
+        rescue StandardError => e
+          # One unreachable attempt costs ONE BEAT, not the thread. Renewing this
+          # lease is this object's job alone, so an exception that ended the loop
+          # would strand a live claim: nothing else renews it, and nothing else
+          # records the stop reason callers wait on. The next tick retries on the
+          # same cadence and renews as soon as Platform answers again.
+          log("[heartbeat] transient error: #{Redaction.redact(e.message)}")
+        end
       end
-    rescue StandardError => e
-      # A transient heartbeat error must not crash the whole runner; the lease
-      # simply won't renew, and Platform will reclaim if it truly lapses.
-      log("[heartbeat] transient error: #{Redaction.redact(e.message)}")
     end
 
     # Sleep the interval in short slices so `stop` is responsive.
