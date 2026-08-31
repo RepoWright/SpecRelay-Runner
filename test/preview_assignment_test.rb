@@ -9,10 +9,11 @@ require_relative "test_helper"
 # forbidden names — it proves that anything not in the contract refuses the whole document.
 class PreviewAssignmentTest < Minitest::Test
   TASK = "MAPIAI-97-provide-live-task-preview-urls-for-human-approval"
+  NAMESPACE = "7c1d4a90e3b25f6108ad4c3b2e59f071"
 
   def payload(**overrides)
     {
-      "contract_version" => "2",
+      "contract_version" => "3",
       "assignment_kind" => "task_preview",
       "claim" => { "execution_id" => "rex_abc", "claimed_at" => "2026-08-27T00:00:00Z",
                    "lease_expires_at" => "2026-08-27T00:05:00Z" },
@@ -21,6 +22,7 @@ class PreviewAssignmentTest < Minitest::Test
       "workspace" => { "key" => "tiny-demo-workspace",
                        "repository_url" => "https://github.com/SpecRelay/tiny-demo-workspace",
                        "default_branch" => "main" },
+      "secure_preview" => { "route_namespace" => NAMESPACE },
       "sources" => [ { "repository" => "SpecRelay/App",
                        "pull_request_url" => "https://github.com/SpecRelay/App/pull/7" } ]
     }.merge(overrides)
@@ -46,12 +48,40 @@ class PreviewAssignmentTest < Minitest::Test
     assert_equal 1, result.sources.length
   end
 
+  # The one block that says anything about remote access, and the only value in it.
+  # It is exposed to the lane and to nothing else: what completes it into a hostname is local
+  # configuration this document never carries.
+  def test_the_secure_preview_namespace_is_read_and_closed
+    assert_equal NAMESPACE, read(payload).route_namespace
+
+    refuses(payload.tap { |document| document.delete("secure_preview") }, "secure preview block is missing")
+    refuses(payload.merge("secure_preview" => { "route_namespace" => NAMESPACE,
+                                                "hidden_zone" => "edge.example" }),
+            "unexpected field \"hidden_zone\"")
+    refuses(payload.merge("secure_preview" => {}), "missing \"route_namespace\"")
+  end
+
+  # The namespace becomes a DNS label this machine publishes, so anything that could carry a dot,
+  # a wildcard or a second label is refused before an ingress rule is ever rendered.
+  def test_an_unsafe_route_namespace_is_refused
+    [ "not-hex", "#{NAMESPACE}.evil.example", "*", NAMESPACE.upcase, NAMESPACE[0, 31],
+      "#{NAMESPACE}0" ].each do |value|
+      refuses(payload.merge("secure_preview" => { "route_namespace" => value }),
+              "not a safe namespace")
+    end
+    refuses(payload.merge("secure_preview" => { "route_namespace" => { "a" => "b" } }),
+            "is not a plain value")
+  end
+
   def test_a_preview_is_never_inferred_from_field_presence
     refuses(payload.merge("assignment_kind" => "run"), "not a task preview")
     refuses(payload.tap { |document| document.delete("assignment_kind") }, "not a task preview")
   end
 
   def test_an_unknown_contract_version_is_refused
+    # Version 2 is the version this one REPLACED. There is no fallback anywhere, so the document
+    # that was valid yesterday is refused today rather than half-understood.
+    refuses(payload.merge("contract_version" => "2"), "unsupported contract version")
     refuses(payload.merge("contract_version" => "mvp-0010"), "unsupported contract version")
     refuses(payload.tap { |document| document.delete("contract_version") }, "unsupported contract version")
   end

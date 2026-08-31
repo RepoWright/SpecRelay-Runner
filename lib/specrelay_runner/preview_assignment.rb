@@ -16,7 +16,7 @@ module SpecrelayRunner
   # It performs no network access and creates nothing. Its whole job is to decide whether the
   # document is worth acting on.
   class PreviewAssignment
-    CONTRACT_VERSION = "2"
+    CONTRACT_VERSION = "3"
     KIND = "task_preview"
     # What this assignment is FOR. {PreviewSession} runs the start path unconditionally, so a
     # re-served claim for an environment this machine already holds has to say it is a release or
@@ -26,20 +26,28 @@ module SpecrelayRunner
     MODE_RELEASE = "release"
     MODES = [ MODE_START, MODE_RELEASE ].freeze
 
-    BLOCKS = %w[contract_version assignment_kind claim preview workspace sources].freeze
+    BLOCKS = %w[contract_version assignment_kind claim preview workspace secure_preview sources].freeze
     CLAIM_KEYS = %w[execution_id claimed_at lease_expires_at].freeze
     CLAIM_REQUIRED = %w[execution_id].freeze
     PREVIEW_KEYS = %w[id ticket_key project_slug task_id canonical_branch mode].freeze
     WORKSPACE_KEYS = %w[key repository_url default_branch].freeze
     WORKSPACE_REQUIRED = %w[key].freeze
+    # The assignment's ONLY statement about remote access, and closed like every other
+    # block here. Platform derives it from this machine's registered identity, so the namespace is
+    # something this runner is addressed INSIDE rather than something it may choose; the hidden zone
+    # it is completed with is local configuration Platform never learns.
+    SECURE_PREVIEW_KEYS = %w[route_namespace].freeze
 
     MAX_VALUE_BYTES = 512
     # A task id names a worktree and a branch, so it is restricted to what both accept. This is
     # also what stops a task id from carrying a path segment or an option-looking argument.
     SAFE_TOKEN = /\A[A-Za-z0-9][A-Za-z0-9._-]*\z/
+    # A DNS label this runner will publish. Fixed length and lowercase hex, so nothing that reaches
+    # an ingress rule can carry a dot, a wildcard or a second label.
+    ROUTE_NAMESPACE = /\A[0-9a-f]{32}\z/
 
     Result = Struct.new(:ok, :reason, :execution_id, :preview_id, :task_id, :canonical_branch,
-                        :ticket_key, :project_slug, :workspace_key, :sources, :mode,
+                        :ticket_key, :project_slug, :workspace_key, :sources, :mode, :route_namespace,
                         keyword_init: true) do
       def ok? = ok
       def release? = mode == MODE_RELEASE
@@ -86,12 +94,26 @@ module SpecrelayRunner
       workspace = block_refusal(hash["workspace"], "workspace", WORKSPACE_KEYS, WORKSPACE_REQUIRED)
       return refuse(workspace) if workspace.is_a?(String)
 
+      secure = secure_preview_refusal(hash["secure_preview"])
+      return refuse(secure) if secure.is_a?(String)
+
       token = token_refusal(preview)
       return refuse(token) if token
       return refuse("the preview mode #{quoted(preview['mode'])} is not a supported mode") unless
         MODES.include?(preview["mode"])
 
-      accepted(claim, preview, workspace, hash["sources"])
+      accepted(claim, preview, workspace, secure, hash["sources"])
+    end
+
+    # The block, then the one value inside it. The shape is checked by the same closed rule every
+    # other block passes; the pattern is checked here because this value becomes a DNS label.
+    def secure_preview_refusal(block)
+      checked = block_refusal(block, "secure preview", SECURE_PREVIEW_KEYS, SECURE_PREVIEW_KEYS)
+      return checked if checked.is_a?(String)
+      return "the secure preview route namespace is not a safe namespace" unless
+        ROUTE_NAMESPACE.match?(checked["route_namespace"].to_s)
+
+      checked
     end
 
     # One closed block: an object, exactly the keys this lane knows, and every required value
@@ -129,11 +151,12 @@ module SpecrelayRunner
 
     # The source list is handed on unresolved: {PreviewSources} owns its complete preflight, and
     # restating those rules here would be a second contract parser for one document.
-    def accepted(claim, preview, workspace, sources)
+    def accepted(claim, preview, workspace, secure, sources)
       Result.new(ok: true, execution_id: claim["execution_id"], preview_id: preview["id"],
                  task_id: preview["task_id"], canonical_branch: preview["canonical_branch"],
                  ticket_key: preview["ticket_key"], project_slug: preview["project_slug"],
-                 workspace_key: workspace["key"], sources: sources, mode: preview["mode"])
+                 workspace_key: workspace["key"], sources: sources, mode: preview["mode"],
+                 route_namespace: secure["route_namespace"])
     end
 
     def quoted(value) = "\"#{value}\""
