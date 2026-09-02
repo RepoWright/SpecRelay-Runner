@@ -225,6 +225,32 @@ module MultiRepositoryWorkspace
     FileUtils.chmod(0o755, script)
   end
 
+  # A SECOND machine holding the same project: every repository cloned from the first one's
+  # working copy, so each carries the same history and the same base commit, and re-identified
+  # with the same GitHub origin the runner normalizes. Its own `bin/worktree create` builds the
+  # composite task environment there, exactly as the first machine's does.
+  #
+  # It exists because a portable checkpoint is only proven by a machine that never saw the work:
+  # restoring onto the machine that produced it would pass even if nothing were transported.
+  def clone_of(built, components: COMPONENTS)
+    root = Dir.mktmpdir("specrelay-runner-multi-clone-")
+    FileUtils.remove_entry(root)
+    clone(built.root, root, "multi-demo-workspace")
+    write_project_command(root, components)
+    components.each { |name| clone(File.join(built.root, name), File.join(root, name), name) }
+    Built.new(root: root, executor: built.executor, bares: built.bares,
+              worktree_log: File.join(root, ".runs", "worktree.log"))
+  end
+
+  def clone(source, target, name)
+    system("git", "clone", "-q", source, target, exception: true)
+    DemoWorkspace.git(target, "config", "user.email", "runner@example.test")
+    DemoWorkspace.git(target, "config", "user.name", "Runner Test")
+    DemoWorkspace.git(target, "config", "commit.gpgsign", "false")
+    DemoWorkspace.git(target, "remote", "remove", "origin")
+    DemoWorkspace.identify(target, name)
+  end
+
   def slug(name) = "#{SLUG_OWNER}/#{name == '.' ? 'multi-demo-workspace' : name}"
 
   # Where the project-owned command put the task workspace.

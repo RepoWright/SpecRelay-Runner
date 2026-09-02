@@ -360,11 +360,10 @@ module SpecrelayRunner
     # A 4xx is a REFUSAL the provider may correct (an invalid document) or must obey (a stale
     # claim). It raises like any other refusal so the bridge fails closed rather than retrying
     # a body Platform will never accept.
-    # `checkpoint` is this parent's OWN assertion about the worktree the provider asked from
-    # (MVP-0036 Stage 2a), sent beside the provider's document rather than inside it: the
-    # provider writes the question, and only the parent can measure the machine. Omitted when
-    # this machine could not measure itself, which leaves the question askable and the run
-    # simply not resumable.
+    # `checkpoint` is this parent's OWN package of the uncommitted work the provider asked from,
+    # sent beside the provider's document rather than inside it: the provider writes the question,
+    # and only the parent can measure and package the machine. Platform requires it, so a machine
+    # that could not package its work reports a capture failure instead of asking.
     def submit_executor_question(claim:, question:, checkpoint: nil)
       body = { claim: claim, question: question, checkpoint: checkpoint }.compact
       status, body = post_json("/api/runner/executor_questions", body)
@@ -404,6 +403,22 @@ module SpecrelayRunner
       path = "/api/runner/executor_questions/#{URI.encode_www_form_component(public_id.to_s)}" \
              "?claim=#{URI.encode_www_form_component(claim.to_s)}"
       status, body = request_json(Net::HTTP::Get, path)
+      status == 200 ? body : raise_for(status, body)
+    end
+
+    # GET the recorded portable checkpoint for one batch, at the claim-bound path Platform put in
+    # the assignment. The bytes come back base64-encoded, exactly as they were submitted, so this
+    # one JSON transport carries the package in both directions and there is no second encoding
+    # for the two halves of the same round trip to disagree about.
+    #
+    # The path is Platform's, and it is checked before it is joined: `URI.join` with an absolute
+    # url would send this runner's bearer token to whatever host that url named.
+    def executor_question_checkpoint(claim:, path:)
+      location = path.to_s
+      raise RequestFailed, "Platform sent an unusable checkpoint location" unless location.start_with?("/")
+
+      status, body = request_json(Net::HTTP::Get,
+                                  "#{location}?claim=#{URI.encode_www_form_component(claim.to_s)}")
       status == 200 ? body : raise_for(status, body)
     end
 

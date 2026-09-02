@@ -126,20 +126,36 @@ module DemoWorkspace
   # This fixture selects the workspace's own `bin/test`, so the single-repository flow keeps
   # proving a REAL command run against the final files rather than an empty plan.
   def selection_snippet(changed: "true", paths: nil)
+    "#{selection_reporter(changed: changed, paths: paths)}\nSELECTION.call"
+  end
+
+  # The same document as a REUSABLE lambda, so an executor that must report BEFORE it asks a
+  # question — which every question-asking provider now must, because SpecRelay checkpoints the
+  # repositories the selection names — can call it at the right moment rather than only on exit.
+  def selection_reporter(changed: "true", paths: nil)
     reported = paths || %([ { "path" => ".", "commands" => [ [ "bin/test" ] ] } ])
     <<~RUBY.strip
-      unless ENV["FAKE_SELECTION_SKIP"]
-        require "json"
-        _prompt = ARGV.last.to_s
-        _prompt = File.read(_prompt) if File.file?(_prompt)
-        _selection = _prompt[%r{`([^`]*/#{SELECTION_FILENAME})`}, 1]
-        abort "the prompt named no repository selection document" if _selection.nil?
-        _document = ENV["FAKE_SELECTION_JSON"] ||
-                    JSON.generate({ "repositories" => ((#{changed}) ? #{reported} : []) })
-        File.write(_selection + ".partial", _document)
-        File.rename(_selection + ".partial", _selection)
+      SELECTION = lambda do
+        unless ENV["FAKE_SELECTION_SKIP"]
+          require "json"
+          _prompt = ARGV.last.to_s
+          _prompt = File.read(_prompt) if File.file?(_prompt)
+          _selection = _prompt[%r{`([^`]*/#{SELECTION_FILENAME})`}, 1]
+          abort "the prompt named no repository selection document" if _selection.nil?
+          _document = ENV["FAKE_SELECTION_JSON"] ||
+                      JSON.generate({ "repositories" => ((#{changed}) ? #{reported} : []) })
+          File.write(_selection + ".partial", _document)
+          File.rename(_selection + ".partial", _selection)
+        end
       end
     RUBY
+  end
+
+  # Put that lambda into a fixture script written as a single quoted heredoc, immediately after
+  # its shebang, so the script can call it wherever it needs to.
+  def with_selection_reporter(source, changed: "true", paths: nil)
+    shebang, rest = source.split("\n", 2)
+    [ shebang, selection_reporter(changed: changed, paths: paths), rest ].join("\n")
   end
 
   # The document's name, stated once here so a fixture can never drift from the production
@@ -178,6 +194,7 @@ module DemoWorkspace
         puts "[question-executor] edited before asking"
       end
 
+      SELECTION.call
       File.write("#{request}.partial", ENV.fetch("FAKE_QUESTION_JSON"))
       File.rename("#{request}.partial", request)
       puts "[question-executor] asked"
@@ -200,7 +217,7 @@ module DemoWorkspace
       File.write(file, content.gsub("Hello Demo", "Hello SpecRelay Demo")) if content.include?("Hello Demo")
       puts "[question-executor] applied edit"
     RUBY
-    File.write(path, File.read(path) + selection_snippet + "\nexit 0\n")
+    File.write(path, with_selection_reporter(File.read(path)) + "\nSELECTION.call\nexit 0\n")
     FileUtils.chmod(0o755, path)
     path
   end
@@ -221,7 +238,7 @@ module DemoWorkspace
       File.write(file, File.read(file).sub("Hello Interrupted Demo", "Hello Resumed Demo"))
       puts "[resume-executor] applied edit"
     RUBY
-    File.write(path, File.read(path) + selection_snippet + "\nexit 0\n")
+    File.write(path, with_selection_reporter(File.read(path)) + "\nSELECTION.call\nexit 0\n")
     FileUtils.chmod(0o755, path)
     path
   end
@@ -243,6 +260,7 @@ module DemoWorkspace
       if (asked = ENV["FAKE_RESUME_NEXT_QUESTION"])
         request = prompt[%r{`([^`]*/question-request\.json)`}, 1]
         abort "the prompt named no bridge" if request.nil?
+        SELECTION.call
         File.write("#{request}.partial", asked)
         File.rename("#{request}.partial", request)
         sleep 30
@@ -252,7 +270,7 @@ module DemoWorkspace
       file = "demo-app/index.html"
       File.write(file, File.read(file).sub("Hello Interrupted Demo", "Hello SpecRelay Demo"))
     RUBY
-    File.write(path, File.read(path) + selection_snippet + "\nexit 0\n")
+    File.write(path, with_selection_reporter(File.read(path)) + "\nSELECTION.call\nexit 0\n")
     FileUtils.chmod(0o755, path)
     path
   end
@@ -268,6 +286,7 @@ module DemoWorkspace
       prompt = File.read(ARGV.last.to_s)
       request = prompt[%r{`([^`]*/question-request\.json)`}, 1]
       abort "[abandoning-executor] the prompt named no bridge" if request.nil?
+      SELECTION.call
       File.write("#{request}.partial", ENV.fetch("FAKE_QUESTION_JSON"))
       File.rename("#{request}.partial", request)
       puts "[abandoning-executor] asked, then leaving"
@@ -276,6 +295,7 @@ module DemoWorkspace
       sleep ENV.fetch("FAKE_QUESTION_ASK_SECONDS", "3").to_f
       exit ENV.fetch("FAKE_QUESTION_EXIT_CODE", "0").to_i
     RUBY
+    File.write(path, with_selection_reporter(File.read(path)))
     FileUtils.chmod(0o755, path)
     path
   end
