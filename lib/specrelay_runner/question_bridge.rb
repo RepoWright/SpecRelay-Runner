@@ -44,27 +44,31 @@ module SpecrelayRunner
     # coming back from the acknowledgement is some OTHER ending that won (CR-003 F1).
     ANSWERED = "ANSWERED"
     OFFLINE_WAIT = "OFFLINE_WAIT"
-    # The one state that means a FRESH session received an offline batch's answers (Stage 2a).
+    # The one state that means a FRESH session received an offline batch's answers.
     RESUMED = "RESUMED"
 
     PROVIDER_EXITED = "the provider exited while its question was still waiting for an answer"
     ANSWER_UNDELIVERED = "the provider exited before its answers could be handed back to it"
     DELIVERY_UNCONFIRMED = "Platform did not confirm that the answers reached this session"
 
-    # `measure` is asked for this machine's checkpoint at the instant the provider pauses — not
-    # when the bridge starts — because the provider changes files right up to that moment, and a
-    # later resume has to land on exactly the state it left (Stage 2a design 3).
+    # `capture` is asked for this machine's portable checkpoint at the instant the provider pauses
+    # — not when the bridge starts — because the provider changes files right up to that moment,
+    # and a later resume has to land on exactly the state it left. It answers with a package or
+    # with ONE reason, and a reason is returned to the provider rather than stored: a batch whose
+    # work could not be captured is one nothing could ever continue.
+    #
+    # There is no default: a batch stored without a package could never be continued, so Platform
+    # refuses one, and a bridge that could not name how to capture has nothing to submit.
     #
     # `resume_question_id` is the earlier batch THIS session is continuing, or nil for an ordinary
     # claim. Holding it here rather than passing it per call is what lets the two things that can
     # trigger the acknowledgement — the provider starting, and the provider asking again — share
     # one gate (CR-004 F3).
-    def initialize(client:, claim:, staging_dir:, measure: -> { nil }, resume_question_id: nil,
-                   io: $stdout)
+    def initialize(client:, claim:, staging_dir:, capture:, resume_question_id: nil, io: $stdout)
       @client = client
       @claim = claim
       @path = File.join(staging_dir, DIRECTORY)
-      @measure = measure
+      @capture = capture
       @resume_question_id = resume_question_id
       @io = io
       @mutex = Mutex.new
@@ -124,7 +128,7 @@ module SpecrelayRunner
     # submission and the answer or release that ends it.
     def awaiting_verdict? = @mutex.synchronize { @awaiting_verdict && @outcome.nil? }
 
-    # Stage 2a — the fresh session was started with an earlier batch's answers in its prompt.
+    # The fresh session was started with an earlier batch's answers in its prompt.
     # Platform is told once, from here, and only then does that batch settle as RESUMED and the
     # run become free to be asked again.
     #
@@ -149,7 +153,7 @@ module SpecrelayRunner
 
     private
 
-    attr_reader :client, :claim, :measure, :io
+    attr_reader :client, :claim, :capture, :io
 
     # Never retried: a failure here has already ended the session, and asking again would be
     # asking Platform to contradict the decision it just reported.
@@ -213,7 +217,11 @@ module SpecrelayRunner
       confirm_resume
       return if stopping? || outcome
 
-      body = client.submit_executor_question(claim: claim, question: document, checkpoint: measure.call)
+      captured = capture.call
+      return refuse(captured.error) unless captured.ok?
+
+      body = client.submit_executor_question(claim: claim, question: document,
+                                             checkpoint: captured.checkpoint)
       await(body.to_h["question"].to_h)
     rescue PlatformClient::Error => e
       # A refusal is Platform having READ the request and declined it, so the same session may

@@ -168,13 +168,20 @@ module SpecrelayRunner
     # It is mechanical on purpose. It never asks whether a selected repository was the right
     # business choice — that decision belongs to the executor and is not reviewable here — only
     # whether it is safe and coherent to publish.
-    def select(task_root, relative_paths)
+    #
+    # `require_change` is the one term the two callers genuinely differ on. Publication refuses a
+    # repository with nothing in it, because there would be no pull request to open. A CHECKPOINT
+    # does not: a provider may pause on a decision before it has changed anything, and refusing
+    # its question would trade a Product Owner decision for a package nobody needed. Every other
+    # rule — containment, git root, remote identity, canonical branch, uniqueness and measurable
+    # change — is the same one, asked once, so the two answers cannot disagree.
+    def select(task_root, relative_paths, require_change: true)
       root = real(task_root)
       return Selection.new(repositories: [], error: "the prepared task workspace could not be resolved") if root.nil?
 
       repositories = []
       relative_paths.each do |relative|
-        verified = verify(root, relative)
+        verified = verify(root, relative, require_change)
         return Selection.new(repositories: [], error: verified) if verified.is_a?(String)
 
         duplicate = duplicate_of(verified, repositories)
@@ -192,7 +199,7 @@ module SpecrelayRunner
     # One entry, or the first fact about it that failed. The order is deliberate: containment
     # before git, git before the remote, and the change set last, so a refusal names the cheapest
     # and most specific cause rather than a consequence of it.
-    def verify(task_root, relative)
+    def verify(task_root, relative, require_change)
       return "selected repository #{quoted(relative)} must be a path relative to the task workspace" if rooted?(relative)
 
       resolved = real(File.expand_path(relative, task_root))
@@ -203,10 +210,10 @@ module SpecrelayRunner
       return "no git repository at the selected path #{quoted(relative)}" if toplevel.nil?
       return "the selected path #{quoted(relative)} is not a git repository root" unless real(toplevel) == resolved
 
-      identify(relative, resolved)
+      identify(relative, resolved, require_change)
     end
 
-    def identify(relative, resolved)
+    def identify(relative, resolved, require_change)
       # The configured remote is read HERE and nowhere else. It may carry credential userinfo, so
       # what travels on is {GithubRemote}'s canonical url, derived from the validated slug.
       origin = capture(resolved, %w[remote get-url origin])
@@ -219,16 +226,18 @@ module SpecrelayRunner
       return "refusing to publish #{quoted(relative)} onto #{default_branch}, which is that repository's default branch" if default_branch == canonical_branch
       return "the selected repository #{quoted(relative)} is not on the run's canonical branch #{canonical_branch}" unless capture(resolved, %w[symbolic-ref --quiet --short HEAD]) == canonical_branch
 
-      measure(relative, resolved, id, clone_url, default_branch)
+      measure(relative, resolved, id, clone_url, default_branch, require_change)
     end
 
-    def measure(relative, resolved, id, clone_url, default_branch)
+    def measure(relative, resolved, id, clone_url, default_branch, require_change)
       changes = capture_changes(resolved)
       return "could not determine what changed in #{quoted(relative)}: #{changes.measurement_error}" unless changes.measured?
 
-      changes = committed_changes(resolved, default_branch) if changes.changed_files.empty?
-      if changes.nil? || changes.changed_files.empty?
-        return "the selected repository #{quoted(relative)} reports no change to publish"
+      if require_change
+        changes = committed_changes(resolved, default_branch) if changes.changed_files.empty?
+        if changes.nil? || changes.changed_files.empty?
+          return "the selected repository #{quoted(relative)} reports no change to publish"
+        end
       end
 
       Repository.new(id: id, relative_path: relative, path: resolved, clone_url: clone_url,

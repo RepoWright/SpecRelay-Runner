@@ -2,13 +2,14 @@
 
 require_relative "test_helper"
 
-# MVP-0036 Stage 2a: resuming an answered offline question on the machine that still holds the
-# uncommitted work.
+# Resuming an answered offline question — on the machine that still holds the uncommitted work,
+# and on one that has to restore it first.
 #
-# The end-to-end cases run the whole CLI twice against a REAL git worktree: once to leave a dirty
-# worktree and a recorded checkpoint behind, and once to resume onto it. The checkpoint proof
-# itself is exercised directly, because a refusal has to name the term that failed and running a
-# child process five times to learn that would prove nothing extra.
+# The cases here run the whole CLI against a REAL git worktree: once to leave a dirty worktree and
+# a recorded portable checkpoint behind, and again to continue from it. The package's own capture
+# and restore boundaries are proven in `portable_checkpoint_test.rb`; what these prove is the
+# WIRING — that the assignment's checkpoint is what a fresh session lands on, and that a claim
+# refuses before any provider whenever it is not.
 class QuestionResumeTest < Minitest::Test
   TASK = "DEMO-0036"
 
@@ -29,6 +30,7 @@ class QuestionResumeTest < Minitest::Test
 
   def setup
     @root, = DemoWorkspace.build
+    @second = nil
     # Every real SpecRelay workspace is a clone, and the checkpoint's normalized origin is what
     # proves a resume is landing on the same repository rather than on a look-alike, so the
     # fixture carries one. Nothing is ever pushed to it.
@@ -38,7 +40,7 @@ class QuestionResumeTest < Minitest::Test
 
   def teardown
     @platform&.stop
-    FileUtils.remove_entry(@root) if @root && File.directory?(@root)
+    [ @root, @second ].compact.each { |root| FileUtils.remove_entry(root) if File.directory?(root) }
   end
 
   # ---------------------------------------------------------------- end to end
@@ -63,11 +65,12 @@ class QuestionResumeTest < Minitest::Test
     end
   end
 
-  # Phase two: the same run, claimed again by the same machine, carrying the answers.
-  def resume_payload(checkpoint, executor: nil, env: nil)
-    executor ||= DemoWorkspace.write_resume_executor(@root)
+  # Phase two: the same run, claimed again, carrying the answers and the recorded checkpoint —
+  # metadata and the one claim-bound download path, never the bytes.
+  def resume_payload(checkpoint, executor: nil, env: nil, root: @root)
+    executor ||= DemoWorkspace.write_resume_executor(root)
     payload = claim_payload_for(task_id: TASK, executor_command: executor).merge(
-      "resume" => { "question_id" => "exq_fake", "checkpoint" => checkpoint,
+      "resume" => { "question_id" => "exq_fake", "checkpoint" => assigned(checkpoint),
                     "continuation_context" => BATCH["continuation_context"],
                     "questions" => BATCH["questions"], "answers" => ANSWERS }
     )
@@ -87,11 +90,19 @@ class QuestionResumeTest < Minitest::Test
                          remaining_seconds: 0, answers: ANSWERS } } ]
   end
 
-  def request_order
-    @platform.requests.map { |request| [ request[:method], request[:path] ] }
+  # A SECOND machine: the same repository, cloned, carrying the same origin identity and the same
+  # base commit, and holding no worktree for the branch at all.
+  def second_machine
+    @second = Dir.mktmpdir("specrelay-runner-second-")
+    FileUtils.remove_entry(@second)
+    system("git", "clone", "-q", @root, @second, exception: true)
+    git(@second, "config", "user.email", "runner@example.test")
+    git(@second, "config", "user.name", "Runner Test")
+    git(@second, "remote", "set-url", "origin", "https://github.com/SpecRelay/tiny-demo-workspace.git")
+    @second
   end
 
-  def run_cli(io)
+  def run_cli_in(root, io)
     path = File.join(Dir.mktmpdir("cfg"), "runner.yml")
     File.write(path, <<~YAML)
       platform:
@@ -103,22 +114,46 @@ class QuestionResumeTest < Minitest::Test
         claim_policy:
           mode: all_eligible
       workspace_roots:
-        tiny-demo-workspace: #{@root}
+        tiny-demo-workspace: #{root}
     YAML
     SpecrelayRunner::CLI.run(%W[claim-once --config #{path}], out: io, err: io,
                              env: { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN, "PATH" => ENV["PATH"] })
+  end
+
+  # What Platform puts in the assignment: everything the runner must prove, plus where to fetch
+  # the package, and NOT the package itself.
+  def assigned(checkpoint)
+    return checkpoint if checkpoint.empty?
+
+    checkpoint.reject { |key, _| key == "payload" }
+              .merge("download_path" => "/api/runner/executor_questions/exq_fake/checkpoint")
+  end
+
+  def request_order
+    @platform.requests.map { |request| [ request[:method], request[:path] ] }
+  end
+
+  def run_cli(io) = run_cli_in(@root, io)
+
+  def git(dir, *args)
+    system("git", "-C", dir, *args, out: File::NULL, err: File::NULL) || raise("git #{args.join(' ')} failed")
   end
 
   # A04/A07 — the whole loop: measure at ask time, prove the same worktree at resume time, hand a
   # FRESH provider the complete public handoff, and tell Platform once that it arrived.
   def test_a_verified_resume_starts_a_fresh_session_with_the_answers_and_reports_them_delivered
     checkpoint = released_question_with_dirty_worktree
-    assert_equal %w[branch change_digest head origin repository_key], checkpoint.keys.sort
-    assert_match(/\A[0-9a-f]{40}\z/, checkpoint["head"])
-    assert_match(/\A[0-9a-f]{64}\z/, checkpoint["change_digest"])
-    assert_equal "tiny-demo-workspace", checkpoint["repository_key"]
-    assert_equal "github.com/specrelay/tiny-demo-workspace", checkpoint["origin"]
-    refute_includes checkpoint.to_json, @root, "the checkpoint carries no local path"
+    assert_equal %w[byte_size digest format payload repositories], checkpoint.keys.sort
+    assert_equal SpecrelayRunner::Checkpoint::FORMAT, checkpoint["format"]
+    entry = checkpoint["repositories"].fetch(0)
+    assert_equal ".", entry["path"]
+    assert_equal "SpecRelay/tiny-demo-workspace", entry["origin"]
+    assert_equal TASK, entry["branch"]
+    assert_match(/\A[0-9a-f]{40}\z/, entry["base"])
+    assert_match(/\A[0-9a-f]{40}\z/, entry["checkpoint_commit"])
+    assert_match(/\A[0-9a-f]{64}\z/, entry["change_digest"])
+    refute_includes checkpoint.reject { |key, _| key == "payload" }.to_json, @root,
+                    "the checkpoint metadata carries no local path"
 
     restart_platform(resume_payload(checkpoint))
     io = StringIO.new
@@ -260,76 +295,69 @@ class QuestionResumeTest < Minitest::Test
     assert_path_exists File.join(@root, ".runs", "worktrees", TASK), "the dirty worktree is preserved"
   end
 
-  # ------------------------------------------------------------ the proof itself
+  # ------------------------------------------------- a machine that never saw the work
 
-  def measuring_workspace(dir)
-    SpecrelayRunner::Workspace.new(root: dir, canonical_branch: TASK, create_command: "")
+  # A01, scenario 8 — the whole point of a PORTABLE checkpoint: a second machine with no worktree
+  # for this branch downloads the recorded package, builds the task workspace with the project's
+  # own command, restores the work, and hands a fresh provider the answers.
+  def test_a_second_machine_downloads_the_checkpoint_builds_the_workspace_and_continues
+    checkpoint = released_question_with_dirty_worktree
+    other = second_machine
+    restart_platform(resume_payload(checkpoint, root: other))
+    @platform.checkpoint_payload = checkpoint["payload"]
+    io = StringIO.new
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli_in(other, io), io.string
+
+    assert_includes io.string, "[resume-executor] resumed"
+    assert_includes io.string, "Match the finance spreadsheets."
+    assert_includes io.string, "[resume-executor] applied edit"
+    assert_equal 1, @platform.requests_to("/api/runner/executor_questions/exq_fake/checkpoint").size
+    assert_equal 1, @platform.delivery_acknowledgements.size
+    assert_equal 1, @platform.requests_to("/api/runner/reports").size
+    # The restored work really was the paused work: the fresh provider could only produce this
+    # heading by editing the interrupted one it was handed.
+    restored = File.read(File.join(other, ".runs", "worktrees", TASK, "demo-app", "index.html"))
+    assert_includes restored, "Hello Resumed Demo"
   end
 
-  def measure(dir)
-    SpecrelayRunner::Checkpoint.measure(repository_key: "tiny-demo-workspace", branch: TASK,
-                                        worktree_path: dir, workspace: measuring_workspace(dir))
+  # Scenario 10 — the package could not be transferred. Nothing was built, no provider started,
+  # the claim went straight back, and the durable checkpoint is untouched for the next attempt.
+  def test_a_transfer_failure_refuses_before_a_workspace_is_built
+    checkpoint = released_question_with_dirty_worktree
+    other = second_machine
+    restart_platform(resume_payload(checkpoint, root: other))
+    @platform.checkpoint_response = [ 503, { error: "storage is unavailable" } ]
+    io = StringIO.new
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli_in(other, io), io.string
+
+    assert_includes io.string, "could not be downloaded"
+    refute_includes io.string, "[resume-executor]", "no provider was started"
+    assert_equal 1, @platform.requests_to("/api/runner/claim_releases").size
+    assert_empty @platform.requests_to("/api/runner/reports")
+    assert_empty @platform.delivery_acknowledgements
+    refute_path_exists File.join(other, ".runs", "worktrees", TASK),
+                       "a failed transfer must not leave a task workspace behind"
   end
 
-  def verify(dir, recorded)
-    SpecrelayRunner::Checkpoint.verify(recorded, repository_key: "tiny-demo-workspace", branch: TASK,
-                                                 worktree_path: dir, workspace: measuring_workspace(dir))
-  end
+  # Scenario 9 — the second machine is not at the recorded base. It refuses before the provider
+  # and leaves the target exactly as it found it.
+  def test_a_second_machine_that_is_not_at_the_recorded_base_refuses
+    checkpoint = released_question_with_dirty_worktree
+    other = second_machine
+    File.write(File.join(other, "demo-app", "index.html"), "<h1>Somewhere Else</h1>\n")
+    git(other, "add", "-A")
+    git(other, "-c", "user.email=t@e.test", "-c", "user.name=T", "commit", "-q", "-m", "moved on")
+    restart_platform(resume_payload(checkpoint, root: other))
+    @platform.checkpoint_payload = checkpoint["payload"]
+    io = StringIO.new
 
-  def git(dir, *args)
-    system("git", "-C", dir, *args, out: File::NULL, err: File::NULL) || raise("git #{args.join(' ')} failed")
-  end
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli_in(other, io), io.string
 
-  def dirty_repository
-    dir = Dir.mktmpdir("checkpoint")
-    git(dir, "init", "-q", "-b", TASK)
-    File.write(File.join(dir, "index.html"), "Hello Demo\n")
-    git(dir, "add", "-A")
-    git(dir, "-c", "user.email=t@example.com", "-c", "user.name=T", "commit", "-qm", "initial")
-    git(dir, "remote", "add", "origin", "https://github.com/SpecRelay/tiny-demo-workspace.git")
-    File.write(File.join(dir, "index.html"), "Hello Changed Demo\n")
-    dir
-  end
-
-  # A06 — every term is compared, and each mismatch names itself so an operator knows which fact
-  # about their machine stopped the resume.
-  def test_every_recorded_term_must_match_the_machine
-    dir = dirty_repository
-    recorded = measure(dir)
-
-    assert verify(dir, recorded).ok?, verify(dir, recorded).reason
-    SpecrelayRunner::Checkpoint::FIELDS.each do |field|
-      result = verify(dir, recorded.merge(field => "#{recorded[field]}x"))
-
-      refute result.ok?, "a differing #{field} must refuse"
-      assert_includes result.reason, field
-    end
-    assert_equal "github.com/specrelay/tiny-demo-workspace", recorded["origin"],
-                 "the origin travels as a normalized identity, never a URL"
-  ensure
-    FileUtils.remove_entry(dir) if dir
-  end
-
-  # A05 — the three ways the machine has nothing left to prove: it was never measured, the
-  # changes are gone, and the checkout is not there at all.
-  def test_a_missing_clean_or_absent_worktree_refuses
-    dir = dirty_repository
-    recorded = measure(dir)
-
-    assert_includes verify(dir, {}).reason, "no checkpoint"
-
-    git(dir, "checkout", "--", "index.html")
-    assert_includes verify(dir, recorded).reason, "change_digest"
-
-    empty = Dir.mktmpdir("not-a-repository")
-    refute verify(empty, recorded).ok?
-    assert_includes verify(empty, recorded).reason, "no git repository"
-  ensure
-    FileUtils.remove_entry(dir) if dir
-    FileUtils.remove_entry(empty) if empty
-  end
-
-  def test_an_unmeasurable_worktree_records_no_checkpoint_at_all
-    assert_nil measure(File.join(Dir.mktmpdir("gone"), "missing"))
+    assert_includes io.string, "base commit"
+    refute_includes io.string, "[resume-executor]", "no provider was started"
+    assert_equal 1, @platform.requests_to("/api/runner/claim_releases").size
+    assert_empty @platform.requests_to("/api/runner/reports")
   end
 end
