@@ -44,7 +44,7 @@ cd SpecRelay-Runner
 bin/specrelay-runner version
 ```
 
-## Usage — the normal path (MVP-0017, extended by MVP-0018)
+## Usage — the normal path
 
 Two commands to get going, no files to author, no credential to export: one to
 connect the machine, one to leave running.
@@ -149,7 +149,7 @@ the controlled single shot.
 ```bash
 bin/specrelay-runner loop                          # poll, claim one at a time, repeat
 bin/specrelay-runner loop --workspace <key>        # when several are connected here
-bin/specrelay-runner loop --poll-interval 300      # 5-3600s (default 60s)
+bin/specrelay-runner loop --poll-interval 300      # 5-3600s (default 10s)
 bin/specrelay-runner loop --on-failure stop        # end the session after a failed run
 
 bin/specrelay-runner claim-once                    # exactly one claim, then exit
@@ -162,7 +162,7 @@ the Keychain, the workspace root is the checkout you validated, and the reviewer
 provider is the one recorded when you connected.
 
 Which connection an argument-free invocation uses, and why, is resolved in this
-order (MVP-0021): `--workspace`, then this machine's **explicit default**, then the
+order: `--workspace`, then this machine's **explicit default**, then the
 sole stored connection. Anything else asks. The chosen source is printed, so the
 decision is visible rather than inferred:
 
@@ -175,7 +175,7 @@ it, and uploads the report. Exit `0` on completion, no eligible work, or a gener
 specification package (below), `1` on a failed execution or a refused generation,
 `2` on a config/usage error.
 
-### Claiming an automated review (MVP-0033, MAPIAI-91)
+### Claiming an automated review
 
 A claimed **review** runs on the same connected machine through the same commands, with
 no per-invocation configuration:
@@ -187,7 +187,7 @@ no per-invocation configuration:
   map, or account: the supported provider resolves its own executable, which is exactly why the
   identifier is enough. (The deterministic development fixture has no default executable and still
   takes `SPECRELAY_RUNNER_REVIEWER_COMMAND`.)
-- **A real Claude review streams (MAPIAI-103).** The reviewer runs in the same supported
+- **A real Claude review streams.** The reviewer runs in the same supported
   structured mode the executor does, so its safe public activity — narration, tool calls,
   commands, file reads and edits, tests, delegated tasks — appears in this terminal as it
   happens, and the verdict comes from the same decoder's terminal result. That stream is local
@@ -198,7 +198,7 @@ no per-invocation configuration:
 - **The reviewed repository is resolved from at most two places:** the connected workspace root
   itself, or one direct child named by the **repository segment** of the pinned key. Platform pins
   `owner/repository`, so `RepoWright/tiny-demo-crm` is looked for at `<root>/tiny-demo-crm` — never
-  at a nested `<root>/RepoWright/tiny-demo-crm` (MAPIAI-98). Exactly one of them must be a Git
+  at a nested `<root>/RepoWright/tiny-demo-crm`. Exactly one of them must be a Git
   repository *at its own top level* whose `origin` matches the assignment's clone URL by identity
   (`host/owner/repo`). Both shapes are normal: a single-repository machine connects the
   repository itself, while a project workspace holds its repositories as direct children.
@@ -214,12 +214,12 @@ no per-invocation configuration:
   reported to Platform as a retryable failed attempt rather than a verdict. A head that moved on
   the remote is reported as a stale target instead, both before the reviewer starts and again
   immediately before any verdict is submitted.
-- **A connection made before MAPIAI-91 holds no reviewer selection.** It stays fully usable for
+- **A connection made before reviewer selection existed holds none.** It stays fully usable for
   implementation and specification work; a review claim fails with one remedy — run `connect`
   again for that workspace — and is never satisfied by guessing from the executor, `PATH`, the
   Platform profile, or a default.
 
-### Two lanes, and one of them writes files (MVP-0026, MVP-0027)
+### Two lanes, and one of them writes files
 
 Platform can hand this runner work from either lane, and the runner branches on the
 assignment's own `run.type` — never on which fields are missing:
@@ -239,7 +239,7 @@ Within the specification lane the runner branches a second time, on
 | anything else | **Stop.** A build that meets an action it does not implement refuses rather than guessing, and prints the release command. |
 
 Neither phase writes a Jira field, transitions an issue, or adds a comment — that is
-MVP-0028, and the assignment says so as data
+the Jira handoff's job, and the assignment says so as data
 (`assignment_boundary.publication = "publish_draft_pull_request_only"`).
 
 #### What it writes
@@ -254,7 +254,7 @@ MVP-0028, and the assignment says so as data
   generation-manifest.json
 ```
 
-`analysis/open-questions.md` is the one CONDITIONAL file (MVP-0028 remediation, defect 3): present
+`analysis/open-questions.md` is the one CONDITIONAL file: present
 only when generation found at least one material Product Owner decision, using stable ids
 (`## OQ-001`, `## OQ-002`, ...) so a later run can reference the same question. Its filename never
 encodes count or status — a run with zero open questions omits the file entirely rather than
@@ -294,7 +294,7 @@ never reach a generated file — including in quoted `bin/graph-check` and
 bundle is identified by its **trace id**, never by a Platform URL: that address is
 machine-local, and this package is destined for a shared repository.
 
-#### Publishing the package (MVP-0027)
+#### Publishing the package
 
 When Platform offers the run again with `expected_runner_action:
 publish_specification_package`, the assignment adds two blocks: `generated_package`, the
@@ -499,7 +499,7 @@ receives is one reviewable, redacted packet. Three implementations ship:
   `runner.executor` configures) writing the specification directly — the ordinary path
   for an operator who wants model-authored synthesis, requiring no separate
   configuration. Its prompt (reviewable in full in `provider.rb`) states the document
-  contract below and the synthesis discipline MVP-0028 requires: describe the
+  contract below and the required synthesis discipline: describe the
   requested product behaviour rather than Jira labels, resolve a vague ticket
   reference (e.g. "the text") from the title and the evidence, avoid raw
   input-bundle or transcript dumps, and never claim a current publication or Jira
@@ -510,8 +510,7 @@ receives is one reviewable, redacted packet. Three implementations ship:
   never handed either checkout, because writing is not its job.
 
 An explicit `provider.kind` always wins; otherwise a configured Claude profile is used;
-otherwise generation refuses rather than silently falling back to the composer
-(MVP-0028 remediation, defect 1).
+otherwise generation refuses rather than silently falling back to the composer.
 
 #### What the built-in composer takes from the ticket
 
@@ -602,7 +601,7 @@ failure exits `1`: the correct behaviour is now a package, so a `loop` session t
 treated a refusal as success would poll forever against a misconfigured runner while
 reporting health.
 
-`loop` (MVP-0018) does the same repeatedly, at a bounded poll interval. Exit `0`
+`loop` does the same repeatedly, at a bounded poll interval. Exit `0`
 when every run it executed succeeded, `1` if any failed or the credential was
 rejected, `2` on a config/usage error. It shares `claim-once`'s connection
 resolution, credential read, readiness gate, claim request, and reporting — it adds
@@ -633,7 +632,7 @@ so a Ctrl-C in the middle of a long provider run does not look ignored:
 
 Foreground only, deliberately: no LaunchAgent, no daemonization, no supervisor.
 
-#### Two kinds of terminal output (RUNNER-0001)
+#### Two kinds of terminal output
 
 | | |
 |---|---|
@@ -641,9 +640,9 @@ Foreground only, deliberately: no LaunchAgent, no daemonization, no supervisor.
 | **Durable** | The record: the start block, a claimed task, real executor stdout/stderr, phase transitions, failures, backoff, recovery, results, the session summary. |
 
 ```text
-[loop] started — polling every 60s, one run at a time, --on-failure continue
+[loop] started — polling every 10s, one run at a time, --on-failure continue
 [loop] press Ctrl-C to stop; an in-progress execution finishes its report first
-| tiny-demo (tiny-demo-workspace) — no eligible work; next check in 43s
+| tiny-demo (tiny-demo-workspace) — no eligible work; next check in 7s
 ```
 
 That third row is the only one that moves; five idle polls add no history at all.
@@ -667,20 +666,20 @@ a machine that is not connected (or not ready) is told to run `connect` rather t
 reading a refusal as a healthy idle — on the transient row in a terminal, as a line
 where there is no row to redraw.
 
-### Live executor output (MVP-0018, real provider progress in MAPIAI-60)
+### Live executor output
 
 While the executor runs, safe output is streamed to the terminal between
 `[core.started]` and `[verification.started]` and submitted to Platform as ordered
 live log events, so a working run never looks like a hung one:
 
 ```text
-[core.started] Running claude executor for MAPIAI-40
+[core.started] Running claude executor for YOUR-1234
   [claude:status] Provider started
   [claude:status] Reading demo-app/index.html
   [claude:status] Running test command: bundle exec rspec
-  [claude:status] claude executor running for 15s on MAPIAI-40 (no new output yet)
+  [claude:status] claude executor running for 15s on YOUR-1234 (no new output yet)
   [claude:status] Provider completed
-[verification.started] Verifying 1 changed repository(ies) for MAPIAI-40
+[verification.started] Verifying 1 changed repository(ies) for YOUR-1234
 ```
 
 **Structured provider output.** The supported Claude profile is structured-output
@@ -708,7 +707,7 @@ A `core.progress` **heartbeat** still names the elapsed time after 15s of genuin
 silence. It is a fallback, never a substitute: real output, when available, is what
 you see.
 
-In a terminal that heartbeat is **transient** (RUNNER-0001): the `[claude:status]`
+In a terminal that heartbeat is **transient**: the `[claude:status]`
 row replaces itself instead of appending a line every 15s, and real provider output
 clears it before printing. Platform still receives every `core.progress` event and
 the report evidence still records each one — the durable protocol and evidence
@@ -717,7 +716,7 @@ terminal to redraw it stays a plain line at the same bounded interval.
 
 Every line is redacted before the terminal write **and** before upload and clipped
 at 2000 bytes; each uploaded event carries at most 65536 bytes and 200 whole lines.
-There is no whole-attempt byte budget (MAPIAI-75): those bounds SPLIT a long stream
+There is no whole-attempt byte budget: those bounds SPLIT a long stream
 into more events, they never stop it, so Platform receives the attempt's complete
 sanitized output. Output is flushed, because Ruby block-buffers a non-terminal
 stdout and an unflushed live log is just a delayed one.
@@ -765,7 +764,7 @@ connected to and been recorded `ready` for — and only while its reported
 repository identity still matches that workspace. A historical `all_eligible`
 claim policy grants nothing on its own.
 
-### 3. Manage this machine's connections (MVP-0021)
+### 3. Manage this machine's connections
 
 ```bash
 bin/specrelay-runner            # in a terminal: opens the local control center
@@ -778,7 +777,7 @@ selected one, offers: `Start live loop`, `Claim once`, `Test connection/readines
 `Show details`, `Set as default` / `Clear default`, `Disconnect locally`,
 `Disconnect from Platform`, `Back`.
 
-Each row leads with the project and keeps its workspace key beside it (RUNNER-0001):
+Each row leads with the project and keeps its workspace key beside it:
 
 ```text
  1  tiny-demo · tiny-demo-workspace · specrelay/tiny-demo-workspace@main · 2d ago
@@ -922,13 +921,13 @@ On this path the physical local workspace root is resolved, in order, from
 `SPECRELAY_RUNNER_WORKSPACE_ROOT_<WORKSPACE_KEY>`,
 `SPECRELAY_RUNNER_WORKSPACE_ROOT`, then the config's `workspace_roots` map. The
 shared **development token** (`platform.token_env`, default
-`SPECRELAY_RUNNER_API_TOKEN`) still authenticates API calls but, since MVP-0017,
+`SPECRELAY_RUNNER_API_TOKEN`) still authenticates API calls but
 **cannot claim work**: it authenticates no machine identity, so it holds no
 workspace grant.
 
 ### There is no Platform-side execution command
 
-`bin/platform runner once|loop` was removed in MVP-0015 and now refuses with a
+`bin/platform runner once|loop` was removed with the runner extraction and now refuses with a
 pointer here. Platform keeps only the commands that operate on **its own state**:
 
 ```bash
@@ -971,7 +970,7 @@ These are enforced, with a test per flag, not documented hopes:
   interpolation, no `eval`.
 - `command`'s basename must be `claude`. Another CLI is refused rather than
   silently executed.
-- Required flags: `--output-format stream-json` and `--verbose` (MAPIAI-60) — the
+- Required flags: `--output-format stream-json` and `--verbose` — the
   profile is structured-output only.
 - Refused flags: `--input-format`, `--mcp-config`,
   `--strict-mcp-config`, `--bg`/`--background`, `--chrome`, `--remote-control`,
@@ -1104,7 +1103,7 @@ SPECRELAY_RUNNER_EVENT_CONFLICT=true          # re-send a used sequence with a d
 SPECRELAY_RUNNER_FORCE_TERMINAL_FAILURE=true  # submit a failed terminal envelope
 ```
 
-## Proportional repository verification (MAPIAI-93)
+## Proportional repository verification
 
 No project configures a test command. For every repository it changed, the executor
 selects the smallest relevant verification by reading that repository's own instructions,
@@ -1154,7 +1153,7 @@ the changed repository output to GitHub — commit, push the run's canonical tas
 branch, and create or reuse a draft pull request, **once per selected repository**
 ([`lib/specrelay_runner/publication.rb`](lib/specrelay_runner/publication.rb)).
 
-Ownership is split, and MAPIAI-84 is where the split moved. **Platform decides HOW**
+Ownership is split. **Platform decides HOW**
 (`repository_policy` / `links`: access, whether a pull request is required, whether it
 is a draft) and sends **no eligible-repository list**. **The executor decides WHICH**,
 because a task workspace may hold several independent repositories and only the executor
@@ -1179,7 +1178,7 @@ array belongs is refused. A missing document fails the attempt; an empty list is
 
 `"commands": []` is the executor's answer that this repository has no applicable
 verification. It is valid and non-blocking — see
-[Proportional repository verification](#proportional-repository-verification-mapiai-93).
+[Proportional repository verification](#proportional-repository-verification).
 
 [`Workspace#select`](lib/specrelay_runner/workspace.rb) then proves every entry before any
 external write — relative, inside the task workspace, a git repository **root**, a
@@ -1296,7 +1295,7 @@ config/runner.example.yml       # the one operator-facing config example
 lib/specrelay_runner.rb         # requires
 lib/specrelay_runner/
   cli.rb                        # argv -> config/connection -> client -> claim/execute
-  loop_runner.rb                # the long-running poll/claim/execute loop (MVP-0018)
+  loop_runner.rb                # the long-running poll/claim/execute loop
   poll_interval.rb              # validated, bounded --poll-interval value object
   connect.rb                    # the guided connection: code -> assignment ->
                                 #   checkout validation -> readiness -> Keychain
@@ -1313,7 +1312,7 @@ lib/specrelay_runner/
                                 #   the top-level list; full detail in the detail view)
   connections_command.rb        # `connections …`: argv -> one operation -> exit code
   terminal_menu.rb              # small raw-mode keyboard menu (io/console); pure key decisions
-  dashboard.rb                  # the control center's top level (MVP-0021)
+  dashboard.rb                  # the control center's top level
   workspace_view.rb             # the per-workspace detail view and its actions
   config.rb                     # local YAML config (secrets from ENV only), or
                                 #   built from a stored connection
@@ -1382,7 +1381,7 @@ metrics `docs/rails-engineering-standard.md` mandates).
 
 What each suite proves:
 
-- **`repository_boundary_test.rb`** (MVP-0015) — this repository ships its own
+- **`repository_boundary_test.rb`** — this repository ships its own
   demo executor and resolves a bundled bare command to it; a real provider command
   and an absolute path are passed through untouched; the config path resolves from
   the canonical env var with the spike-era name still honoured as a deprecated
@@ -1417,14 +1416,14 @@ What each suite proves:
 - **`lease_test.rb`** proves the heartbeater renews on Platform's advertised
   cadence and that the runner stops and uploads nothing when Platform signals the
   claim is no longer live.
-- **`claude_profile_test.rb`** (MVP-0016) covers the real profile as a unit: the
+- **`claude_profile_test.rb`** covers the real profile as a unit: the
   accepted argv, a refusal for every forbidden flag and for a credential in `env:`,
   the readiness classifications (ready / unavailable / not authenticated / timed
   out) through an **injected** command seam that mutates no ENV and needs no live
   CLI, proof that the readiness result carries no account detail and runs only the
   two bounded metadata probes, the fail-closed payload comparison, and the four
   failure classifications.
-- **`real_executor_flow_test.rb`** (MVP-0016) drives the real profile through the
+- **`real_executor_flow_test.rb`** drives the real profile through the
   whole runner against an on-disk executable named `claude`, so PATH resolution,
   readiness, argv assembly, worktree creation, verification replay, and report
   upload are all the runner's real code. It proves a readiness failure performs
