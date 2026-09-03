@@ -4,7 +4,7 @@ require "socket"
 require "json"
 
 # A minimal, dependency-free fake Platform runner API for the standalone runner
-# runner tests (MVP-0010). It is a real HTTP server on an ephemeral loopback port,
+# runner tests. It is a real HTTP server on an ephemeral loopback port,
 # so the runner exercises its real Net::HTTP client and the real process boundary
 # — not an in-process stub. It records every request so tests can assert the
 # claim/event/heartbeat/report contract the runner actually sent.
@@ -16,47 +16,55 @@ class FakePlatform
   EXPECTED_TOKEN = "fake-dev-token"
   EXPECTED_REGISTRATION_TOKEN = "srt_fake-registration-token"
   ISSUED_CREDENTIAL = "src_fake-issued-credential"
+  # The machine's own preview connector token, issued alongside the credential on every
+  # successful exchange — including a reconnect, which replaces only this one.
+  ISSUED_CONNECTOR_TOKEN = "cft_fake-issued-connector-token"
 
-  # MVP-0017 guided connection. `enrollment_code` is the one-time code the runner
+  # Guided connection. `enrollment_code` is the one-time code the runner
   # presents to /enrollment; on success the fake issues ISSUED_CREDENTIAL and then
   # accepts it as a registered bearer, exactly as Platform does. The readiness
   # verdict is scripted per-instance so a test can prove the runner renders the
   # state PLATFORM decided rather than its own opinion.
   attr_accessor :enrollment_code, :readiness_verdict, :enrollment_status
 
-  # Round 002: the credential the fake believes this machine already holds. When the runner
+  # The runner identity the fake issues, and the `preview_connector` object it returns with it.
+  # Both are settable: two machines must be able to arrive at two identities, and a test has to be
+  # able to model an otherwise successful exchange whose connector object is absent or malformed.
+  attr_accessor :runner_public_id, :preview_connector
+
+  # The credential the fake believes this machine already holds. When the runner
   # presents it on the exchange, the fake responds `credential_unchanged` and issues nothing —
-  # mirroring Platform's non-destructive reconnect (review-001 F3).
+  # mirroring Platform's non-destructive reconnect.
   attr_accessor :held_credential
 
-  # MVP-0021: what the per-workspace GET reports. Scripted so a test can model a grant an
+  # What the per-workspace GET reports. Scripted so a test can model a grant an
   # operator blocked, a workspace that was deactivated, and a healthy one — the runner must
   # render Platform's verdict rather than deciding for itself.
   attr_accessor :grant_state, :grant_failure_class, :workspace_active
 
-  # CR-001: make DELETE answer 200 with a body that confirms nothing. Set to a Hash (rendered as
+  # Make DELETE answer 200 with a body that confirms nothing. Set to a Hash (rendered as
   # the JSON body) — `{}` for "no disconnected block", or a block with a missing/unrecognised
   # `outcome`. A non-JSON 200 is modelled by `unconfirmed_disconnect_raw`.
   attr_accessor :unconfirmed_disconnect, :unconfirmed_disconnect_raw
 
-  # MVP-0027 review-001 P2-2: script the publication endpoint's answer so a test can model
+  # Script the publication endpoint's answer so a test can model
   # Platform READING a locally successful publication and REFUSING it. Set to a
   # `[status, body]` pair; the live case this models is the 422 that fired during the round's
   # live pass. Distinct from `unconfirmed_disconnect` because it must also cover 5xx, which
   # the runner treats as a transport fault rather than a refusal.
   attr_accessor :publication_response
 
-  # MVP-0033: script the review-result endpoint's answer, so a test can model Platform's
+  # Script the review-result endpoint's answer, so a test can model Platform's
   # strict validation refusing a submission the runner considered fine.
   attr_accessor :review_response
 
-  # MAPIAI-90: a SEQUENCE of scripted answers, consumed one per delivery, so a test can model
+  # A SEQUENCE of scripted answers, consumed one per delivery, so a test can model
   # Platform recording the verdict and then reporting that the ticket's Jira description update did
   # not complete — followed by whatever the identical retry earns. Takes precedence over
   # `review_response`, which stays the always-the-same script.
   attr_accessor :review_responses
 
-  # MAPIAI-88: the closed retirement plan Platform returns instead of a verdict for the FIRST
+  # The closed retirement plan Platform returns instead of a verdict for the FIRST
   # ACCEPT delivery. Set to `{ "digest" => ..., "pull_requests" => [...] }` to model a candidate
   # that omits current pull requests; nil keeps the ordinary one-request acceptance. The
   # completion delivery (the one carrying `retirement`) is always answered with the verdict, so
@@ -69,19 +77,19 @@ class FakePlatform
   attr_writer :claim_payload
 
   # Lets a test model a SECOND workspace on the same Platform and the same machine, which is the
-  # shape that used to orphan the first workspace's stored credential (review-002, F3 residual).
+  # shape that used to orphan the first workspace's stored credential.
   def claim_payload_workspace_key=(key)
     @claim_payload["workspace"]["workspace_key"] = key
   end
 
-  # MVP-0021: the executor the workspace resolves to, as reported by the assignment and the
+  # The executor the workspace resolves to, as reported by the assignment and the
   # per-workspace GET. Scripted so a test can model the real Claude profile (which triggers the
   # bounded provider readiness check) as well as the deterministic fixture (which must not).
   def claim_payload_executor=(executor)
     @claim_payload["executor"] = executor
   end
 
-  # MAPIAI-84 — a SECOND attempt at the same task, which is what an operator retry of a partially
+  # A SECOND attempt at the same task, which is what an operator retry of a partially
   # published run is. The fake serves the same assignment again, so the retry is a genuine second
   # pass over one task workspace rather than a different run that happens to look similar.
   def offer_claim_again = tap { @claimed = false }
@@ -103,6 +111,8 @@ class FakePlatform
     @registration_token = registration_token
     @enrollment_code = enrollment_code
     @enrollment_status = 201
+    @runner_public_id = "rnr_fake"
+    @preview_connector = { token: ISSUED_CONNECTOR_TOKEN }
     @grant_state = "ready"
     @grant_failure_class = nil
     @workspace_active = true
@@ -117,7 +127,7 @@ class FakePlatform
     @claimed = false
     @lease_signal = lease_signal
     @seen_sequences = []
-    # MVP-0036: the answer window starts OPEN and stays open until a test plays the Product
+    # The answer window starts OPEN and stays open until a test plays the Product
     # Owner, so a test that scripts nothing models a provider that is still waiting.
     @question = nil
     @question_answers = []
@@ -128,7 +138,7 @@ class FakePlatform
     @mutex = Mutex.new
   end
 
-  # MVP-0012: flip the lease/cancellation signal the heartbeat/event responses
+  # Flip the lease/cancellation signal the heartbeat/event responses
   # carry, so a test can prove the runner OBSERVES an expiry/cancellation and
   # stops without uploading a success report.
   def signal_cancelled! = set_signal("state" => "cancelled", "cancel_requested" => true)
@@ -164,10 +174,10 @@ class FakePlatform
   def requests_to(path) = requests.select { |r| r[:path] == path }
   def last_report = requests_to("/api/runner/reports").last
 
-  # MVP-0033 — what the runner actually submitted for a claimed review. `review_results` being
+  # What the runner actually submitted for a claimed review. `review_results` being
   # EMPTY is as load-bearing as its contents: a refused checkout must not produce a verdict.
   #
-  # A stale-target report and (since MAPIAI-78) an explicit failure report go to the same
+  # A stale-target report and an explicit failure report go to the same
   # endpoint with different bodies, and are kept apart here for the same reason Platform keeps
   # them apart: "no verdict because the reviewer failed", "no verdict because the reviewer
   # produced nothing usable" and "no verdict because the target moved" are different facts.
@@ -178,19 +188,19 @@ class FakePlatform
   def last_review = review_results.last&.dig(:body, "review")
   def last_review_failure = review_failures.last
 
-  # MAPIAI-88 — the completion half of a two-phase ACCEPT. `retirement_completions` being EMPTY
+  # The completion half of a two-phase ACCEPT. `retirement_completions` being EMPTY
   # while `review_results` is not is the shape of "the prepare landed and the closes did not", so
   # the two are counted separately rather than folded into one list.
   def retirement_completions = review_submissions.filter_map { |request| request[:body].to_h["retirement"] }
   def last_retirement_completion = retirement_completions.last
 
-  # MVP-0036 — what the provider actually asked through the bridge. An EMPTY list is as
+  # What the provider actually asked through the bridge. An EMPTY list is as
   # load-bearing as its contents: a locally refused request must never reach Platform.
   def executor_questions = requests_to("/api/runner/executor_questions")
   def asked_question = @mutex.synchronize { @question }
   def capture_failures = executor_questions.select { |r| r[:body].to_h.key?("capture_failure") }
 
-  # CR-002 F1 — the acknowledgement the runner sends once it has written the answers into the
+  # F1 — the acknowledgement the runner sends once it has written the answers into the
   # live session's bridge.
   def delivery_acknowledgements
     requests.select { |r| r[:method] == "PATCH" && r[:path].start_with?("/api/runner/executor_questions/") }
@@ -220,7 +230,7 @@ class FakePlatform
   # sends), so a test can prove the runner tells the two apart.
   attr_accessor :question_response
 
-  # CR-002 F1: a slow answer poll, so a test can put the provider's exit INSIDE the poll the
+  # F1: a slow answer poll, so a test can put the provider's exit INSIDE the poll the
   # runner is waiting on, and a scripted answer for the acknowledgement itself.
   attr_accessor :question_poll_delay, :delivery_response
 
@@ -229,7 +239,7 @@ class FakePlatform
   # yet built anything.
   attr_accessor :checkpoint_payload, :checkpoint_response
 
-  # MAPIAI-60 CR-002 F1: how long a live-log response is withheld, so a test can put a Platform
+  # How long a live-log response is withheld, so a test can put a Platform
   # that has stopped answering UNDERNEATH an attempt that is finishing. Only `log.*` events are
   # held, and only on their own connection thread — a delay that also stalled this fake's accept
   # loop would postpone the result-path requests the test measures and prove nothing.
@@ -238,23 +248,23 @@ class FakePlatform
   def last_enrollment = requests_to("/api/runner/enrollment").last
   def last_enrollment_preview = requests_to("/api/runner/enrollment_preview").last
   def last_readiness_report = requests_to("/api/runner/workspace_connections").last
-  # MVP-0026: what the runner reported about a specification-generation attempt, and — just
+  # What the runner reported about a specification-generation attempt, and — just
   # as load-bearing for criterion 15 — the fact that nothing was sent to /reports.
   def specification_generations = requests_to("/api/runner/specification_generations")
   def last_specification_generation = specification_generations.last&.dig(:body, "generation")
-  # MVP-0027: what the runner reported about a publication attempt, and the fact that a
+  # What the runner reported about a publication attempt, and the fact that a
   # publication claim sent nothing to the generation endpoint.
   def specification_publications = requests_to("/api/runner/specification_publications")
   def last_specification_publication = specification_publications.last&.dig(:body, "publication")
 
-  # MVP-0013: the v1 protocol events the runner sent (the `event` sub-hash of each
+  # The v1 protocol events the runner sent (the `event` sub-hash of each
   # /events request), in receipt order, and the terminal-result envelope uploaded
   # with the last report.
   def protocol_events = requests_to("/api/runner/events").map { |r| r[:body]["event"] }.compact
   def last_terminal_result = last_report&.dig(:body, "terminal_result")
   def protocol_attempt_id = @claim_payload.dig("claim", "runner_execution_id")
 
-  # MVP-0021: the workspace grants this fake holds for the calling runner. It starts as the one
+  # The workspace grants this fake holds for the calling runner. It starts as the one
   # workspace the claim payload models; a test clears or inspects it to model a grant an operator
   # revoked in Platform, and DELETE removes from it, which is what makes the fake's idempotency
   # real rather than assumed.
@@ -265,7 +275,7 @@ class FakePlatform
   # exit-0 poll, so the resolution is proven on the real code path rather than a stubbed one.
   def offer_no_work! = @claimed = true
 
-  # MVP-0027: offer the SAME assignment again, which is what real Platform does after
+  # Offer the SAME assignment again, which is what real Platform does after
   # `bin/platform runner retry-publication` returns a blocked run to the publishable state. It
   # is how a retry is exercised end to end through the CLI rather than by calling a publisher
   # twice in-process — and the retry-idempotency rule is about what a second CLAIM does.
@@ -350,7 +360,7 @@ class FakePlatform
     when "/api/runner/events" then events(request)
     when "/api/runner/heartbeat" then [ 200, { acknowledged: true, state: "EXECUTING", lease: lease_signal } ]
     when "/api/runner/reports" then report(request)
-    # MVP-0035 — a runner abandoning its own claim before it executed anything. The fake answers
+    # A runner abandoning its own claim before it executed anything. The fake answers
     # what Platform answers, because the runner PRINTS the run state back and a constant would
     # let a released claim and an unreleased one look identical in the operator's output.
     when "/api/runner/claim_releases" then claim_release
@@ -364,7 +374,7 @@ class FakePlatform
     end
   end
 
-  # MVP-0036: the question bridge's endpoint. Deliberately dumb about the document schema
+  # The question bridge's endpoint. Deliberately dumb about the document schema
   # (Platform's own specs cover that) but NOT dumb about the state it reports back: the runner
   # branches on it to decide whether to keep the provider alive, hand it the answers, or end
   # it, so a fake that always said LIVE_WAIT would let every one of those branches pass
@@ -375,7 +385,7 @@ class FakePlatform
     # make "the runner told Platform" unprovable.
     #
     # The execution state is the one Platform KEPT, because the runner classifies the attempt
-    # from it (CR-002 F2): a release that already won leaves the execution terminal and
+    # from it: a release that already won leaves the execution terminal and
     # AWAITING_INPUT, and a genuinely lost question does not.
     return [ 201, { contract_version: "mvp-0036", execution: { state: kept_execution_state } } ] if
       request[:body].to_h.key?("capture_failure")
@@ -431,7 +441,7 @@ class FakePlatform
   end
 
 
-  # MVP-0026: the specification-generation result endpoint. Deliberately dumb about domain
+  # The specification-generation result endpoint. Deliberately dumb about domain
   # rules (Platform's own request specs cover the real state transitions) but NOT dumb about
   # the run state it reports back: the runner prints it, and a fake that always said the same
   # thing would let a generated run and a refused one look identical in the runner's output.
@@ -445,7 +455,7 @@ class FakePlatform
                           "BLOCKED_SPECIFICATION_GENERATION" } ]
   end
 
-  # MVP-0027: the specification-publication result endpoint. Dumb about domain rules for the
+  # The specification-publication result endpoint. Dumb about domain rules for the
   # same reason its sibling is — Platform's own specs cover the real validation — but honest
   # about the run state it reports back, because the runner prints it and a fake that always
   # said "published" would let a fail-closed path look identical to a success in the output.
@@ -459,7 +469,7 @@ class FakePlatform
 
     # The state Platform really records, not one constant for every verdict: NEEDS_INPUT leaves
     # the attempt awaiting a Product Owner answer, and the runner checks the acknowledgement
-    # against the ending its delivery produces (MAPIAI-78 review-002 F1).
+    # against the ending its delivery produces.
     review = request[:body].to_h["review"].to_h
     return retiring_answer if retirement_plan && review["outcome"] == "ACCEPT" && !request[:body].to_h.key?("retirement")
 
@@ -468,7 +478,7 @@ class FakePlatform
              review: { attempt_id: "rvt_fake", state: state, outcome: review["outcome"] } } ]
   end
 
-  # MAPIAI-88 — the prepare answer: no verdict yet, and the exact pull requests the runner is
+  # The prepare answer: no verdict yet, and the exact pull requests the runner is
   # authorized to close.
   def retiring_answer
     [ 201, { contract_version: "mvp-0033",
@@ -488,7 +498,7 @@ class FakePlatform
              run_state: published ? "AWAITING_SPECIFICATION_APPROVAL" : "BLOCKED_SPECIFICATION_PUBLICATION" } ]
   end
 
-  # MVP-0021: the per-workspace member routes. GET describes this runner's grant; DELETE
+  # The per-workspace member routes. GET describes this runner's grant; DELETE
   # removes it and is idempotent, exactly as Platform's own controller is — the runner's
   # branching depends on that, so a fake that 404'd the second delete would let a broken
   # idempotency assumption pass.
@@ -522,8 +532,8 @@ class FakePlatform
       reported_default_branch: @claim_payload.dig("workspace", "default_branch") }
   end
 
-  # CR-001: a 200 that is NOT a confirmation must be expressible, because that is the shape the
-  # runner used to accept (review-001 F2). `unconfirmed_disconnect` replaces the body while
+  # A 200 that is NOT a confirmation must be expressible, because that is the shape the
+  # runner used to accept. `unconfirmed_disconnect` replaces the body while
   # keeping the 200, modelling a proxy, a captive portal, or another service on that port — and,
   # deliberately, the grant is NOT removed, so a test can assert the runner refused to treat it
   # as done AND that Platform-side state is untouched.
@@ -560,22 +570,23 @@ class FakePlatform
       executor: @claim_payload.fetch("executor") }
   end
 
-  # MVP-0017 guided connection: consume the code and return the durable credential once — unless
+  # Guided connection: consume the code and return the durable credential once — unless
   # the runner presented the credential it already holds, in which case nothing is issued.
   def enrollment(request)
     return spent_code if code_spent?
 
-    # The held credential arrives in a HEADER, never the body (round 003, review-002 N1), so the
+    # The held credential arrives in a HEADER, never the body, so the
     # fake reads it where Platform reads it.
     presented = request.dig(:headers, "x-specrelay-runner-credential")
     unchanged = !@held_credential.nil? && presented == @held_credential
     @consumed_codes << @enrollment_code
     [ @enrollment_status,
       assignment.merge(
-        runner: { id: "host-runner", public_id: "rnr_fake", display_name: "host runner",
+        runner: { id: "host-runner", public_id: @runner_public_id, display_name: "host runner",
                   connection_public_id: "rwc_fake", reconnected: unchanged },
         credential: unchanged ? nil : ISSUED_CREDENTIAL,
-        credential_unchanged: unchanged
+        credential_unchanged: unchanged,
+        preview_connector: @preview_connector
       ) ]
   end
 
@@ -591,7 +602,7 @@ class FakePlatform
                            ready_at: "2026-07-26T00:00:00Z" } } ]
   end
 
-  # MVP-0013 v1 event ingest: classify a repeat (attempt_id, sequence) as an
+  # V1 event ingest: classify a repeat (attempt_id, sequence) as an
   # idempotent duplicate, everything else as accepted_current. This is a dumb
   # stand-in; the real Platform request specs cover full classification.
   def events(request)
@@ -617,18 +628,18 @@ class FakePlatform
     end
   end
 
-  # MAPIAI-107 — the BOUND a session-termination test needs. A released run really is offered
+  # The BOUND a session-termination test needs. A released run really is offered
   # again, forever, so a `loop` that fails to stop does not fail a test: it never returns. Past
   # this limit the fake answers the one thing the loop treats as fatal, so a session that should
   # have stopped by itself ends with a claim count that says it did not.
   def claim_limit_reached? = !@claim_limit.nil? && @claims_served >= @claim_limit
 
-  # MAPIAI-107 — a released run is CLAIMABLE AGAIN, which is the whole point of releasing it and
+  # A released run is CLAIMABLE AGAIN, which is the whole point of releasing it and
   # the reason a repeated claim loop was possible at all. The fake said "already claimed"
   # afterwards, so a session that reclaimed its own refusal looked healthy here while the live
   # runner refused the same run twelve times.
   #
-  # `release_status` models the release Platform did NOT accept (CR-001 F2). The run then stays
+  # `release_status` models the release Platform did NOT accept. The run then stays
   # CLAIMED here, because that is what actually happens: nothing was released, and the lease has
   # to expire before any machine sees the run again.
   def claim_release
@@ -645,7 +656,7 @@ class FakePlatform
                run_state: "COMPLETED" } ]
   end
 
-  # CR-001: `:raw` is an escape hatch for a 200 whose body is NOT JSON — an HTML error page from
+  # `:raw` is an escape hatch for a 200 whose body is NOT JSON — an HTML error page from
   # a proxy or a captive portal. The runner's client parses that to `{}`, which is exactly the
   # input that used to reach the operator as "Platform confirmed".
   def respond(socket, status, body)
