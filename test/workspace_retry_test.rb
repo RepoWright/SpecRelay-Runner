@@ -37,7 +37,36 @@ class WorkspaceRetryTest < Minitest::Test
     assert_equal "keep me\n", File.read(File.join(@worktree, "unfinished.txt"))
   end
 
+  # Git keeps a worktree registration after its directory is removed by hand, and still lists the
+  # branch at that path. Using it as a working directory would escape as a system error; the
+  # workspace boundary must refuse it instead, name the operator's action, and leave the stale
+  # registration untouched — it is the operator's to prune, never the runner's.
+  def test_refuses_a_registration_whose_directory_is_missing_and_leaves_it_in_place
+    FileUtils.remove_entry(@worktree)
+
+    error = assert_raises(SpecrelayRunner::Workspace::Error) { build_workspace.create }
+
+    assert_includes error.message, "stale worktree registration"
+    assert_includes error.message, "git worktree prune"
+    refute_includes error.message, @worktree, "the missing absolute path must not be printed"
+    assert_includes registrations, "branch refs/heads/DEMO-1"
+    assert_includes registrations, "prunable"
+    refute File.exist?(@worktree), "nothing may be recreated"
+  end
+
+  # The read-only lookup a resume relies on reaches the same registration, so it must meet the
+  # same refusal from the same place rather than a second copy of the rule.
+  def test_reading_an_existing_worktree_refuses_a_missing_registered_directory_the_same_way
+    FileUtils.remove_entry(@worktree)
+
+    error = assert_raises(SpecrelayRunner::Workspace::Error) { build_workspace.existing }
+
+    assert_includes error.message, "git worktree prune"
+  end
+
   private
+
+  def registrations = git_output("worktree", "list", "--porcelain")
 
   def build_workspace
     SpecrelayRunner::Workspace.new(
