@@ -3,7 +3,7 @@
 require "shellwords"
 
 module SpecrelayRunner
-  # Local worktree operations for the standalone runner (MVP-0010) — a runner/
+  # Local worktree operations for the standalone runner — a runner/
   # operator responsibility, not Platform's. It runs the workspace's configured
   # `worktree_create_command` (received in the run payload) verbatim as an argv
   # array in the operator's local workspace root, locates the created worktree by
@@ -15,7 +15,7 @@ module SpecrelayRunner
   class Workspace
     Error = Class.new(StandardError)
 
-    # MAPIAI-87 — `created` says whether THIS call built the task workspace or found the exact
+    # `created` says whether THIS call built the task workspace or found the exact
     # clean one already there. Reconstructing from an older accepted package is only ever correct
     # for a workspace that did not exist a moment ago: a reused one may already hold this run's
     # own partial publication, rework, restart or answered-resume state.
@@ -27,12 +27,12 @@ module SpecrelayRunner
     # It is NOT the same as "no files changed", and callers must not conflate them:
     # on the success path an unmeasurable worktree has to fail the run, because
     # reporting `changed: false` would tell Jira "no code changes" while the
-    # executor's diff sits on disk (review-002 finding N1).
+    # executor's diff sits on disk.
     Changes = Struct.new(:changed_files, :diff, :head_commit, :measurement_error, keyword_init: true) do
       def measured? = measurement_error.nil?
     end
 
-    # MAPIAI-84 — one repository the executor selected, verified and measured on its own terms.
+    # One repository the executor selected, verified and measured on its own terms.
     #
     # `id` is the normalized GitHub identity ({GithubRemote}), which is also what `gh` is asked
     # about and what a pull-request URL must belong to. Everything else is read from the
@@ -40,13 +40,13 @@ module SpecrelayRunner
     # publication is allowed to know about a repository.
     Repository = Struct.new(:id, :relative_path, :path, :clone_url, :default_branch, :branch,
                             :base_commit, :head_commit, :changed_files, :diff, keyword_init: true) do
-      # MAPIAI-93 — everything about this repository that publication will WRITE and the report
+      # Everything about this repository that publication will WRITE and the report
       # will DESCRIBE, as one comparable value.
       #
       # It exists because verification runs between measurement and publication: a selected
       # command can succeed and still rewrite a tracked file, move HEAD, or undo the change it
       # was verifying. Comparing this before and after replay is what proves the tree that was
-      # verified is the tree that gets published (CR-001 F1).
+      # verified is the tree that gets published.
       #
       # `base_commit` carries the measured HEAD, so commit movement is included. `head_commit` is
       # deliberately absent: publication assigns it afterwards, so it is nil on both sides and
@@ -64,7 +64,7 @@ module SpecrelayRunner
     # The project's own task-environment command, relative to the connected checkout root.
     PROJECT_COMMAND = File.join("bin", "worktree")
 
-    # MAPIAI-97 — `on_output` is the live consumer of the CREATE command's own stdout/stderr, and
+    # `on_output` is the live consumer of the CREATE command's own stdout/stderr, and
     # only that command's: it is the one invocation here that belongs to an operator watching a
     # page. The git reads below are this class's own bookkeeping and stay silent.
     def initialize(root:, canonical_branch:, create_command:, task_id: nil, env: {}, on_output: nil)
@@ -97,13 +97,13 @@ module SpecrelayRunner
       Info.new(path: path, base_commit: rev_parse(path, "HEAD"), created: true)
     end
 
-    # MAPIAI-84 — HOW the one task workspace is constructed.
+    # HOW the one task workspace is constructed.
     #
     # When the connected checkout owns `bin/worktree`, that command is the single authority for
     # building its task environment, and the runner invokes it exactly once. A project whose task
     # environment is several independent repositories can only be assembled by the project itself;
     # a runner that assembled one instead would be maintaining a second repository-layout
-    # convention, which is precisely what this ticket removes.
+    # convention, which is precisely the duplication a single create authority removes.
     #
     # Otherwise the existing native single-repository path stands, verbatim from the assignment.
     #
@@ -117,7 +117,7 @@ module SpecrelayRunner
       Shellwords.split(create_command)
     end
 
-    # The worktree this canonical branch is ALREADY checked out in, or nil (MVP-0036 Stage 2a).
+    # The worktree this canonical branch is ALREADY checked out in, or nil.
     #
     # A sibling of `create`, never a mode of it. `create` refuses an existing worktree that has
     # uncommitted changes, because an ordinary attempt must never start on top of work it did
@@ -135,14 +135,13 @@ module SpecrelayRunner
     #
     # Never raises — that is load-bearing, not a convenience: the executor-failure
     # path calls this to describe a broken attempt before uploading a FAILED report,
-    # and raising there crashed the runner and left the run stuck (QUALITY-0002).
+    # and raising there crashed the runner and left the run stuck.
     #
     # But "did not raise" must never be confused with "measured zero changes". When
     # the change set cannot be established the result carries a `measurement_error`
     # and an EMPTY file list, and the caller decides: truthful on the failure path,
     # fatal on the success path. Returning a bare empty list here is what let a
-    # single transient spawn error be announced to Jira as "no code changes"
-    # (review-002 finding N1).
+    # single transient spawn error be announced to Jira as "no code changes".
     def capture_changes(path)
       status = git(path, %w[status --porcelain])
       return unmeasured("git status failed: #{first_line(status.stderr, status.stdout)}") unless status.success?
@@ -158,7 +157,7 @@ module SpecrelayRunner
       unmeasured("could not run git in the worktree: #{e.class}")
     end
 
-    # MAPIAI-84 — verify and measure every repository the executor reported, or refuse.
+    # Verify and measure every repository the executor reported, or refuse.
     #
     # `task_root` is the prepared task workspace; `relative_paths` are the executor's reported
     # entries in its own order. Nothing here trusts the executor: it proves each entry is a real,
@@ -323,6 +322,10 @@ module SpecrelayRunner
       Changes.new(changed_files: [], diff: "", head_commit: nil, measurement_error: reason)
     end
 
+    # Git keeps a worktree registration after its directory is removed by hand, and still lists the
+    # branch at that path. The path is proved to be a directory here, before any caller uses it as a
+    # working directory, so the failure is this boundary's own refusal rather than a system error
+    # escaping from the spawn. Pruning the registration is the operator's action, never the runner's.
     def locate(required: true)
       listing = git(root, %w[worktree list --porcelain])
       raise Error, "could not list git worktrees in #{root}" unless listing.success?
@@ -330,6 +333,10 @@ module SpecrelayRunner
       path = parse_worktree_for_branch(listing.stdout)
       if required && path.to_s.empty?
         raise Error, "no worktree found for branch #{canonical_branch} after create"
+      end
+      if !path.to_s.empty? && !File.directory?(path)
+        raise Error, "stale worktree registration for #{canonical_branch}: its directory no longer exists; " \
+                     "run `git worktree prune` in the workspace checkout before releasing or retrying"
       end
 
       path
