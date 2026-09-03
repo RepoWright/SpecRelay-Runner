@@ -123,8 +123,8 @@ module SpecrelayRunner
       # request an abandoned run had already published. A run is never both this and a rework:
       # a replacement is new, so nothing has reviewed it.
       @restart = ContinuedTarget.for(payload, "restart")
-      # MVP-0036 Stage 2a — nil unless this claim continues an answered offline question on the
-      # machine that still holds its uncommitted work.
+      # Nil unless this claim continues an answered offline question — on the machine that asked,
+      # or on any other eligible one, which restores the recorded work first.
       @resume = Resume.for(payload)
       # MAPIAI-87 — what the claim says about the ticket's previous accepted implementation. The
       # field is required and nullable, so this reads it rather than guessing at it: a malformed
@@ -218,9 +218,9 @@ module SpecrelayRunner
       refuse_before_provider(reason, "Refusing to continue the recorded work for #{run['task_id']}")
     end
 
-    # Stage 2a — the recorded checkpoint is not what this machine holds. The question, its
-    # answers and its checkpoint all stay durable on Platform, and the uncommitted work stays
-    # here, so the owner can correct the worktree and claim again.
+    # The recorded work is not what this machine could prove. The question, its answers and its
+    # recorded package all stay durable on Platform, and every local file stays exactly as it is,
+    # so this machine — or another eligible one — can try again.
     def resume_refused(reason)
       refuse_before_provider(reason, "Refusing to resume #{run['task_id']}")
     end
@@ -299,7 +299,8 @@ module SpecrelayRunner
       # it reads and proves that worktree where an ordinary claim creates a clean one. A refusal
       # here stops before the provider, before the package, and before any external write.
       if @resume
-        prepared = @resume.prepare(workspace: measuring_workspace(root))
+        prepared = @resume.prepare(measuring: measuring_workspace(root), creating: creating_workspace(root),
+                                   download: -> { download_checkpoint })
         return resume_refused(prepared.reason) unless prepared.ok?
       end
       worktree = prepared&.worktree || create_worktree(root)
@@ -586,14 +587,25 @@ module SpecrelayRunner
       "Published #{published.length} repository branch(es) for #{run['task_id']}"
     end
 
-    def create_worktree(root)
+    def create_worktree(root) = creating_workspace(root).create
+
+    # The workspace that may BUILD the task environment, through the project's own command. One
+    # owner, because a resume onto a machine that never saw the work builds it the same way an
+    # ordinary first execution does.
+    def creating_workspace(root)
       Workspace.new(root: root, canonical_branch: run["canonical_branch"], task_id: run["task_id"],
-                    create_command: workspace.fetch("worktree_create_command")).create
+                    create_command: workspace.fetch("worktree_create_command"))
     end
 
-    # The same workspace, for READING only: the change capture, the Stage 2a checkpoint and the
-    # resume's worktree lookup all ask about a worktree rather than create one, so none of them
-    # carries a create command.
+    # The recorded package, from the one claim-bound path Platform put in the assignment.
+    def download_checkpoint
+      client.executor_question_checkpoint(claim: claim, path: @resume.download_path)
+            .to_h["payload"]
+    end
+
+    # The same workspace, for READING only: the change capture, the checkpoint and the resume's
+    # worktree lookup all ask about a worktree rather than create one, so none of them carries a
+    # create command.
     def measuring_workspace(root)
       Workspace.new(root: root, canonical_branch: run["canonical_branch"], create_command: "")
     end
@@ -611,7 +623,7 @@ module SpecrelayRunner
       # The bridge lives in the STAGING directory, outside the worktree, so a question request
       # can never appear in the diff the executor is measured on.
       @bridge = QuestionBridge.new(client: client, claim: claim, staging_dir: staging, io: io,
-                                   measure: -> { measure_checkpoint(root, worktree) },
+                                   capture: -> { capture_checkpoint(root, worktree, staging) },
                                    resume_question_id: @resume&.question_id).start
       result = Executor.new(config: payload.fetch("executor"), worktree_path: worktree.path,
                             staging_dir: staging, env: env)
@@ -643,11 +655,22 @@ module SpecrelayRunner
       Executor::Result.new(**result.to_h, stdout: @claude_stream.final_text)
     end
 
-    # MVP-0036 Stage 2a — what this machine looked like at the instant the provider paused.
-    def measure_checkpoint(root, worktree)
-      Checkpoint.measure(repository_key: workspace.fetch("workspace_key"),
-                         branch: run["canonical_branch"].to_s, worktree_path: worktree.path,
-                         workspace: measuring_workspace(root))
+    # The portable checkpoint of everything the provider has changed, taken at the instant it
+    # pauses. It reads the executor's OWN repository selection — the same document publication
+    # reads — and verifies it through the same rules, so a question is never stored describing
+    # repositories this runner could not prove.
+    #
+    # A refusal here reaches the provider, which may correct its selection and ask again while
+    # its session is alive.
+    def capture_checkpoint(root, worktree, staging)
+      reported = RepositorySelection.read(staging)
+      return Checkpoint.refuse_capture(reported.error) unless reported.ok?
+
+      measuring = measuring_workspace(root)
+      selection = measuring.select(worktree.path, reported.entries.map(&:path), require_change: false)
+      return Checkpoint.refuse_capture(selection.error) unless selection.ok?
+
+      Checkpoint.capture(repositories: selection.repositories, workspace: measuring)
     end
 
     # MVP-0036 — the two honest endings for a provider that paused on a question. Neither runs
@@ -911,6 +934,9 @@ module SpecrelayRunner
           and is a reserved key. The whole document must fit within #{contract['max_document_bytes']} bytes.
         - `continuation_context` requires: #{fields.map { |name, description| "`#{name}` (#{description})" }.join(', ')}.
           It is PUBLIC: no local paths, credentials, or your own reasoning.
+        - Write the repository selection above FIRST and keep it current: SpecRelay checkpoints
+          exactly the repositories it names so another machine can continue this work, and a
+          question whose selection is missing, stale or unverifiable is refused rather than stored.
         - Then wait for `#{File.join(bridge_path, QuestionBridge::ANSWER)}` and continue with its
           `answers`, or for `#{File.join(bridge_path, QuestionBridge::ERROR)}`, which you may correct
           and re-submit. If neither appears, your session was released; stop.

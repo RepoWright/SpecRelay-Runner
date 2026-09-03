@@ -224,6 +224,11 @@ class FakePlatform
   # runner is waiting on, and a scripted answer for the acknowledgement itself.
   attr_accessor :question_poll_delay, :delivery_response
 
+  # The recorded portable checkpoint this fake hands back on the claim-bound download path, and
+  # a scripted response so a test can put a transfer failure in front of a runner that has not
+  # yet built anything.
+  attr_accessor :checkpoint_payload, :checkpoint_response
+
   # MAPIAI-60 CR-002 F1: how long a live-log response is withheld, so a test can put a Platform
   # that has stopped answering UNDERNEATH an attempt that is finishing. Only `log.*` events are
   # held, and only on their own connection thread — a delay that also stalled this fake's accept
@@ -353,6 +358,7 @@ class FakePlatform
     when "/api/runner/specification_publications" then specification_publication(request)
     when "/api/runner/review_results" then review_result(request)
     when "/api/runner/executor_questions" then executor_question(request)
+    when %r{\A/api/runner/executor_questions/[^/]+/checkpoint\z} then executor_question_checkpoint
     when %r{\A/api/runner/executor_questions/(?<id>.+)\z} then executor_question_member(request)
     else [ 404, { error: "not found" } ]
     end
@@ -383,6 +389,18 @@ class FakePlatform
 
   def executor_question_member(request)
     request[:method] == "PATCH" ? confirm_delivery : executor_question_state
+  end
+
+  # The claim-bound download. The bytes travel base64-encoded exactly as they were submitted,
+  # because the runner verifies them against the size and checksum the assignment recorded.
+  #
+  # No version field: the runner declares its own on the way out and never reads the server's, so
+  # a fixture that echoed one would only be an unverified copy of a Platform constant.
+  def executor_question_checkpoint
+    return @checkpoint_response if @checkpoint_response
+    return [ 404, { error: "no checkpoint for the given claim" } ] if @checkpoint_payload.nil?
+
+    [ 200, { payload: @checkpoint_payload } ]
   end
 
   # The POLL. Every read moves the counter, so a settlement scheduled for the Nth poll happens
