@@ -88,10 +88,12 @@ module SpecrelayRunner
     # dependencies rather than facts about the developer's machine.
     def initialize(out:, err:, claim:, execute:, poll_seconds:, on_failure: ON_FAILURE_CONTINUE,
                    install_signals: true, max_iterations: nil, sleeper: nil, presenter: nil,
-                   clock: Process, label: nil, presence: Presence::NONE)
+                   clock: Process, label: nil, presence: Presence::NONE,
+                   connector: PreviewConnector::NONE)
       @claim = claim
       @execute = execute
       @presence = presence
+      @connector = connector
       @poll_seconds = poll_seconds
       @on_failure = on_failure
       @install_signals = install_signals
@@ -117,10 +119,14 @@ module SpecrelayRunner
     def call
       trap_signals
       announce_start
-      status = announce_presence == :stop ? FAILED : poll_loop
+      status = session_status
       announce_stop
       status
     ensure
+      # The connector is this session's own child, and this is the only place that runs on every
+      # exit path — so it is stopped here rather than beside the start, and before the goodbye
+      # that ends the session's presence.
+      connector.stopped
       # MVP-0031: the best-effort goodbye, on EVERY exit path — a normal stop, Ctrl-C,
       # SIGTERM, a fatal credential rejection, or an exception on its way past. It cannot
       # change `status`, which has already been decided: a machine that failed to say goodbye
@@ -135,7 +141,17 @@ module SpecrelayRunner
     private
 
     attr_reader :claim, :execute, :poll_seconds, :on_failure, :max_iterations, :sleeper, :presenter,
-                :clock, :label, :presence
+                :clock, :label, :presence, :connector
+
+    # The session's two preconditions, LOCAL before remote: a machine that cannot run its own
+    # preview connector is told so before it asks Platform for anything, so it never holds work it
+    # could not have published. Either refusal has already recorded one actionable failure.
+    def session_status
+      return FAILED if start_connector == :stop
+      return FAILED if announce_presence == :stop
+
+      poll_loop
+    end
 
     def poll_loop
       iterations = 0
@@ -154,6 +170,11 @@ module SpecrelayRunner
 
     # One poll. Returns :continue to keep looping or :stop to end the session.
     def one_iteration
+      # Asked once per poll, which makes this loop's own interval the connector's recovery
+      # cadence: a child that has gone is reported and started again here, on the tick after it
+      # went, rather than in a retry of its own.
+      return :stop if keep_connector_running == :stop
+
       transient "checking for eligible work"
       result = claim.call
       note_recovery
@@ -353,18 +374,30 @@ module SpecrelayRunner
     # process will never be current again. A transient failure is left alone — the loop keeps
     # polling and Platform's own window reports Offline until the network returns.
     def keep_presence_current
-      act_on_presence(presence.heartbeat_if_due)
+      act_on_session(presence.heartbeat_if_due)
     end
 
     def resume_presence
-      act_on_presence(presence.resume)
+      act_on_session(presence.resume)
     end
 
     def announce_presence
-      act_on_presence(presence.started)
+      act_on_session(presence.started)
     end
 
-    def act_on_presence(outcome)
+    def start_connector
+      act_on_session(connector.started)
+    end
+
+    def keep_connector_running
+      act_on_session(connector.restart_if_exited)
+    end
+
+    # ONE rule for every permanent session-level refusal, whatever reported it: record one
+    # actionable failure, print the single thing the operator has to do, and stop. A revoked
+    # credential, a superseded presence session, a machine with no stored preview connector and a
+    # machine with no connector program to run are all states no wait would fix.
+    def act_on_session(outcome)
       return :continue unless outcome.stop?
 
       @stop_requested = true
