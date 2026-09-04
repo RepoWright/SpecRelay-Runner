@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 
 # An in-memory stand-in for the macOS Keychain, exercising the same narrow seam the real
-# SecretStore exposes (MVP-0017, extended for MVP-0021 deletion).
+# SecretStore exposes.
 #
 # It is used INSTEAD of shelling out to `security` so the suite never touches the developer's
 # real Keychain and never raises an interactive prompt in CI. The real tool's own behaviour —
@@ -29,8 +29,11 @@ class FakeSecretStore
     @fail_delete = fail_delete
   end
 
-  def write(account:, credential:)
-    raise SpecrelayRunner::SecretStore::Error, "keychain access was denied" if @fail_write
+  # `label` is accepted because the real store takes it — it names the stored item in a failure
+  # message — and a double whose signature drifts from the class it stands in for is how a caller
+  # passes something production would reject.
+  def write(account:, credential:, label: "runner credential")
+    raise SpecrelayRunner::SecretStore::Error, "keychain access was denied #{label}" if @fail_write
 
     @writes << account
     @entries[account] = credential
@@ -48,15 +51,13 @@ class FakeSecretStore
 
   def read(account:) = @entries[account]
 
-  # MVP-0021 scope 5. Mirrors the real store: removing an item that is not there is SUCCESS,
-  # because the caller has got the state it asked for. A Keychain that REFUSED the deletion is a
-  # failure, and — this is the part round 001 could not express — the item is still stored
-  # afterwards.
+  # Mirrors the real store: removing an item that is not there is SUCCESS, because the caller has
+  # got the state it asked for. A Keychain that REFUSED the deletion is a failure, and the item is
+  # still stored afterwards.
   #
-  # `fail_delete` existed before CR-001 but nothing used it, and the fake deleted the entry even
-  # when it was set. That was the coverage gap review-001 named: a double that cannot answer
-  # *wrongly* cannot catch a caller that believes every answer. It now leaves the entry in place,
-  # so a test can assert both the reported failure AND that the credential really survived.
+  # `fail_delete` once deleted the entry anyway, which was a coverage gap: a double that cannot
+  # answer *wrongly* cannot catch a caller that believes every answer. It now leaves the entry in
+  # place, so a test can assert both the reported failure AND that the credential really survived.
   def delete_credential(account:)
     if @fail_delete
       @refused_deletes << account

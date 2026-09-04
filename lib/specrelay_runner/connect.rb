@@ -5,7 +5,7 @@ require "socket"
 require "time"
 
 module SpecrelayRunner
-  # The guided runner connection (MVP-0017 scope 2): `specrelay-runner connect <code>`.
+  # The guided runner connection: `specrelay-runner connect <code>`.
   #
   # This is the ONLY local action a normal user performs. The whole command asks for
   # exactly one thing — the local checkout directory — and derives everything else:
@@ -14,8 +14,9 @@ module SpecrelayRunner
   #      secret, so it travels inside the code and the displayed command needs no flag);
   #   2. the runner identity, derived from this machine's hostname, so it is stable and a
   #      retry updates the same runner instead of creating a second one;
-  #   3. the project/workspace assignment, the repository identity to validate against,
-  #      and the executor profile, all returned by the enrollment exchange.
+  #   3. the project/workspace assignment, the repository identity to validate against, the
+  #      executor profile, and this machine's own preview connector, all returned by the
+  #      enrollment exchange.
   #
   # Order is load-bearing and fails closed at each step:
   #
@@ -23,20 +24,22 @@ module SpecrelayRunner
   #   ask for the checkout -> validate the checkout ->
   #   provider readiness (only for the real Claude profile) ->
   #   prove the OS secret store is writable -> EXCHANGE the code ->
-  #   store the credential -> save non-secret local state -> report readiness to Platform
+  #   store the credential and the preview connector token ->
+  #   save non-secret local state -> report readiness to Platform
   #
   # Every step that can fail for a purely local reason runs BEFORE the exchange, so a failed
-  # first connection costs nothing — not even the one-time code. The unsupported-platform check
-  # runs first, before any Platform call; the Keychain writability check runs last among the
-  # local steps, immediately before the code is spent. The credential is stored BEFORE readiness
-  # is reported, so a runner Platform believes is ready can always authenticate. If a step after
+  # attempt costs nothing — not even the one-time code — on a first connection and on a
+  # reconnect alike. The unsupported-platform check runs first, before any Platform call; the
+  # Keychain writability check runs last among the local steps, immediately before the code is
+  # spent. The credential is stored BEFORE readiness is reported, so a runner Platform believes
+  # is ready can always authenticate. If a step after
   # the exchange fails, Platform holds the connection in `pending`/`blocked` — never `ready` —
   # and the operator reissues a code and retries.
   #
-  # Secret posture: the durable credential is never printed, never written to YAML, a
-  # shell profile, Git, or a log, and never appears in an error message. The local
-  # checkout path is stored locally and never sent to Platform. Provider probe output is
-  # reduced to one classification and discarded.
+  # Secret posture: neither the durable credential nor the preview connector token is ever
+  # printed, written to YAML, a shell profile, Git, or a log, and neither appears in an error
+  # message. The local checkout path is stored locally and never sent to Platform. Provider probe
+  # output is reduced to one classification and discarded.
   class Connect
     Error = Class.new(StandardError)
 
@@ -46,8 +49,8 @@ module SpecrelayRunner
     CODE_PREFIX = "sre_"
     CODE_SEPARATOR = "."
 
-    # MVP-0033 — this machine advertises no reviewer capability. A normal state, not a
-    # failure: it stays a fully usable executor (S12).
+    # This machine advertises no reviewer capability. A normal state, not a failure: it stays a
+    # fully usable executor.
     NO_REVIEWER = "not_configured"
 
     # The readiness classification Platform accepts as ready.
@@ -81,24 +84,23 @@ module SpecrelayRunner
       secret_store = resolve_secret_store
       origin = origin_from_code!
 
-      # Everything local happens against a PREVIEW, which does not consume the code (round 002,
-      # review-001 F3). Round 001 exchanged first, so a mistyped checkout or an unauthenticated
-      # provider spent the code and — for an already-connected machine — rotated its credential
-      # and demoted its grant. One typo took a working runner offline. Now a failure here costs
-      # nothing at all: the same code still works.
+      # Everything local happens against a PREVIEW, which does not consume the code. Exchanging
+      # first meant a mistyped checkout or an unauthenticated provider spent the code and — for an
+      # already-connected machine — rotated its credential and demoted its grant. One typo took a
+      # working runner offline. Now a failure here costs nothing at all: the same code still works.
       assignment = preview(origin)
       workspace = assignment.fetch("workspace")
       checkout = validated_checkout!(workspace)
       readiness = executor_readiness(assignment.fetch("executor", {}))
-      # Resolved ONCE, before anything is stored or reported (MAPIAI-91). Deriving it separately
-      # for the readiness report and for later local execution is what let this machine advertise
-      # a reviewer it could not then launch.
+      # Resolved ONCE, before anything is stored or reported. Deriving it separately for the
+      # readiness report and for later local execution is what let this machine advertise a
+      # reviewer it could not then launch.
       reviewer = reviewer_settings(readiness)
 
-      # What this machine already holds decides both whether a write will be needed and what
-      # the exchange presents, so it is resolved before anything is consumed.
+      # What this machine already holds decides what the exchange presents, so it is resolved
+      # before anything is consumed.
       held = held_credential(secret_store, workspace, origin)
-      verify_secret_storage!(secret_store) if held.nil?
+      verify_secret_storage!(secret_store)
 
       # Only now is anything consumed or changed.
       enrolled = exchange(origin, held)
@@ -152,13 +154,15 @@ module SpecrelayRunner
 
     # Prove local secret storage works BEFORE the one-time code is spent.
     #
-    # Only when this machine holds no credential yet, because that is exactly when a write is
-    # certain to be needed; a reconnect that presents its held credential is not asked to write
-    # anything, so a Keychain check must not be able to block it.
+    # Unconditionally, because every successful exchange returns a connector token this machine
+    # must store — a reconnect included. Probing only a machine that holds no credential yet was
+    # right while the credential was the only stored secret; it would now let a reconnect spend a
+    # code it could never have finished using.
     #
-    # This ordering is the difference between a failed first connection costing nothing and
-    # costing a freshly issued code every retry — the state a real operator hit when the
-    # Keychain write itself was broken.
+    # This ordering is the difference between a failed connection costing nothing and costing a
+    # freshly issued code every retry — the state a real operator hit when the Keychain write
+    # itself was broken. It runs last among the local steps, so an operator with a mistyped
+    # checkout still hears about the checkout.
     def verify_secret_storage!(secret_store)
       secret_store.verify_writable!
       out.puts "Keychain:           writable (checked before the enrollment code was used)"
@@ -176,17 +180,32 @@ module SpecrelayRunner
       raise Error, "Platform returned no usable credential for this machine" if @credential.nil?
 
       @credential_unchanged = enrolled["credential_unchanged"] ? true : false
+      @preview_connector = preview_connector!(enrolled["preview_connector"])
       @base_url = presence(enrolled.dig("platform", "base_url")) || origin
       enrolled
+    end
+
+    # The token for this machine's own preview connector, which Platform provisioned during the
+    # exchange. REQUIRED: a machine that Platform believes can publish a preview but which holds
+    # no connector would fail much later and somewhere else, so a nominally successful response
+    # without one is refused here — before anything is stored or reported.
+    #
+    # Only the token is read. Platform sends nothing else about the connector, and this machine
+    # deliberately learns nothing about the account it lives in.
+    def preview_connector!(connector)
+      token = presence(connector.is_a?(Hash) ? connector["token"] : nil)
+      raise Error, "Platform returned no preview connector for this machine" if token.nil?
+
+      token
     end
 
     # The credential this machine already holds for THIS Platform, or nil.
     #
     # The credential is per RUNNER, not per workspace, so it is looked up by the runner identity
     # this machine already has for this Platform origin — found in the local connection store,
-    # from ANY workspace it has connected to. Round 002 looked only at the workspace being
-    # connected, so a first-time connection to a second workspace presented nothing, Platform
-    # rotated, and the first workspace's stored copy went stale (review-002, F3 residual).
+    # from ANY workspace it has connected to. Looking only at the workspace being connected meant
+    # a first-time connection to a second workspace presented nothing, Platform rotated, and the
+    # first workspace's stored copy went stale.
     #
     # Legacy per-workspace entries are read as a fallback so a machine that connected under the
     # old scheme keeps working without reconnecting.
@@ -207,11 +226,11 @@ module SpecrelayRunner
     # legacy per-workspace accounts for EVERY workspace this machine has connected at this
     # origin — not only the one being connected.
     #
-    # Round 003 checked the legacy account for the workspace being connected alone. A machine
-    # whose credential is still under `workspace:<some-other-workspace>` therefore presented
-    # nothing when connecting a NEW workspace, Platform issued a fresh credential, and the
-    # other workspace's stored copy went stale — the same orphaning the runner-scoped account
-    # was introduced to end, just reached by a different route.
+    # Checking the legacy account for the workspace being connected alone left a machine whose
+    # credential is still under `workspace:<some-other-workspace>` presenting nothing when
+    # connecting a NEW workspace: Platform issued a fresh credential and the other workspace's
+    # stored copy went stale — the same orphaning the runner-scoped account was introduced to
+    # end, just reached by a different route.
     def candidate_accounts(origin, workspace)
       legacy_keys = origin_connections(origin).map(&:workspace_key) + [ workspace["workspace_key"] ]
       runner_accounts(origin) +
@@ -293,15 +312,22 @@ module SpecrelayRunner
       "executor_check_failed"
     end
 
-    # Credential first, then local state. A credential stored without local state leaves a
+    # Secrets first, then local state. A credential stored without local state leaves a
     # recoverable runner; local state pointing at a credential that was never stored would
-    # not authenticate. A reconnect that kept its existing credential writes nothing to the
-    # secret store, so it cannot fail on a Keychain prompt it does not need.
+    # not authenticate. A reconnect that kept its existing credential writes no CREDENTIAL, so
+    # nothing it already relies on is replaced.
+    #
+    # The connector token IS upserted on every connection, because Platform issues one every
+    # time and a reconnect must end holding the token for the connector it was just given. That
+    # is why `#verify_secret_storage!` now runs before every exchange rather than only before a
+    # first one: every path through here writes.
     def persist(secret_store, assignment, workspace, checkout, reviewer)
+      public_id = runner_public_id!(assignment)
       unless @credential_unchanged
-        secret_store.write(account: SecretStore.account_for_runner(runner_public_id!(assignment)),
-                           credential: @credential)
+        secret_store.write(account: SecretStore.account_for_runner(public_id), credential: @credential)
       end
+      secret_store.write(account: SecretStore.preview_connector_account_for(public_id),
+                         credential: @preview_connector, label: "preview connector token")
       store.save(ConnectionStore::Connection.new(
                    base_url: @base_url, runner_id: identity.fetch("id"),
                    runner_public_id: assignment.dig("runner", "public_id"),
@@ -313,12 +339,13 @@ module SpecrelayRunner
                    repository_url: workspace.fetch("repository_url"),
                    default_branch: workspace.fetch("default_branch"),
                    local_path: checkout.fetch(:path),
-                   # MAPIAI-91 — the provider identifier only, and only when a reviewer was really
-                   # advertised. Non-secret, and the least that reconstructs the same reviewer.
+                   # The provider identifier only, and only when a reviewer was really advertised.
+                   # Non-secret, and the least that reconstructs the same reviewer.
                    reviewer_provider: (reviewer.provider if reviewer&.configured?),
                    connected_at: Time.now.utc.iso8601
                  ))
       out.puts "Credential:         #{credential_line}"
+      out.puts "Preview connector:  stored in the macOS Keychain (never printed or written to a file)"
     end
 
     # The runner identity Platform issued. Required, because it is the Keychain account name the
@@ -348,7 +375,7 @@ module SpecrelayRunner
       build_result(assignment, response)
     end
 
-    # MVP-0033 contract 3 — the REVIEWER capability, advertised alongside the executor one.
+    # The REVIEWER capability, advertised alongside the executor one.
     #
     # Bounded public facts only: role, name, provider, version and a one-way digest of the
     # local configuration. The command, its arguments, the timeout and the operator's paths
@@ -356,7 +383,7 @@ module SpecrelayRunner
     #
     # A machine with no `runner.reviewer:` block reports `not_configured` and nothing else.
     # That leaves review waiting for another machine and does not affect this one's executor
-    # readiness in any way (S12).
+    # readiness in any way.
     def reviewer_report(reviewer)
       return { reviewer_readiness: NO_REVIEWER } unless reviewer&.configured?
 
@@ -368,11 +395,11 @@ module SpecrelayRunner
     # lane's provider is: an explicit environment override wins, and otherwise the machine
     # reviews with the SAME provider installation its executor already proved ready.
     #
-    # That default is contract 3's "ordinary solo setup may select the same provider
-    # installation for both roles" — the independence this MVP requires comes from a separate
-    # role profile, a separate process and separate fixed instructions, not from a second
-    # installation. A machine whose executor is NOT ready advertises no reviewer: an
-    # unauthenticated CLI cannot review any more than it can implement.
+    # That default is the "ordinary solo setup may select the same provider installation for both
+    # roles" case — the independence this product requires comes from a separate role profile, a
+    # separate process and separate fixed instructions, not from a second installation. A machine
+    # whose executor is NOT ready advertises no reviewer: an unauthenticated CLI cannot review any
+    # more than it can implement.
     def reviewer_settings(readiness)
       return Review::Settings.new({}, env: env) if env[Review::Settings::PROVIDER_ENV].to_s.strip != ""
       return nil unless readiness[:classification] == READY && readiness[:provider] == ClaudeProfile::PROVIDER

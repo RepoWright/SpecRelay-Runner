@@ -2,18 +2,18 @@
 
 require_relative "test_helper"
 
-# MVP-0017 — the macOS Keychain adapter seam.
+# The macOS Keychain adapter seam.
 #
 # The real `security` command is not invoked here: shelling out to it would touch the
 # developer's Keychain and could raise an interactive prompt in CI. What is proved instead is
 # everything around the tool — the platform gate refuses a non-macOS host with NO plaintext
-# fallback; the argv handed to the tool never contains the credential (an argv element is
-# visible in the process table, review-001 F8); the value is delivered on stdin; every write is
-# read back and a mismatch is undone; a missing item is a normal empty result; and no failure
-# message ever echoes the credential.
+# fallback; the argv handed to the tool never contains a stored value (an argv element is
+# visible in the process table); the value is delivered on stdin; every write is read back and a
+# mismatch is undone; a missing item is a normal empty result; and no failure message ever
+# echoes a stored value.
 #
-# The one thing a fake runner CANNOT prove is how the real tool reads a prompt. That is what
-# shipped broken in round 002, and it is covered by `keychain_tty_test.rb` under a real pty.
+# The one thing a fake runner CANNOT prove is how the real tool reads a prompt, which is covered
+# by `keychain_tty_test.rb` under a real pty.
 class SecretStoreTest < Minitest::Test
   SERVICE = SpecrelayRunner::SecretStore::SERVICE
   ACCOUNT = "runner:rnr_ea88b7a19b174a9788acf36f2fac693d"
@@ -75,7 +75,7 @@ class SecretStoreTest < Minitest::Test
     assert store.write(account: ACCOUNT, credential: "src_abc")
 
     # THE point of this example: the credential is in no process's argv, so it is not visible
-    # in the process table (review-001 F8).
+    # in the process table.
     assert_equal %w[security -i], runner.invocations.first
     refute runner.all_argv.any? { |element| element.include?("src_abc") },
            "credential leaked into argv: #{runner.all_argv.inspect}"
@@ -261,10 +261,9 @@ class SecretStoreTest < Minitest::Test
 
   # --- the account name is non-secret and RUNNER-scoped ---------------------
 
-  # Round 003 (review-002, F3 residual): the credential is per RUNNER
-  # (`registered_runners.credential_digest`), so its Keychain account must be too. Keying it per
-  # workspace meant a first-time connection to a second workspace rotated the shared credential
-  # and orphaned the first workspace's stored copy.
+  # The credential is per RUNNER (`registered_runners.credential_digest`), so its Keychain
+  # account must be too. Keying it per workspace meant a first-time connection to a second
+  # workspace rotated the shared credential and orphaned the first workspace's stored copy.
   def test_the_keychain_account_names_only_the_runner_identity
     account = SpecrelayRunner::SecretStore.account_for_runner("rnr_ea88b7a19b174a9788acf36f2fac693d")
 
@@ -272,6 +271,51 @@ class SecretStoreTest < Minitest::Test
     # No local path, operator email, or provider account may appear in the key.
     refute_match(%r{/}, account)
     refute_includes account, "@"
+  end
+
+  # The preview connector token is a different secret with a different lifetime from the durable
+  # Platform credential, so it gets its own account under the same runner identity. Sharing one
+  # account would make replacing either one destroy the other.
+  def test_the_preview_connector_has_its_own_runner_scoped_account
+    public_id = "rnr_ea88b7a19b174a9788acf36f2fac693d"
+    account = SpecrelayRunner::SecretStore.preview_connector_account_for(public_id)
+
+    assert_equal "preview-connector:#{public_id}", account
+    refute_equal SpecrelayRunner::SecretStore.account_for_runner(public_id), account
+    # Two machines get two accounts, and neither names a path, an operator, or a provider account.
+    refute_equal account, SpecrelayRunner::SecretStore.preview_connector_account_for("rnr_other")
+    refute_match(%r{/}, account)
+    refute_includes account, "@"
+  end
+
+  def test_a_connector_token_is_written_to_its_own_account_and_named_in_its_own_failures
+    token = "connector-token-not-a-real-secret"
+    runner = write_runner(stored: token)
+    store = SpecrelayRunner::SecretStore.new(runner: runner)
+
+    assert store.write(account: SpecrelayRunner::SecretStore.preview_connector_account_for("rnr_x"),
+                       credential: token, label: "preview connector token")
+
+    assert_includes runner.stdins.first, "preview-connector:rnr_x"
+    refute_includes runner.stdins.first, "runner:rnr_x"
+    refute runner.all_argv.any? { |element| element.include?(token) },
+           "the connector token must never appear in argv"
+  end
+
+  # A failure has to name the item that failed. Reporting the durable credential when the
+  # connector token is what could not be stored would send the operator after the wrong secret.
+  def test_a_refused_connector_write_names_the_connector_token_and_never_its_value
+    token = "connector-token-not-a-real-secret"
+    runner = RecordingRunner.new([ ok, ok(stdout: "something-else\n"), ok ])
+
+    error = assert_raises(SpecrelayRunner::SecretStore::Error) do
+      SpecrelayRunner::SecretStore.new(runner: runner)
+                                  .write(account: "preview-connector:rnr_x", credential: token,
+                                         label: "preview connector token")
+    end
+
+    assert_match(/did not store the preview connector token exactly as issued/, error.message)
+    refute_includes error.message, token
   end
 
   # Retained for READS only, so a machine that connected under the old scheme keeps working.
@@ -302,7 +346,7 @@ class SecretStoreTest < Minitest::Test
     assert_empty runner.invocations
   end
 
-  # --- deletion (MVP-0021 scope 5) ------------------------------------------
+  # --- deletion -------------------------------------------------------------
 
   def test_deleting_a_credential_addresses_exactly_that_account_and_service
     runner = RecordingRunner.new([ ok ])
@@ -315,7 +359,7 @@ class SecretStoreTest < Minitest::Test
   # `security` exits ITEM_NOT_FOUND (44) when there is nothing to delete. That is the state the
   # caller asked for, so it is success — an operator cleaning up a connection whose credential was
   # already gone must not be shown a failure. It is the ONLY non-zero status treated this way; the
-  # full classification matrix lives in `destructive_paths_test.rb` (CR-001).
+  # full classification matrix lives in `destructive_paths_test.rb`.
   def test_deleting_a_credential_that_is_not_there_is_success
     runner = RecordingRunner.new([ failed(stderr: "SecKeychainSearchCopyNext: The specified item could not be found") ])
 
@@ -324,7 +368,7 @@ class SecretStoreTest < Minitest::Test
 
   # A tool that could not be RUN means the operator's request was not carried out and the item is
   # still stored — which the message must say, because the caller may have just deleted the local
-  # entry that would lead back to it (CR-001, review-001 F1).
+  # entry that would lead back to it.
   def test_a_keychain_that_cannot_be_reached_raises_and_names_the_account
     runner = RecordingRunner.new([ nil ])
 

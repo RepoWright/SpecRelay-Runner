@@ -2,14 +2,15 @@
 
 require_relative "test_helper"
 
-# MVP-0017 — the guided connection, asserted as behavior against a real HTTP fake
-# Platform and real local Git repositories.
+# The guided connection, asserted as behavior against a real HTTP fake Platform and real local
+# Git repositories.
 #
 # The claims this file is here to prove:
 #   - `connect` needs no YAML, no exported credential, and no workspace key;
 #   - the local checkout is validated against the ASSIGNED repository before the runner
 #     can become ready, and a mismatch/missing checkout/missing branch refuses;
-#   - the durable credential goes to the OS secret store and is never printed;
+#   - the durable credential and the machine's own preview connector token go to the OS secret
+#     store, under separate accounts, and neither is ever printed;
 #   - only non-secret facts reach Platform — no local path, no credential;
 #   - a retry is idempotent in the runner's own storage;
 #   - the runner renders the state PLATFORM decided, not its own opinion;
@@ -29,7 +30,7 @@ class ConnectFlowTest < Minitest::Test
   # --- test doubles ---------------------------------------------------------
 
   # The in-memory Keychain stand-in lives in `support/fake_secret_store.rb` — it is shared with
-  # the MVP-0021 connection-management tests, so "what the Keychain seam does" has exactly one
+  # the connection-management tests, so "what the Keychain seam does" has exactly one
   # definition rather than one per test file.
   FakeSecretStore = ::FakeSecretStore
 
@@ -89,8 +90,8 @@ class ConnectFlowTest < Minitest::Test
     assert result.ready?, "Platform reported #{result.state}: #{result.detail}"
     assert_equal "tiny-demo-workspace", result.workspace_key
     # The credential reached the OS secret store, keyed by the RUNNER identity Platform issued —
-    # the credential's actual scope (round 003, review-002 F3 residual).
-    assert_equal [ "runner:rnr_fake" ], secret_store.writes
+    # the credential's actual scope.
+    assert_equal [ "runner:rnr_fake", "preview-connector:rnr_fake" ], secret_store.writes
     # …and was never printed.
     refute_includes out, FakePlatform::ISSUED_CREDENTIAL
   end
@@ -218,7 +219,7 @@ class ConnectFlowTest < Minitest::Test
 
   # --- the Keychain is proved writable BEFORE the code is spent --------------
   #
-  # Reported from a real manual run after round 003: the Keychain write was broken on the
+  # Reported from a real manual run: the Keychain write was broken on the
   # operator's machine, and because it was attempted only AFTER the exchange, every retry
   # needed a newly issued enrollment code. A local storage failure must cost nothing, exactly
   # like the local checkout failures above.
@@ -264,22 +265,34 @@ class ConnectFlowTest < Minitest::Test
     assert_equal 0, secret_store.probes
   end
 
-  # A reconnect writes nothing, so a Keychain check must not be able to block it. Otherwise a
-  # machine that already holds a working credential could be refused for a write it never makes.
-  def test_a_reconnect_that_keeps_its_credential_is_not_gated_on_writability
+  # A reconnect writes too. Every successful exchange returns a connector token this machine must
+  # store, so the pre-flight covers a reconnect as well: a machine whose store is locked must be
+  # refused BEFORE it spends a code it could not have finished using.
+  def test_a_reconnect_with_a_locked_store_is_refused_before_the_code_is_consumed
     platform = start_platform
     secret_store = FakeSecretStore.new
     connect(code: platform.enrollment_code, checkout: git_checkout, secret_store: secret_store)
-    baseline_probes = secret_store.probes
+    stored_writes = secret_store.writes.dup
+    stored_state = File.read(@state_file)
+    exchanges = platform.requests_to("/api/runner/enrollment").size
 
     platform.held_credential = FakePlatform::ISSUED_CREDENTIAL
     platform.enrollment_code = code_for(platform.base_url)
     secret_store.fail_probe = true
 
-    result, = connect(code: platform.enrollment_code, checkout: git_checkout, secret_store: secret_store)
+    error = assert_raises(SpecrelayRunner::SecretStore::Error) do
+      connect(code: platform.enrollment_code, checkout: git_checkout, secret_store: secret_store)
+    end
 
-    assert result.ready?, "a reconnect must not be blocked by a check for a write it does not make"
-    assert_equal baseline_probes, secret_store.probes, "no probe may run when a credential is held"
+    # Refused before the exchange was POSTed, so the reissued code is still usable…
+    assert_equal exchanges, platform.requests_to("/api/runner/enrollment").size
+    assert_match(/code was NOT used/, error.message)
+    # …and neither stored secret nor the local connection record moved.
+    assert_equal stored_writes, secret_store.writes
+    assert_equal FakePlatform::ISSUED_CREDENTIAL, secret_store.read(account: "runner:rnr_fake")
+    assert_equal FakePlatform::ISSUED_CONNECTOR_TOKEN,
+                 secret_store.read(account: "preview-connector:rnr_fake")
+    assert_equal stored_state, File.read(@state_file)
   end
 
   # The pre-flight is not a substitute for handling a write that fails afterwards.
@@ -295,9 +308,9 @@ class ConnectFlowTest < Minitest::Test
     assert_empty platform.requests_to("/api/runner/workspace_connections")
   end
 
-  # --- review-001 F3: a failed attempt must cost the operator nothing --------
+  # --- a failed attempt must cost the operator nothing ----------------------
   #
-  # Round 001 consumed the code and rotated the credential BEFORE validating locally, so a
+  # Consuming the code and rotating the credential BEFORE validating locally meant a
   # mistyped checkout took a working runner offline. These assert the new order directly.
 
   def test_a_local_failure_does_not_consume_the_code
@@ -342,7 +355,7 @@ class ConnectFlowTest < Minitest::Test
     platform = start_platform
     secret_store = FakeSecretStore.new
     connect(code: platform.enrollment_code, checkout: git_checkout, secret_store: secret_store)
-    assert_equal 1, secret_store.writes.size
+    assert_equal 1, secret_store.writes.count("runner:rnr_fake")
 
     # Platform now recognises the held credential and issues nothing.
     platform.held_credential = FakePlatform::ISSUED_CREDENTIAL
@@ -351,8 +364,8 @@ class ConnectFlowTest < Minitest::Test
                            secret_store: secret_store)
 
     assert result.ready?
-    # No second write: the machine kept what it had, so nothing could be invalidated.
-    assert_equal 1, secret_store.writes.size
+    # No second CREDENTIAL write: the machine kept what it had, so nothing could be invalidated.
+    assert_equal 1, secret_store.writes.count("runner:rnr_fake")
     assert_includes out, "unchanged"
     assert_equal FakePlatform::ISSUED_CREDENTIAL, secret_store.read(account: "runner:rnr_fake")
   end
@@ -366,7 +379,6 @@ class ConnectFlowTest < Minitest::Test
     connect(code: platform.enrollment_code, checkout: git_checkout, secret_store: secret_store)
 
     # It travels in a HEADER, never the body, so Rails' parameter log can never contain it
-    # (round 003, review-002 N1).
     assert_equal FakePlatform::ISSUED_CREDENTIAL,
                  platform.last_enrollment.dig(:headers, "x-specrelay-runner-credential")
     refute_includes JSON.generate(platform.last_enrollment.fetch(:body)), "current_credential"
@@ -383,9 +395,9 @@ class ConnectFlowTest < Minitest::Test
     assert_equal FakePlatform::ISSUED_CREDENTIAL, secret_store.read(account: "runner:rnr_fake")
   end
 
-  # --- review-002, F3 residual: a second workspace must not orphan the first ---
+  # --- a second workspace must not orphan the first -------------------------
   #
-  # The credential is per RUNNER, but round 002 stored it per WORKSPACE. Connecting a SECOND
+  # The credential is per RUNNER, but storing it per WORKSPACE meant connecting a SECOND
   # workspace on an already-registered machine presented nothing (there was no entry for the new
   # workspace), so Platform rotated, and the first workspace's stored copy stopped
   # authenticating — `claim-once --workspace <first>` then failed.
@@ -411,7 +423,8 @@ class ConnectFlowTest < Minitest::Test
                  platform.last_enrollment.dig(:headers, "x-specrelay-runner-credential")
     # …and the single runner-scoped entry still holds it, so the FIRST workspace still works.
     assert_equal first_credential, secret_store.read(account: "runner:rnr_fake")
-    assert_equal 1, secret_store.writes.size, "a second workspace must not rewrite the credential"
+    assert_equal 1, secret_store.writes.count("runner:rnr_fake"),
+                 "a second workspace must not rewrite the credential"
   end
 
   def test_both_stored_workspaces_resolve_the_same_credential
@@ -443,7 +456,7 @@ class ConnectFlowTest < Minitest::Test
                  platform.last_enrollment.dig(:headers, "x-specrelay-runner-credential")
   end
 
-  # Round 003 consulted the legacy account for the workspace being connected ONLY. A machine
+  # Consulting the legacy account for the workspace being connected ONLY left a machine
   # whose credential still sits under ANOTHER workspace's legacy account therefore presented
   # nothing when connecting a new workspace, Platform issued a fresh credential, and the legacy
   # copy went stale — reaching the same orphaning by a different route.
@@ -453,7 +466,7 @@ class ConnectFlowTest < Minitest::Test
   def test_a_legacy_credential_stored_for_another_workspace_is_still_presented
     platform = start_platform
     secret_store = FakeSecretStore.new
-    # A machine that connected under the pre-round-003 scheme: local state knows the runner
+    # A machine that connected under the superseded scheme: local state knows the runner
     # identity and the FIRST workspace, and the credential lives under that workspace's account.
     store.save(SpecrelayRunner::ConnectionStore::Connection.new(
                  base_url: platform.base_url, runner_id: "host-runner", runner_public_id: "rnr_fake",
@@ -472,8 +485,9 @@ class ConnectFlowTest < Minitest::Test
     assert result.ready?
     assert_equal FakePlatform::ISSUED_CREDENTIAL,
                  platform.last_enrollment.dig(:headers, "x-specrelay-runner-credential")
-    # Nothing rotated, so the first workspace's stored credential still authenticates.
-    assert_equal 1, secret_store.writes.size
+    # Nothing rotated, so the first workspace's stored credential still authenticates and no
+    # runner-scoped credential was written over it.
+    assert_equal 0, secret_store.writes.count("runner:rnr_fake")
     assert_equal FakePlatform::ISSUED_CREDENTIAL, secret_store.read(account: "workspace:first-workspace")
   end
 
@@ -485,6 +499,92 @@ class ConnectFlowTest < Minitest::Test
 
     refute_includes body, FakePlatform::ISSUED_CREDENTIAL
     refute_includes body, "credential"
+  end
+
+  # --- the machine's own isolated preview connector -------------------------
+  #
+  # The operator supplies no connector configuration at all: Platform provisions the machine its
+  # own connector during the exchange and returns only that connector's token, which is stored
+  # beside — never instead of — the durable Platform credential.
+
+  def test_stores_the_preview_connector_beside_the_credential_under_its_own_account
+    platform = start_platform
+    result, out, _err, secret_store = connect(code: platform.enrollment_code, checkout: git_checkout)
+
+    assert result.ready?
+    assert_equal FakePlatform::ISSUED_CONNECTOR_TOKEN,
+                 secret_store.read(account: "preview-connector:rnr_fake")
+    # Beside, not instead of: the durable credential is untouched under its own account.
+    assert_equal FakePlatform::ISSUED_CREDENTIAL, secret_store.read(account: "runner:rnr_fake")
+    # And the operator is told it happened without being asked to configure anything.
+    assert_match(/Preview connector:\s+stored in the macOS Keychain/, out)
+  end
+
+  def test_never_prints_files_or_reports_the_preview_connector_token
+    platform = start_platform
+    _result, out, err = connect(code: platform.enrollment_code, checkout: git_checkout)
+
+    refute_includes out, FakePlatform::ISSUED_CONNECTOR_TOKEN
+    refute_includes err, FakePlatform::ISSUED_CONNECTOR_TOKEN
+    refute_includes File.read(@state_file), FakePlatform::ISSUED_CONNECTOR_TOKEN
+    refute_includes JSON.generate(platform.last_readiness_report[:body]),
+                    FakePlatform::ISSUED_CONNECTOR_TOKEN
+  end
+
+  # A reconnect keeps the credential it holds and replaces only the connector token, so a machine
+  # that reconnects can still publish a preview without its Platform authentication being touched.
+  def test_a_reconnect_replaces_only_the_preview_connector_token
+    platform = start_platform
+    secret_store = FakeSecretStore.new
+    connect(code: platform.enrollment_code, checkout: git_checkout, secret_store: secret_store)
+    platform.held_credential = FakePlatform::ISSUED_CREDENTIAL
+    platform.enrollment_code = code_for(platform.base_url)
+    platform.preview_connector = { token: "cft_fake-replacement-connector-token" }
+
+    connect(code: platform.enrollment_code, checkout: git_checkout, secret_store: secret_store)
+
+    assert_equal 1, secret_store.writes.count("runner:rnr_fake")
+    assert_equal 2, secret_store.writes.count("preview-connector:rnr_fake")
+    assert_equal "cft_fake-replacement-connector-token",
+                 secret_store.read(account: "preview-connector:rnr_fake")
+    assert_equal FakePlatform::ISSUED_CREDENTIAL, secret_store.read(account: "runner:rnr_fake")
+  end
+
+  def test_two_machine_identities_store_two_separate_preview_connectors
+    platform = start_platform
+    secret_store = FakeSecretStore.new
+    connect(code: platform.enrollment_code, checkout: git_checkout, secret_store: secret_store)
+
+    platform.runner_public_id = "rnr_second"
+    platform.preview_connector = { token: "cft_fake-second-machine-connector-token" }
+    platform.enrollment_code = code_for(platform.base_url)
+    connect(code: platform.enrollment_code, checkout: git_checkout, secret_store: secret_store)
+
+    assert_equal FakePlatform::ISSUED_CONNECTOR_TOKEN,
+                 secret_store.read(account: "preview-connector:rnr_fake")
+    assert_equal "cft_fake-second-machine-connector-token",
+                 secret_store.read(account: "preview-connector:rnr_second")
+  end
+
+  # An otherwise successful exchange that carries no usable connector is refused BEFORE anything
+  # is stored: a machine Platform believes can publish a preview but which holds no connector
+  # would fail later and somewhere else.
+  def test_refuses_an_enrollment_that_carries_no_usable_preview_connector
+    [ nil, {}, { token: "  " }, "not-an-object" ].each do |connector|
+      platform = start_platform
+      platform.preview_connector = connector
+      secret_store = FakeSecretStore.new
+
+      error = assert_raises(SpecrelayRunner::Connect::Error) do
+        connect(code: platform.enrollment_code, checkout: git_checkout, secret_store: secret_store)
+      end
+
+      assert_match(/preview connector/, error.message)
+      assert_empty secret_store.writes, "nothing may be stored for #{connector.inspect}"
+      refute File.exist?(@state_file)
+      assert_nil platform.last_readiness_report
+      platform.stop
+    end
   end
 
   # --- Platform owns the verdict --------------------------------------------
@@ -538,7 +638,7 @@ class ConnectFlowTest < Minitest::Test
     assert_equal checkout, config.workspace_root("tiny-demo-workspace", env: {})
   end
 
-  # MVP-0017: "not connected to any workspace" and "nothing to do" are different problems, so
+  # "Not connected to any workspace" and "nothing to do" are different problems, so
   # the runner surfaces the reason Platform returned instead of one generic idle line.
   def test_reports_platforms_reason_when_no_work_was_claimed
     out = StringIO.new
@@ -568,9 +668,9 @@ class ConnectFlowTest < Minitest::Test
     assert_equal "src_from-keychain", auth.token
   end
 
-  # --- the connection is enough to REVIEW (MAPIAI-91) ------------------------
+  # --- the connection is enough to REVIEW -----------------------------------
 
-  # The MAPIAI-82 defect, reproduced: `connect` advertised a ready reviewer to Platform and then
+  # The reproduced defect: `connect` advertised a ready reviewer to Platform and then
   # stored a record that said nothing about which provider that was, so the next `claim-once`
   # reported no reviewer provider on a machine Platform had just been told could review.
   def test_the_reviewer_provider_reported_as_ready_is_the_one_the_connection_stores
@@ -602,7 +702,7 @@ class ConnectFlowTest < Minitest::Test
 
   # The whole point of the ticket: after ONE guided connection, the ordinary claim command
   # completes a review of the connected checkout itself with no reviewer-provider and no
-  # workspace-root environment override. The live MAPIAI-82 run needed both.
+  # workspace-root environment override. The live run that found this needed both.
   def test_claim_once_completes_a_review_of_the_connected_checkout_without_any_override
     platform = start_platform
     checkout = git_checkout

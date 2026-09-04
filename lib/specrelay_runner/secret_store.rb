@@ -1,13 +1,14 @@
 # frozen_string_literal: true
 
 module SpecrelayRunner
-  # The runner's local durable-credential store (MVP-0017).
+  # The runner's local secret store: its durable Platform credential and its own preview
+  # connector token.
   #
-  # The guided connection must never print a durable credential, write it to YAML, a
-  # shell profile, Git, or a log. So the credential goes straight into the operating
-  # system's own secret store, and this class is the ONE narrow seam where that happens.
+  # The guided connection must never print either secret, write it to YAML, a shell profile,
+  # Git, or a log. So both go straight into the operating system's own secret store, and this
+  # class is the ONE narrow seam where that happens.
   #
-  # macOS is the supported guided-storage platform for this MVP. On any other system
+  # macOS is the supported guided-storage platform for this release. On any other system
   # `connect` fails BEFORE registration with a clear message rather than silently saving
   # a plaintext credential — an unsupported platform is a refusal, never a downgrade.
   # There is deliberately no file-based fallback in this class at all: adding one later
@@ -22,12 +23,12 @@ module SpecrelayRunner
   # ----------------------------------------------------------------------
   # `security` documents `-w` as insecure when given a value — "Use of the -p or -w options
   # is insecure" — because an argv element is visible in the process table to any process
-  # running as the same user for the duration of the call (round 002, review-001 F8).
+  # running as the same user for the duration of the call.
   #
-  # Round 002 therefore passed `-w` LAST with no value so the tool would prompt, and wrote the
-  # credential to the child's stdin. That is wrong on a real operator's machine, and it shipped
-  # because it was only ever verified where it happens to work. `security` reads that prompt
-  # with `readpassphrase(3)`, which opens **`/dev/tty`** and only falls back to stdin when no
+  # Passing `-w` LAST with no value so the tool would prompt, and writing the credential to the
+  # child's stdin, is wrong on a real operator's machine, and it shipped because it was only ever
+  # verified where it happens to work. `security` reads that prompt with `readpassphrase(3)`,
+  # which opens **`/dev/tty`** and only falls back to stdin when no
   # controlling terminal can be opened. In CI and in a captured non-interactive shell there is
   # no controlling terminal, so the stdin fallback engaged and the write succeeded. In a real
   # terminal — which is the only place a normal user ever runs `connect` — the tool prompted on
@@ -36,8 +37,7 @@ module SpecrelayRunner
   # So the command is delivered through `security -i` (interactive mode), which reads its
   # command line from **stdin**. The credential is part of that stdin line, so:
   #
-  #   - it is not an argv element of any process (`ps` shows only `security -i`), which is what
-  #     F8 required; and
+  #   - it is not an argv element of any process (`ps` shows only `security -i`); and
   #   - no terminal is involved at all, so the behaviour is identical with and without a
   #     controlling terminal.
   #
@@ -78,8 +78,8 @@ module SpecrelayRunner
     # `SecKeychainSearchCopyNext: The specified item could not be found in the keychain.`
     #
     # This is the ONLY non-zero status `delete_credential` treats as success. It exists as a
-    # named constant because round 001 assumed every non-zero status meant this one, and a
-    # refusal (exit 36, keychain locked or access denied) took the same path.
+    # named constant because assuming every non-zero status meant this one put a refusal
+    # (exit 36, keychain locked or access denied) on the same path.
     ITEM_NOT_FOUND = 44
     ITEM_NOT_FOUND_HINT = /could not be found in the keychain/i
 
@@ -100,10 +100,14 @@ module SpecrelayRunner
       @runner = runner
     end
 
-    # Store (or replace) the credential for one runner identity. `-U` upserts, so reconnecting
+    # Store (or replace) one secret for one runner identity. `-U` upserts, so reconnecting
     # overwrites rather than failing.
-    def write(account:, credential:)
-      store!(account: account, value: credential, label: "runner credential")
+    #
+    # `label` names the item in this class's own failure messages. It is a parameter because a
+    # failure that reported the durable credential when the preview connector token is what could
+    # not be stored would send the operator after the wrong secret.
+    def write(account:, credential:, label: "runner credential")
+      store!(account: account, value: credential, label: label)
     end
 
     # Prove the Keychain will accept a write, using a throwaway non-secret item.
@@ -132,23 +136,22 @@ module SpecrelayRunner
       value.empty? ? nil : value
     end
 
-    # Remove one stored item (MVP-0021 scope 5).
+    # Remove one stored item.
     #
     # SUCCESS means exactly two things: the item was deleted (exit 0), or it was ALREADY GONE
     # (exit ITEM_NOT_FOUND). The second is a success because the operator asked for the item not
     # to be there and it is not there.
     #
-    # EVERYTHING else is a refusal and raises. Round 001 shipped this as "any non-zero exit means
-    # no such item", which was measured wrong and was the more dangerous direction to be wrong in
-    # (review-001 F1): a locked or access-denied login keychain exits 36
-    # (`SecKeychainItemDelete: User interaction is not allowed.`) with the credential still
-    # stored, and that reported as "the credential was removed" — while the same operation had
+    # EVERYTHING else is a refusal and raises. Treating "any non-zero exit" as "no such item" was
+    # measured wrong, and was the more dangerous direction to be wrong in: a locked or
+    # access-denied login keychain exits 36 (`SecKeychainItemDelete: User interaction is not
+    # allowed.`) with the credential still stored, and that reported as "the credential was
+    # removed" — while the same operation had
     # just deleted the local entry that would have led the operator back to it. A deletion the OS
     # refused must reach the operator as a refusal.
     #
-    # The account name is non-secret by construction (`runner:<public-id>` or `workspace:<key>`),
-    # so a caller may name it in the confirmation it shows before calling this, and this method
-    # may name it in a failure.
+    # The account name is non-secret by construction, so a caller may name it in the confirmation
+    # it shows before calling this, and this method may name it in a failure.
     #
     # The runner NEVER calls this as a side effect of another operation. Removing a credential is
     # its own explicit, separately confirmed decision, because the credential is scoped to the
@@ -163,16 +166,24 @@ module SpecrelayRunner
     # The non-secret Keychain account name for one RUNNER identity.
     #
     # Keyed by the runner's Platform-issued public id, because that is the credential's actual
-    # scope: `registered_runners.credential_digest` is per runner, not per workspace. Round 002
-    # keyed it per workspace, so a first-time connection to a second workspace rotated the shared
+    # scope: `registered_runners.credential_digest` is per runner, not per workspace. Keying it
+    # per workspace meant a first-time connection to a second workspace rotated the shared
     # credential and left the first workspace's stored copy stale — `claim-once --workspace A`
-    # then failed to authenticate (review-002, F3 residual).
+    # then failed to authenticate.
     #
     # The public id is non-secret and carries no local path, provider account, or operator email,
     # so the Keychain listing still leaks nothing about the operator's work.
     def self.account_for_runner(runner_public_id) = "runner:#{runner_public_id}"
 
-    # The pre-round-003 per-workspace account name. Retained for READS only, so a machine that
+    # The non-secret Keychain account name for one runner identity's own preview connector token.
+    #
+    # Deliberately a SEPARATE account from the durable credential under the same identity. The two
+    # secrets have different issuers and different lifetimes — a reconnect replaces the connector
+    # token while leaving the credential alone — so one account would make replacing either one
+    # destroy the other.
+    def self.preview_connector_account_for(runner_public_id) = "preview-connector:#{runner_public_id}"
+
+    # The superseded per-workspace account name. Retained for READS only, so a machine that
     # connected under the old scheme keeps authenticating without reconnecting; nothing writes
     # here any more.
     def self.legacy_account_for(workspace_key) = "workspace:#{workspace_key}"
