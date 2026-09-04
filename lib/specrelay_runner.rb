@@ -117,5 +117,9 @@ require_relative "specrelay_runner/specification"
 require_relative "specrelay_runner/package_preflight"
 require_relative "specrelay_runner/poll_interval"
 require_relative "specrelay_runner/presence"
+# The one outbound connector a connected machine runs while its loop is active, started from the
+# token the guided connection stored. Beside `presence` because both are collaborators the loop
+# session owns for exactly as long as it runs.
+require_relative "specrelay_runner/preview_connector"
 require_relative "specrelay_runner/loop_runner"
 require_relative "specrelay_runner/cli"

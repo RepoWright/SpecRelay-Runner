@@ -36,7 +36,9 @@ Platform to claim work it is already authorized for.
 ## Install
 
 Requirements: **Ruby 3.4+** (standard library only — no gems, no Bundler),
-**git**, and **`gh`** if your Platform policy asks for pull requests.
+**git**, **`gh`** if your Platform policy asks for pull requests, and
+**`cloudflared`** — the loop runs this machine's own preview connector with it;
+you install the program and configure nothing for it.
 
 ```bash
 git clone git@github.com:SpecRelay/SpecRelay-Runner.git
@@ -85,7 +87,10 @@ the operator nothing and the same code still works:
    Platform (if any) in the `X-SpecRelay-Runner-Credential` header, so Platform can recognise a
    reconnect;
 7. store the durable credential in the **macOS Keychain** — skipped entirely when
-   Platform replied `credential_unchanged`, because there is nothing new to store;
+   Platform replied `credential_unchanged`, because there is nothing new to store —
+   and, on every successful exchange, this machine's own **preview connector token**
+   beside it under its own runner-scoped account, so a reconnect replaces the
+   connector without touching the credential;
 8. write non-secret connection facts to `~/.specrelay/runner/connections.json`
    (mode `0600`, and you never need to edit it) — including the **reviewer provider
    identifier** this machine selected, when it advertised a reviewer at all, so review
@@ -160,6 +165,17 @@ Neither needs a config file, an exported credential, a workspace-root environmen
 variable, or a reviewer-provider environment variable: the credential is read from
 the Keychain, the workspace root is the checkout you validated, and the reviewer
 provider is the one recorded when you connected.
+
+**The preview connector.** `loop` starts this machine's own preview connector with
+`cloudflared` before its first claim and keeps exactly one running for the session,
+from the token stored when you connected — no tunnel name, credential file,
+certificate, or environment setting. The token reaches `cloudflared` only through a
+private temporary file, removed once the connector is up; it is never an argument
+and never printed. A missing program or a missing stored token stops the session
+before any claim and names the one remedy: install `cloudflared`, or reconnect. The
+connector stops with the loop, including on Ctrl-C. `claim-once` and the `--config`
+path manage none. It does not yet carry preview traffic; routing each preview to the
+machine that owns it is the next slice.
 
 Which connection an argument-free invocation uses, and why, is resolved in this
 order: `--workspace`, then this machine's **explicit default**, then the
@@ -1296,6 +1312,8 @@ lib/specrelay_runner.rb         # requires
 lib/specrelay_runner/
   cli.rb                        # argv -> config/connection -> client -> claim/execute
   loop_runner.rb                # the long-running poll/claim/execute loop
+  preview_connector.rb          # this machine's own preview connector: one child per loop
+                                #   session, token via a private file (never argv), no state
   poll_interval.rb              # validated, bounded --poll-interval value object
   connect.rb                    # the guided connection: code -> assignment ->
                                 #   checkout validation -> readiness -> Keychain

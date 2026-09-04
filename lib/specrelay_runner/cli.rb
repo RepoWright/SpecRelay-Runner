@@ -273,6 +273,7 @@ module SpecrelayRunner
         out: out, err: err, presenter: presenter, label: loop_label(config),
         poll_seconds: interval.seconds, on_failure: policy,
         presence: loop_presence(config, client, interval),
+        connector: loop_connector(config),
         claim: -> { client.claim(config.claim_runner_params) },
         execute: ->(payload) { loop_disposition(config, client, payload) }
       )
@@ -310,6 +311,21 @@ module SpecrelayRunner
       Presence.new(client: client, workspace_key: connection.workspace_key,
                    interval_seconds: interval.seconds,
                    on_notice: ->(message) { presenter.line("[loop] #{message}") })
+    end
+
+    # This loop session's own preview connector, read from the token the guided connection stored
+    # under this machine's identity.
+    #
+    # An advanced `--config` invocation manages none. That path has no connection record, so it
+    # has no machine identity to read a connector for and never ran the guided connection that
+    # provisions one — the same real limitation of the legacy path that leaves it with no presence.
+    def loop_connector(config)
+      connection = config.connection
+      return PreviewConnector::NONE if connection.nil?
+
+      PreviewConnector.new(runner_public_id: connection.runner_public_id,
+                           secret_store: secret_store,
+                           on_notice: ->(message) { presenter.line("[loop] #{message}") })
     end
 
     # What the transient status row says this runner is polling for. The PROJECT is the
