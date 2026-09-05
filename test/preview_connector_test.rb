@@ -116,20 +116,6 @@ class PreviewConnectorTest < Minitest::Test
     assert_includes command_line, "--token-file #{record(:ready).fetch(:path)}"
   end
 
-  # For the first time two connector children can be running on one machine at once: this
-  # session's own, and the one a claimed preview starts for its own attempt. That one finds a
-  # child it lost by the EXACT argument tail it would have spawned — a configuration path
-  # following `--config`, with `run` last — so this child must be unable to satisfy it. Nothing
-  # here re-implements that rule; it asserts against the vocabulary that owns it.
-  def test_the_connector_can_never_be_adopted_by_the_per_preview_tunnels_recovery_scan
-    connector = build
-    connector.started
-    command_line = `ps -ww -o args= -p #{child_pid(connector)}`.to_s.strip
-
-    refute_includes command_line, SpecrelayRunner::SecurePreviewTunnel::CONFIG_FLAG
-    refute command_line.end_with?(" #{SpecrelayRunner::SecurePreviewTunnel::RUN_VERB}")
-  end
-
   def test_the_token_file_is_private_and_carries_exactly_the_stored_value
     connector = build
     connector.started

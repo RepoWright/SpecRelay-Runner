@@ -13,6 +13,12 @@ module SpecrelayRunner
   # `cancelled` signal every other lane obeys. `expired` and `terminal` are deliberately NOT
   # treated as Stop — a lapsed lease means nobody is coordinating this environment any more, and
   # releasing on that basis would be this runner deciding something Platform did not.
+  #
+  # REMOTE ACCESS IS NOT THIS CLAIM'S CONCERN. The one connector this machine runs belongs to the
+  # loop session, not to a claim, and Platform publishes each service of an available preview
+  # through it. So a claim starts no publishing child, keeps no per-attempt state for one, and
+  # reports nothing about whether a link exists — which is also why the project-owned release has
+  # nothing to be ordered against any more.
   class PreviewSession
     CANCELLED = "cancelled"
     # The beat is doing two jobs, and they pull in opposite directions: renewing a lease that must
@@ -25,8 +31,7 @@ module SpecrelayRunner
     def self.call(**kwargs) = new(**kwargs).call
 
     def initialize(payload:, client:, root:, io:, env: ENV, heartbeat_seconds: HEARTBEAT_SECONDS,
-                   sleeper: Kernel, github: PreviousAcceptedPackage::GitHub,
-                   tunnel: SecurePreviewTunnel)
+                   sleeper: Kernel, github: PreviousAcceptedPackage::GitHub)
       @payload = payload
       @client = client
       @root = root
@@ -35,7 +40,6 @@ module SpecrelayRunner
       @heartbeat_seconds = heartbeat_seconds
       @sleeper = sleeper
       @github = github
-      @tunnel_class = tunnel
     end
 
     # True when this claim did what it was made for. A refused assignment, a failed start and a
@@ -57,13 +61,9 @@ module SpecrelayRunner
       beat
       outcome = streaming { execution.start }
       report(outcome)
-      publish_securely(outcome) if outcome.available?
       outcome.cleanup_required? ? hold : true
     ensure
       @beat&.stop
-      # The tunnel is this claim's child and ends with it. On the release path it has already been
-      # accounted for; this is what stops one outliving a claim that ended some other way.
-      stop_tunnel
     end
 
     private
@@ -154,83 +154,21 @@ module SpecrelayRunner
     end
 
     def await_signal
-      while beat.stop_reason.nil?
-        watch_tunnel
-        sleeper.sleep(WAIT_SLICE)
-      end
+      sleeper.sleep(WAIT_SLICE) while beat.stop_reason.nil?
+
       reason = beat.stop_reason
       beat.stop
       @beat = nil
       reason
     end
 
-    # Remote access to the environment this claim just made available.
-    #
-    # It is started AFTER the local preview is available, and its outcome changes nothing about
-    # that preview: a machine that cannot publish remotely still has a running application a person
-    # standing at it can open. One attempt, one honest report, and no retry.
-    def publish_securely(outcome)
-      result = tunnel(services: outcome.document["services"]).start
-      return submit(kind: "secure_preview_ready") if result.ok?
-
-      report_secure_failure(result.reason)
-    end
-
-    # The one thing that can change while a person is testing: the subordinate tunnel exiting. It
-    # is reported once, on the same claim, and the wait carries on — the environment is still
-    # there and this machine still owes its release.
-    def watch_tunnel
-      return if @tunnel.nil? || @secure_settled || @tunnel.running?
-
-      report_secure_failure("the secure preview tunnel exited")
-    end
-
-    def report_secure_failure(reason)
-      @secure_settled = true
-      submit(kind: "secure_preview_failed", reason: reason)
-      line(reason)
-    end
-
-    # Ends this attempt's subordinate child and answers whether it is accounted for. The question
-    # is asked of the attempt, not of this process's memory: the reconnect release runs in a
-    # runner process that spawned nothing, and the child it must account for is one the PREVIOUS
-    # process left behind. Asking also SETTLES secure access — from here the tunnel's absence is
-    # this claim's own doing, and reporting it as a failure would describe the shutdown as the
-    # fault it is not.
-    def stop_tunnel
-      return true if @assignment.nil?
-
-      @secure_settled = true
-      tunnel.stop
-    end
-
-    def tunnel(services: [])
-      @tunnel ||= @tunnel_class.new(preview_id: @assignment.preview_id,
-                                    namespace: @assignment.route_namespace,
-                                    services: services, env: env)
-    end
-
-    # THE ORDER IS THE PRODUCT RULE, and this is the whole of it on this side: the subordinate
-    # tunnel is accounted for BEFORE the project-owned release runs. Releasing a worktree out from
-    # under a process still publishing it is the one state nobody can reason about afterwards, so a
-    # shutdown that cannot be accounted for leaves the existing release obligation exactly where it
-    # was — retryable, on this claim and this machine.
     def release
-      return unaccounted_tunnel unless stop_tunnel
-
       outcome = streaming { execution.release }
       return false unless outcome.state == PreviewExecution::RELEASED || failed_release(outcome)
 
       submit(kind: "released")
       line("released the task environment")
       true
-    end
-
-    def unaccounted_tunnel
-      reason = "the secure preview tunnel could not be stopped"
-      submit(kind: "release_failed", reason: reason)
-      line(reason)
-      false
     end
 
     # Reported, and then waited on again: the machine stays reserved, because the environment the
@@ -250,8 +188,6 @@ module SpecrelayRunner
            "It is handed back for release when this runner reconnects."
       false
     end
-
-
 
     def beat
       @beat ||= Heartbeater.new(client: client, claim: @claim, interval_seconds: @heartbeat_seconds,

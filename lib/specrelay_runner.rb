@@ -93,11 +93,7 @@ require_relative "specrelay_runner/preview_status"
 # MAPIAI-97: the ordered preview lifecycle that drives the project's own worktree commands. Last
 # of the four, because it composes the other three.
 require_relative "specrelay_runner/preview_execution"
-# The subordinate tunnel that makes an already-available preview reachable from
-# outside this machine's network. After the lifecycle above, because it is derived entirely from
-# the service snapshot that lifecycle produced.
-require_relative "specrelay_runner/secure_preview_tunnel"
-# MAPIAI-97: the claim that holds a preview open — the lifecycle above, plus the heartbeat that
+# The claim that holds a preview open — the lifecycle above, plus the heartbeat that
 # renews it and carries Stop back.
 require_relative "specrelay_runner/preview_session"
 # MAPIAI-97: releasing the task environment a finished run leaves behind, through the same
