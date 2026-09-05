@@ -59,59 +59,6 @@ class PreviewSessionTest < Minitest::Test
     def stop_signalling! = @triggered = false
   end
 
-  # A stand-in for the subordinate tunnel. The child process itself is proved in
-  # `secure_preview_tunnel_test.rb`; what these examples are about is the ORDER the claim imposes
-  # on it — ready only after the application is available, stopped before the project-owned
-  # release, and one honest report either way.
-  class FakeTunnel
-    attr_reader :preview_id, :namespace, :services, :verbs_at_stop
-
-    def initialize(factory, preview_id, namespace, services)
-      @factory = factory
-      @preview_id = preview_id
-      @namespace = namespace
-      @services = services
-      @running = true
-    end
-
-    def start
-      @factory.started = true
-      return SpecrelayRunner::SecurePreviewTunnel::Result.new(ok: true) if @factory.starts
-
-      SpecrelayRunner::SecurePreviewTunnel::Result.new(ok: false, reason: @factory.reason)
-    end
-
-    def running? = @running && !@factory.exits
-    def stop
-      # Only the FIRST stop is recorded: the claim asks once on the release path and once more as
-      # it ends, and it is the first that has to have happened before the release ran.
-      @verbs_at_stop ||= @factory.observer&.call
-      @running = false
-      @factory.stops
-    end
-  end
-
-  # Answers `new` exactly as the product's tunnel class does, so the session is wired the way it is
-  # in production and the example keeps hold of the child it created.
-  class TunnelFactory
-    attr_reader :starts, :stops, :exits, :reason, :observer, :made
-    attr_accessor :started
-
-    def initialize(starts: true, stops: true, exits: false, observer: nil,
-                   reason: "the secure preview tunnel would not start")
-      @starts = starts
-      @stops = stops
-      @exits = exits
-      @observer = observer
-      @reason = reason
-    end
-
-    def new(preview_id:, namespace:, services:, env:)
-      @env = env
-      @made = FakeTunnel.new(self, preview_id, namespace, services)
-    end
-  end
-
   class FakeGitHubReader
     def initialize(answers) = (@answers = answers)
     def pull_request(root:, slug:, url:, env:) = @answers[url]
@@ -199,14 +146,12 @@ class PreviewSessionTest < Minitest::Test
                             "isCrossRepository" => false }
 
   def session(client, document = payload, github: FakeGitHubReader.new(URL_A => open_pull_request),
-              io: @io, tunnel: tunnels, env: {})
+              io: @io, env: {})
     SpecrelayRunner::PreviewSession.call(
       payload: document, client: client, root: @workspace.root, io: io, env: env,
-      heartbeat_seconds: 1, sleeper: Ticker.new, github: github, tunnel: tunnel
+      heartbeat_seconds: 1, sleeper: Ticker.new, github: github
     )
   end
-
-  def tunnels(**options) = @tunnels ||= TunnelFactory.new(**options)
 
   def kinds(client) = client.results.map { |result| result[:kind] }
 
@@ -220,7 +165,7 @@ class PreviewSessionTest < Minitest::Test
 
     assert session(client), @io.string
 
-    assert_equal %w[sources started secure_preview_ready released], kinds(client)
+    assert_equal %w[sources started released], kinds(client)
     assert_equal %w[contract_version task_id state primary_url services],
                  client.results[1][:status].keys
     assert_equal %w[create up status release], @workspace.verbs
@@ -264,7 +209,7 @@ class PreviewSessionTest < Minitest::Test
 
     assert session(client), @io.string
 
-    assert_equal %w[sources started secure_preview_ready release_failed released], kinds(client)
+    assert_equal %w[sources started release_failed released], kinds(client)
     assert_equal %w[create up status release release], @workspace.verbs
   end
 
@@ -275,7 +220,7 @@ class PreviewSessionTest < Minitest::Test
 
     refute session(client)
 
-    assert_equal %w[sources started secure_preview_ready], kinds(client)
+    assert_equal %w[sources started], kinds(client)
     assert_equal %w[create up status], @workspace.verbs
     assert_includes @io.string, "handed back for release"
     refute_includes @io.string, "bin/worktree release #{TASK}"
@@ -359,141 +304,20 @@ class PreviewSessionTest < Minitest::Test
     assert_equal 1, client.results.count { |result| result[:kind] == "released" }
   end
 
-  # ---- the subordinate tunnel, and the order the claim imposes on it ---------
+  # ---- remote access is not this machine's job ------------------------------
 
-  # It is started only AFTER the application is available, from the snapshot the project's own
-  # status command reported, inside the namespace the assignment carried. Nothing else reaches it:
-  # no hostname, no port, no zone and no credential travel in the assignment at all.
-  def test_the_tunnel_is_started_after_the_application_is_available_and_only_from_the_validated_snapshot
+  # A preview claim starts no subordinate publishing process of its own, keeps no state for one,
+  # and reports nothing about remote access. The one connector this machine runs belongs to the
+  # LOOP, and Platform publishes each service through it — so a claim that invented a second child
+  # would be publishing an environment nobody asked it to publish.
+  def test_a_preview_claim_starts_no_subordinate_tunnel_and_reports_nothing_about_remote_access
     client = FakeClient.new(after: "started")
 
     assert session(client), @io.string
 
-    assert_equal %w[sources started secure_preview_ready released], kinds(client)
-    child = tunnels.made
-
-    assert_equal "prv_abc", child.preview_id
-    assert_equal "7c1d4a90e3b25f6108ad4c3b2e59f071", child.namespace
-    # The OPENABLE services only, exactly as Platform stored them: the internal database the
-    # project also reports has no browser url and is not published.
-    assert_equal [ "dashboard" ], child.services.map { |service| service["service"] }
-    assert_equal [ "http://127.0.0.1:5173" ], child.services.map { |service| service["url"] }
-    assert_equal({ kind: "secure_preview_ready" }, client.results[2])
-  end
-
-  # A tunnel that will not start is ONE bounded report and nothing else. The preview stays
-  # available, the machine stays reserved, the Stop control still works, and no retry happens.
-  def test_a_tunnel_that_will_not_start_is_one_bounded_failure_that_leaves_the_preview_running
-    @tunnels = TunnelFactory.new(starts: false)
-    client = FakeClient.new(after: "secure_preview_failed")
-
-    assert session(client), @io.string
-
-    assert_equal %w[sources started secure_preview_failed released], kinds(client)
-    assert_equal 1, kinds(client).count("secure_preview_failed")
-    assert_equal "the secure preview tunnel would not start", client.results[2][:reason]
+    assert_equal %w[sources started released], kinds(client)
+    assert_empty kinds(client).grep(/secure/), "the claim reported remote access"
     assert_equal %w[create up status release], @workspace.verbs
-  end
-
-  # A child that exits while a person is testing is reported once, on the same claim. The wait
-  # carries on: the environment is still there and this machine still owes its release.
-  def test_a_tunnel_that_exits_while_a_person_is_testing_is_reported_exactly_once
-    @tunnels = TunnelFactory.new(exits: true)
-    client = FakeClient.new(after: "secure_preview_failed")
-
-    assert session(client), @io.string
-
-    assert_equal %w[sources started secure_preview_ready secure_preview_failed released], kinds(client)
-    assert_equal "the secure preview tunnel exited", client.results[3][:reason]
-  end
-
-  # THE ordering rule. The tunnel is accounted for BEFORE the project-owned release runs, because
-  # releasing a worktree out from under a process still publishing it is the one state nobody can
-  # reason about afterwards.
-  def test_the_tunnel_is_stopped_before_the_project_owned_release_runs
-    @tunnels = TunnelFactory.new(observer: -> { @workspace.verbs.dup })
-    client = FakeClient.new(after: "started")
-
-    assert session(client), @io.string
-
-    assert_equal %w[create up status], tunnels.made.verbs_at_stop
-    assert_equal %w[create up status release], @workspace.verbs
-  end
-
-  # A shutdown that cannot be accounted for leaves the EXISTING release obligation exactly where
-  # it was: the project-owned release does not run, and the same claim re-offers it on the next
-  # Stop rather than inventing a second cleanup path.
-  def test_a_tunnel_that_cannot_be_stopped_keeps_the_release_obligation_and_runs_no_release
-    @tunnels = TunnelFactory.new(stops: false)
-    client = nil
-    client = FakeClient.new(after: "started",
-                            on_result: ->(r) { client.stop_signalling! if r[:kind] == "release_failed" })
-    io = WatchingIo.new
-    claim = Thread.new { session(client, io: io) }
-
-    assert await_line(io, "could not be stopped"), io.string
-    assert_equal %w[create up status], @workspace.verbs, "the project-owned release ran anyway"
-    assert_includes kinds(client), "release_failed"
-    refute_includes kinds(client), "released"
-    claim.kill
-  end
-
-  # The release Platform hands back on reconnect performs the SAME ordering, and it is the case
-  # that needs it most: this process spawned nothing, so any child still publishing the
-  # environment was left by a runner process that has since died. The tunnel is asked to account
-  # for that child BEFORE the project-owned release runs.
-  def test_a_release_assignment_accounts_for_a_remaining_tunnel_before_the_release_only_path
-    @tunnels = TunnelFactory.new(observer: -> { @workspace.verbs.dup })
-    client = FakeClient.new
-
-    assert session(client, release_payload), @io.string
-
-    child = tunnels.made
-
-    refute_nil child, "the reconnect release never asked about a remaining tunnel"
-    assert_equal "prv_abc", child.preview_id, "the question was not bound to this attempt"
-    assert_equal [], child.verbs_at_stop, "the project-owned release ran first"
-    assert_equal [ "released" ], kinds(client)
-    assert_equal %w[release], @workspace.verbs
-  end
-
-  # And a child it cannot account for keeps the EXISTING obligation on the reconnect path exactly
-  # as on the start path: no project-owned release, and the same assignment returns on the next
-  # poll rather than a second cleanup path being invented for it.
-  def test_a_release_assignment_that_cannot_account_for_a_remaining_tunnel_runs_no_project_release
-    @tunnels = TunnelFactory.new(stops: false)
-    client = FakeClient.new
-
-    assert session(client, release_payload), @io.string
-
-    assert_equal [ "release_failed" ], kinds(client)
-    assert_equal "the secure preview tunnel could not be stopped", client.results.first[:reason]
-    assert_equal [], @workspace.verbs, "the project-owned release ran anyway"
-  end
-
-  # The two owners composed, with the REAL tunnel rather than a stand-in: state left by a previous
-  # runner process that this machine cannot make sense of. The session does not interpret it — it
-  # fences the project-owned release on the answer, reports the obligation, and the evidence stays
-  # on disk for the retry.
-  def test_a_reconnect_release_fences_the_project_command_on_state_it_cannot_account_for
-    home = Dir.mktmpdir("preview-session-tunnel-state")
-    attempt = SpecrelayRunner::SecurePreviewTunnel.new(
-      preview_id: payload["preview"]["id"], namespace: "n", services: [], env: { "HOME" => home }
-    ).state_directory
-    FileUtils.mkdir_p(attempt)
-    File.write(File.join(attempt, SpecrelayRunner::SecurePreviewTunnel::CONFIGURATION_FILE), "ingress: []\n")
-    File.write(File.join(attempt, SpecrelayRunner::SecurePreviewTunnel::PID_FILE), "not-a-pid\n")
-    client = FakeClient.new
-
-    assert session(client, release_payload, tunnel: SpecrelayRunner::SecurePreviewTunnel,
-                                            env: { "HOME" => home }), @io.string
-
-    assert_equal [ "release_failed" ], kinds(client)
-    assert_equal [], @workspace.verbs, "the project-owned release ran on state nobody could read"
-    assert_path_exists File.join(attempt, SpecrelayRunner::SecurePreviewTunnel::PID_FILE),
-                       "the evidence was discarded"
-  ensure
-    FileUtils.remove_entry(home) if home
   end
 
   # ---- F5: every project-owned command's raw output, not just `up` ----------------------
