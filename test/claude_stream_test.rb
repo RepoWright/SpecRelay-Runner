@@ -152,6 +152,62 @@ class ClaudeStreamTest < Minitest::Test
     refute_nil stream.close.failure
   end
 
+# ---- a result frame that belongs to a REFUSED question turn -------------
+#
+# The one exception to the one-result rule, and it is not the decoder's to grant: `refusals`
+# is the attempt's question bridge reporting how many question turns it has refused back to
+# the same provider process so far. A held result may be superseded only by a later frame
+# from that same process, and only when a refusal the bridge recorded BEFORE the held result
+# has not already explained an earlier one.
+
+def test_a_result_that_followed_a_refused_question_turn_is_superseded_by_the_final_one
+  stream = build_stream(refusals: -> { 1 })
+  stream.accept("stdout", JSON.generate(result_message("stopped on the refused question")))
+  stream.accept("stdout", JSON.generate(result_message("final")))
+
+  assert_nil stream.close.failure
+  assert_equal "final", stream.final_text
+  refute_includes texts.join("\n"), "stopped on the refused question", "a superseded result is never displayed"
+end
+
+def test_a_second_result_with_no_recorded_refusal_still_fails_closed
+  stream = build_stream(refusals: -> { 0 })
+  stream.accept("stdout", JSON.generate(result_message("first")))
+  stream.accept("stdout", JSON.generate(result_message("second")))
+
+  assert_equal SpecrelayRunner::ClaudeStream::FAILURE_TWO_RESULTS, stream.close.failure
+  assert_equal "", stream.final_text
+end
+
+def test_each_refusal_explains_exactly_one_superseded_result
+  stream = build_stream(refusals: -> { 1 })
+  %w[first second third].each { |text| stream.accept("stdout", JSON.generate(result_message(text))) }
+
+  assert_equal SpecrelayRunner::ClaudeStream::FAILURE_TWO_RESULTS, stream.close.failure
+  assert_equal "", stream.final_text
+end
+
+def test_a_refusal_recorded_after_a_result_does_not_explain_it
+  refusals = 0
+  stream = build_stream(refusals: -> { refusals })
+  stream.accept("stdout", JSON.generate(result_message("before any refusal")))
+  refusals = 1
+  stream.accept("stdout", JSON.generate(result_message("after the refusal")))
+
+  assert_equal SpecrelayRunner::ClaudeStream::FAILURE_TWO_RESULTS, stream.close.failure
+end
+
+# The allowance lifts no bound: an oversized frame still fails closed at the first bound it
+# crosses (here the pending-message cap, which is the smaller), and nothing later rescues it.
+def test_a_refused_turn_never_lifts_the_size_bounds_on_a_result
+  stream = build_stream(refusals: -> { 1 })
+  stream.accept("stdout", JSON.generate(result_message("x" * (SpecrelayRunner::ClaudeStream::MAX_PENDING_BYTES + 1))))
+  stream.accept("stdout", JSON.generate(result_message("final")))
+
+  assert_equal SpecrelayRunner::ClaudeStream::FAILURE_UNREADABLE, stream.close.failure
+  assert_equal "", stream.final_text
+end
+
   def test_a_non_object_json_line_fails_closed
     stream = build_stream
     stream.accept("stdout", "42")
@@ -182,9 +238,9 @@ class ClaudeStreamTest < Minitest::Test
 
   def monotonic = Process.clock_gettime(Process::CLOCK_MONOTONIC)
 
-  def build_stream(repository_path: @tmp)
+  def build_stream(repository_path: @tmp, **options)
     SpecrelayRunner::ClaudeStream.new(
-      sink: ->(source, text) { @seen << [ source, text ] }, repository_path: repository_path
+      sink: ->(source, text) { @seen << [ source, text ] }, repository_path: repository_path, **options
     )
   end
 

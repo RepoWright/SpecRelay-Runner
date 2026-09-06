@@ -715,9 +715,10 @@ root, so all of its absolute paths use the placeholder. An unquoted path followe
 by ambiguous prose is conservatively withheld through the next strong shell
 boundary or line end; privacy takes precedence over retaining that suffix. Quoted
 paths and explicit adjacent shell operators retain their deterministic boundaries.
-Malformed output, a missing terminal result, or two terminal results fail the
-attempt closed without displaying the frame. Both workflows use this one decoder
-and this one stream; there is no lane-specific path rule.
+The attempt fails closed without displaying the frame for malformed output, a
+missing terminal result, or a second terminal result without a matching refused
+question turn. Both workflows use this one decoder and this one stream; there is
+no lane-specific path rule.
 
 A `core.progress` **heartbeat** still names the elapsed time after 15s of genuine
 silence. It is a fallback, never a substitute: real output, when available, is what

@@ -35,15 +35,18 @@ module FakeClaudeCli
   #
   #   version: :ok | :error | :hang
   #   auth:    :logged_in | :logged_out | :error | :hang
-  #   run:     :edit | :fail | :auth_failure | :hang | :no_change
-  def build(install: true, version: :ok, auth: :logged_in, run: :edit,
+  #   run:     :edit | :fail | :auth_failure | :hang | :no_change | :refused_question
+  #   refused_turn: what a :refused_question provider does once its first question is refused —
+  #            :correct re-asks and finishes on the answer; :exit leaves without asking again;
+  #            :repeat ends the refused turn with a second result frame before correcting.
+  def build(install: true, version: :ok, auth: :logged_in, run: :edit, refused_turn: :correct,
             from_heading: "Hello Demo", to_heading: "Hello SpecRelay Demo")
     bin_dir = Dir.mktmpdir("fake-claude-bin-")
     argv_log = File.join(bin_dir, "argv.json")
     return [ bin_dir, argv_log ] unless install
 
     path = File.join(bin_dir, "claude")
-    File.write(path, script(argv_log, version, auth, run, from_heading, to_heading))
+    File.write(path, script(argv_log, version, auth, run, refused_turn, from_heading, to_heading))
     FileUtils.chmod(0o755, path)
     [ bin_dir, argv_log ]
   end
@@ -52,7 +55,7 @@ module FakeClaudeCli
   # own Timeout/process-group kill is what ends it — a real timeout, not a stub.
   HANG_SECONDS = 600
 
-  def script(argv_log, version, auth, run, from_heading, to_heading)
+  def script(argv_log, version, auth, run, refused_turn, from_heading, to_heading)
     <<~RUBY
       #!/usr/bin/env ruby
       # frozen_string_literal: true
@@ -70,7 +73,7 @@ module FakeClaudeCli
         #{auth_branch(auth)}
       end
 
-      #{run_branch(run, from_heading, to_heading)}
+      #{run_branch(run, refused_turn, from_heading, to_heading)}
     RUBY
   end
 
@@ -99,11 +102,12 @@ module FakeClaudeCli
     }.inspect
   end
 
-  def run_branch(run, from_heading, to_heading)
+  def run_branch(run, refused_turn, from_heading, to_heading)
     case run
     when :fail then %(warn "the model produced no usable change"; exit 4)
     when :auth_failure then %(warn "Not logged in. Please run `claude auth login`."; exit 1)
     when :hang then %(sleep #{HANG_SECONDS}; exit 0)
+    when :refused_question then refused_question_branch(refused_turn, from_heading, to_heading)
     when :no_change
       # MAPIAI-84 — a provider that changed nothing still reports an EMPTY selection. Writing
       # no document at all is a different fact (the executor did not answer), and the runner
@@ -160,4 +164,88 @@ module FakeClaudeCli
       exit 0
     RUBY
   end
+
+# The refused question turn's own result frame and the final one, told apart by content so a test
+# can prove which of them became evidence.
+INTERMEDIATE_RESULT = "stopped on the refused question"
+FINAL_RESULT = "applied the heading change after the answer"
+QUESTION = {
+  "questions" => [ { "prompt" => "Keep the heading change?",
+                     "options" => [ { "key" => "keep", "label" => "Keep it", "recommended" => true } ] } ],
+  "continuation_context" => {
+    "progress" => "the heading is changed", "changed_areas" => "demo-app/index.html",
+    "why_it_matters" => "the choice decides the visible copy", "next_step" => "finish",
+    "remaining_work" => "verification", "do_not_repeat" => "the heading edit"
+  }
+}.freeze
+
+# The observed rejected-question chain, as the supported profile emits it: the provider edits the
+# worktree, reports its selection and asks; the first request is REFUSED, and the refused turn
+# ends in a `result` frame of its own before the session continues. What follows is
+# `refused_turn`'s choice. The blocked wait is bounded by the profile's own timeout, not here.
+def refused_question_branch(refused_turn, from_heading, to_heading)
+  <<~RUBY.strip
+    prompt = ARGV.last.to_s
+    abort "refusing to run without a prompt" if prompt.strip.empty?
+    $stdout.sync = true
+    def say(message) = puts(JSON.generate(message))
+    def narrate(text) = say("type" => "assistant", "message" => { "content" => [ { "type" => "text", "text" => text } ] })
+    def result(text) = say("type" => "result", "subtype" => "success", "is_error" => false, "result" => text)
+
+    request = prompt[%r{`([^`]*/question-request\.json)`}, 1]
+    abort "the prompt named no bridge" if request.nil?
+    answer = File.join(File.dirname(request), "question-answer.json")
+    error = File.join(File.dirname(request), "question-error.json")
+    # A verdict is CONSUMED when read: the parent clears the previous verdict only when it
+    # picks up the next request, so a provider that re-asks and polls at once would otherwise
+    # read its own earlier refusal again.
+    def verdict(answer, error)
+      loop do
+        return [ :answered, consume(answer)["answers"] ] if File.file?(answer)
+        return [ :refused, consume(error)["error"] ] if File.file?(error)
+
+        sleep 0.05
+      end
+    end
+    def consume(path)
+      JSON.parse(File.read(path)).tap { File.delete(path) }
+    end
+    def ask(request)
+      File.write("\#{request}.partial", JSON.generate(#{QUESTION.inspect}))
+      File.rename("\#{request}.partial", request)
+    end
+
+    say("type" => "system", "subtype" => "init", "cwd" => Dir.pwd, "model" => "fake-claude")
+    file = "demo-app/index.html"
+    File.write(file, File.read(file).gsub(#{from_heading.inspect}, #{to_heading.inspect}))
+    #{DemoWorkspace.selection_reporter}
+    SELECTION.call
+    ask(request)
+    kind, detail = verdict(answer, error)
+    abort "expected the first question to be refused" unless kind == :refused
+    narrate("question refused: \#{detail}")
+    result(#{INTERMEDIATE_RESULT.inspect})
+    #{after_refusal(refused_turn)}
+  RUBY
+end
+
+def after_refusal(refused_turn)
+  case refused_turn
+  when :exit then "exit 1"
+  when :repeat then "result(#{"#{INTERMEDIATE_RESULT} again".inspect})\n#{corrected_turn}"
+  else corrected_turn
+  end
+end
+
+def corrected_turn
+  <<~RUBY.strip
+    ask(request)
+    kind, detail = verdict(answer, error)
+    abort "expected the corrected question to be answered" unless kind == :answered
+    narrate("answered: \#{JSON.generate(detail)}")
+    result(#{FINAL_RESULT.inspect})
+    SELECTION.call
+    exit 0
+  RUBY
+end
 end

@@ -540,12 +540,22 @@ module SpecrelayRunner
     end
 
     def raise_for(status, body)
-      message = body.is_a?(Hash) ? body["error"].to_s : ""
+      message = refusal_detail(body)
       detail = message.empty? ? "" : ": #{message}"
       raise Unauthorized.new("Platform rejected the runner token (401)#{detail}", status: status) if status == 401
       raise NotFound.new("Platform found no such resource (404)#{detail}", status: status) if status == 404
 
       raise RequestFailed.new("Platform request failed (#{status})#{detail}", status: status)
+    end
+
+    # A refusal's reason arrives in one of two shapes: an authority refusal's single `error`, or a
+    # validation refusal's `errors` — the field messages a live provider must be handed to correct
+    # its request. Both are the detail; neither is dropped.
+    def refusal_detail(body)
+      return "" unless body.is_a?(Hash)
+
+      message = body["error"].to_s
+      message.empty? ? Array(body["errors"]).map(&:to_s).reject(&:empty?).join("; ") : message
     end
   end
 end

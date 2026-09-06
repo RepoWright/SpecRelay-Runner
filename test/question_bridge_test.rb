@@ -305,6 +305,79 @@ class QuestionBridgeTest < Minitest::Test
     assert_empty @platform.capture_failures, "a correctable refusal is not a capture failure"
   end
 
+# Platform's VALIDATION refusal is `{ accepted: false, errors: [...] }` — a different body from
+# an authority refusal's `{ error: ... }` — and the provider can only correct what it is told.
+def test_a_platform_validation_refusal_reaches_the_same_session_with_its_field_errors
+  errors = [ "continuation_context.progress is required", "questions[0].prompt is required" ]
+  @platform.question_response = [ 422, { accepted: false, errors: errors } ]
+  io = StringIO.new
+
+  exit_code = run_cli(io)
+
+  assert_equal SpecrelayRunner::CLI::SUCCESS, exit_code, io.string
+  assert_includes io.string, "[question-executor] refused"
+  errors.each { |error| assert_includes io.string, error, "the field error must reach the provider" }
+  assert_empty @platform.capture_failures, "a correctable refusal is not a capture failure"
+end
+
+# The bridge is the ONE owner of the refusal fact the result decoder later relies on, so the
+# count is proven at the bridge: one per refusal it wrote back to the provider — Platform's or
+# its own local one — and never for a fault, which ends the session instead.
+def test_the_bridge_counts_each_refusal_it_returns_and_never_a_fault
+  refused = direct_bridge(status: 422)
+  ask(refused, BATCH.to_json)
+  assert_equal SpecrelayRunner::QuestionBridge::ERROR, await_verdict(refused)
+  assert_equal 1, refused.refusals
+  ask(refused, "{not json")
+  assert_equal SpecrelayRunner::QuestionBridge::ERROR, await_verdict(refused)
+  assert_equal 2, refused.refusals
+  assert_nil refused.outcome, "a refusal leaves the session and the claim live"
+
+  faulted = direct_bridge(status: 500)
+  ask(faulted, BATCH.to_json)
+  assert_nil await_verdict(faulted)
+  assert_predicate faulted, :failed?
+  assert_equal 0, faulted.refusals
+ensure
+  [ refused, faulted ].compact.each(&:stop)
+end
+
+# A client that answers every submission with one scripted status, so the bridge's own
+# classification of refusal against fault is what is under test.
+ScriptedClient = Struct.new(:status) do
+  def submit_executor_question(**)
+    raise SpecrelayRunner::PlatformClient::RequestFailed.new("Platform request failed (#{status}): scripted", status: status)
+  end
+end
+
+def direct_bridge(status:)
+  captured = SpecrelayRunner::Checkpoint::Captured.new(checkpoint: { "recorded" => true }, error: nil)
+  SpecrelayRunner::QuestionBridge.new(client: ScriptedClient.new(status), claim: "rex_direct",
+                                      staging_dir: Dir.mktmpdir("bridge"), capture: -> { captured },
+                                      io: StringIO.new).start
+end
+
+def ask(bridge, body)
+  request = File.join(bridge.path, SpecrelayRunner::QuestionBridge::REQUEST)
+  File.write("#{request}.partial", body)
+  File.rename("#{request}.partial", request)
+end
+
+# The bridge's verdict file for the request just asked, or nil once the bridge ended instead.
+# The verdict is CONSUMED, as a provider consumes it: the bridge clears an earlier verdict only
+# when it picks up the next request, so an unread one would be mistaken for the new answer.
+def await_verdict(bridge, deadline: 5)
+  finish = Process.clock_gettime(Process::CLOCK_MONOTONIC) + deadline
+  verdict = File.join(bridge.path, SpecrelayRunner::QuestionBridge::ERROR)
+  loop do
+    return File.delete(verdict) && SpecrelayRunner::QuestionBridge::ERROR if File.file?(verdict)
+    return nil if bridge.outcome
+    raise "the bridge produced no verdict within #{deadline}s" if Process.clock_gettime(Process::CLOCK_MONOTONIC) > finish
+
+    sleep 0.05
+  end
+end
+
   def test_an_unrecoverable_bridge_fault_reports_input_capture_failed_and_uploads_no_report
     @platform.question_response = [ 500, { error: "platform is unwell" } ]
     io = StringIO.new

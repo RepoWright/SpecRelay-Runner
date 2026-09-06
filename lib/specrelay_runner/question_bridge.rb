@@ -82,6 +82,7 @@ module SpecrelayRunner
       @thread = nil
       @awaiting_verdict = false
       @resume_confirmed = false
+      @refusals = 0
     end
 
     attr_reader :path
@@ -127,6 +128,13 @@ module SpecrelayRunner
     # A batch Platform accepted that nobody has settled yet. True only between the accepted
     # submission and the answer or release that ends it.
     def awaiting_verdict? = @mutex.synchronize { @awaiting_verdict && @outcome.nil? }
+
+    # How many question turns this bridge has refused back to the same provider process —
+    # Platform's refusals and its own two local checks alike, because each one ends a turn the
+    # provider then corrects in place. The result decoder reads this count and nothing else about
+    # questions: a result frame may belong to a refused turn only while a refusal recorded before
+    # it is still unexplained. A fault never counts, because a fault ends the session instead.
+    def refusals = @mutex.synchronize { @refusals }
 
     # The fresh session was started with an earlier batch's answers in its prompt.
     # Platform is told once, from here, and only then does that batch settle as RESUMED and the
@@ -290,7 +298,9 @@ module SpecrelayRunner
       record(:failed, "#{DELIVERY_UNCONFIRMED} (#{settled['id']} is #{settled['state']})")
     end
 
+    # Counted BEFORE the file appears, so the refusal exists by the time the provider can act on it.
     def refuse(message)
+      @mutex.synchronize { @refusals += 1 }
       write(ERROR, { "error" => message })
       log("[question] the request was refused: #{message}")
     end
