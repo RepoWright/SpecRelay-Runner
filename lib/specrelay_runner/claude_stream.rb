@@ -41,6 +41,9 @@ module SpecrelayRunner
   # FAIL CLOSED. Malformed output, no terminal result, or two terminal results all mean the
   # runner can no longer prove which bytes are progress and which are the authoritative result.
   # It refuses both rather than guessing, and it never displays or stores the offending frame.
+  # The ONE exception is causal and is not this decoder's to grant: a question turn the attempt's
+  # bridge refused ends in a result frame of its own, and the same process then continues. Such a
+  # result is superseded by the frame that follows it — see {#capture_result}.
   #
   # Deliberately Claude-specific: there is no provider registry, no event SDK and no plugin
   # surface here, because exactly one provider emits this format.
@@ -139,12 +142,18 @@ module SpecrelayRunner
     # belongs to, so it is the only prefix a public path may be shown relative to. A lane without
     # one (specification creation, whose provider works in a private temporary directory) can
     # prove nothing and therefore shows no absolute path at all.
-    def initialize(sink: nil, repository_path: nil)
+    # `refusals`, when given, is the attempt's question bridge counting the question turns it has
+    # refused back to this same provider process. A lane without a bridge passes nothing and keeps
+    # the strict one-result rule.
+    def initialize(sink: nil, repository_path: nil, refusals: nil)
       @sink = sink
+      @refusals = refusals
       @repository_path = repository_path && File.expand_path(repository_path.to_s)
       @pending = +""
       @result = nil
       @result_seen = false
+      @result_refusals = 0
+      @superseded = 0
       @failure = nil
       @diagnostic_reported = false
     end
@@ -485,15 +494,32 @@ module SpecrelayRunner
 
     # ---- the terminal result ------------------------------------------------
 
+    # ONE result, with one causal exception. A refused question turn ends in a result frame of its
+    # own and the session then continues, so a held result may be SUPERSEDED by a later frame — from
+    # the same process, on the same stream — when a refusal the bridge recorded BEFORE the held
+    # result has not already explained an earlier one. Nothing else lets a second result through:
+    # no refusal, a refusal recorded only after the result, or one more result than refusals all
+    # still fail closed. A superseded result is dropped, never kept in a list, and never shown.
     def capture_result(message)
-      return fail!(FAILURE_TWO_RESULTS) if @result_seen
+      return fail!(FAILURE_TWO_RESULTS) if @result_seen && !supersede
 
       text = message["result"].to_s
       return fail!(FAILURE_RESULT_TOO_LARGE) if text.bytesize > MAX_RESULT_BYTES
 
       @result_seen = true
       @result = text
+      @result_refusals = refusals_observed
     end
+
+    # Explaining the held result spends one refusal, so the allowance is exactly the count.
+    def supersede
+      return false unless @result_refusals > @superseded
+
+      @superseded += 1
+      true
+    end
+
+    def refusals_observed = @refusals ? @refusals.call.to_i : 0
 
     # ---- output -------------------------------------------------------------
 

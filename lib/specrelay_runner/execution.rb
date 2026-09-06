@@ -350,15 +350,15 @@ module SpecrelayRunner
       # BEFORE running tests or uploading anything (MVP-0012).
       check_stop!
       unless executor_result.success?
-        return failed_report(root, worktree, executor_result, executor_failure(executor_result),
-                             classification: executor_classification(executor_result))
+        return unfinished_provider(root, worktree, executor_result, executor_failure(executor_result),
+                                   classification: executor_classification(executor_result))
       end
       # MAPIAI-60 — the provider exited cleanly but its structured output could not be read, so
       # there is no result this runner can prove. Fails closed as a failed attempt rather than
       # reporting an empty success: an unreadable stream is not an unchanged repository.
       if (unreadable = @claude_stream&.close&.failure)
-        return failed_report(root, worktree, executor_result,
-                             "the #{provider} executor produced unusable output: #{unreadable}")
+        return unfinished_provider(root, worktree, executor_result,
+                                   "the #{provider} executor produced unusable output: #{unreadable}")
       end
 
       changes = measuring_workspace(root).capture_changes(worktree.path)
@@ -619,12 +619,13 @@ module SpecrelayRunner
     # live executor log is a record of the CORE phase, not of everything after it.
     def run_executor(root, worktree, staging)
       @log_stream = start_log_stream
-      @claude_stream = claude_stream(worktree)
       # The bridge lives in the STAGING directory, outside the worktree, so a question request
-      # can never appear in the diff the executor is measured on.
+      # can never appear in the diff the executor is measured on. It is built before the decoder,
+      # which reads its refusal count.
       @bridge = QuestionBridge.new(client: client, claim: claim, staging_dir: staging, io: io,
                                    capture: -> { capture_checkpoint(root, worktree, staging) },
                                    resume_question_id: @resume&.question_id).start
+      @claude_stream = claude_stream(worktree)
       result = Executor.new(config: payload.fetch("executor"), worktree_path: worktree.path,
                             staging_dir: staging, env: env)
                        .run(prompt_text(worktree.path, @bridge.path, RepositorySelection.path(staging)),
@@ -644,7 +645,9 @@ module SpecrelayRunner
     def claude_stream(worktree)
       return nil unless ClaudeProfile.selected?(payload["executor"])
 
-      ClaudeStream.new(sink: @log_stream.sink, repository_path: worktree.path)
+      # The decoder's one exception to its one-result rule is authorized by the bridge's refusal
+      # count and by nothing else it knows about questions.
+      ClaudeStream.new(sink: @log_stream.sink, repository_path: worktree.path, refusals: -> { @bridge.refusals })
     end
 
     # The report is built from the DECODED terminal result, never from the raw frames: raw JSONL
@@ -677,7 +680,7 @@ module SpecrelayRunner
     # tests, uploads a report, publishes, or touches Jira: there is no result to report, only a
     # decision a human has not made yet. The dirty worktree stays exactly where it is.
     def question_outcome
-      return input_capture_failure if @bridge.failed?
+      return input_capture_failure(@bridge.failure_reason.to_s) if @bridge.failed?
 
       released_session
     end
@@ -700,8 +703,7 @@ module SpecrelayRunner
     # not recognise — stays a failure, because an ending it cannot confirm must not be reported
     # as handled. A failure to REPORT the failure is still an honest non-zero exit: Platform
     # reclaims the lapsed lease.
-    def input_capture_failure
-      reason = @bridge.failure_reason.to_s
+    def input_capture_failure(reason)
       response = client.report_input_capture_failure(claim: claim, reason: reason)
       return released_session if response.to_h.dig("execution", "state") == PLATFORM_AWAITING_INPUT
 
@@ -784,6 +786,19 @@ module SpecrelayRunner
                                  changes: changes, error_classification: classification)
       client.submit_report(claim: claim, bundle: bundle, terminal_result: terminal)
       Result.new(outcome: :executor_failed, message: message)
+    end
+
+    # The provider ended without one provable result: a non-zero exit, a timeout, or a stream this
+    # runner cannot decode. Ordinarily that is a failed report. After a question turn this attempt
+    # REFUSED back to the provider it is the rejected-question continuation failing to finish, and
+    # the ending belongs to the question lifecycle: a failed report about a changed worktree would
+    # carry no verification rows, which Platform's report contract refuses, and the operator would
+    # see that refusal instead of the cause. The bridge's own faults never reach here — they end the
+    # attempt above, before any report is considered.
+    def unfinished_provider(root, worktree, executor_result, reason, classification: ClaudeProfile::EXECUTOR_FAILED)
+      return failed_report(root, worktree, executor_result, reason, classification: classification) unless @bridge.refusals.positive?
+
+      input_capture_failure("the provider's question was refused and its session did not finish: #{reason}")
     end
 
     # Which local condition actually failed. Timeout and "could not launch it at

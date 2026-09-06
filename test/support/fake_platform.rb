@@ -135,6 +135,7 @@ class FakePlatform
     @question_settle_after = 1
     @question_polls = 0
     @question_delivered = false
+    @question_refusals = []
     @mutex = Mutex.new
   end
 
@@ -199,6 +200,7 @@ class FakePlatform
   def executor_questions = requests_to("/api/runner/executor_questions")
   def asked_question = @mutex.synchronize { @question }
   def capture_failures = executor_questions.select { |r| r[:body].to_h.key?("capture_failure") }
+  def question_submissions = executor_questions.reject { |r| r[:body].to_h.key?("capture_failure") }
 
   # F1 — the acknowledgement the runner sends once it has written the answers into the
   # live session's bridge.
@@ -229,6 +231,14 @@ class FakePlatform
   # Script a refusal (a 4xx the provider may correct) or a fault (5xx / a body Platform never
   # sends), so a test can prove the runner tells the two apart.
   attr_accessor :question_response
+
+  # Script the NEXT submission as Platform's VALIDATION refusal — `{ accepted: false, errors }`, the
+  # body a live provider may correct, and a different shape from an authority refusal's `error` —
+  # while every later submission is accepted, so a test can play the observed refuse-then-correct
+  # chain rather than a refusal that never ends.
+  def refuse_next_question!(errors)
+    @mutex.synchronize { @question_refusals << [ 422, { accepted: false, errors: errors } ] }
+  end
 
   # F1: a slow answer poll, so a test can put the provider's exit INSIDE the poll the
   # runner is waiting on, and a scripted answer for the acknowledgement itself.
@@ -389,6 +399,8 @@ class FakePlatform
     # AWAITING_INPUT, and a genuinely lost question does not.
     return [ 201, { contract_version: "mvp-0036", execution: { state: kept_execution_state } } ] if
       request[:body].to_h.key?("capture_failure")
+    refusal = @mutex.synchronize { @question_refusals.shift }
+    return refusal if refusal
     return @question_response if @question_response
 
     @mutex.synchronize { @question = request.dig(:body, "question").to_h }
