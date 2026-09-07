@@ -477,6 +477,39 @@ class ReviewFlowTest < Minitest::Test
     assert_equal true, @platform.last_review.dig("evidence", "structural_review")
   end
 
+  # A reviewer's input-required decision is a WRITTEN one: a long prompt and three mutually
+  # exclusive options. This machine holds no prompt limit of its own, so the whole document must
+  # reach Platform exactly as the reviewer wrote it — a runner that quietly shortened it would
+  # hide the very field Platform is about to judge.
+  def test_a_long_three_option_decision_reaches_platform_whole
+    build_repo
+    prompt = review_prompt_of(2_000)
+    script = reviewer_script(JSON.generate(
+                               "outcome" => "NEEDS_INPUT", "summary" => "A product decision is required.",
+                               "evidence" => { "structural_review" => true, "verification_run" => true },
+                               "question" => {
+                                 "prompt" => prompt, "reason" => "It changes what the operator approves.",
+                                 "options" => [
+                                   { "key" => "stop_polling", "label" => "Stop polling",
+                                     "trade_off" => "Quieter, but a stale tab.", "recommended" => true },
+                                   { "key" => "keep_polling", "label" => "Keep polling",
+                                     "trade_off" => "Always fresh, more requests." },
+                                   { "key" => "poll_while_open", "label" => "Poll while a question is open",
+                                     "trade_off" => "Fresh where it matters." }
+                                 ]
+                               }
+                             ))
+
+    result = run_review(command: script)
+
+    assert result.success?, result.message
+    question = @platform.last_review["question"]
+    assert_equal "NEEDS_INPUT", @platform.last_review["outcome"]
+    assert_equal prompt, question["prompt"]
+    assert_equal 2_000, question["prompt"].length
+    assert_equal %w[stop_polling keep_polling poll_while_open], question["options"].map { |o| o["key"] }
+  end
+
   # The prompt is the reviewer's ENTIRE input. It must name the pinned commits and must carry
   # no session id, resume flag or executor context.
   def test_the_prompt_pins_the_commits_and_carries_no_executor_context
@@ -813,6 +846,15 @@ class ReviewFlowTest < Minitest::Test
   # The real commit when the repository was built with one, otherwise the deliberately absent
   # sha a refusal test wants.
   def pinned_head = @actual_head || HEAD
+
+  # Real spaced prose of an exact length, not one repeated token: redaction and JSON transport
+  # treat text with word boundaries differently from an entropy-like blob.
+  def review_prompt_of(length)
+    sentence = "The reviewer needs one product decision before this assignment can continue, " \
+               "because the pinned specification leaves the retention boundary open. "
+    text = (sentence * (length.fdiv(sentence.length).ceil + 1))[0, length]
+    text.end_with?(" ") ? "#{text.chomp(' ')}." : text
+  end
 
   # A reviewer stand-in that prints `body` and exits. It is a real executable launched as a
   # real child process, so the runner's argv, timeout and capture behaviour are all exercised.

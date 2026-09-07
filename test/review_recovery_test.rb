@@ -241,6 +241,36 @@ class ReviewRecoveryTest < Minitest::Test
     refute_includes prompt, %("ACCEPT" | "CHANGES_REQUESTED" | "NEEDS_INPUT")
   end
 
+  # The length limits are Platform's to state and this machine's to render. Two complete review
+  # passes were lost to a prompt bound the reviewer was never shown, so the number in the prompt
+  # must be the number Platform sent — with no constant kept here that could drift, and no
+  # fallback that would invent a limit when Platform states none.
+  def test_the_prompt_states_the_prompt_bound_platform_advertised
+    packet = review_payload
+    packet["result_contract"]["max_question_prompt_length"] = 2_000
+
+    prompt = SpecrelayRunner::Review::Packet.new(SpecrelayRunner::Review::Assignment.new(packet)).prompt
+
+    assert_includes prompt, "question prompt length: 2000"
+  end
+
+  def test_a_changed_advertised_prompt_bound_changes_the_prompt_with_no_local_constant
+    packet = review_payload
+    packet["result_contract"]["max_question_prompt_length"] = 4_242
+
+    prompt = SpecrelayRunner::Review::Packet.new(SpecrelayRunner::Review::Assignment.new(packet)).prompt
+
+    assert_includes prompt, "question prompt length: 4242"
+    refute_includes prompt, "question prompt length: 2000"
+  end
+
+  def test_no_length_limits_are_stated_when_platform_advertises_none
+    prompt = SpecrelayRunner::Review::Packet.new(SpecrelayRunner::Review::Assignment.new(review_payload)).prompt
+
+    refute_includes prompt, "## Length limits"
+    refute_includes prompt, "question prompt length:"
+  end
+
   # --- a failure is reported as a failure -----------------------------------
 
   def test_a_provider_that_exits_non_zero_reports_a_provider_execution_failure
@@ -462,6 +492,26 @@ class ReviewRecoveryTest < Minitest::Test
 
     refute result.success?
     assert_includes result.message, "Platform refused the review result"
+    assert_empty @platform.review_failures
+  end
+
+  # The exact shape the two lost passes took. A prompt-bound refusal must reach the operator as
+  # ONE terminal cause naming the field and the limit — never a retry, and never a second
+  # delivery reporting the refusal as a failure of the review itself.
+  def test_an_over_long_prompt_refusal_names_the_bound_once_and_delivers_nothing_further
+    build_repo
+    @platform.review_response = [ 422, { accepted: false,
+                                         errors: [ "question.prompt exceeds 2000 characters" ] } ]
+
+    result = run_review(command: reviewer_script(
+      %({"outcome":"NEEDS_INPUT","summary":"A decision is required.",) +
+      %("question":{"prompt":"Which bound?","reason":"It changes the release.",) +
+      %("options":[{"key":"a","label":"A","trade_off":"One."},{"key":"b","label":"B","trade_off":"Two."}]}})
+    ))
+
+    refute result.success?
+    assert_includes result.message, "question.prompt exceeds 2000 characters"
+    assert_equal 1, @platform.review_submissions.size
     assert_empty @platform.review_failures
   end
 
