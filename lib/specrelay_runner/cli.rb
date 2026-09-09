@@ -211,7 +211,7 @@ module SpecrelayRunner
       end
 
       execute(config, client, result.payload)
-    rescue ClaudeProfile::Error => e
+    rescue ImplementationProfile::Error, ClaudeProfile::Error, CodexProfile::Error => e
       err.puts "Invalid executor profile: #{e.message}"
       USAGE_ERROR
     rescue CleanupRequired => e
@@ -259,7 +259,7 @@ module SpecrelayRunner
       return RUN_FAILED unless executor_ready?(config)
 
       run_loop(config, auth, interval, policy)
-    rescue ClaudeProfile::Error => e
+    rescue ImplementationProfile::Error, ClaudeProfile::Error, CodexProfile::Error => e
       err.puts "Invalid executor profile: #{e.message}"
       USAGE_ERROR
     rescue Config::Error => e
@@ -353,13 +353,14 @@ module SpecrelayRunner
       reason.strip.empty? ? "no eligible work (Platform authorized no run for this runner)." : "no work claimed: #{reason}"
     end
 
-    # The local, no-edit readiness gate for the real provider profile. Returns true
-    # immediately when no real profile is selected, so the deterministic
-    # fake-executor regression path never requires Claude Code to be installed or
-    # authenticated. Only classifications are printed — never probe output, which
-    # carries the operator's account identity.
+    # The local, no-edit readiness gate for whichever real provider this runner selected. It makes
+    # NO Platform request: an unready host must cost nothing, not a burned claim. Returns true
+    # immediately when no real profile is selected, so the deterministic fixture regression path
+    # never requires either provider CLI to be installed or authenticated. Only classifications and
+    # the profile's own safe version fact are printed — never probe output, which carries the
+    # operator's account identity.
     def executor_ready?(config)
-      profile = config.selected_claude_profile
+      profile = config.selected_implementation_profile
       return true if profile.nil?
 
       out.puts "Executor: #{profile.describe}"
@@ -371,7 +372,7 @@ module SpecrelayRunner
       # classification would otherwise appear AFTER the remedy in a merged
       # operator log — exactly the ordering that makes such a log hard to read.
       out.flush if out.respond_to?(:flush)
-      err.puts "Claude Code is not ready on this host — no run was claimed and nothing was executed."
+      err.puts "The selected AI provider is not ready on this host — no run was claimed and nothing was executed."
       err.puts "Remedy: #{readiness.remedy}"
       false
     end

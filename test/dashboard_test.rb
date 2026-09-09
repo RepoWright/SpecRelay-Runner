@@ -30,7 +30,7 @@ class DashboardTest < Minitest::Test
     @state_file = File.join(@dir, "connections.json")
     @checkout = git_checkout(REPOSITORY)
     @platform = FakePlatform.new(
-      claim_payload: claim_payload_for(task_id: "DEMO-0021", executor_command: "specrelay-fake-executor")
+      claim_payload: claim_payload_for(task_id: "DEMO-0021")
     ).start
     @secret_store = FakeSecretStore.new(entries: { RUNNER_ACCOUNT => CREDENTIAL })
     @dispatched = []

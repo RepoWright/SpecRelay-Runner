@@ -141,68 +141,27 @@ class ConfigTest < Minitest::Test
     assert_nil config.selected_claude_profile
   end
 
-  def test_a_claude_override_selects_the_real_profile
-    config = config_with_executor(<<~YAML)
-      provider: claude
-      command: claude
-      args: [--print, --output-format, stream-json, --verbose, --dangerously-skip-permissions]
-      prompt_delivery: argument
-      timeout_seconds: 900
-      env: {}
-    YAML
+  # The local block is a PROVIDER-ONLY selection, so the specification lane resolves the canonical
+  # Claude profile from the provider name rather than from anything the file describes.
+  def test_a_claude_selection_resolves_the_canonical_profile
+    config = config_with_executor("provider: claude\n")
 
     profile = config.selected_claude_profile
     refute_nil profile
-    assert_equal %w[--print --output-format stream-json --verbose --dangerously-skip-permissions], profile.args
-    # The override is non-secret logical config and is what Platform merges.
-    assert_equal 900, config.executor_override["timeout_seconds"]
+    assert_equal SpecrelayRunner::ClaudeProfile::CANONICAL.fetch("args"), profile.args
+    assert_equal({ "provider" => "claude" }, config.executor_override)
   end
 
-  # --- reconstructing a guided connection (MAPIAI-91) ------------------------
-
-  def stored_connection(reviewer_provider: nil)
-    SpecrelayRunner::ConnectionStore::Connection.new(
-      base_url: "http://127.0.0.1:3100", runner_id: "host-runner", runner_public_id: "rnr_one",
-      runner_display_name: "host runner", project_slug: "tiny-demo",
-      workspace_key: "tiny-demo-workspace", project_key: "tiny-demo",
-      workspace_display_name: "Tiny Demo Workspace",
-      repository_url: "https://github.com/SpecRelay/tiny-demo-workspace", default_branch: "main",
-      local_path: Dir.mktmpdir("ws"), reviewer_provider: reviewer_provider,
-      connected_at: "2026-08-17T00:00:00Z"
-    )
-  end
-
-  # The stored selection is reconstructed into the EXISTING `runner.reviewer:` shape, so
-  # {Review::Settings} stays the single owner of provider precedence and launch defaults.
-  def test_a_guided_connection_reconstructs_the_stored_reviewer_provider
-    config = SpecrelayRunner::Config.from_connection(stored_connection(reviewer_provider: "claude"),
-                                                    credential: "src_from-keychain")
-
-    assert_equal({ "provider" => "claude" }, config.reviewer_settings)
-    assert_equal "claude", SpecrelayRunner::Review::Settings.from(config, env: {}).provider
-  end
-
-  # No stored selection means NO reviewer — never one inferred from the executor, PATH, or a
-  # default. The connection stays completely usable for non-review work.
-  def test_a_connection_without_a_stored_reviewer_provider_configures_no_reviewer
-    config = SpecrelayRunner::Config.from_connection(stored_connection, credential: "src_from-keychain")
-
-    assert_empty config.reviewer_settings
-    refute SpecrelayRunner::Review::Settings.from(config, env: {}).configured?
-    assert_equal :registered, config.resolve_auth(env: {}).mode
-    assert_equal config.connection.local_path, config.workspace_root("tiny-demo-workspace", env: {})
-  end
-
-  # A selected profile the runner refuses to launch is an operator config error,
-  # surfaced by the CLI before any Platform request.
-  def test_an_unsafe_claude_override_raises
+  # A local block that tries to DESCRIBE a profile is refused before any Platform request, because
+  # the approved command, argv, timeout and environment belong to the profile, not to this file.
+  def test_a_local_block_that_composes_a_profile_is_refused
     config = config_with_executor(<<~YAML)
       provider: claude
       command: claude
       args: [--print, --output-format, stream-json, --verbose, --resume]
     YAML
 
-    error = assert_raises(SpecrelayRunner::ClaudeProfile::Error) { config.selected_claude_profile }
-    assert_match(/--resume/, error.message)
+    error = assert_raises(SpecrelayRunner::Config::Error) { config.selected_implementation_profile }
+    assert_match(/only a provider/, error.message)
   end
 end

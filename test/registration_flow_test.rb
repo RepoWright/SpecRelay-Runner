@@ -9,11 +9,16 @@ require_relative "test_helper"
 # issued credential both travel only through the environment and the
 # Authorization header.
 class RegistrationFlowTest < Minitest::Test
+  # The one directory on the child PATH that provides the approved fixture name. The PAYLOAD is
+  # always the canonical fixture profile; which script that approved name resolves to on this
+  # host is the test's choice, exactly as it is the operator's choice on a real machine.
+  def fixture_dir = @fixture_dir ||= fixture_bin
   TASK = "DEMO-0001"
 
   def setup
     @root, @executor = DemoWorkspace.build
-    @platform = FakePlatform.new(claim_payload: claim_payload_for(task_id: TASK, executor_command: @executor)).start
+    use_fixture(fixture_dir, @executor)
+    @platform = FakePlatform.new(claim_payload: claim_payload_for(task_id: TASK)).start
     @config = build_config
     @io = StringIO.new
   end
@@ -50,7 +55,7 @@ class RegistrationFlowTest < Minitest::Test
 
   def test_register_then_claim_once_in_registered_mode
     # 1. Register with the one-time registration token (env-supplied, not in the file).
-    code, output = register("TEST_REG_TOKEN" => FakePlatform::EXPECTED_REGISTRATION_TOKEN, "PATH" => ENV["PATH"])
+    code, output = register("TEST_REG_TOKEN" => FakePlatform::EXPECTED_REGISTRATION_TOKEN, "PATH" => "#{fixture_dir}:#{ENV['PATH']}")
     assert_equal SpecrelayRunner::CLI::SUCCESS, code, output
     assert_includes output, "Registered."
     assert_includes output, FakePlatform::ISSUED_CREDENTIAL # shown exactly once to the operator
@@ -65,7 +70,7 @@ class RegistrationFlowTest < Minitest::Test
     io = StringIO.new
     code = SpecrelayRunner::CLI.run(
       %W[claim-once --config #{@config.source_path}], out: io, err: io,
-      env: { "TEST_CREDENTIAL" => FakePlatform::ISSUED_CREDENTIAL, "PATH" => ENV["PATH"] }
+      env: { "TEST_CREDENTIAL" => FakePlatform::ISSUED_CREDENTIAL, "PATH" => "#{fixture_dir}:#{ENV['PATH']}" }
     )
     assert_equal SpecrelayRunner::CLI::SUCCESS, code, io.string
     assert_includes io.string, "registered runner credential"
@@ -80,13 +85,13 @@ class RegistrationFlowTest < Minitest::Test
   end
 
   def test_register_rejects_when_no_registration_token_is_set
-    code, output = register("PATH" => ENV["PATH"])
+    code, output = register("PATH" => "#{fixture_dir}:#{ENV['PATH']}")
     assert_equal SpecrelayRunner::CLI::USAGE_ERROR, code
     assert_match(/TEST_REG_TOKEN/, output)
   end
 
   def test_register_reports_a_rejected_token_without_leaking_it
-    code, output = register("TEST_REG_TOKEN" => "srt_wrong-token", "PATH" => ENV["PATH"])
+    code, output = register("TEST_REG_TOKEN" => "srt_wrong-token", "PATH" => "#{fixture_dir}:#{ENV['PATH']}")
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, code
     assert_match(/Registration failed/, output)
     refute_includes output, "srt_wrong-token"

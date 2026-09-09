@@ -11,7 +11,7 @@ class MissingWorktreeDirectoryFlowTest < Minitest::Test
 
   def setup
     @root, @executor = DemoWorkspace.build
-    @platform = FakePlatform.new(claim_payload: claim_payload_for(task_id: TASK, executor_command: @executor)).start
+    @platform = FakePlatform.new(claim_payload: claim_payload_for(task_id: TASK)).start
     @io = StringIO.new
     system(File.join(@root, "bin", "worktree"), "create", TASK, out: File::NULL, err: File::NULL, exception: true)
     FileUtils.remove_entry(worktree)

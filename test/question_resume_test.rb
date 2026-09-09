@@ -11,6 +11,10 @@ require_relative "test_helper"
 # WIRING — that the assignment's checkpoint is what a fresh session lands on, and that a claim
 # refuses before any provider whenever it is not.
 class QuestionResumeTest < Minitest::Test
+  # The one directory on the child PATH that provides the approved fixture name. The PAYLOAD is
+  # always the canonical fixture profile; which script that approved name resolves to on this
+  # host is the test's choice, exactly as it is the operator's choice on a real machine.
+  def fixture_dir = @fixture_dir ||= fixture_bin
   TASK = "DEMO-0036"
 
   BATCH = {
@@ -57,25 +61,26 @@ class QuestionResumeTest < Minitest::Test
     @platform.executor_questions.first[:body]["checkpoint"]
   end
 
+  # What the double asks and how it behaves are host-side controls installed behind the approved
+  # bare name; the assignment is always the canonical fixture profile.
   def question_payload(executor)
-    claim_payload_for(task_id: TASK, executor_command: executor).tap do |built|
-      built["executor"]["env"] = { "FAKE_QUESTION_JSON" => BATCH.to_json,
-                                   "FAKE_QUESTION_TIMEOUT_SECONDS" => "5",
-                                   "FAKE_QUESTION_EDIT_FIRST" => "1" }
-    end
+    use_fixture(fixture_dir, executor,
+                env: { "FAKE_EXECUTOR_QUESTION_JSON" => BATCH.to_json,
+                       "FAKE_EXECUTOR_QUESTION_TIMEOUT_SECONDS" => "5",
+                       "FAKE_EXECUTOR_QUESTION_EDIT_FIRST" => "1" })
+    claim_payload_for(task_id: TASK)
   end
 
   # Phase two: the same run, claimed again, carrying the answers and the recorded checkpoint —
   # metadata and the one claim-bound download path, never the bytes.
-  def resume_payload(checkpoint, executor: nil, env: nil, root: @root)
+  def resume_payload(checkpoint, executor: nil, env: {}, root: @root)
     executor ||= DemoWorkspace.write_resume_executor(root)
-    payload = claim_payload_for(task_id: TASK, executor_command: executor).merge(
+    use_fixture(fixture_dir, executor, env: env)
+    claim_payload_for(task_id: TASK).merge(
       "resume" => { "question_id" => "exq_fake", "checkpoint" => assigned(checkpoint),
                     "continuation_context" => BATCH["continuation_context"],
                     "questions" => BATCH["questions"], "answers" => ANSWERS }
     )
-    payload["executor"]["env"] = env if env
-    payload
   end
 
   def restart_platform(payload, delivery: settled_resume("RESUMED"))
@@ -117,7 +122,8 @@ class QuestionResumeTest < Minitest::Test
         tiny-demo-workspace: #{root}
     YAML
     SpecrelayRunner::CLI.run(%W[claim-once --config #{path}], out: io, err: io,
-                             env: { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN, "PATH" => ENV["PATH"] })
+                             env: { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN,
+                                    "PATH" => @child_path || "#{fixture_dir}:#{ENV['PATH']}" })
   end
 
   # What Platform puts in the assignment: everything the runner must prove, plus where to fetch
@@ -134,6 +140,23 @@ class QuestionResumeTest < Minitest::Test
   end
 
   def run_cli(io) = run_cli_in(@root, io)
+
+  # A real `codex` that exits at once without reading stdin.
+  def deaf_codex_bin
+    dir = Dir.mktmpdir("deaf-codex-")
+    path = File.join(dir, "codex")
+    File.write(path, "#!/bin/sh\nexit 0\n")
+    FileUtils.chmod(0o755, path)
+    dir
+  end
+
+  # Every PATH entry that does NOT hold an executable named `codex`, so this deterministic suite
+  # can never reach the operator's real CLI.
+  def self.path_without_codex
+    @path_without_codex ||= ENV["PATH"].to_s.split(File::PATH_SEPARATOR).reject do |dir|
+      dir.strip.empty? || File.executable?(File.join(dir, "codex"))
+    end.join(File::PATH_SEPARATOR)
+  end
 
   def git(dir, *args)
     system("git", "-C", dir, *args, out: File::NULL, err: File::NULL) || raise("git #{args.join(' ')} failed")
@@ -210,7 +233,7 @@ class QuestionResumeTest < Minitest::Test
     checkpoint = released_question_with_dirty_worktree
     restart_platform(resume_payload(checkpoint,
                                     executor: DemoWorkspace.write_silent_resume_executor(@root),
-                                    env: { "FAKE_RESUME_NEXT_QUESTION" => BATCH.to_json }))
+                                    env: { "FAKE_EXECUTOR_RESUME_NEXT_QUESTION" => BATCH.to_json }))
     @platform.release_question!
     io = StringIO.new
 
@@ -240,10 +263,14 @@ class QuestionResumeTest < Minitest::Test
 
   # CR-004 F3.3 — the process never started, so nothing received the answers and nothing may say
   # it did. The offline batch stays exactly as it was, for the owner to retry.
+  # The claimed profile is the CANONICAL Codex one and `codex` is absent from the child PATH, which
+  # is how a provider that cannot be launched really presents itself. A payload naming an
+  # arbitrary missing path is refused before the launch and would prove nothing about this path.
   def test_a_resumed_provider_that_cannot_be_launched_acknowledges_nothing
     checkpoint = released_question_with_dirty_worktree
-    restart_platform(resume_payload(checkpoint, executor: File.join(@root, "bin", "not-installed")))
+    restart_platform(resume_payload(checkpoint).merge("executor" => SpecrelayRunner::CodexProfile::CANONICAL))
     io = StringIO.new
+    @child_path = self.class.path_without_codex
 
     refute_equal SpecrelayRunner::CLI::SUCCESS, run_cli(io), io.string
     assert_empty @platform.delivery_acknowledgements, "a process that never started received nothing"
@@ -255,15 +282,16 @@ class QuestionResumeTest < Minitest::Test
   # session received them, so nothing may say one did, and the run must stay retryable: no tests,
   # no report, no publication, and the claim handed straight back.
   #
-  # `/usr/bin/true` is a real child that exits without ever reading its input, and the prompt is
-  # larger than the pipe buffer, so the failed handoff is deterministic rather than timing.
+  # The CANONICAL Codex profile already delivers its prompt on stdin. A `codex` double that exits
+  # without ever reading its input, with a prompt larger than the pipe buffer, makes the failed
+  # handoff deterministic rather than timing-dependent.
   def test_a_resume_whose_prompt_never_reaches_the_provider_acknowledges_nothing
     checkpoint = released_question_with_dirty_worktree
-    payload = resume_payload(checkpoint, executor: "/usr/bin/true")
-    payload["executor"]["prompt_delivery"] = "stdin"
+    payload = resume_payload(checkpoint).merge("executor" => SpecrelayRunner::CodexProfile::CANONICAL)
     payload["specification_package"]["handoff_prompt"] = "x" * 200_000
     restart_platform(payload)
     io = StringIO.new
+    @child_path = "#{deaf_codex_bin}:#{self.class.path_without_codex}"
 
     exit_code = run_cli(io)
 

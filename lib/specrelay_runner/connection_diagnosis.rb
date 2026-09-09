@@ -182,9 +182,10 @@ module SpecrelayRunner
         "point this connection at the correct checkout by reconnecting: " \
           "`specrelay-runner connect <enrollment-code>`"
       when "executor_not_authenticated"
-        "sign in to Claude Code on this host (`claude auth login`), then reconnect this workspace"
+        "sign in to this project's AI provider on this host, then reconnect this workspace"
       when "executor_unavailable", "executor_check_failed"
-        "install Claude Code so `claude` resolves on this runner's PATH, then reconnect this workspace"
+        "install this project's AI provider so its CLI resolves on this runner's PATH, then " \
+          "reconnect this workspace"
       else
         "reconnect this workspace with `specrelay-runner connect <enrollment-code>` so it reports " \
           "readiness again; Platform marks a connection ready only after a successful report"
@@ -234,31 +235,34 @@ module SpecrelayRunner
                 "it the correct local checkout directory")
     end
 
-    # Only for the supported real Claude profile. The deterministic fixture executor must
-    # never require Claude Code to be installed or signed in, so a fake-executor workspace
-    # skips this check explicitly rather than silently passing it.
+    # Only for whichever real profile the workspace's executor resolves to. The deterministic
+    # fixture must never require a provider CLI to be installed or signed in, so it resolves to no
+    # profile and skips this check explicitly rather than silently passing it.
     def executor(described)
-      executor_config = described.fetch("executor", {})
-      unless ClaudeProfile.selected?(executor_config)
+      profile = ImplementationProfile.for(described.fetch("executor", {}))
+      if profile.nil?
         return skip("Executor readiness", "this workspace uses the deterministic fixture executor, " \
                                           "which needs no provider CLI")
       end
 
-      readiness = ClaudeProfile.new(executor_config).readiness(env: env)
+      readiness = profile.readiness(env: env)
       return pass("Executor readiness (#{readiness.summary})") if readiness.ready?
 
-      fail_with(executor_outcome(readiness), "Executor readiness", readiness.summary, readiness.remedy)
-    rescue ClaudeProfile::Error => e
-      # A profile this runner REFUSES to launch is an executor problem, reported as one rather
-      # than raised: the operator needs the remedy, and the claim path would have failed here too.
+      fail_with(executor_outcome(readiness, profile.class), "Executor readiness", readiness.summary, readiness.remedy)
+    rescue ImplementationProfile::Error, ClaudeProfile::Error, CodexProfile::Error => e
+      # A provider this runner does not support, or a profile it REFUSES to launch, is an executor
+      # problem reported as one rather than raised: the operator needs the remedy, and the claim
+      # path would have failed here too.
       fail_with(EXECUTOR_CHECK_FAILED, "Executor readiness", Redaction.redact(e.message),
                 "this runner will not launch the executor this workspace resolves to; ask your " \
                 "project owner to correct the workspace's executor configuration in Platform")
     end
 
-    def executor_outcome(readiness)
-      return EXECUTOR_UNAVAILABLE if readiness.version == ClaudeProfile::UNAVAILABLE
-      return EXECUTOR_NOT_AUTHENTICATED if readiness.auth == ClaudeProfile::NOT_AUTHENTICATED
+    # The outcomes are provider-neutral Platform vocabulary; which constants say "unavailable" and
+    # "not authenticated" belongs to the profile that produced the readiness.
+    def executor_outcome(readiness, owner)
+      return EXECUTOR_UNAVAILABLE if readiness.version == owner::UNAVAILABLE
+      return EXECUTOR_NOT_AUTHENTICATED if readiness.auth == owner::NOT_AUTHENTICATED
 
       EXECUTOR_CHECK_FAILED
     end

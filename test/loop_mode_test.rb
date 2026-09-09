@@ -11,6 +11,8 @@ require_relative "test_helper"
 # handler that only works in theory is exactly the class of bug MVP-0017 round 004
 # was written to prevent.
 class LoopModeTest < Minitest::Test
+  # The one directory on the child PATH that provides the approved fixture name.
+  def fixture_dir = @fixture_dir ||= fixture_bin
   Loop = SpecrelayRunner::LoopRunner
   Interval = SpecrelayRunner::PollInterval
 
@@ -278,7 +280,8 @@ class LoopModeTest < Minitest::Test
 
   def test_claim_once_is_unchanged_and_prints_no_loop_status
     root, executor = DemoWorkspace.build
-    platform = FakePlatform.new(claim_payload: claim_payload_for(task_id: "DEMO-ONCE", executor_command: executor)).start
+    use_fixture(fixture_dir, executor)
+    platform = FakePlatform.new(claim_payload: claim_payload_for(task_id: "DEMO-ONCE")).start
     path = File.join(Dir.mktmpdir("cfg"), "runner.yml")
     File.write(path, <<~YAML)
       platform:
@@ -294,7 +297,7 @@ class LoopModeTest < Minitest::Test
     YAML
     io = StringIO.new
     code = SpecrelayRunner::CLI.run(%W[claim-once --config #{path}], out: io, err: io,
-                                                                    env: { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN, "PATH" => ENV["PATH"] })
+                                                                    env: { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN, "PATH" => "#{fixture_dir}:#{ENV['PATH']}" })
 
     assert_equal SpecrelayRunner::CLI::SUCCESS, code, io.string
     refute_includes io.string, "[loop]", "claim-once must remain a single shot with no loop output"
@@ -360,7 +363,8 @@ class LoopModeTest < Minitest::Test
   # `claim_limit` is the fake's bound rather than the loop's. A session that fails to stop would
   # otherwise never return, and a hanging test proves nothing.
   def run_refusing_loop(release_status: 201)
-    @loop_root, = DemoWorkspace.build
+    @loop_root, loop_executor = DemoWorkspace.build
+    use_fixture(fixture_dir, loop_executor)
     bare = FakeGithub.add_remote(@loop_root)
     %w[main DEMO-LOOP].each do |branch|
       system("git", "-C", @loop_root, "push", "-q", "origin", "HEAD:refs/heads/#{branch}", exception: true)
@@ -371,7 +375,7 @@ class LoopModeTest < Minitest::Test
                  "clone_url" => "git@github.com:SpecRelay/tiny-demo-workspace.git",
                  "branch" => "DEMO-LOOP", "head_commit" => "a" * 40,
                  "pull_request_url" => "https://github.com/SpecRelay/tiny-demo-workspace/pull/9" }
-    payload = claim_payload_for(task_id: "DEMO-LOOP", executor_command: "/bin/true",
+    payload = claim_payload_for(task_id: "DEMO-LOOP",
                                 publication: {}, rework: { "repositories" => [ reviewed ] })
     @loop_platform = FakePlatform.new(claim_payload: payload, claim_limit: 4,
                                       release_status: release_status).start
@@ -392,7 +396,7 @@ class LoopModeTest < Minitest::Test
     io = StringIO.new
     code = SpecrelayRunner::CLI.run(%W[loop --config #{path} --on-failure continue], out: io, err: io,
                                     env: { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN,
-                                           "PATH" => "#{gh_dir}:#{ENV['PATH']}", "HOME" => ENV["HOME"].to_s })
+                                           "PATH" => "#{fixture_dir}:#{gh_dir}:#{ENV['PATH']}", "HOME" => ENV["HOME"].to_s })
     [ code, io.string, @loop_platform, gh_log ]
   end
 

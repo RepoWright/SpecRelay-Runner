@@ -17,6 +17,10 @@ require_relative "test_helper"
 #   3. output cannot break the run. A consumer that raises, and a Platform that
 #      refuses the upload, both leave the execution's captured result untouched.
 class LiveLogTest < Minitest::Test
+  # The one directory on the child PATH that provides the approved fixture name. The PAYLOAD is
+  # always the canonical fixture profile; which script that approved name resolves to on this
+  # host is the test's choice, exactly as it is the operator's choice on a real machine.
+  def fixture_dir = @fixture_dir ||= fixture_bin
   Sink = Struct.new(:lines, :times) do
     def to_proc = ->(source, line) { lines << [ source, line ] and times << Process.clock_gettime(Process::CLOCK_MONOTONIC) }
   end
@@ -40,7 +44,7 @@ class LiveLogTest < Minitest::Test
     RUBY
     seen = []
     result = SpecrelayRunner::CommandRunner.run(
-      [ RbConfig.ruby, script ], chdir: @tmp, env: { "PATH" => ENV["PATH"] }, timeout_seconds: 20,
+      [ RbConfig.ruby, script ], chdir: @tmp, env: { "PATH" => "#{fixture_dir}:#{ENV['PATH']}" }, timeout_seconds: 20,
       on_output: ->(source, line) { seen << [ monotonic, source, line ] }
     )
 
@@ -63,7 +67,7 @@ class LiveLogTest < Minitest::Test
     started = 0
 
     result = SpecrelayRunner::CommandRunner.run(
-      [ RbConfig.ruby, write_script("exit 0\n") ], chdir: @tmp, env: { "PATH" => ENV["PATH"] },
+      [ RbConfig.ruby, write_script("exit 0\n") ], chdir: @tmp, env: { "PATH" => "#{fixture_dir}:#{ENV['PATH']}" },
       timeout_seconds: 20, on_start: -> { started += 1 }
     )
 
@@ -80,7 +84,7 @@ class LiveLogTest < Minitest::Test
     prompt = "x" * 200_000
 
     result = SpecrelayRunner::CommandRunner.run(
-      [ RbConfig.ruby, script ], chdir: @tmp, env: { "PATH" => ENV["PATH"] }, timeout_seconds: 20,
+      [ RbConfig.ruby, script ], chdir: @tmp, env: { "PATH" => "#{fixture_dir}:#{ENV['PATH']}" }, timeout_seconds: 20,
       stdin_data: prompt, on_start: -> { started += 1 }
     )
 
@@ -97,7 +101,7 @@ class LiveLogTest < Minitest::Test
 
     assert_raises(Errno::EPIPE) do
       SpecrelayRunner::CommandRunner.run(
-        [ RbConfig.ruby, write_script("exit 0\n") ], chdir: @tmp, env: { "PATH" => ENV["PATH"] },
+        [ RbConfig.ruby, write_script("exit 0\n") ], chdir: @tmp, env: { "PATH" => "#{fixture_dir}:#{ENV['PATH']}" },
         timeout_seconds: 20, stdin_data: "x" * 1_000_000, on_start: -> { started += 1 }
       )
     end
@@ -109,7 +113,7 @@ class LiveLogTest < Minitest::Test
   # before reading its input has always been an ordinary early exit, and its result still decides.
   def test_a_child_that_never_reads_its_input_is_unchanged_without_a_start_callback
     result = SpecrelayRunner::CommandRunner.run(
-      [ RbConfig.ruby, write_script("exit 7\n") ], chdir: @tmp, env: { "PATH" => ENV["PATH"] },
+      [ RbConfig.ruby, write_script("exit 7\n") ], chdir: @tmp, env: { "PATH" => "#{fixture_dir}:#{ENV['PATH']}" },
       timeout_seconds: 20, stdin_data: "x" * 1_000_000
     )
 
@@ -124,7 +128,7 @@ class LiveLogTest < Minitest::Test
       warn "to stderr"
     RUBY
     seen = []
-    SpecrelayRunner::CommandRunner.run([ RbConfig.ruby, script ], chdir: @tmp, env: { "PATH" => ENV["PATH"] },
+    SpecrelayRunner::CommandRunner.run([ RbConfig.ruby, script ], chdir: @tmp, env: { "PATH" => "#{fixture_dir}:#{ENV['PATH']}" },
                                                                  timeout_seconds: 20,
                                                                  on_output: ->(s, l) { seen << [ s, l ] })
 
@@ -135,7 +139,7 @@ class LiveLogTest < Minitest::Test
   def test_a_final_line_without_a_trailing_newline_is_still_delivered
     script = write_script('$stdout.write("no trailing newline")')
     seen = []
-    SpecrelayRunner::CommandRunner.run([ RbConfig.ruby, script ], chdir: @tmp, env: { "PATH" => ENV["PATH"] },
+    SpecrelayRunner::CommandRunner.run([ RbConfig.ruby, script ], chdir: @tmp, env: { "PATH" => "#{fixture_dir}:#{ENV['PATH']}" },
                                                                  timeout_seconds: 20,
                                                                  on_output: ->(s, l) { seen << [ s, l ] })
 
@@ -145,7 +149,7 @@ class LiveLogTest < Minitest::Test
   def test_a_consumer_that_raises_cannot_fail_the_execution
     script = write_script('puts "still captured"')
     result = SpecrelayRunner::CommandRunner.run([ RbConfig.ruby, script ], chdir: @tmp,
-                                                                          env: { "PATH" => ENV["PATH"] }, timeout_seconds: 20,
+                                                                          env: { "PATH" => "#{fixture_dir}:#{ENV['PATH']}" }, timeout_seconds: 20,
                                                                           on_output: ->(_s, _l) { raise "consumer exploded" })
 
     assert_equal 0, result.exit_code
@@ -159,7 +163,7 @@ class LiveLogTest < Minitest::Test
     # terminal, a JSON body, and a browser can render.
     script = write_script('$stdout.write(("é" * 60_000) + "\n")')
     seen = []
-    SpecrelayRunner::CommandRunner.run([ RbConfig.ruby, script ], chdir: @tmp, env: { "PATH" => ENV["PATH"] },
+    SpecrelayRunner::CommandRunner.run([ RbConfig.ruby, script ], chdir: @tmp, env: { "PATH" => "#{fixture_dir}:#{ENV['PATH']}" },
                                                                  timeout_seconds: 30,
                                                                  on_output: ->(s, l) { seen << [ s, l ] })
 
@@ -180,7 +184,7 @@ class LiveLogTest < Minitest::Test
       $stdout.write("\\n")
     RUBY
     seen = []
-    SpecrelayRunner::CommandRunner.run([ RbConfig.ruby, script ], chdir: @tmp, env: { "PATH" => ENV["PATH"] },
+    SpecrelayRunner::CommandRunner.run([ RbConfig.ruby, script ], chdir: @tmp, env: { "PATH" => "#{fixture_dir}:#{ENV['PATH']}" },
                                                                  timeout_seconds: 20,
                                                                  on_output: ->(_s, l) { seen << [ monotonic, l ] })
 
@@ -438,7 +442,7 @@ class LiveLogTest < Minitest::Test
 
     started = monotonic
     result = SpecrelayRunner::CommandRunner.run([ RbConfig.ruby, chatty_provider ], chdir: @tmp,
-                                                env: { "PATH" => ENV["PATH"] }, timeout_seconds: 20,
+                                                env: { "PATH" => "#{fixture_dir}:#{ENV['PATH']}" }, timeout_seconds: 20,
                                                 on_output: decoder.sink)
     elapsed = monotonic - started
     stream.finish
@@ -776,7 +780,8 @@ class LiveLogTest < Minitest::Test
 
   def with_execution(log_event_delay: nil)
     root, executor = DemoWorkspace.build
-    platform = FakePlatform.new(claim_payload: claim_payload_for(task_id: "DEMO-0018", executor_command: executor)).start
+    use_fixture(fixture_dir, executor)
+    platform = FakePlatform.new(claim_payload: claim_payload_for(task_id: "DEMO-0018")).start
     platform.log_event_delay = log_event_delay
     path = File.join(Dir.mktmpdir("cfg"), "runner.yml")
     File.write(path, <<~YAML)
@@ -794,7 +799,7 @@ class LiveLogTest < Minitest::Test
     io = StringIO.new
     started = monotonic
     code = SpecrelayRunner::CLI.run(%W[claim-once --config #{path}], out: io, err: io,
-                                                                    env: { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN, "PATH" => ENV["PATH"] })
+                                                                    env: { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN, "PATH" => "#{fixture_dir}:#{ENV['PATH']}" })
     elapsed = monotonic - started
     assert_equal SpecrelayRunner::CLI::SUCCESS, code, io.string
     yield platform, io.string, elapsed

@@ -21,6 +21,10 @@ require "open3"
 # repository in a different publishable state than the one that was measured and verified, and
 # publishing that would commit files the report's own diff does not describe.
 class ProportionalVerificationTest < Minitest::Test
+  # The one directory on the child PATH that provides the approved fixture name. The PAYLOAD is
+  # always the canonical fixture profile; which script that approved name resolves to on this
+  # host is the test's choice, exactly as it is the operator's choice on a real machine.
+  def fixture_dir = @fixture_dir ||= fixture_bin
   TASK = "MAPIAI-93"
   BRANCH = TASK
   WORKSPACE_SLUG = "SpecRelay/multi-demo-workspace"
@@ -48,13 +52,15 @@ class ProportionalVerificationTest < Minitest::Test
 
   # --- harness -------------------------------------------------------------
 
-  # `executor_env` reaches the fake executor through the assignment's own `executor.env`, the only
-  # channel Platform has. A nil value REMOVES a default, which is how a test says "this executor
-  # did not run its own selection" — the case that isolates the runner's independent replay.
-  def start(executor_env: {})
-    payload = claim_payload_for(task_id: TASK, executor_command: @built.executor, publication: {})
-    payload["executor"]["env"] = { "FAKE_EDITED" => "component-a,component-b",
-                                  "FAKE_RUN_SELECTED" => "1" }.merge(executor_env).compact
+  # `fixture_env` is the environment the double runs under on this host, installed behind the
+  # approved bare name on the child PATH. A nil value REMOVES a default, which is how a test says
+  # "this executor did not run its own selection" — the case that isolates the runner's
+  # independent replay.
+  def start(fixture_env: {})
+    use_fixture(fixture_dir, @built.executor,
+                env: { "FAKE_EXECUTOR_EDITED" => "component-a,component-b",
+                       "FAKE_EXECUTOR_RUN_SELECTED" => "1" }.merge(fixture_env).compact)
+    payload = claim_payload_for(task_id: TASK, publication: {})
     @platform = FakePlatform.new(claim_payload: payload).start
     @config_path = write_config
     payload
@@ -80,7 +86,7 @@ class ProportionalVerificationTest < Minitest::Test
   def run_cli
     io = StringIO.new
     env = { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN,
-            "PATH" => "#{@gh_dir}:#{ENV['PATH']}", "HOME" => ENV["HOME"].to_s }
+            "PATH" => "#{fixture_dir}:#{@gh_dir}:#{ENV['PATH']}", "HOME" => ENV["HOME"].to_s }
     code = SpecrelayRunner::CLI.run(%W[claim-once --config #{@config_path}], out: io, err: io, env: env)
     [ code, io.string ]
   end
@@ -165,7 +171,7 @@ class ProportionalVerificationTest < Minitest::Test
   # --- S02 / S04: no verification found, and a mixed result ----------------
 
   def test_a_changed_repository_with_no_verification_is_not_found_and_still_publishes
-    start(executor_env: { "FAKE_COMMANDS" => JSON.generate({ "component-b" => [] }) })
+    start(fixture_env: { "FAKE_EXECUTOR_COMMANDS" => JSON.generate({ "component-b" => [] }) })
     code, output = run_cli
 
     assert_equal SpecrelayRunner::CLI::SUCCESS, code, output
@@ -179,7 +185,7 @@ class ProportionalVerificationTest < Minitest::Test
   end
 
   def test_each_repository_uses_its_own_independent_plan
-    start(executor_env: { "FAKE_COMMANDS" => JSON.generate(
+    start(fixture_env: { "FAKE_EXECUTOR_COMMANDS" => JSON.generate(
       { "component-a" => [ %w[bin/verify], [ "sh", "-c", "exit 0" ] ], "component-b" => [] }
     ) })
     code, output = run_cli
@@ -192,7 +198,7 @@ class ProportionalVerificationTest < Minitest::Test
   # --- S05: the executor repairs before it returns -------------------------
 
   def test_the_executor_repairs_a_failure_and_the_runner_replay_observes_the_final_pass
-    start(executor_env: { "FAKE_BREAK" => "component-b", "FAKE_REPAIR" => "1" })
+    start(fixture_env: { "FAKE_EXECUTOR_BREAK" => "component-b", "FAKE_EXECUTOR_REPAIR" => "1" })
     code, output = run_cli
 
     assert_equal SpecrelayRunner::CLI::SUCCESS, code, output
@@ -207,7 +213,7 @@ class ProportionalVerificationTest < Minitest::Test
   # --- S06: an unresolved failure publishes nothing ------------------------
 
   def test_an_unresolved_failure_is_failed_and_prevents_every_external_write
-    start(executor_env: { "FAKE_BREAK" => "component-b" })
+    start(fixture_env: { "FAKE_EXECUTOR_BREAK" => "component-b" })
     run_cli
 
     assert_equal "failed", terminal["outcome"]
@@ -229,7 +235,7 @@ class ProportionalVerificationTest < Minitest::Test
   # A passing repository beside a failing one is NOT published either: publication is all-or-fail,
   # so a partially verified run must not leave a half-published output for review.
   def test_a_passing_repository_beside_a_failing_one_is_not_published
-    start(executor_env: { "FAKE_BREAK" => "component-b" })
+    start(fixture_env: { "FAKE_EXECUTOR_BREAK" => "component-b" })
     run_cli
 
     assert_empty branches_of("SpecRelay/component-a")
@@ -254,8 +260,8 @@ class ProportionalVerificationTest < Minitest::Test
   # Publication runs `git add -A`, so committing here would publish content absent from the
   # report's own diff.
   def test_a_zero_exit_command_that_rewrites_a_tracked_file_fails_before_any_external_write
-    start(executor_env: { "FAKE_COMMANDS" => JSON.generate({ "component-a" => [ %w[bin/mutate] ] }),
-                          "FAKE_RUN_SELECTED" => nil })
+    start(fixture_env: { "FAKE_EXECUTOR_COMMANDS" => JSON.generate({ "component-a" => [ %w[bin/mutate] ] }),
+                          "FAKE_EXECUTOR_RUN_SELECTED" => nil })
     run_cli
 
     assert_equal "failed", terminal["outcome"]
@@ -269,8 +275,8 @@ class ProportionalVerificationTest < Minitest::Test
   # HEAD moved out from under the measurement. The tree is clean afterwards, so a run that
   # accepted this would publish a commit nobody measured.
   def test_a_command_that_commits_moves_head_and_fails_closed
-    start(executor_env: { "FAKE_COMMANDS" => JSON.generate({ "component-b" => [ %w[bin/commit-it] ] }),
-                          "FAKE_RUN_SELECTED" => nil })
+    start(fixture_env: { "FAKE_EXECUTOR_COMMANDS" => JSON.generate({ "component-b" => [ %w[bin/commit-it] ] }),
+                          "FAKE_EXECUTOR_RUN_SELECTED" => nil })
     run_cli
 
     assert_equal "failed", terminal["outcome"]
@@ -281,8 +287,8 @@ class ProportionalVerificationTest < Minitest::Test
   # A selected repository that becomes clean has nothing left to publish. The re-verification
   # refuses it by the same rule the first selection would have, and that refusal is the drift.
   def test_a_command_that_reverts_the_change_leaves_nothing_to_publish_and_fails_closed
-    start(executor_env: { "FAKE_COMMANDS" => JSON.generate({ "component-a" => [ %w[bin/revert-it] ] }),
-                          "FAKE_RUN_SELECTED" => nil })
+    start(fixture_env: { "FAKE_EXECUTOR_COMMANDS" => JSON.generate({ "component-a" => [ %w[bin/revert-it] ] }),
+                          "FAKE_EXECUTOR_RUN_SELECTED" => nil })
     run_cli
 
     assert_equal "failed", terminal["outcome"]
@@ -293,7 +299,7 @@ class ProportionalVerificationTest < Minitest::Test
   # Ignored scratch output is not publishable state, so it must NOT fail the run. Without this the
   # fail-closed rule would break every real test command that writes a log or a coverage report.
   def test_a_command_writing_only_git_ignored_output_still_passes_and_publishes
-    start(executor_env: { "FAKE_COMMANDS" => JSON.generate(
+    start(fixture_env: { "FAKE_EXECUTOR_COMMANDS" => JSON.generate(
       { "component-a" => [ %w[bin/verify], %w[bin/verify-ignored] ], "component-b" => [ %w[bin/verify] ] }
     ) })
     code, output = run_cli
@@ -308,7 +314,7 @@ class ProportionalVerificationTest < Minitest::Test
   # The stability gate belongs only to the path that would otherwise publish. An ordinary command
   # failure already blocks publication, and its own reason must not be replaced by a drift reason.
   def test_an_ordinary_command_failure_still_reports_its_own_cause
-    start(executor_env: { "FAKE_BREAK" => "component-b" })
+    start(fixture_env: { "FAKE_EXECUTOR_BREAK" => "component-b" })
     run_cli
 
     assert_equal "failed", terminal["outcome"]
@@ -322,7 +328,7 @@ class ProportionalVerificationTest < Minitest::Test
   # something changed and had no verification. The clean run must state the first without
   # borrowing the second's vocabulary.
   def test_a_clean_no_change_run_reports_an_empty_verification_collection
-    start(executor_env: { "FAKE_EDITED" => "" })
+    start(fixture_env: { "FAKE_EXECUTOR_EDITED" => "" })
     code, output = run_cli
 
     assert_equal SpecrelayRunner::CLI::SUCCESS, code, output

@@ -6,6 +6,7 @@ require "json"
 require "tmpdir"
 require "stringio"
 require "fileutils"
+require "shellwords"
 
 $LOAD_PATH.unshift(File.expand_path("../lib", __dir__))
 require "specrelay_runner"
@@ -17,6 +18,7 @@ require_relative "support/multi_repository_workspace"
 require_relative "support/preview_workspace"
 require_relative "support/fake_github"
 require_relative "support/fake_claude_cli"
+require_relative "support/fake_codex_cli"
 require_relative "support/specification_workspace"
 require_relative "support/recording_terminal"
 
@@ -24,6 +26,44 @@ require_relative "support/recording_terminal"
 # (MVP-0025 scope 3, consumed by MVP-0026). It deliberately carries NO `executor`,
 # `repositories`, or `report_contract` block, because Platform sends none for this lane — a
 # fixture that included them would be testing a payload this product does not produce.
+# Install `script` as the approved bare fixture name on its own bin directory and return that
+# directory. A test prepends it to the CHILD PATH it hands the CLI, so the runner resolves the
+# approved name to the double exactly the way it resolves it to the shipped fixture on a real host.
+#
+# This is the explicit test seam that replaced writing an arbitrary executable path — and, since
+# the fixture environment became exact, an arbitrary set of fixture instructions — into a `fake`
+# payload. It adds no production bypass, no environment override and no test-only branch: the
+# payload is always the canonical profile, and what a bare name resolves to on a host, under which
+# environment, is the host's business.
+def fixture_bin(script = nil, env: {})
+  dir = Dir.mktmpdir("fixture-bin-")
+  script ? use_fixture(dir, script, env: env) : dir
+end
+
+# Point the approved fixture name at `script`, replacing whatever it pointed at before. A suite that
+# chooses a different double per example re-points one directory rather than rebuilding its PATH.
+#
+# `env` is the host-side environment the double runs under: the controls a particular example needs
+# it to read. It is installed HERE, on this machine, next to the choice of which file the name
+# resolves to — which is the same decision, and the one an operator owns.
+#
+# A launcher that `exec`s the script rather than a copy of it, so a test that rewrites its double
+# mid-example still runs the script it just wrote. `exec` replaces the shell, so the child the
+# runner waits on, times out and signals is the double itself.
+def use_fixture(dir, script, env: {})
+  target = File.join(dir, SpecrelayRunner::ImplementationProfile::FIXTURE_COMMAND)
+  File.delete(target) if File.symlink?(target) || File.exist?(target)
+  exports = env.map { |name, value| "export #{name}=#{Shellwords.escape(value.to_s)}\n" }.join
+  File.write(target, "#!/bin/sh\n#{exports}exec #{Shellwords.escape(File.expand_path(script))} \"$@\"\n")
+  FileUtils.chmod(0o755, target)
+  dir
+end
+
+# The child PATH that resolves the approved fixture name to `script`.
+def fixture_path(script, base: ENV["PATH"], env: {})
+  [ fixture_bin(script, env: env), base.to_s ].reject(&:empty?).join(File::PATH_SEPARATOR)
+end
+
 def spec_creation_payload_for(issue_key:, title: "Add an export button", inputs: nil,
                               specification_root: "specs", complete: true, content: nil,
                               existing_pull_request_url: nil, specification_provider: nil)
@@ -154,10 +194,9 @@ end
 # rework: when given, adds the MVP-0035 change-request block and advances the assigned report
 # round, exactly as Platform does for a claim that follows a CHANGES_REQUESTED review. Omit it
 # to model a first execution, which carries no rework block at all.
-def claim_payload_for(task_id:, executor_command:, publication: nil, rework: nil, restart: nil,
+def claim_payload_for(task_id:, publication: nil, rework: nil, restart: nil,
                       worktree_create_command: nil)
-  payload = base_claim_payload(task_id: task_id, executor_command: executor_command,
-                               worktree_create_command: worktree_create_command)
+  payload = base_claim_payload(task_id: task_id, worktree_create_command: worktree_create_command)
   payload = payload.merge("rework" => rework_block(rework), "report_contract" => rework_round(task_id)) if rework
   # MVP-0036 Stage 2b — a REPLACEMENT run's recorded target. Its report round stays the first
   # one, because the replacement is a new run rather than another round of the old one.
@@ -227,7 +266,7 @@ def rework_round(task_id)
     "report_path" => "specs/#{task_id}/execution-reports/002-review-fixes" }
 end
 
-def base_claim_payload(task_id:, executor_command:, worktree_create_command: nil)
+def base_claim_payload(task_id:, worktree_create_command: nil)
   {
     "contract_version" => "mvp-0010",
     "claim" => { "runner_execution_id" => "rex_test123", "claim_policy_mode" => "all_eligible" },
@@ -241,11 +280,12 @@ def base_claim_payload(task_id:, executor_command:, worktree_create_command: nil
       "worktree_create_command" => worktree_create_command || "./bin/worktree create #{task_id}",
       "worktree_release_command" => "./bin/worktree release #{task_id}"
     },
-    "executor" => {
-      "provider" => "fake", "command" => executor_command, "args" => [],
-      "prompt_delivery" => "file_argument", "mode" => "",
-      "timeout_seconds" => 120, "env" => {}
-    },
+    # The CANONICAL fixture identity, byte-for-byte what Platform serves and what the runner
+    # refuses to deviate from — environment included. A test that needs different behaviour
+    # installs a different SCRIPT, under a different host environment, behind this approved bare
+    # name (see `fixture_bin`). Which file a bare name resolves to on a host, and what that file
+    # reads while it runs, is the host's business — not something a payload may say.
+    "executor" => SpecrelayRunner::ImplementationProfile::FIXTURE_CANONICAL,
     "specification_package" => specification_package_block(task_id),
     # MAPIAI-87 — required on EVERY assignment and null only when the ticket has no accepted
     # implementation. Absence is malformed input, not a first run, so the fixture states it.

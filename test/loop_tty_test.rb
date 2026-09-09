@@ -24,6 +24,8 @@ require_relative "support/pty_session"
 # Nothing here reaches a real Platform, a real Keychain, or a real executor: the config is the
 # advanced/legacy `--config` path pointed at FakePlatform, which authorizes no work.
 class LoopTtyTest < Minitest::Test
+  # The one directory on the child PATH that provides the approved fixture name.
+  def fixture_dir = @fixture_dir ||= fixture_bin
   include PtySession
 
   IDLE_POLLS = 5
@@ -32,9 +34,10 @@ class LoopTtyTest < Minitest::Test
 
   def setup
     @dir = Dir.mktmpdir("loop-tty")
-    @root, = DemoWorkspace.build
+    @root, executor = DemoWorkspace.build
+    use_fixture(fixture_dir, executor)
     @platform = FakePlatform.new(
-      claim_payload: claim_payload_for(task_id: "DEMO-RUNNER-0001", executor_command: slow_executor)
+      claim_payload: claim_payload_for(task_id: "DEMO-LOOP-0001")
     )
     @platform.offer_no_work!
     @platform.start
@@ -189,7 +192,7 @@ class LoopTtyTest < Minitest::Test
     # MAPIAI-97 — the task environment is handed back at the LOOP boundary, before the loop could
     # poll again. A preview of this same ticket addresses the same task id, so an environment left
     # behind here is one the next claim would be built on top of.
-    assert_includes output, "Released the task environment DEMO-RUNNER-0001"
+    assert_includes output, "Released the task environment DEMO-LOOP-0001"
     assert_operator output.index("Released the task environment"), :<,
                     output.index("stopped by signal"),
                     "the release must happen before the loop winds down, not after"
@@ -379,6 +382,6 @@ class LoopTtyTest < Minitest::Test
   def child_env
     { "SPECRELAY_RUNNER_STATE_FILE" => @state_file, "SPECRELAY_RUNNER_CONFIG" => @config,
       "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN, "RUNNER_LIB" => File.expand_path("../lib", __dir__),
-      "PATH" => ENV.fetch("PATH", ""), "TERM" => "xterm" }
+      "PATH" => "#{fixture_dir}:#{ENV.fetch('PATH', '')}", "TERM" => "xterm" }
   end
 end

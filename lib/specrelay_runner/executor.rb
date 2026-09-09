@@ -16,11 +16,13 @@ module SpecrelayRunner
   class Executor
     PROMPT_PLACEHOLDER = "<PROMPT>"
 
-    # Executables this repository ships (currently only the deterministic fake
-    # executor). Platform names them as a bare command in the workspace executor
-    # config because Platform cannot know where this repository is checked out on
-    # the runner's host; the runner resolves them against its own bin/ so the
-    # documented Tiny Demo path needs no absolute-path override from the operator.
+    # Executables this repository ships (currently only the deterministic fixture).
+    # Platform names them as a bare command in the workspace executor config because
+    # Platform cannot know where this repository is checked out on the runner's host;
+    # the runner falls back to its own bin/ so the documented Tiny Demo path needs no
+    # absolute-path override from the operator. It is a FALLBACK rather than an
+    # override: a name the operator's own PATH already provides is the operator's
+    # choice to make on their own machine.
     BUNDLED_BIN = File.expand_path("../../bin", __dir__)
 
     # `launch_error` is set when the configured executable could not be started at
@@ -78,18 +80,27 @@ module SpecrelayRunner
       launch_failure(e, prompt_path)
     end
 
-    # The executable to launch. A bare name that this repository ships resolves to
-    # the bundled absolute path; anything else — an absolute path, a relative path,
-    # or a provider CLI like `claude` — is passed through untouched for the normal
-    # PATH/filesystem lookup. Never a shell string.
+    # The executable to launch. The payload may only name an APPROVED BARE NAME
+    # (ImplementationProfile enforces that before this object is built); WHICH file on this host
+    # that name resolves to is the host's business, not the payload's. A bare name is therefore
+    # looked up on the runner's own PATH first and falls back to the copy this repository ships,
+    # so the documented Tiny Demo path still works on a machine that has installed nothing. Never a
+    # shell string.
     def command
       raw = config.fetch("command", "claude").to_s
+      # The BARE name is handed to the launcher whenever this host's PATH provides it, because
+      # Process.spawn resolves it against the same PATH and would pick the same file. Keeping the
+      # name rather than the resolved path also keeps an absolute LOCAL path out of the argv this
+      # attempt records as report evidence. The bundled copy is used only when PATH has nothing,
+      # which is the documented Tiny Demo case on a machine that installed nothing.
+      return raw if self.class.on_path(raw, env: env)
+
       self.class.bundled(raw) || raw
     end
 
     # The absolute file a configured command will ACTUALLY launch, resolved exactly
-    # the way #command + Process.spawn resolve it: a bundled bare name first, then
-    # the effective PATH. Returns nil when nothing executable resolves.
+    # the way #command + Process.spawn resolve it: the effective PATH first, then
+    # the copy this repository bundles. Returns nil when nothing executable resolves.
     #
     # This is the one authoritative answer to "which file are we about to run", and
     # it is deliberately shared with ClaudeProfile so the readiness probe, the
@@ -102,12 +113,22 @@ module SpecrelayRunner
       raw = raw.to_s.strip
       return nil if raw.empty?
 
-      candidate = raw.include?(File::SEPARATOR) ? File.expand_path(raw) : (bundled(raw) || path_lookup(raw, env))
+      candidate = raw.include?(File::SEPARATOR) ? File.expand_path(raw) : (path_lookup(raw, env) || bundled(raw))
       return nil unless candidate && File.executable?(candidate)
 
       File.realpath(candidate)
     rescue SystemCallError
       nil
+    end
+
+    # A bare name as the runner's OWN PATH resolves it, or nil. This is host ownership: the payload
+    # chose the name, the operator's machine chooses the file. It is also the seam a deterministic
+    # test uses to put a double behind the approved bare fixture name without any production
+    # bypass, environment override or test-only branch.
+    def self.on_path(raw, env: ENV)
+      return nil if raw.to_s.include?(File::SEPARATOR)
+
+      path_lookup(raw, env)
     end
 
     # An executable this repository ships, or nil. A name containing a separator is

@@ -13,7 +13,8 @@ class ProtocolFlowTest < Minitest::Test
 
   def setup
     @root, @executor = DemoWorkspace.build
-    @platform = FakePlatform.new(claim_payload: claim_payload_for(task_id: TASK, executor_command: @executor)).start
+    @executor_path = fixture_path(@executor)
+    @platform = FakePlatform.new(claim_payload: claim_payload_for(task_id: TASK)).start
     @config_path = write_config
   end
 
@@ -41,7 +42,7 @@ class ProtocolFlowTest < Minitest::Test
 
   def run_cli(extra_env = {})
     io = StringIO.new
-    env = { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN, "PATH" => ENV["PATH"] }.merge(extra_env)
+    env = { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN, "PATH" => @executor_path }.merge(extra_env)
     code = SpecrelayRunner::CLI.run(%W[claim-once --config #{@config_path}], out: io, err: io, env: env)
     [ code, io.string ]
   end

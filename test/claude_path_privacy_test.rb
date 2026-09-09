@@ -241,7 +241,7 @@ class ClaudePathPrivacyTest < Minitest::Test
   def test_s11_a_path_longer_than_both_clip_thresholds_leaks_neither_end
     long = "/Users/dev-fixture/SECRETHEAD/#{(1..300).map { |n| "segment#{n}" }.join('/')}/SECRETTAIL.rb"
 
-    assert_operator long.length, :>, SpecrelayRunner::ClaudeStream::MAX_LINE_CHARS
+    assert_operator long.length, :>, SpecrelayRunner::PublicProgress::MAX_LINE_CHARS
     assert_operator long.bytesize, :>, SpecrelayRunner::ExecutorLogStream::MAX_LINE_BYTES
 
     through_fan_out(J.read_call(long), J.bash_result("toolu_bash", stdout: "cat #{long}\n")).each do |surface|
