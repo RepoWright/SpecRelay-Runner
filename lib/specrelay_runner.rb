@@ -23,13 +23,21 @@ require_relative "specrelay_runner/redaction"
 # MAPIAI-97 CR-006 — the one private-host-path rule, beside the one secret rule. Loaded here
 # because both the specification analyzer and the preview lane depend on it.
 require_relative "specrelay_runner/private_paths"
+# The one path-projection, redaction and bounding rule for a lane that HAS an approved root.
+# Loaded before the decoders, which are its only consumers.
+require_relative "specrelay_runner/public_progress"
 require_relative "specrelay_runner/config"
 require_relative "specrelay_runner/platform_client"
 require_relative "specrelay_runner/command_runner"
 require_relative "specrelay_runner/claude_profile"
+require_relative "specrelay_runner/codex_profile"
+# The one closed implementation-provider choice, loaded after both profiles it maps to.
+require_relative "specrelay_runner/implementation_profile"
 # MAPIAI-60: the one decoder that turns the supported profile's structured output into safe
 # progress and a terminal result. Loaded here because both execution lanes depend on it.
 require_relative "specrelay_runner/claude_stream"
+# The Codex turn contract has its own terminal rules, so it has its own decoder.
+require_relative "specrelay_runner/codex_stream"
 # MVP-0017 guided connection: the OS secret store, the local checkout validator, the
 # non-secret local connection record, and the `connect` operation that drives them.
 require_relative "specrelay_runner/secret_store"

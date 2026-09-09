@@ -110,11 +110,14 @@ end
 # cannot show that the delivery happens before the provider starts (MVP-0034 S22, S23, and the
 # deterministic half of S28).
 class SpecificationPackageDeliveryFlowTest < Minitest::Test
+  # The one directory on the child PATH that provides the approved fixture name.
+  def fixture_dir = @fixture_dir ||= fixture_bin
   TASK = "DEMO-0001"
 
   def setup
     @root, @executor = DemoWorkspace.build
-    @payload = claim_payload_for(task_id: TASK, executor_command: @executor)
+    use_fixture(fixture_dir, @executor)
+    @payload = claim_payload_for(task_id: TASK)
     @platform = nil
   end
 
@@ -140,7 +143,7 @@ class SpecificationPackageDeliveryFlowTest < Minitest::Test
     YAML
     @io = StringIO.new
     SpecrelayRunner::CLI.run(%W[claim-once --config #{path}], out: @io, err: @io,
-                             env: { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN, "PATH" => ENV["PATH"] })
+                             env: { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN, "PATH" => "#{fixture_dir}:#{ENV['PATH']}" })
   end
 
   # S22 / S28 — every document, not only `spec.md`, is readable by the executor while it runs.

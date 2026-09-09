@@ -31,19 +31,16 @@ class RealExecutorFlowTest < Minitest::Test
 
   # The claim payload Platform returns once it has merged this runner's `executor:`
   # override over the workspace definition — i.e. the real Claude profile.
+  # The CANONICAL Claude profile, byte-for-byte what Platform serves. An override here produces a
+  # payload the runner must refuse, which is what the refusal examples assert.
   def claude_payload(overrides = {})
-    payload = base_claim_payload(task_id: TASK, executor_command: "claude")
-    payload.merge(
-      "executor" => payload.fetch("executor").merge(
-        "provider" => "claude", "command" => "claude",
-        "args" => ARGS,
-        "prompt_delivery" => "argument", "mode" => "print", "timeout_seconds" => 30
-      ).merge(overrides)
-    )
+    base_claim_payload(task_id: TASK)
+      .merge("executor" => SpecrelayRunner::ClaudeProfile::CANONICAL.merge(overrides))
   end
 
-  # A runner config that SELECTS the real Claude profile locally.
-  def claude_config(args: ARGS, timeout_seconds: 30)
+  # A PROVIDER-ONLY local selection — the same shape Platform accepts and expands from its own
+  # fixed map. `extra` is how a test writes a local block that tries to describe a profile.
+  def claude_config(extra: nil)
     write_config(<<~YAML)
       platform:
         base_url: #{@platform.base_url}
@@ -55,11 +52,7 @@ class RealExecutorFlowTest < Minitest::Test
           mode: all_eligible
         executor:
           provider: claude
-          command: claude
-          args: [#{args.join(', ')}]
-          prompt_delivery: argument
-          timeout_seconds: #{timeout_seconds}
-          env: {}
+      #{extra ? "    #{extra}" : ""}
       workspace_roots:
         tiny-demo-workspace: #{@root}
     YAML
@@ -169,10 +162,12 @@ class RealExecutorFlowTest < Minitest::Test
   # A regression run of the deterministic fake executor must not require Claude
   # Code to be installed or authenticated at all.
   def test_the_fake_executor_path_never_probes_claude
-    start_platform(base_claim_payload(task_id: TASK, executor_command: File.join(@root, "bin", "fake-executor")))
+    root, executor = DemoWorkspace.build
+    @root = root
+    start_platform(base_claim_payload(task_id: TASK))
     bin_dir, argv_log = FakeClaudeCli.build
 
-    exit_code = run_cli(fake_config, bin_dir: bin_dir)
+    exit_code = run_cli(fake_config, bin_dir: "#{fixture_bin(executor)}:#{bin_dir}")
 
     assert_equal SpecrelayRunner::CLI::SUCCESS, exit_code, @io.string
     refute File.exist?(argv_log), "the fake-executor path must never invoke the claude CLI"
@@ -182,15 +177,15 @@ class RealExecutorFlowTest < Minitest::Test
 
   # An argv this runner refuses to launch is a config error surfaced BEFORE any
   # network call — not something discovered after a claim is burned.
-  def test_an_unsafe_local_profile_is_a_usage_error_before_any_request
+  def test_a_local_block_that_composes_a_profile_is_a_usage_error_before_any_request
     start_platform(claude_payload)
     bin_dir, = FakeClaudeCli.build
 
-    exit_code = run_cli(claude_config(args: ARGS + %w[--resume]), bin_dir: bin_dir)
+    exit_code = run_cli(claude_config(extra: "args: [--print, --resume]"), bin_dir: bin_dir)
 
     assert_equal SpecrelayRunner::CLI::USAGE_ERROR, exit_code, @io.string
     assert_equal 0, @platform.requests.size
-    assert_match(/must not pass --resume/, @io.string)
+    assert_match(/only a provider/, @io.string)
   end
 
   # --- fail closed on a mismatched claim (acceptance criterion 4) ------------
@@ -199,7 +194,7 @@ class RealExecutorFlowTest < Minitest::Test
     # Platform hands back the seeded FAKE fixture even though this runner selected
     # the real Claude profile. Executing it would produce evidence that lies about
     # what ran, so the runner refuses.
-    start_platform(base_claim_payload(task_id: TASK, executor_command: File.join(@root, "bin", "fake-executor")))
+    start_platform(base_claim_payload(task_id: TASK))
     bin_dir, argv_log = FakeClaudeCli.build
 
     exit_code = run_cli(claude_config, bin_dir: bin_dir)
@@ -239,7 +234,7 @@ class RealExecutorFlowTest < Minitest::Test
     assert_equal 0, @platform.requests_to("/api/runner/reports").size
     refute File.exist?(File.join(@root, ".runs", "worktrees", TASK)), "no worktree may be created"
     assert_match(/preflight_failed/, @io.string)
-    assert_match(/differs from the selected profile in command/, @io.string)
+    assert_match(/executor\.command is not the approved claude profile/, @io.string)
   ensure
     FileUtils.remove_entry(attacker_dir) if attacker_dir && File.directory?(attacker_dir)
   end
@@ -256,7 +251,7 @@ class RealExecutorFlowTest < Minitest::Test
     assert_equal 0, @platform.requests_to("/api/runner/reports").size
     # Only the readiness probe touched the CLI; no prompt was ever delivered.
     assert_equal %w[auth status], JSON.parse(File.read(argv_log))
-    assert_match(/differs from the selected profile in env/, @io.string)
+    assert_match(/executor\.env is not the approved claude profile/, @io.string)
   end
 
   def test_a_claimed_payload_that_shrinks_the_timeout_is_refused
@@ -265,23 +260,25 @@ class RealExecutorFlowTest < Minitest::Test
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli(claude_config, bin_dir: bin_dir), @io.string
     assert_equal 0, @platform.requests_to("/api/runner/reports").size
-    assert_match(/differs from the selected profile in timeout_seconds/, @io.string)
+    assert_match(/executor\.timeout_seconds is not the approved claude profile/, @io.string)
   end
 
-  # A regression guard for the tightened comparison: the EXACT executor block the
-  # real proven run received from Platform (workspace definition merged with this
-  # runner's non-secret override, including the `mode`/`semantic_events` keys the
-  # profile does not own) must still match. Tightening the guard must not break the
-  # documented happy path.
-  def test_the_real_merged_payload_shape_still_matches
-    start_platform(claude_payload("mode" => "print", "semantic_events" => "auto"))
+  # This example used to assert the opposite. It guarded the merged block Platform once produced —
+  # a workspace definition composed with a runner-local override, carrying a `semantic_events` key
+  # the profile never owned — and required that shape to still launch.
+  #
+  # Two things retired it. Platform stopped composing overrides into the executor block and dropped
+  # `semantic_events` from its default configuration entirely, so no assignment carries the key any
+  # more; and the claim gate now reads the whole hash, so a key the runner cannot account for
+  # is a claim it will not launch on. What was a compatibility guarantee is now a refusal, and the
+  # refusal is the boundary worth guarding.
+  def test_a_claimed_payload_carrying_an_unknown_key_is_refused
+    start_platform(claude_payload("semantic_events" => "auto"))
     bin_dir, = FakeClaudeCli.build
 
-    exit_code = run_cli(claude_config(timeout_seconds: 30), bin_dir: bin_dir)
-
-    assert_equal SpecrelayRunner::CLI::SUCCESS, exit_code, @io.string
-    refute_match(/preflight_failed/, @io.string)
-    assert_equal "succeeded", @platform.last_terminal_result["outcome"]
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli(claude_config, bin_dir: bin_dir), @io.string
+    assert_equal 0, @platform.requests_to("/api/runner/reports").size
+    assert_match(/executor carries semantic_events/, @io.string)
   end
 
   def test_a_claimed_payload_with_different_args_is_refused
@@ -291,7 +288,7 @@ class RealExecutorFlowTest < Minitest::Test
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli(claude_config, bin_dir: bin_dir), @io.string
     assert_equal 0, @platform.requests_to("/api/runner/reports").size
     assert_match(/preflight_failed/, @io.string)
-    assert_match(/differs from the selected profile in args/, @io.string)
+    assert_match(/executor\.args is not the approved claude profile/, @io.string)
   end
 
   # --- the complete real-profile success seam (acceptance criterion 6) -------
@@ -437,24 +434,11 @@ class RealExecutorFlowTest < Minitest::Test
     assert(terminal.fetch("repositories").none? { |repo| repo["pull_request_url"] })
   end
 
-  # A real wall-clock timeout: the CLI double sleeps far past the profile's
-  # timeout, so the runner's own Timeout + process-group kill is what ends it.
-  def test_a_claude_timeout_produces_a_failed_report_and_no_pull_request
-    start_platform(claude_payload("timeout_seconds" => 2))
-    bin_dir, = FakeClaudeCli.build(run: :hang)
-
-    exit_code = run_cli(claude_config(timeout_seconds: 2), bin_dir: bin_dir)
-
-    assert_equal SpecrelayRunner::CLI::RUN_FAILED, exit_code, @io.string
-    terminal = @platform.last_terminal_result
-    assert_equal "failed", terminal["outcome"]
-    assert_equal "executor_timeout", terminal.dig("core", "error_classification")
-    assert(terminal.fetch("repositories").none? { |repo| repo["pull_request_url"] })
-    assert_match(/executor timed out/, @io.string)
-    manifest = YAML.safe_load(decode_file("manifest.yml"))
-    refute manifest["final_jira_update_ready"]
-    assert manifest.dig("executor", "timed_out")
-  end
+  # The wall-clock timeout proof moved to executor_timeout_test.rb when the claimed profile became
+  # EXACT: a payload may no longer shorten the approved 1800-second timeout, so a flow-level timeout
+  # can no longer be provoked without waiting half an hour. The mechanism (real Timeout, real
+  # process-group kill, `timed_out` result) is proven there against a real hanging process, and the
+  # classification it produces is proven in claude_profile_test.rb and codex_profile_test.rb.
 
   # The CLI vanishing between the readiness probe and the launch is the one case
   # that used to kill the runner on an unhandled Errno, leaving the run stuck

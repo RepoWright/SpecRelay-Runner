@@ -37,7 +37,7 @@ class ConnectFlowTest < Minitest::Test
   # --- fixtures -------------------------------------------------------------
 
   def start_platform(repository_url: "https://github.com/SpecRelay/tiny-demo-workspace")
-    payload = claim_payload_for(task_id: "DEMO-0017", executor_command: "specrelay-fake-executor")
+    payload = claim_payload_for(task_id: "DEMO-0017")
     payload["workspace"]["repository_url"] = repository_url
     @platform = FakePlatform.new(claim_payload: payload).start
     @platform.enrollment_code = code_for(@platform.base_url)

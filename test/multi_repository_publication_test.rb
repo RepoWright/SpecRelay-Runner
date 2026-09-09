@@ -45,12 +45,18 @@ class MultiRepositoryPublicationTest < Minitest::Test
 
   # --- harness -------------------------------------------------------------
 
-  # `executor_env` reaches the fake executor the way a real provider's environment does: through
-  # the assignment's own `executor.env`, which is the only channel Platform has.
-  def start(publication: {}, executor_command: nil, executor_env: {})
-    payload = claim_payload_for(task_id: TASK, executor_command: executor_command || @built.executor,
-                               publication: publication)
-    payload["executor"]["env"] = { "FAKE_EDITED" => "component-a,component-b" }.merge(executor_env)
+  # The one directory on the child PATH that provides the approved fixture name. Which script it
+  # points at, and what that script reads while it runs, is this HOST's choice; the PAYLOAD is
+  # always the canonical fixture profile, environment included.
+  def fixture_dir = @fixture_dir ||= fixture_bin
+
+  # `fixture_env` is the environment the double runs under on this machine. It is installed behind
+  # the approved bare name on the child PATH, because a payload that could name it would be
+  # choosing which repositories this host edits.
+  def start(publication: {}, fixture_env: {}, executor: nil)
+    use_fixture(fixture_dir, executor || @built.executor,
+                env: { "FAKE_EXECUTOR_EDITED" => "component-a,component-b" }.merge(fixture_env))
+    payload = claim_payload_for(task_id: TASK, publication: publication)
     @platform = FakePlatform.new(claim_payload: payload).start
     @config_path = write_config
     payload
@@ -76,7 +82,7 @@ class MultiRepositoryPublicationTest < Minitest::Test
   def run_cli(gh_dir: @gh_dir)
     io = StringIO.new
     env = { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN,
-            "PATH" => "#{gh_dir}:#{ENV['PATH']}",
+            "PATH" => "#{fixture_dir}:#{gh_dir}:#{ENV['PATH']}",
             "HOME" => ENV["HOME"].to_s }
     code = SpecrelayRunner::CLI.run(%W[claim-once --config #{@config_path}], out: io, err: io, env: env)
     [ code, io.string ]
@@ -128,7 +134,7 @@ class MultiRepositoryPublicationTest < Minitest::Test
   end
 
   def test_the_workspace_repository_itself_can_be_the_selected_repository
-    start(executor_env: { "FAKE_EDITED" => "." })
+    start(fixture_env: { "FAKE_EXECUTOR_EDITED" => "." })
     code, output = run_cli
     assert_equal SpecrelayRunner::CLI::SUCCESS, code, output
 
@@ -140,7 +146,7 @@ class MultiRepositoryPublicationTest < Minitest::Test
   # --- S03: subset selection ----------------------------------------------
 
   def test_only_the_selected_subset_is_published
-    start(executor_env: { "FAKE_EDITED" => "component-a,component-c" })
+    start(fixture_env: { "FAKE_EXECUTOR_EDITED" => "component-a,component-c" })
     code, output = run_cli
     assert_equal SpecrelayRunner::CLI::SUCCESS, code, output
 
@@ -153,7 +159,7 @@ class MultiRepositoryPublicationTest < Minitest::Test
   # A repository the executor changed but did NOT report is not published. The selection
   # document is the only input considered — prose and terminal output are never parsed.
   def test_an_unreported_changed_repository_is_not_published
-    start(executor_env: { "FAKE_SELECTED" => "component-a" })
+    start(fixture_env: { "FAKE_EXECUTOR_SELECTED" => "component-a" })
     code, = run_cli
     assert_equal SpecrelayRunner::CLI::SUCCESS, code
 
@@ -164,7 +170,7 @@ class MultiRepositoryPublicationTest < Minitest::Test
   # --- S04: no changes ----------------------------------------------------
 
   def test_an_empty_selection_on_a_clean_workspace_succeeds_without_publishing
-    start(executor_env: { "FAKE_EDITED" => "" })
+    start(fixture_env: { "FAKE_EXECUTOR_EDITED" => "" })
     code, output = run_cli
     assert_equal SpecrelayRunner::CLI::SUCCESS, code, output
 
@@ -178,7 +184,7 @@ class MultiRepositoryPublicationTest < Minitest::Test
   # An ABSENT document is not an empty selection: it means the executor never answered. Guessing
   # "nothing changed" there would publish nothing while a diff sits on disk.
   def test_a_missing_selection_document_fails_closed
-    start(executor_env: { "FAKE_SELECTION_SKIP" => "1" })
+    start(fixture_env: { "FAKE_EXECUTOR_SELECTION_SKIP" => "1" })
     run_cli
 
     assert_equal "failed", terminal["outcome"]
@@ -190,7 +196,7 @@ class MultiRepositoryPublicationTest < Minitest::Test
   # --- S05: the project-owned worktree command ----------------------------
 
   def test_the_project_owned_worktree_command_is_invoked_once_with_create
-    start(executor_env: { "FAKE_EDITED" => "component-a" })
+    start(fixture_env: { "FAKE_EXECUTOR_EDITED" => "component-a" })
     run_cli
 
     assert_equal [ "create #{TASK}", "release #{TASK}" ],
@@ -212,11 +218,12 @@ class MultiRepositoryPublicationTest < Minitest::Test
   def test_a_checkout_without_the_project_command_uses_the_native_worktree_path
     FileUtils.remove_entry(@root)
     @root, executor = DemoWorkspace.build
+    use_fixture(fixture_dir, executor)
     dev_log = DemoWorkspace.without_project_command(@root)
     bare = FakeGithub.add_remote(@root)
     gh_dir, gh_log, = FakeGithub.gh_bin(bare: bare)
 
-    payload = claim_payload_for(task_id: TASK, executor_command: executor, publication: {},
+    payload = claim_payload_for(task_id: TASK, publication: {},
                                 worktree_create_command: "git worktree add .runs/worktrees/#{TASK} -b #{TASK}")
     @platform = FakePlatform.new(claim_payload: payload).start
     @config_path = write_config
@@ -295,7 +302,7 @@ class MultiRepositoryPublicationTest < Minitest::Test
   # Every refusal must happen BEFORE any external write: no branch on any remote, and no `gh`
   # invocation at all.
   def assert_selection_refused(selection_ruby, reason_pattern)
-    start(executor_env: { "FAKE_SELECTION_JSON" => selection_json(selection_ruby) })
+    start(fixture_env: { "FAKE_EXECUTOR_SELECTION_JSON" => selection_json(selection_ruby) })
     prepare_task_workspace
     yield if block_given?
     run_cli
@@ -361,7 +368,7 @@ class MultiRepositoryPublicationTest < Minitest::Test
   # One task branch exists in several repositories, so a pull request on ANOTHER repository's
   # branch of the same name is not this repository's current pull request.
   def test_a_pull_request_on_a_different_repository_is_never_reused
-    start(executor_env: { "FAKE_EDITED" => "component-a" })
+    start(fixture_env: { "FAKE_EXECUTOR_EDITED" => "component-a" })
     seed = [ { "url" => "https://github.com/SpecRelay/component-c/pull/99", "state" => "OPEN",
                "headRefName" => BRANCH, "repo" => "SpecRelay/component-c", "headRefOid" => "live" } ]
     gh_dir, gh_log, = FakeGithub.gh_bin(urls: PR_URLS, bares: @bares, seed: seed)
@@ -408,7 +415,7 @@ class MultiRepositoryPublicationTest < Minitest::Test
   # the task branch's own commits, ahead of the repository's default branch — and the retry has to
   # find it, or the missing pull request can never be completed on this workspace.
   def test_a_retry_recovers_the_committed_repositories_and_completes_the_missing_publication
-    payload = start
+    start
     gh_dir, first_log, state = FakeGithub.gh_bin(urls: PR_URLS, bares: @bares,
                                                  fail_create_for: "SpecRelay/component-b")
     run_cli(gh_dir: gh_dir)
@@ -418,7 +425,10 @@ class MultiRepositoryPublicationTest < Minitest::Test
 
     # The retry edits NOTHING: it reports the repositories the previous attempt already
     # committed. `gh` shares the earlier state file, so component-a's pull request is still open.
-    payload["executor"]["env"].merge!("FAKE_EDITED" => "", "FAKE_SELECTED" => "component-a,component-b")
+    # The retry's assignment is the same canonical profile; what changed is the double behind the
+    # approved name on this host.
+    use_fixture(fixture_dir, @built.executor,
+                env: { "FAKE_EXECUTOR_EDITED" => "", "FAKE_EXECUTOR_SELECTED" => "component-a,component-b" })
     retry_dir, retry_log, = FakeGithub.gh_bin(urls: PR_URLS, bares: @bares, state: state)
     @platform.offer_claim_again
     code, output = run_cli(gh_dir: retry_dir)
@@ -455,7 +465,7 @@ class MultiRepositoryPublicationTest < Minitest::Test
   # The ordinary rule survives the recovery path: a repository the executor never touched has no
   # commit of its own ahead of its default branch, so reporting it is still refused.
   def test_an_untouched_repository_is_still_refused_after_the_recovery_path_exists
-    start(executor_env: { "FAKE_EDITED" => "component-a", "FAKE_SELECTED" => "component-a,component-c" })
+    start(fixture_env: { "FAKE_EXECUTOR_EDITED" => "component-a", "FAKE_EXECUTOR_SELECTED" => "component-a,component-c" })
     run_cli
 
     assert_equal "failed", terminal["outcome"]
@@ -474,7 +484,7 @@ class MultiRepositoryPublicationTest < Minitest::Test
     url = FakeGithub.credential_remote(File.join(@root, "component-a"),
                                        @built.bares["component-a"],
                                        "https://#{secret}@github.com/SpecRelay/component-a.git")
-    start(executor_env: { "FAKE_EDITED" => "component-a" })
+    start(fixture_env: { "FAKE_EXECUTOR_EDITED" => "component-a" })
     code, output = run_cli
 
     assert_equal SpecrelayRunner::CLI::SUCCESS, code, output
@@ -504,7 +514,7 @@ class MultiRepositoryPublicationTest < Minitest::Test
     secret = "dummy-secret"
     FakeGithub.credential_remote(File.join(@root, "component-c"), @built.bares["component-c"],
                                  "https://#{secret}@github.com/SpecRelay/component-c.git")
-    start(executor_env: { "FAKE_EDITED" => "component-a", "FAKE_SELECTED" => "component-a,component-c" })
+    start(fixture_env: { "FAKE_EXECUTOR_EDITED" => "component-a", "FAKE_EXECUTOR_SELECTED" => "component-a,component-c" })
     _code, output = run_cli
 
     assert_equal "repository_selection_refused", terminal.dig("core", "error_classification")

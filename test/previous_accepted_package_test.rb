@@ -14,6 +14,10 @@ require "open3"
 # S09 (an accepted package that changed nothing), S10 (same-run authority outranks the older
 # package).
 class PreviousAcceptedPackageTest < Minitest::Test
+  # The one directory on the child PATH that provides the approved fixture name. The PAYLOAD is
+  # always the canonical fixture profile; which script that approved name resolves to on this
+  # host is the test's choice, exactly as it is the operator's choice on a real machine.
+  def fixture_dir = @fixture_dir ||= fixture_bin
   TASK = "MAPIAI-87"
   ACCEPTED = %w[component-a component-b].freeze
   PR_URLS = {
@@ -29,6 +33,7 @@ class PreviousAcceptedPackageTest < Minitest::Test
 
   def setup
     @built = MultiRepositoryWorkspace.build
+    use_fixture(fixture_dir, @built.executor)
     @root = @built.root
     @root_slug = "SpecRelay/multi-demo-workspace"
     @bares = @built.bares.to_h { |name, bare| [ slug_for(name), bare ] }
@@ -237,11 +242,13 @@ class PreviousAcceptedPackageTest < Minitest::Test
   # --- S05 / S06 / S10: the execution wiring -------------------------------
 
   def start(continuation_block: nil, restart: nil, absent: false)
-    payload = claim_payload_for(task_id: TASK, executor_command: @built.executor,
+    # Which repository the double edits is a host-side control, installed behind the approved bare
+    # name; the assignment carries the canonical fixture profile and nothing else.
+    use_fixture(fixture_dir, @built.executor, env: { "FAKE_EXECUTOR_EDITED" => "component-a" })
+    payload = claim_payload_for(task_id: TASK,
                                 publication: {}, restart: restart)
     absent ? payload.delete("previous_accepted_package") :
       payload["previous_accepted_package"] = continuation_block
-    payload["executor"]["env"] = { "FAKE_EDITED" => "component-a" }
     @platform = FakePlatform.new(claim_payload: payload).start
     @config_path = write_config
   end
@@ -265,7 +272,7 @@ class PreviousAcceptedPackageTest < Minitest::Test
 
   def run_cli(gh_dir)
     io = StringIO.new
-    env = { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN, "PATH" => "#{gh_dir}:#{ENV['PATH']}",
+    env = { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN, "PATH" => "#{fixture_dir}:#{gh_dir}:#{ENV['PATH']}",
             "HOME" => ENV["HOME"].to_s }
     code = SpecrelayRunner::CLI.run(%W[claim-once --config #{@config_path}], out: io, err: io, env: env)
     [ code, io.string ]
@@ -318,6 +325,7 @@ class PreviousAcceptedPackageTest < Minitest::Test
   def test_a_checkout_without_the_project_command_is_reconstructed_the_same_way
     FileUtils.remove_entry(@root)
     @root, executor = DemoWorkspace.build
+    use_fixture(fixture_dir, executor)
     DemoWorkspace.without_project_command(@root)
     slug = @root_slug = "SpecRelay/tiny-demo-workspace"
     bare = FakeGithub.add_remote(@root)
@@ -330,7 +338,7 @@ class PreviousAcceptedPackageTest < Minitest::Test
                 "headRefOid" => @heads.fetch(".") } ]
     )
 
-    payload = claim_payload_for(task_id: TASK, executor_command: executor, publication: {},
+    payload = claim_payload_for(task_id: TASK, publication: {},
                                 worktree_create_command: "git worktree add .runs/worktrees/#{TASK} -b #{TASK}")
     payload["previous_accepted_package"] = continuation(components: [ "." ]).merge(
       "implementation_pull_requests" => [ accepted_row(".", "pull_request_url" => url) ]

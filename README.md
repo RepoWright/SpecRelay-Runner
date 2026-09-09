@@ -80,7 +80,7 @@ the operator nothing and the same code still works:
    (`host/owner/repo`), so an `https` URL and an scp-like SSH remote for the same
    repository match, while a different repository, owner, or host does not;
 4. run the bounded provider readiness checks **only** when the assigned executor
-   is the real Claude profile;
+   is one of the real provider profiles;
 5. prove the **Keychain accepts a write**, using a throwaway non-secret item — only when this
    machine holds no credential yet, because that is when a write is certain to be needed;
 6. **exchange** the code, presenting the credential this machine already holds for this
@@ -698,12 +698,13 @@ live log events, so a working run never looks like a hung one:
 [verification.started] Verifying 1 changed repository(ies) for YOUR-1234
 ```
 
-**Structured provider output.** The supported Claude profile is structured-output
-only: `--output-format stream-json` and `--verbose` are *required* flags, and a
-profile missing either is refused before the process is launched. Claude then
-writes one JSON object per line while it works, and that stream is a transport, not
-operator text — one Runner-owned decoder reads it and produces two independent
-things: safe public progress, and the terminal result.
+**Structured provider output.** Both supported real profiles are structured-output
+only — Claude through `--output-format stream-json --verbose`, Codex through
+`exec --json` — and a claim that omits them is refused before the process is
+launched. Each then writes one JSON object per line while it works, and that stream
+is a transport, not operator text. The two turn contracts differ, so each provider
+has its OWN Runner-owned decoder (`ClaudeStream`, `CodexStream`); each produces the
+same two independent things: safe public progress, and the terminal result.
 
 **The public transcript is projected once.** Public assistant prose, tool calls and
 results are rendered from the structured stream; private reasoning, transport
@@ -954,68 +955,75 @@ bin/platform runner sweep-leases               # reclaim lapsed leases
 bin/platform runners issue-registration-token|list|revoke|rotate-credential
 ```
 
-## The real provider: one Claude Code profile
+## The real providers: two approved profiles
 
-The runner supports exactly **one** real provider profile — Claude Code — and it
-is a *validated* profile, not an arbitrary command string that happens to work on
-your laptop. Supporting a second provider requires its own approved
-specification; there is no plugin registry and no auto-detection here on purpose.
+The runner supports exactly **two** real provider profiles — Claude Code and Codex — plus the
+deterministic fixture. Each is an *audited* profile, not an arbitrary command string that happens
+to work on your laptop. Supporting a third provider requires its own approved specification; there
+is no plugin registry, no auto-detection and no fallback from one provider to another.
 
-Select it in your own runner config:
+| Provider | Command | Invocation | Prompt | Timeout |
+| --- | --- | --- | --- | --- |
+| `claude` | `claude` | `--print --output-format stream-json --verbose --dangerously-skip-permissions` | one argv element | 1800s |
+| `codex` | `codex` | `exec --json --ephemeral --dangerously-bypass-approvals-and-sandbox` | stdin | 1800s |
+| `fake` | `specrelay-fake-executor` | none | prompt file path | 120s |
+
+Select one in your own runner config by naming the provider — and only the provider:
 
 ```yaml
 runner:
   executor:
-    provider: claude
-    command: claude                  # or an absolute path whose basename is `claude`
-    args: [--print, --dangerously-skip-permissions]
-    prompt_delivery: argument
-    timeout_seconds: 900
-    env: {}
+    provider: codex          # claude | codex | fake
 ```
 
-`SpecrelayRunner::ClaudeProfile` ([lib](lib/specrelay_runner/claude_profile.rb)) is
-the only place that knows anything Claude-specific. `Executor` and `CommandRunner`
-stay provider-agnostic — they launch an argv array and nothing more.
+A block that says anything more is refused: the command, arguments, prompt delivery, timeout and
+environment belong to the profile, not to this file.
 
-### It refuses a profile that breaks the bounded contract
+`SpecrelayRunner::ImplementationProfile`
+([lib](lib/specrelay_runner/implementation_profile.rb)) is the one place that decides what may run.
+`ClaudeProfile` and `CodexProfile` own only what is genuinely provider-specific — readiness probes,
+the safe version fact, the claimed-versus-selected comparison and failure classification. `Executor`
+and `CommandRunner` stay provider-agnostic: they launch an argv array and nothing more.
 
-These are enforced, with a test per flag, not documented hopes:
+### It refuses anything that is not an approved profile
 
-- `--print`/`-p` is **required** (non-interactive), and `prompt_delivery` must be
-  `argument` so the prompt stays one distinct argv element — no shell, no
-  interpolation, no `eval`.
-- `command`'s basename must be `claude`. Another CLI is refused rather than
-  silently executed.
-- Required flags: `--output-format stream-json` and `--verbose` — the
-  profile is structured-output only.
-- Refused flags: `--input-format`, `--mcp-config`,
-  `--strict-mcp-config`, `--bg`/`--background`, `--chrome`, `--remote-control`,
-  `--tmux`, `-c`/`--continue`/`-r`/`--resume`/`--fork-session`/`--session-id`.
-- `env:` must carry **no credential** — that block travels to Platform in the
-  claim request, so the runner fails closed instead of redacting afterwards.
+The claimed executor block is compared against the approved profile **as a whole hash** — the same
+keys, the same values, nothing missing, nothing extra, nothing spelled differently — *before* a
+worktree exists and *before* any process starts. That is the whole rule; there is no tolerant
+validator and no denylist of individually forbidden flags to keep up to date.
+
+So a claim is refused when it changes the command, reorders or adds an argument, alters the prompt
+delivery or timeout, adds an environment entry, decorates the provider name, omits a field, or
+carries a key the profile does not own. `codex` pins no model and `--ephemeral` prevents session
+reuse, so a resumed conversation cannot influence an automated run.
+
+`env:` is empty for both real profiles. That block travels to Platform in the claim request, so a
+token smuggled in there would leave your machine; the runner fails closed rather than redacting
+afterwards.
 
 ### Readiness is checked before any claim
 
-With this profile selected, `claim-once` runs a local, no-edit readiness check
+With a real profile selected, `claim-once` runs a local, no-edit readiness check
 and **exits non-zero having sent no claim request at all** if it fails. It runs
-exactly two bounded metadata commands, `claude --version` and
-`claude auth status`, and nothing else — no prompt, no inference, no repository
-access, no claim consumed.
+exactly two bounded metadata commands for that provider — `claude --version` and
+`claude auth status`, or `codex --version` and `codex login status` — and nothing
+else: no prompt, no inference, no repository access, no claim consumed.
 
 ```text
-Executor: claude claude --print --dangerously-skip-permissions (prompt via argument)
-Readiness: claude=available, auth=authenticated
+Executor: codex codex exec --json --ephemeral --dangerously-bypass-approvals-and-sandbox (prompt via stdin)
+Readiness: codex=available, auth=authenticated, codex-cli 0.153.4
 ```
 
 Only a classification is recorded: `available`, `unavailable`, `authenticated`,
-`not_authenticated`, or `check_failed`. `claude auth status` returns your account
-email, org id, and org name — the runner reads a single boolean out of it and
-**discards the rest**. It never reaches a console, log, report, event, or Platform.
+`not_authenticated`, or `check_failed` — plus, for Codex, one strictly parsed and
+length-bounded `codex-cli <version>` fact. An auth probe returns your account
+identity; the runner reads a single classification out of it and **discards the
+rest**. It never reaches a console, log, report, event, or Platform, and version
+output that is not exactly the proven form becomes `check_failed` rather than
+being repeated anywhere.
 
-Not ready gives you the classification and a remedy (`install Claude Code so
-`claude` resolves on this runner's PATH`, or `run `claude auth login` as this
-runner's operator on this host`).
+Not ready gives you the classification and a remedy — install the CLI so its name
+resolves on this runner's `PATH`, or log in as this runner's operator on this host.
 
 Both the readiness probe and the executor launch resolve `claude` through the
 **same** effective `PATH`, so readiness can never pass against one CLI while

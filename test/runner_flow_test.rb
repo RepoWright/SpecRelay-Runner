@@ -11,7 +11,10 @@ class RunnerFlowTest < Minitest::Test
 
   def setup
     @root, @executor = DemoWorkspace.build
-    @platform = FakePlatform.new(claim_payload: claim_payload_for(task_id: TASK, executor_command: @executor)).start
+    # The approved fixture name resolves to this test's own script on the CHILD PATH. The payload
+    # stays canonical; only the host decides which file the approved name is.
+    @executor_path = fixture_path(@executor)
+    @platform = FakePlatform.new(claim_payload: claim_payload_for(task_id: TASK)).start
     @config = build_config
     @io = StringIO.new
   end
@@ -40,7 +43,7 @@ class RunnerFlowTest < Minitest::Test
 
   def run_cli
     SpecrelayRunner::CLI.run(%W[claim-once --config #{@config.source_path}],
-                             out: @io, err: @io, env: { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN, "PATH" => ENV["PATH"] })
+                             out: @io, err: @io, env: { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN, "PATH" => @executor_path })
   end
 
   def worktree = File.join(@root, ".runs", "worktrees", TASK)
@@ -138,7 +141,7 @@ class RunnerFlowTest < Minitest::Test
     io2 = StringIO.new
     exit_code = SpecrelayRunner::CLI.run(%W[claim-once --config #{@config.source_path}],
                                          out: io2, err: io2,
-                                         env: { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN, "PATH" => ENV["PATH"] })
+                                         env: { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN, "PATH" => @executor_path })
     assert_equal SpecrelayRunner::CLI::SUCCESS, exit_code
     # MVP-0017: the runner prints the reason PLATFORM returned rather than one generic idle
     # line, so an unconnected runner is told to run `connect` instead of reading a refusal as a
@@ -150,7 +153,7 @@ class RunnerFlowTest < Minitest::Test
     io = StringIO.new
     exit_code = SpecrelayRunner::CLI.run(%W[claim-once --config #{@config.source_path}],
                                          out: io, err: io,
-                                         env: { "TEST_TOKEN" => "wrong", "PATH" => ENV["PATH"] })
+                                         env: { "TEST_TOKEN" => "wrong", "PATH" => @executor_path })
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, exit_code
     assert_match(/rejected the runner token|401/, io.string)
   end
@@ -177,7 +180,7 @@ class RunnerFlowTest < Minitest::Test
     io = StringIO.new
     exit_code = SpecrelayRunner::CLI.run(%W[claim-once --config #{path}],
                                          out: io, err: io,
-                                         env: { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN, "PATH" => ENV["PATH"] })
+                                         env: { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN, "PATH" => @executor_path })
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, exit_code, io.string
     assert_equal 1, @platform.requests_to("/api/runner/claim").size

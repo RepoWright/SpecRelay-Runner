@@ -113,7 +113,7 @@ module SpecrelayRunner
       @claim = payload.fetch("claim").fetch("runner_execution_id")
       @heartbeater = nil
       @log_stream = nil
-      @claude_stream = nil
+      @provider_stream = nil
       @lease_stop_reason = nil
       @package = nil
       # MVP-0035 — nil for an ordinary first execution, which is every claim that does not
@@ -257,18 +257,28 @@ module SpecrelayRunner
       log("Could not release the claim (#{Redaction.redact(e.message)}); its lease will expire on Platform.")
     end
 
-    # Fail closed before anything happens: no worktree, no executor launch, no
-    # report, no publication, no Jira transition. Only checked when this runner
-    # selected a real provider profile — the fake-executor regression path is
-    # unaffected.
+    # Fail closed before anything happens: no worktree, no executor launch, no report, no
+    # publication, no Jira transition.
+    #
+    # TWO refusals, in the order they can be decided. The CLAIMED executor is resolved through the
+    # one closed choice first, because that is the configuration that would actually be launched:
+    # an unsupported provider or an argv this runner will not run is refused here even when this
+    # machine selected nothing locally, which a guided connection never does. Only then, when this
+    # runner DID select a profile of its own, is the claim compared against it.
     def guard_selected_executor!
-      profile = config.selected_claude_profile
-      return if profile.nil?
+      # Resolving the CLAIM is the first refusal: it raises for an unsupported provider, and for a
+      # supported one whose argv this runner will not launch. Its return value is deliberately
+      # unused — what matters is that an unusable claim never reaches the second check.
+      ImplementationProfile.for(payload.fetch("executor"))
+      selected = config.selected_implementation_profile
+      return if selected.nil?
 
       # Same env the executor will launch with, so the comparison resolves the very
       # file that would run (review-001 finding F1).
-      reason = profile.mismatch_reason(payload.fetch("executor"), env: env)
+      reason = selected.mismatch_reason(payload.fetch("executor"), env: env)
       raise ExecutorMismatch, reason if reason
+    rescue ImplementationProfile::Error, ClaudeProfile::Error, CodexProfile::Error => e
+      raise ExecutorMismatch, "claimed executor is not one this runner will launch: #{Redaction.redact(e.message)}"
     end
 
     def executor_mismatch_failure(error)
@@ -356,7 +366,7 @@ module SpecrelayRunner
       # MAPIAI-60 — the provider exited cleanly but its structured output could not be read, so
       # there is no result this runner can prove. Fails closed as a failed attempt rather than
       # reporting an empty success: an unreadable stream is not an unchanged repository.
-      if (unreadable = @claude_stream&.close&.failure)
+      if (unreadable = @provider_stream&.close&.failure)
         return unfinished_provider(root, worktree, executor_result,
                                    "the #{provider} executor produced unusable output: #{unreadable}")
       end
@@ -625,11 +635,11 @@ module SpecrelayRunner
       @bridge = QuestionBridge.new(client: client, claim: claim, staging_dir: staging, io: io,
                                    capture: -> { capture_checkpoint(root, worktree, staging) },
                                    resume_question_id: @resume&.question_id).start
-      @claude_stream = claude_stream(worktree)
+      @provider_stream = provider_stream(worktree)
       result = Executor.new(config: payload.fetch("executor"), worktree_path: worktree.path,
                             staging_dir: staging, env: env)
                        .run(prompt_text(worktree.path, @bridge.path, RepositorySelection.path(staging)),
-                            on_output: (@claude_stream || @log_stream).sink,
+                            on_output: (@provider_stream || @log_stream).sink,
                             on_start: -> { @bridge.confirm_resume },
                             stop_check: -> { @bridge.stop_provider? })
       decoded(result)
@@ -638,24 +648,27 @@ module SpecrelayRunner
       @bridge&.stop
     end
 
-    # MAPIAI-60 — the supported Claude profile is structured-output-only, so its stdout is a
-    # JSONL transport rather than operator text and is decoded before anything sees it. Any other
-    # configured executor (the deterministic fixture, an operator's own command) keeps the
-    # line-oriented contract it has always had; nothing pretends it emits Claude semantics.
-    def claude_stream(worktree)
-      return nil unless ClaudeProfile.selected?(payload["executor"])
-
-      # The decoder's one exception to its one-result rule is authorized by the bridge's refusal
-      # count and by nothing else it knows about questions.
-      ClaudeStream.new(sink: @log_stream.sink, repository_path: worktree.path, refusals: -> { @bridge.refusals })
+    # Both real profiles are structured-output-only, so their stdout is a JSONL
+    # transport rather than operator text and is decoded before anything sees it. Each provider
+    # gets its OWN decoder because the two turn contracts differ; the deterministic fixture keeps
+    # the line-oriented contract it has always had, and nothing pretends it emits either shape.
+    def provider_stream(worktree)
+      case ImplementationProfile.provider_of(payload["executor"])
+      when ClaudeProfile::PROVIDER
+        # The Claude decoder's one exception to its one-result rule is authorized by the bridge's
+        # refusal count and by nothing else it knows about questions.
+        ClaudeStream.new(sink: @log_stream.sink, repository_path: worktree.path, refusals: -> { @bridge.refusals })
+      when CodexProfile::PROVIDER
+        CodexStream.new(sink: @log_stream.sink, repository_path: worktree.path)
+      end
     end
 
     # The report is built from the DECODED terminal result, never from the raw frames: raw JSONL
     # is transport, so it may not become this attempt's stdout evidence.
     def decoded(result)
-      return result unless @claude_stream
+      return result unless @provider_stream
 
-      Executor::Result.new(**result.to_h, stdout: @claude_stream.final_text)
+      Executor::Result.new(**result.to_h, stdout: @provider_stream.final_text)
     end
 
     # The portable checkpoint of everything the provider has changed, taken at the instant it
@@ -806,12 +819,17 @@ module SpecrelayRunner
     # non-zero exit into an authentication problem when its own captured output
     # says so, so an expired login is not reported as a task failure.
     def executor_classification(result)
-      profile = config.selected_claude_profile
+      profile = ImplementationProfile.for(payload["executor"])
       return profile.classify_failure(result) if profile
 
       return ClaudeProfile::EXECUTOR_UNAVAILABLE if result.launch_error
       return ClaudeProfile::EXECUTOR_TIMEOUT if result.timed_out
 
+      ClaudeProfile::EXECUTOR_FAILED
+    rescue ImplementationProfile::Error, ClaudeProfile::Error, CodexProfile::Error
+      # Unreachable through a claim {#guard_selected_executor!} admitted, and stated rather than
+      # assumed: a classification is the last thing a failed attempt reports, and it must not
+      # raise over a configuration the attempt already refused to be launched with.
       ClaudeProfile::EXECUTOR_FAILED
     end
 

@@ -163,16 +163,31 @@ class SpecificationProviderPropagationTest < Minitest::Test
     refute File.exist?(@prompt), "a refused profile must never be launched"
   end
 
-  # An operator who hand-wrote a profile has decided. Platform's selection must not silently
-  # replace it, for the same reason an explicit `provider.kind` wins over everything else.
-  def test_a_local_executor_override_still_wins_over_the_platform_selection
+  # An operator who SELECTED a provider locally has decided which provider this machine uses, and
+  # Platform's selection does not silently replace that — the same reason an explicit
+  # `provider.kind` wins over everything else. What a local block may no longer do is DESCRIBE the
+  # profile: the approved command, argv, timeout and environment belong to the profile itself.
+  def test_a_local_provider_selection_still_wins_over_the_platform_selection
     stub_claude
     start_platform(profile: "claude", executor: CLAUDE_PROFILE)
-    local = CLAUDE_PROFILE.merge("timeout_seconds" => 111)
 
-    assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli(config: build_config(local_executor: local)), @io.string
+    assert_equal SpecrelayRunner::CLI::SUCCESS,
+                 run_cli(config: build_config(local_executor: { "provider" => "claude" })), @io.string
 
     assert_equal "generated", @platform.last_specification_generation["outcome"], @io.string
+  end
+
+  # The replacement for the old "a hand-written profile wins" case. A local block carrying its own
+  # timeout is a composed profile, and it is refused before any Platform request rather than
+  # quietly launching something nobody audited.
+  def test_a_local_block_that_composes_a_profile_is_refused
+    stub_claude
+    start_platform(profile: "claude", executor: CLAUDE_PROFILE)
+    local = { "provider" => "claude", "timeout_seconds" => 111 }
+
+    assert_equal SpecrelayRunner::CLI::USAGE_ERROR,
+                 run_cli(config: build_config(local_executor: local)), @io.string
+    assert_match(/only a provider/, @io.string)
   end
 
   # A Platform old enough to send no block at all must not crash a current runner: it refuses with

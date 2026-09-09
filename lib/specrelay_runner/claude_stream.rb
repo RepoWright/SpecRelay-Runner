@@ -55,59 +55,13 @@ module SpecrelayRunner
     # The terminal result the existing parsers receive. Anything larger is a provider fault,
     # not a very thorough answer.
     MAX_RESULT_BYTES = 4_000_000
-    # ONE block — a file's contents, a command's output, a delegated Task's answer — may spend
-    # this much of the operator's attention. ExecutorLogStream bounds the whole stream and says
-    # so; this stops a single large read from spending that whole budget before anything else is
-    # seen. Both notices are truthful; neither truncation is silent.
-    MAX_BLOCK_LINES = 40
-    MAX_LINE_CHARS = 500
     # How deep a public input value is unwrapped before it stops being readable as one line.
     MAX_VALUE_DEPTH = 2
 
-    # MAPIAI-77 — what an absolute path this class cannot prove is in-root renders as. One stable
-    # token across users, hosts, runs, lanes and path categories: keeping even a basename would
-    # still disclose a private project, customer or temporary-file name.
-    LOCAL_PATH = "[LOCAL_PATH]"
-    # CR-002 — deliberately NOT a filename-character list. Both earlier attempts described what a
-    # segment MAY contain, and every such list has a next unenumerated character: a space, a
-    # Unicode letter, then `:`, `=`, `,`, `()`, `[]`, `{}`, `*` and `?` — all legal in a POSIX
-    # segment, and each one the scanner treated as a terminator published whatever followed it.
-    # Recognizing LESS of a path is the fail-open direction, so the boundary is stated ONCE and in
-    # the safe direction. A quoted token ends at its quote. A bare token continues across ambiguous
-    # whitespace until a strong shell control or the line end, with a following explicit `/...`
-    # left for the next independent scan. Everything swallowed is withheld unless the complete
-    # candidate is provably in-root; only {WRAPPER} punctuation is handed back.
-    #
-    # CR-003 — a token also ends at an UNESCAPED shell control. `;`, `&`, `|`, `<` and `>` are
-    # operators in shell grammar with or without surrounding spaces, so `a.rb;echo` is two tokens;
-    # treating them as path text swallowed the operator, the command after it, and a second path
-    # in a redirection. This is a short fixed operator set, not a list of legal filename
-    # characters — an escaped control (`\;`) is still path text.
-    PATH_CHAR = %r{(?:\\.|[^\s'"\\;&|<>/])}
-    # MAPIAI-77 Product Owner closure — assistant narration is not shell-quoted, so whitespace does
-    # NOT prove a path ended. Once a bare absolute token is followed by ordinary text, no character
-    # rule can tell whether that text is a multiword pathname or prose. Withhold through the next
-    # strong shell boundary (or the line end) instead of guessing. A second explicit absolute span
-    # remains independently recognizable because `/` cannot continue this whitespace branch.
-    PATH_SPAN = %r{
-      /(?:/|#{PATH_CHAR.source})+                       # the unambiguous absolute-token prefix
-      (?:[ \t]+(?!/)[^'"\\;&|<>\n]*)?                # ambiguous narration: fail closed
-    }x
-    WRAPPER = %r{[)\]\}>.,;:!?'"`]+\z}
-    # The lookbehind decides where a token may START, and fails safe in the other direction: a `/`
-    # that CONTINUES something is not an absolute path. That leaves relative paths (`spec/models`),
-    # git refs (`origin/main`), dates, Unicode segments, closing tags (`</h1>`), a URL's own path,
-    # a separator after a closing wrapper (`Acme(Client)/report.md`) and a shell expansion
-    # (`${HOME}/x`) alone. Requiring one character after the separator leaves prose
-    # (`input / output`) alone. Windows syntax is deliberately not parsed.
-    PATH_START = %r{(?<![[:word:].~/<)\]\}])}
-    PATH_SCAN = %r{
-      (?<q>['"])(?<quoted>(?:file://[^\s'"/]*)?/[^'"\n]*)\k<q>   # quoted: a literal space is path
-      | (?<file>file://[^\s'"/]*#{PATH_SPAN.source})             # a local path wearing a scheme
-      | (?<url>[A-Za-z][A-Za-z0-9+.\-]*://[^\s"'<>]*)            # any other scheme: the network
-      | (?<path>#{PATH_START.source}#{PATH_SPAN.source})         # a bare absolute POSIX token
-    }x
-    private_constant :PATH_CHAR, :PATH_SPAN, :WRAPPER, :PATH_START, :PATH_SCAN
+    # The local-path projection rule, the block bounds and the call into {Redaction} live in
+    # {PublicProgress}, which the Codex decoder consumes too. They are one privacy policy for a
+    # lane with an approved root, not a Claude one — so they are asked of that owner rather than
+    # kept here in a second copy that could drift.
 
     # Input keys the specialized presentation already showed, and the transport's own identity.
     # Everything else a tool declares publicly goes through the generic renderer.
@@ -148,7 +102,7 @@ module SpecrelayRunner
     def initialize(sink: nil, repository_path: nil, refusals: nil)
       @sink = sink
       @refusals = refusals
-      @repository_path = repository_path && File.expand_path(repository_path.to_s)
+      @text = PublicProgress.new(repository_path: repository_path)
       @pending = +""
       @result = nil
       @result_seen = false
@@ -201,8 +155,6 @@ module SpecrelayRunner
     def final_text = @failure ? "" : @result.to_s
 
     private
-
-    attr_reader :repository_path
 
     def decode(line)
       @pending << line
@@ -398,99 +350,14 @@ module SpecrelayRunner
       " in #{parts.join(', ')}"
     end
 
-    # ---- bounds -------------------------------------------------------------
+    # ---- bounds and path policy ---------------------------------------------
+    #
+    # Asked of {PublicProgress}, which owns them for every lane that has an approved root.
 
-    # ExecutorLogStream bounds the WHOLE stream and announces that; this bounds ONE block, so a
-    # single large file or log cannot spend the run's whole budget before anything else is seen.
-    # Both notices are truthful and neither is silent.
-    def bounded(value)
-      # CR-006 F1. The multiline private-key rule can only fire while the block is still whole,
-      # and this method is where a block stops being whole. Redaction stays the ONE owner of
-      # credential patterns; it is simply called before the split rather than only after it, and
-      # ExecutorLogStream still redacts every line on its own way out ([REDACTED] is idempotent).
-      text = redact(value)
-      return [] if text.empty?
-
-      lines = text.split("\n", -1)
-      lines.pop while lines.last == ""
-      return lines.map { |line| clip_line(line) } if lines.length <= MAX_BLOCK_LINES
-
-      lines.first(MAX_BLOCK_LINES).map { |line| clip_line(line) } <<
-        "[... #{lines.length - MAX_BLOCK_LINES} more lines]"
-    end
-
-    # MAPIAI-77 — the ONE place public text is normalized, and the order matters. Path policy runs
-    # first, then {Redaction} over the still-whole block, and only then does anything split or
-    # clip: a sensitive span removed before both bounds cannot survive as a retained prefix or
-    # suffix on the terminal, in the report's live-log evidence, or in a Platform chunk.
-    def redact(value) = Redaction.redact(sanitize_paths(value.to_s))
-
-    def sanitize_paths(text)
-      return text unless text.include?("/")
-
-      text.gsub(PATH_SCAN) do
-        match = Regexp.last_match
-        next match[:url] if match[:url]
-        # CR-001 — the quote DELIMITS the span, so it stays outside the replacement while the
-        # complete quoted path, spaces included, goes through the one projection.
-        next "#{match[:q]}#{project(match[:quoted])}#{match[:q]}" if match[:quoted]
-
-        span = match[:file] || match[:path]
-        trailing_space = span[/[ \t]+\z/].to_s
-        project(span.delete_suffix(trailing_space)) + trailing_space
-      end
-    end
-
-    # Containment must be PROVEN lexically, never assumed: a traversal segment, a prefix collision
-    # (`/repo` against `/repo-copy`), and a lane with no approved root all fail to the placeholder
-    # rather than to the original span. Nothing here touches the filesystem — a live transcript
-    # names files that do not exist yet, and the public question is about the path TEXT, not about
-    # filesystem authorization — so no symlink is resolved and no existence is required.
-    # CR-003 — containment is decided from the UNSTRIPPED candidate, and nothing is peeled first.
-    # Wrapper recovery is PRESENTATION; letting it run earlier is what allowed `<root>.` and
-    # `<root>!` — outside siblings — to become the approved root itself and render as `.`.
-    def project(span)
-      path = span.start_with?("file://") ? file_url_path(span) : span
-      return withheld(span) if path.nil? || traversal?(path) || repository_path.nil?
-      return "." if path == repository_path
-      return withheld(span) unless path.start_with?("#{repository_path}/")
-
-      relative = path.delete_prefix("#{repository_path}/")
-      # An in-root PREFIX must not carry an outside path out with it: a token that still holds an
-      # absolute start is not ONE provable in-root path, so it is withheld rather than published.
-      return withheld(span) if relative.match?(PATH_SCAN)
-
-      # A proven in-root span needs no peeling: its trailing punctuation is already outside the
-      # root prefix, so it survives in the relative form untouched.
-      relative.empty? ? "." : relative
-    end
-
-    # CR-002 — the ONLY thing handed back from a withheld token. These characters wrap or end a
-    # path in prose and in shell text; none of them can be path material on its own, so at worst a
-    # name that really ended in one renders a stray delimiter beside the placeholder.
-    def withheld(span) = LOCAL_PATH + span[WRAPPER].to_s
-
-    def traversal?(path) = path.split("/").any? { |segment| segment == "." || segment == ".." }
-
-    # CR-001 — a `file://` authority names a HOST. An empty one and `localhost` are THIS machine,
-    # so their path can be tested against the approved root like any other. Any other authority
-    # describes a filesystem this runner has no root for, so membership is unprovable by
-    # definition and `nil` sends it to the placeholder.
-    def file_url_path(span)
-      authority, _, rest = span.delete_prefix("file://").partition("/")
-      return nil unless authority.empty? || authority == "localhost"
-
-      "/#{rest}"
-    end
-
-    def clip_line(line)
-      line.length > MAX_LINE_CHARS ? "#{line[0, MAX_LINE_CHARS]}[... clipped]" : line
-    end
-
-    def indent(*values)
-      values.flatten.flat_map { |value| value.is_a?(String) ? bounded(value) : [] }
-            .map { |line| "  #{line}" }
-    end
+    def bounded(value) = @text.bounded(value)
+    def indent(*values) = @text.indent(*values)
+    def redact(value) = @text.redact(value)
+    def clip_line(line) = @text.clip_line(line)
 
     # ---- the terminal result ------------------------------------------------
 

@@ -8,6 +8,10 @@ require_relative "test_helper"
 # "the same provider session received the answer" is proven by the provider's own output rather
 # than by a stubbed return value.
 class QuestionBridgeTest < Minitest::Test
+  # The one directory on the child PATH that provides the approved fixture name. The PAYLOAD is
+  # always the canonical fixture profile; which script that approved name resolves to on this
+  # host is the test's choice, exactly as it is the operator's choice on a real machine.
+  def fixture_dir = @fixture_dir ||= fixture_bin
   TASK = "DEMO-0036"
 
   BATCH = {
@@ -38,11 +42,14 @@ class QuestionBridgeTest < Minitest::Test
     FileUtils.remove_entry(@root) if @root && File.directory?(@root)
   end
 
-  def payload(request: BATCH.to_json, timeout: "20", executor: nil)
-    claim_payload_for(task_id: TASK, executor_command: executor || @executor).tap do |built|
-      built["executor"]["env"] = { "FAKE_QUESTION_JSON" => request,
-                                   "FAKE_QUESTION_TIMEOUT_SECONDS" => timeout }
-    end
+  # The question the double asks, and how long it waits, are host-side controls: they are installed
+  # behind the approved bare name on the child PATH, not written into the assignment. The payload
+  # is always the canonical fixture profile.
+  def payload(request: BATCH.to_json, timeout: "20", executor: nil, env: {})
+    use_fixture(fixture_dir, executor || @executor,
+                env: { "FAKE_EXECUTOR_QUESTION_JSON" => request,
+                       "FAKE_EXECUTOR_QUESTION_TIMEOUT_SECONDS" => timeout }.merge(env))
+    claim_payload_for(task_id: TASK)
   end
 
   def build_config
@@ -66,11 +73,10 @@ class QuestionBridgeTest < Minitest::Test
   # `ask_seconds` places the provider's exit before or after the parent's next answer poll.
   def use_abandoning_provider(provider_exit:, ask_seconds: nil)
     @platform.stop
+    env = { "FAKE_EXECUTOR_QUESTION_EXIT_CODE" => provider_exit }
+    env["FAKE_EXECUTOR_QUESTION_ASK_SECONDS"] = ask_seconds if ask_seconds
     executor = DemoWorkspace.write_abandoning_executor(@root)
-    @platform = FakePlatform.new(claim_payload: payload(executor: executor).tap do |built|
-      built["executor"]["env"]["FAKE_QUESTION_EXIT_CODE"] = provider_exit
-      built["executor"]["env"]["FAKE_QUESTION_ASK_SECONDS"] = ask_seconds if ask_seconds
-    end).start
+    @platform = FakePlatform.new(claim_payload: payload(executor: executor, env: env)).start
     @config = build_config
   end
 
@@ -95,7 +101,7 @@ class QuestionBridgeTest < Minitest::Test
   def run_cli(io)
     SpecrelayRunner::CLI.run(%W[claim-once --config #{@config.source_path}],
                              out: io, err: io,
-                             env: { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN, "PATH" => ENV["PATH"] })
+                             env: { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN, "PATH" => "#{fixture_dir}:#{ENV['PATH']}" })
   end
 
   def test_answers_reach_the_same_provider_session_and_the_run_continues
@@ -439,7 +445,8 @@ end
 
   def test_an_ordinary_provider_that_never_asks_follows_the_existing_path_unchanged
     root, executor = DemoWorkspace.build
-    platform = FakePlatform.new(claim_payload: claim_payload_for(task_id: TASK, executor_command: executor)).start
+    use_fixture(fixture_dir, executor)
+    platform = FakePlatform.new(claim_payload: claim_payload_for(task_id: TASK)).start
     config_path = File.join(Dir.mktmpdir("cfg"), "runner.yml")
     File.write(config_path, <<~YAML)
       platform:
@@ -457,7 +464,7 @@ end
 
     exit_code = SpecrelayRunner::CLI.run(%W[claim-once --config #{config_path}], out: io, err: io,
                                          env: { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN,
-                                                "PATH" => ENV["PATH"] })
+                                                "PATH" => "#{fixture_dir}:#{ENV['PATH']}" })
 
     assert_equal SpecrelayRunner::CLI::SUCCESS, exit_code, io.string
     assert_empty platform.executor_questions, "an ordinary run never touches the question endpoint"

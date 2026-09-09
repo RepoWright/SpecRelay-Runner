@@ -30,6 +30,12 @@ module SpecrelayRunner
     PROVIDER = "claude"
     EXECUTABLE = "claude"
     PROMPT_DELIVERY = "argument"
+    # The `mode` Platform stores beside the argv. It decides nothing on this side — {Executor}
+    # never reads it — but it is part of the stored profile, so it is part of the identity that
+    # must match exactly.
+    MODE = "print"
+    # Unattended execution: without it the CLI waits for an approval nobody is there to give.
+    PERMISSION_FLAG = "--dangerously-skip-permissions"
 
     # The readiness/auth classifications this profile is allowed to record. They
     # are the ONLY thing the probes produce — never the underlying output.
@@ -109,6 +115,11 @@ module SpecrelayRunner
       def ready? = version == AVAILABLE && auth == AUTHENTICATED
       def summary = "claude=#{version}, auth=#{auth}"
 
+      # What the readiness `detail` field carries. Nothing when this host is ready: unlike the
+      # Codex profile, this one parses no public fact out of `claude --version`, so there is none
+      # to report. One accessor across both profiles, so a caller never has to know which.
+      def detail = remedy
+
       # A redacted, actionable remedy for the operator, or nil when ready.
       def remedy
         return nil if ready?
@@ -186,6 +197,16 @@ module SpecrelayRunner
 
     # Mirrors Executor's fallback so `identity` compares effective values.
     DEFAULT_TIMEOUT_SECONDS = 1800
+
+    # The ONE approved Claude invocation, assembled from this profile's own constants so the
+    # canonical identity and the validation rules below cannot describe different things. It is the
+    # exact hash Platform stores and serves; {ImplementationProfile} compares a claimed payload
+    # against it before a worktree exists.
+    CANONICAL_ARGS = [ PRINT_FLAGS.first, "--output-format", STREAM_FORMAT, "--verbose", PERMISSION_FLAG ].freeze
+    CANONICAL = {
+      "provider" => PROVIDER, "command" => EXECUTABLE, "mode" => MODE, "args" => CANONICAL_ARGS,
+      "prompt_delivery" => PROMPT_DELIVERY, "timeout_seconds" => DEFAULT_TIMEOUT_SECONDS, "env" => {}
+    }.freeze
 
     # Labels for the identity tuple, so a mismatch names the dimension that differed
     # instead of dumping two opaque arrays at the operator.

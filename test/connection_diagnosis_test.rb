@@ -22,7 +22,7 @@ class ConnectionDiagnosisTest < Minitest::Test
     @dir = Dir.mktmpdir("diagnosis")
     @checkout = git_checkout(REPOSITORY)
     @platform = FakePlatform.new(
-      claim_payload: claim_payload_for(task_id: "DEMO-0021", executor_command: "specrelay-fake-executor")
+      claim_payload: claim_payload_for(task_id: "DEMO-0021")
     ).start
   end
 
@@ -145,7 +145,10 @@ class ConnectionDiagnosisTest < Minitest::Test
     result = diagnose
 
     assert_equal SpecrelayRunner::ConnectionDiagnosis::WORKSPACE_GRANT_NOT_READY, result.outcome
-    assert_match(/claude auth login/, result.remedy)
+    # Platform's classification is provider-neutral and the remedy that follows it must be too:
+    # this machine may be running either approved provider, and naming the wrong one sends an
+    # operator to sign in to a product their project never selected.
+    assert_match(/sign in to this project's AI provider/, result.remedy)
   end
 
   def test_a_pending_grant_asks_for_a_reconnect_so_readiness_is_reported_again
@@ -229,13 +232,22 @@ class ConnectionDiagnosisTest < Minitest::Test
   # An executor profile this runner refuses to launch would fail the claim too, so it is
   # reported here as an executor problem rather than raised at the operator.
   def test_an_executor_profile_this_runner_refuses_is_reported_not_raised
-    @platform.claim_payload_executor = { "provider" => "claude", "command" => "claude",
-                                        "args" => [], "prompt_delivery" => "argument" }
+    @platform.claim_payload_executor = SpecrelayRunner::ClaudeProfile::CANONICAL.merge("args" => [])
     result = diagnose
 
     assert_equal SpecrelayRunner::ConnectionDiagnosis::EXECUTOR_CHECK_FAILED, result.outcome
-    assert_match(/non-interactive output/, result.summary)
+    assert_match(/not the approved claude profile/, result.summary)
     assert_match(/correct the workspace's executor configuration/, result.remedy)
+  end
+
+  # A provider this runner has no profile for is the same kind of executor problem, reported rather
+  # than raised at the operator.
+  def test_an_unsupported_provider_is_reported_not_raised
+    @platform.claim_payload_executor = SpecrelayRunner::ClaudeProfile::CANONICAL.merge("provider" => "some-other-agent")
+    result = diagnose
+
+    assert_equal SpecrelayRunner::ConnectionDiagnosis::EXECUTOR_CHECK_FAILED, result.outcome
+    assert_match(/not supported by this runner/, result.summary)
   end
 
   private
@@ -257,12 +269,11 @@ class ConnectionDiagnosisTest < Minitest::Test
     )
   end
 
+  # The CANONICAL Claude profile, because that is now the only Claude configuration a workspace can
+  # resolve to. A readiness classification about a profile this runner would refuse to launch would
+  # describe a run that could never happen.
   def use_claude_executor
-    @platform.claim_payload_executor = {
-      "provider" => "claude", "command" => "claude",
-      "args" => [ "--print", "--output-format", "stream-json", "--verbose" ],
-      "prompt_delivery" => "argument", "timeout_seconds" => 900, "env" => {}
-    }
+    @platform.claim_payload_executor = SpecrelayRunner::ClaudeProfile::CANONICAL
     FileUtils.mkdir_p(File.join(@dir, "empty-bin"))
   end
 

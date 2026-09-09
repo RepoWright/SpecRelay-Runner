@@ -10,6 +10,11 @@ require_relative "test_helper"
 # the workspace has to fetch it. The refusals are driven by real remote state — a moved branch,
 # a deleted branch, an unreadable remote, a foreign origin, a dirty worktree — never by a stub.
 class ReworkFlowTest < Minitest::Test
+  # The one directory on the child PATH that provides the approved fixture name. The PAYLOAD is
+  # always the canonical fixture profile; which script that approved name resolves to on this
+  # host is the test's choice, exactly as it is the operator's choice on a real machine.
+  # The approved fixture name resolves to the recording double these tests exist to observe.
+  def fixture_dir = @fixture_dir ||= fixture_bin(recording_executor)
   TASK = "MAPIAI-902"
   # MAPIAI-84 — the publication branch is the run's canonical branch, so the reviewed round's
   # branch is that one too.
@@ -51,8 +56,8 @@ class ReworkFlowTest < Minitest::Test
     git(clone, "rev-parse", "HEAD").strip
   end
 
-  def start(rework: nil, restart: nil, executor_command: nil, seed: nil, gh_mode: "ok")
-    payload = claim_payload_for(task_id: TASK, executor_command: executor_command || recording_executor,
+  def start(rework: nil, restart: nil, seed: nil, gh_mode: "ok")
+    payload = claim_payload_for(task_id: TASK,
                                 publication: {}, rework: rework, restart: restart)
     @platform = FakePlatform.new(claim_payload: payload).start
     @gh_dir, @gh_log, = FakeGithub.gh_bin(mode: gh_mode, pull_request_url: PR_URL, bare: @bare,
@@ -86,7 +91,7 @@ class ReworkFlowTest < Minitest::Test
 
   def run_cli(extra_env = {})
     io = StringIO.new
-    env = { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN, "PATH" => "#{@gh_dir}:#{ENV['PATH']}",
+    env = { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN, "PATH" => "#{fixture_dir}:#{@gh_dir}:#{ENV['PATH']}",
             "HOME" => ENV["HOME"].to_s }.merge(extra_env)
     code = SpecrelayRunner::CLI.run(%W[claim-once --config #{@config_path}], out: io, err: io, env: env)
     [ code, io.string ]
@@ -111,8 +116,7 @@ class ReworkFlowTest < Minitest::Test
   # --- S05 continue from the reviewed head ---------------------------------
 
   def test_the_worktree_is_materialized_at_the_exact_reviewed_head_before_the_executor_runs
-    start(rework: { "repositories" => [ reviewed_repository ] },
-          executor_command: recording_executor)
+    start(rework: { "repositories" => [ reviewed_repository ] })
     code, output = run_cli
     assert_equal SpecrelayRunner::CLI::SUCCESS, code, output
 
@@ -122,8 +126,7 @@ class ReworkFlowTest < Minitest::Test
   end
 
   def test_the_prompt_names_the_reviewed_head_the_pull_request_and_every_current_finding
-    start(rework: { "repositories" => [ reviewed_repository ] },
-          executor_command: recording_executor)
+    start(rework: { "repositories" => [ reviewed_repository ] })
     run_cli
 
     prompt = File.read(prompt_path)
@@ -141,7 +144,7 @@ class ReworkFlowTest < Minitest::Test
   # --- S06 a legitimate no-change review has no reviewed head --------------
 
   def test_a_rework_with_no_reviewed_repository_uses_the_ordinary_checkout_and_still_supplies_findings
-    start(rework: { "repositories" => [] }, executor_command: recording_executor)
+    start(rework: { "repositories" => [] })
     code, output = run_cli
     assert_equal SpecrelayRunner::CLI::SUCCESS, code, output
 
@@ -162,8 +165,7 @@ class ReworkFlowTest < Minitest::Test
   end
 
   def test_a_moved_remote_head_refuses_before_the_executor_and_releases_the_claim
-    start(rework: { "repositories" => [ reviewed_repository(head_commit: "a" * 40) ] },
-          executor_command: recording_executor)
+    start(rework: { "repositories" => [ reviewed_repository(head_commit: "a" * 40) ] })
     code, output = run_cli
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, code, output
@@ -172,7 +174,7 @@ class ReworkFlowTest < Minitest::Test
 
   def test_a_deleted_remote_branch_refuses_before_the_executor
     git(@bare, "update-ref", "-d", "refs/heads/#{BRANCH}")
-    start(rework: { "repositories" => [ reviewed_repository ] }, executor_command: recording_executor)
+    start(rework: { "repositories" => [ reviewed_repository ] })
     code, output = run_cli
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, code, output
@@ -181,7 +183,7 @@ class ReworkFlowTest < Minitest::Test
 
   def test_an_unreadable_remote_refuses_rather_than_guessing_the_head_did_not_move
     FileUtils.remove_entry(@bare)
-    start(rework: { "repositories" => [ reviewed_repository ] }, executor_command: recording_executor)
+    start(rework: { "repositories" => [ reviewed_repository ] })
     code, output = run_cli
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, code, output

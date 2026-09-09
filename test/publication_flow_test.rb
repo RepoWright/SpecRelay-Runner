@@ -13,6 +13,10 @@ require_relative "test_helper"
 # rejection and gh unavailable/failing), the publication.* events, and secret
 # redaction in publication output.
 class PublicationFlowTest < Minitest::Test
+  # The one directory on the child PATH that provides the approved fixture name. The PAYLOAD is
+  # always the canonical fixture profile; which script that approved name resolves to on this
+  # host is the test's choice, exactly as it is the operator's choice on a real machine.
+  def fixture_dir = @fixture_dir ||= fixture_bin
   TASK = "MAPIAI-901"
   # MAPIAI-84 — the publication branch IS the run's canonical branch. One task branch exists in
   # every repository of the prepared task workspace, so a separately patterned branch would name
@@ -22,6 +26,7 @@ class PublicationFlowTest < Minitest::Test
 
   def setup
     @root, @executor = DemoWorkspace.build
+    use_fixture(fixture_dir, @executor)
     @bare = FakeGithub.add_remote(@root)
     # `bare:` lets the fake resolve real head shas, so headRefOid is a fact.
     @gh_dir, @gh_log, = FakeGithub.gh_bin(bare: @bare)
@@ -35,8 +40,8 @@ class PublicationFlowTest < Minitest::Test
 
   # --- harness -------------------------------------------------------------
 
-  def start(publication: {}, executor_command: nil)
-    payload = claim_payload_for(task_id: TASK, executor_command: executor_command || @executor,
+  def start(publication: {})
+    payload = claim_payload_for(task_id: TASK,
                                 publication: publication)
     @platform = FakePlatform.new(claim_payload: payload).start
     @config_path = write_config
@@ -64,7 +69,7 @@ class PublicationFlowTest < Minitest::Test
   def run_cli(extra_env = {}, gh_dir: @gh_dir)
     io = StringIO.new
     env = { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN,
-            "PATH" => "#{gh_dir}:#{ENV['PATH']}",
+            "PATH" => "#{fixture_dir}:#{gh_dir}:#{ENV['PATH']}",
             "HOME" => ENV["HOME"].to_s }.merge(extra_env)
     code = SpecrelayRunner::CLI.run(%W[claim-once --config #{@config_path}], out: io, err: io, env: env)
     [ code, io.string ]
@@ -170,9 +175,9 @@ class PublicationFlowTest < Minitest::Test
       changed_files: [ "demo-app/index.html" ], diff: ""
     )
     SpecrelayRunner::Publication.new(
-      payload: claim_payload_for(task_id: TASK, executor_command: @executor, publication: {}),
+      payload: claim_payload_for(task_id: TASK, publication: {}),
       repository: repository,
-      env: { "PATH" => "#{gh_dir}:#{ENV['PATH']}", "HOME" => ENV["HOME"].to_s }, io: StringIO.new
+      env: { "PATH" => "#{fixture_dir}:#{gh_dir}:#{ENV['PATH']}", "HOME" => ENV["HOME"].to_s }, io: StringIO.new
     ).call
   end
 
@@ -182,6 +187,7 @@ class PublicationFlowTest < Minitest::Test
     # An executor that changes nothing: the heading is already the expected value.
     FileUtils.rm_rf(@root)
     @root, @executor = DemoWorkspace.build(initial_heading: "Hello SpecRelay Demo")
+    use_fixture(fixture_dir, @executor)
     @bare = FakeGithub.add_remote(@root)
     start
     code, output = run_cli
@@ -549,7 +555,7 @@ class PublicationFlowTest < Minitest::Test
   def predicate_publication(repo)
     SpecrelayRunner::Publication.new(
       payload: {}, repository: SpecrelayRunner::Workspace::Repository.new(path: repo),
-      env: { "PATH" => ENV["PATH"].to_s, "HOME" => ENV["HOME"].to_s }, io: StringIO.new
+      env: { "PATH" => "#{fixture_dir}:#{ENV['PATH']}", "HOME" => ENV["HOME"].to_s }, io: StringIO.new
     )
   end
 
@@ -593,6 +599,7 @@ class PublicationFlowTest < Minitest::Test
   def test_runner_refuses_to_publish_a_repository_whose_default_branch_is_the_task_branch
     FileUtils.rm_rf(@root)
     @root, @executor = DemoWorkspace.build
+    use_fixture(fixture_dir, @executor)
     @bare = FakeGithub.add_remote(@root, default_branch: TASK)
     start
     run_cli
@@ -615,9 +622,9 @@ class PublicationFlowTest < Minitest::Test
       changed_files: [ "demo-app/index.html" ], diff: ""
     )
     publication = SpecrelayRunner::Publication.new(
-      payload: claim_payload_for(task_id: TASK, executor_command: "/bin/true", publication: {}),
+      payload: claim_payload_for(task_id: TASK, publication: {}),
       repository: repository,
-      env: { "PATH" => "#{@gh_dir}:#{ENV['PATH']}", "HOME" => ENV["HOME"].to_s }, io: StringIO.new
+      env: { "PATH" => "#{fixture_dir}:#{@gh_dir}:#{ENV['PATH']}", "HOME" => ENV["HOME"].to_s }, io: StringIO.new
     )
 
     result = publication.call

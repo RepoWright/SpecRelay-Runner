@@ -287,27 +287,34 @@ module SpecrelayRunner
 
     def expand(path) = File.expand_path(path.to_s.strip)
 
-    # The existing bounded Claude readiness checks, run ONLY when the assigned executor is
-    # the supported real profile. The deterministic fixture path must never require Claude
-    # Code to be installed or authenticated. Raw probe output — which carries the
-    # operator's account email and organization — is never printed or returned.
+    # The bounded readiness checks for whichever real profile the assigned executor resolves to.
+    # The deterministic fixture path must never require a provider CLI to be installed or
+    # authenticated, so it resolves to no profile and is reported ready as it stands. Raw probe
+    # output — which carries the operator's account identity — is never printed or returned.
+    #
+    # `detail` is the profile's own: the safe, bounded CLI-version fact once this host is ready,
+    # and the actionable remedy when it is not. It travels in the EXISTING readiness field; no new
+    # wire key is introduced for it.
     def executor_readiness(executor)
-      return { classification: READY, provider: executor["provider"].to_s, detail: nil } unless ClaudeProfile.selected?(executor)
+      profile = ImplementationProfile.for(executor)
+      return { classification: READY, provider: executor["provider"].to_s, detail: nil } if profile.nil?
 
-      profile = ClaudeProfile.new(executor)
       out.puts "Executor:           #{profile.describe}"
       readiness = profile.readiness(env: env)
       out.puts "Readiness:          #{readiness.summary}"
-      return { classification: READY, provider: ClaudeProfile::PROVIDER, detail: nil } if readiness.ready?
+      provider = ImplementationProfile.provider_of(executor)
+      return { classification: READY, provider: provider, detail: readiness.detail } if readiness.ready?
 
-      { classification: classify(readiness), provider: ClaudeProfile::PROVIDER, detail: readiness.remedy }
-    rescue ClaudeProfile::Error => e
+      { classification: classify(readiness, profile.class), provider: provider, detail: readiness.detail }
+    rescue ImplementationProfile::Error, ClaudeProfile::Error, CodexProfile::Error => e
       raise Error, "the assigned executor profile is not usable on this host: #{Redaction.redact(e.message)}"
     end
 
-    def classify(readiness)
-      return "executor_unavailable" if readiness.version == ClaudeProfile::UNAVAILABLE
-      return "executor_not_authenticated" if readiness.auth == ClaudeProfile::NOT_AUTHENTICATED
+    # The classifications are provider-neutral Platform vocabulary; which constants say
+    # "unavailable" and "not authenticated" belongs to the profile that produced the readiness.
+    def classify(readiness, owner)
+      return "executor_unavailable" if readiness.version == owner::UNAVAILABLE
+      return "executor_not_authenticated" if readiness.auth == owner::NOT_AUTHENTICATED
 
       "executor_check_failed"
     end
@@ -402,6 +409,8 @@ module SpecrelayRunner
     # more than it can implement.
     def reviewer_settings(readiness)
       return Review::Settings.new({}, env: env) if env[Review::Settings::PROVIDER_ENV].to_s.strip != ""
+      # Still Claude-only: reviewing through the second provider is its own delivery, so a machine
+      # whose EXECUTOR is Codex advertises no reviewer rather than one it cannot launch.
       return nil unless readiness[:classification] == READY && readiness[:provider] == ClaudeProfile::PROVIDER
 
       Review::Settings.new({ "provider" => Review::Settings::PROVIDER_CLAUDE }, env: env)

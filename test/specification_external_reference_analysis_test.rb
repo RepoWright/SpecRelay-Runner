@@ -310,22 +310,28 @@ class SpecificationExternalReferenceAnalysisTest < Minitest::Test
     SpecrelayRunner::Config.load(path)
   end
 
-  # The SAME real Claude profile a fixed D1 would use for generation — configured here purely so
-  # the reference analyzer can be offered it, with `specification.provider.kind: fake` above
-  # keeping generation itself on the deterministic composer.
+  # The SAME real Claude profile a fixed D1 would use for generation — SELECTED here purely so the
+  # reference analyzer can be offered it, with `specification.provider.kind: fake` above keeping
+  # generation itself on the deterministic composer.
+  #
+  # The block names the provider and nothing else, which is the only shape either side accepts. The
+  # double is reached the way the real CLI is: under its own bare name on the child PATH.
   def executor_block(claude_command)
     return "" if claude_command.nil?
 
-    <<~YAML.strip
-      executor:
-          provider: claude
-          command: #{claude_command}
-          args: ["--print", "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions"]
-    YAML
+    @claude_bin = claude_bin(claude_command)
+    "executor:\n      provider: claude"
+  end
+
+  def claude_bin(script)
+    dir = Dir.mktmpdir("fake-claude-bin-")
+    File.symlink(File.expand_path(script), File.join(dir, "claude"))
+    dir
   end
 
   def run_cli(config:)
-    env = { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN, "PATH" => ENV["PATH"] }
+    path = [ @claude_bin, ENV["PATH"] ].compact.join(File::PATH_SEPARATOR)
+    env = { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN, "PATH" => path }
           .merge(SpecificationWorkspace.lane_env(@temp))
     SpecrelayRunner::CLI.run(%W[claim-once --config #{config.source_path}], out: @io, err: @io, env: env)
   end

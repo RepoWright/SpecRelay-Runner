@@ -22,9 +22,8 @@ module SpecrelayRunner
   #     operator_account_id: 5b10ac...          # optional (assigned_to_me)
   #     claim_policy:
   #       mode: all_eligible                     # all_eligible | assigned_to_me
-  #     executor:                                # optional non-secret override
-  #       provider: fake
-  #       command: ./bin/fake-executor
+  #     executor:                                # optional non-secret provider SELECTION
+  #       provider: fake                         # claude | codex | fake, and nothing else
   #   workspace_roots:                           # optional; else env resolution
   #     tiny-demo-workspace: /abs/path/to/tiny-demo-workspace
   #
@@ -53,6 +52,8 @@ module SpecrelayRunner
     WORKSPACE_ROOT_ENV = "SPECRELAY_RUNNER_WORKSPACE_ROOT"
     # The policy value a guided connection uses; see .from_connection.
     ALL_ELIGIBLE_MODE = "all_eligible"
+    # The only key `runner.executor:` may carry.
+    PROVIDER_KEY = "provider"
 
     # The resolved runner API bearer: a per-runner registered credential
     # (mode: :registered) or the shared development token (mode: :development).
@@ -163,22 +164,45 @@ module SpecrelayRunner
       value.is_a?(Hash) ? value.transform_keys(&:to_s) : {}
     end
 
-    # The operator's optional, NON-SECRET `runner.executor:` override block. It is
-    # logical config only (provider/command/args/prompt delivery/timeout/env) and
-    # is sent to Platform, which merges it over the workspace's stored executor
-    # config to produce the effective claim payload.
+    # The operator's optional, NON-SECRET `runner.executor:` SELECTION block. It names one of the
+    # supported providers and NOTHING else, and it is sent to Platform, which expands it from its
+    # own fixed profile map to produce the effective claim payload. It is not a way to compose a
+    # profile: a command, argv, prompt delivery, timeout or environment written here is refused by
+    # {#selected_implementation_profile} before any Platform request, and Platform refuses it too.
     def executor_override
       value = runner["executor"]
       value.is_a?(Hash) ? value.transform_keys(&:to_s) : {}
     end
 
-    # The real Claude Code profile this runner selected locally (MVP-0016), or nil
-    # when it selected no real provider — the deterministic fake-executor
-    # regression path, which must never require Claude to be installed. Raises
-    # ClaudeProfile::Error when the operator selected `provider: claude` with an
-    # argv this runner refuses to launch.
+    # The real IMPLEMENTATION profile this runner selected locally, or nil when it selected the
+    # deterministic fixture or nothing at all — the offline regression path, which must never
+    # require either provider CLI to be installed.
+    #
+    # `runner.executor:` is a PROVIDER-ONLY selection, the same shape Platform accepts and expands
+    # from its own fixed map. It used to be a full profile here and a provider-only key there, so
+    # neither representation worked across both halves of the ordinary local-selection path. A
+    # machine names a provider; it does not describe one, and any additional key is refused here —
+    # before a claim request is made.
+    def selected_implementation_profile
+      selection = executor_override
+      return nil if selection.empty?
+
+      extra = selection.keys - [ PROVIDER_KEY ]
+      raise Error, "runner.executor selects only a provider (remove #{extra.join(', ')}); " \
+                   "the approved command, arguments, prompt delivery, timeout and environment " \
+                   "belong to the profile, not to this file" unless extra.empty?
+
+      ImplementationProfile.for(ImplementationProfile.canonical(selection[PROVIDER_KEY]))
+    end
+
+    # The real Claude Code profile this runner selected locally, or nil when it selected another
+    # provider or none. The SPECIFICATION lane is Claude-only until its own delivery, so it asks
+    # this narrower question rather than the implementation lane's closed choice — a Codex executor
+    # selection must leave specification generation exactly as it was.
     def selected_claude_profile
-      ClaudeProfile.selected?(executor_override) ? ClaudeProfile.new(executor_override) : nil
+      return nil unless ImplementationProfile.provider_of(executor_override) == ClaudeProfile::PROVIDER
+
+      ClaudeProfile.new(ClaudeProfile::CANONICAL)
     end
 
     # Resolve the Platform API token from the environment (never the file). A

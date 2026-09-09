@@ -17,6 +17,10 @@ require "open3"
 # pass by accident: each checkout has to fetch its own. The refusals are driven by real remote
 # state rather than by a stub.
 class MultiRepositoryContinuationTest < Minitest::Test
+  # The one directory on the child PATH that provides the approved fixture name. The PAYLOAD is
+  # always the canonical fixture profile; which script that approved name resolves to on this
+  # host is the test's choice, exactly as it is the operator's choice on a real machine.
+  def fixture_dir = @fixture_dir ||= fixture_bin
   TASK = "MAPIAI-903"
   BRANCH = TASK
   WORKSPACE_SLUG = "SpecRelay/multi-demo-workspace"
@@ -66,10 +70,14 @@ class MultiRepositoryContinuationTest < Minitest::Test
     git(clone, "rev-parse", "HEAD").strip
   end
 
-  def start(rework: nil, restart: nil, executor_command: nil, executor_env: {}, seed: nil)
-    payload = claim_payload_for(task_id: TASK, executor_command: executor_command || @built.executor,
+  # `fixture_env` is the environment the double runs under on this host, installed behind the
+  # approved bare name on the child PATH. The assignment itself is always the canonical fixture
+  # profile, environment included.
+  def start(rework: nil, restart: nil, executor: nil, fixture_env: {}, seed: nil)
+    use_fixture(fixture_dir, executor || @built.executor,
+                env: { "FAKE_EXECUTOR_EDITED" => ".,component-a" }.merge(fixture_env))
+    payload = claim_payload_for(task_id: TASK,
                                 publication: {}, rework: rework, restart: restart)
-    payload["executor"]["env"] = { "FAKE_EDITED" => ".,component-a" }.merge(executor_env)
     @platform = FakePlatform.new(claim_payload: payload).start
     @gh_dir, @gh_log, = FakeGithub.gh_bin(urls: PR_URLS, bares: @bares, seed: seed || open_pull_requests)
     @config_path = write_config
@@ -113,7 +121,7 @@ class MultiRepositoryContinuationTest < Minitest::Test
 
   def run_cli
     io = StringIO.new
-    env = { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN, "PATH" => "#{@gh_dir}:#{ENV['PATH']}",
+    env = { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN, "PATH" => "#{fixture_dir}:#{@gh_dir}:#{ENV['PATH']}",
             "HOME" => ENV["HOME"].to_s }
     code = SpecrelayRunner::CLI.run(%W[claim-once --config #{@config_path}], out: io, err: io, env: env)
     [ code, io.string ]
@@ -138,7 +146,7 @@ class MultiRepositoryContinuationTest < Minitest::Test
   # --- S02: the complete set is materialized, each at its OWN recorded head ---
 
   def test_the_root_and_a_contained_child_are_both_at_their_own_recorded_head_before_the_provider
-    start(rework: { "repositories" => both_targets }, executor_command: observing_executor)
+    start(rework: { "repositories" => both_targets }, executor: observing_executor)
     code, output = run_cli
     assert_equal SpecrelayRunner::CLI::SUCCESS, code, output
 
@@ -155,7 +163,7 @@ class MultiRepositoryContinuationTest < Minitest::Test
   # The report's base commit still means what it always meant: the task-workspace repository's
   # own starting point. A contained child's measurement stays with Workspace#select.
   def test_the_reported_base_commit_is_the_task_workspace_repositorys_recorded_head
-    start(rework: { "repositories" => both_targets }, executor_command: observing_executor)
+    start(rework: { "repositories" => both_targets }, executor: observing_executor)
     run_cli
 
     assert_equal @recorded.fetch(WORKSPACE_SLUG),
@@ -168,7 +176,7 @@ class MultiRepositoryContinuationTest < Minitest::Test
     before = { WORKSPACE_SLUG => nil, CHILD_SLUG => nil }
     start(rework: { "repositories" => [ recorded_repository(WORKSPACE_SLUG),
                                         recorded_repository(CHILD_SLUG, head_commit: "a" * 40) ] },
-          executor_command: observing_executor)
+          executor: observing_executor)
     code, output = run_cli
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, code, output
@@ -187,7 +195,7 @@ class MultiRepositoryContinuationTest < Minitest::Test
   def test_a_second_target_pointing_at_a_foreign_remote_refuses_the_whole_continuation
     git(File.join(@root, "component-a"), "remote", "set-url", "origin",
         "https://github.com/SpecRelay/component-z.git")
-    start(rework: { "repositories" => both_targets }, executor_command: observing_executor)
+    start(rework: { "repositories" => both_targets }, executor: observing_executor)
     code, output = run_cli
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, code, output
@@ -199,7 +207,7 @@ class MultiRepositoryContinuationTest < Minitest::Test
   def test_the_same_repository_named_twice_refuses_before_any_reset
     start(rework: { "repositories" => [ recorded_repository(CHILD_SLUG),
                                         recorded_repository(CHILD_SLUG) ] },
-          executor_command: observing_executor)
+          executor: observing_executor)
     code, output = run_cli
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, code, output
@@ -217,7 +225,7 @@ class MultiRepositoryContinuationTest < Minitest::Test
                "branch" => BRANCH, "head_commit" => "c" * 40,
                "pull_request_url" => "https://github.com/SpecRelay/component-z/pull/35" }
     start(rework: { "repositories" => [ recorded_repository(WORKSPACE_SLUG), absent ] },
-          executor_command: observing_executor)
+          executor: observing_executor)
     code, output = run_cli
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, code, output
@@ -239,7 +247,7 @@ class MultiRepositoryContinuationTest < Minitest::Test
     prepare_task_workspace
     git(File.join(task_workspace, "component-a"), "checkout", "-q", "-b", "wip/side-quest")
     before = head_of(CHILD_SLUG)
-    start(rework: { "repositories" => both_targets }, executor_command: observing_executor)
+    start(rework: { "repositories" => both_targets }, executor: observing_executor)
     code, output = run_cli
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, code, output
@@ -256,7 +264,7 @@ class MultiRepositoryContinuationTest < Minitest::Test
     prepare_task_workspace
     git(File.join(task_workspace, "component-a"), "checkout", "-q", "--detach", "HEAD")
     before = head_of(CHILD_SLUG)
-    start(rework: { "repositories" => both_targets }, executor_command: observing_executor)
+    start(rework: { "repositories" => both_targets }, executor: observing_executor)
     code, output = run_cli
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, code, output
@@ -272,7 +280,7 @@ class MultiRepositoryContinuationTest < Minitest::Test
   def test_a_branch_that_cannot_be_read_refuses_rather_than_assuming_it_is_correct
     prepare_task_workspace
     before = head_of(CHILD_SLUG)
-    start(rework: { "repositories" => both_targets }, executor_command: observing_executor)
+    start(rework: { "repositories" => both_targets }, executor: observing_executor)
     code, output = with_failing_git("symbolic-ref", :unspawnable, only_under: "component-a") { run_cli }
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, code, output
@@ -292,7 +300,7 @@ class MultiRepositoryContinuationTest < Minitest::Test
     prepare_task_workspace
     child_before = head_of(CHILD_SLUG)
     git(task_workspace, "checkout", "-q", "-b", "wip/root-side-quest")
-    start(rework: { "repositories" => both_targets }, executor_command: observing_executor)
+    start(rework: { "repositories" => both_targets }, executor: observing_executor)
     code, output = run_cli
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, code, output
@@ -309,7 +317,7 @@ class MultiRepositoryContinuationTest < Minitest::Test
   def test_a_replacement_with_a_child_on_another_local_branch_refuses_at_the_same_boundary
     prepare_task_workspace
     git(File.join(task_workspace, "component-a"), "checkout", "-q", "-b", "wip/side-quest")
-    start(restart: { "repositories" => both_targets }, executor_command: observing_executor)
+    start(restart: { "repositories" => both_targets }, executor: observing_executor)
     code, output = run_cli
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, code, output
@@ -322,7 +330,7 @@ class MultiRepositoryContinuationTest < Minitest::Test
   def test_a_dirty_contained_child_is_preserved_and_no_target_is_reset
     prepare_task_workspace
     File.write(File.join(task_workspace, "component-a", "app.txt"), "work in progress\n")
-    start(rework: { "repositories" => both_targets }, executor_command: observing_executor)
+    start(rework: { "repositories" => both_targets }, executor: observing_executor)
     code, output = run_cli
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, code, output
@@ -340,7 +348,7 @@ class MultiRepositoryContinuationTest < Minitest::Test
   # would then have been handed to the provider as though it held the recorded code.
 
   def test_a_reset_that_cannot_be_spawned_refuses_and_names_the_repository
-    start(rework: { "repositories" => both_targets }, executor_command: observing_executor)
+    start(rework: { "repositories" => both_targets }, executor: observing_executor)
     code, output = with_failing_git("reset", :unspawnable) { run_cli }
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, code, output
@@ -349,7 +357,7 @@ class MultiRepositoryContinuationTest < Minitest::Test
   end
 
   def test_a_reset_that_exits_nonzero_refuses_and_names_the_repository
-    start(rework: { "repositories" => both_targets }, executor_command: observing_executor)
+    start(rework: { "repositories" => both_targets }, executor: observing_executor)
     code, output = with_failing_git("reset", :nonzero) { run_cli }
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, code, output
@@ -362,7 +370,7 @@ class MultiRepositoryContinuationTest < Minitest::Test
   # — and this ticket deliberately invents no rollback for it. What must still hold absolutely is
   # that the half-built base never reaches the provider or any external write.
   def test_a_second_reset_failing_leaves_recoverable_local_state_and_still_reaches_no_provider
-    start(rework: { "repositories" => both_targets }, executor_command: observing_executor)
+    start(rework: { "repositories" => both_targets }, executor: observing_executor)
     code, output = with_failing_git("reset", :nonzero, only_under: "component-a") { run_cli }
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, code, output
@@ -419,7 +427,7 @@ class MultiRepositoryContinuationTest < Minitest::Test
   # --- S07: the executor is told about EVERY continued repository ----------
 
   def test_the_prompt_lists_every_repository_once_in_order_with_the_summary_and_findings_once
-    start(rework: { "repositories" => both_targets }, executor_command: observing_executor)
+    start(rework: { "repositories" => both_targets }, executor: observing_executor)
     run_cli
 
     section = change_request_section
@@ -440,7 +448,7 @@ class MultiRepositoryContinuationTest < Minitest::Test
   end
 
   def test_the_prompt_carries_no_review_internals_transcript_or_local_path
-    start(rework: { "repositories" => both_targets }, executor_command: observing_executor)
+    start(rework: { "repositories" => both_targets }, executor: observing_executor)
     run_cli
 
     section = change_request_section
@@ -477,7 +485,7 @@ class MultiRepositoryContinuationTest < Minitest::Test
   # --- S10: the same proof and materialization for a REPLACEMENT run -------
 
   def test_a_replacement_run_materializes_every_recorded_repository_without_a_change_request
-    start(restart: { "repositories" => both_targets }, executor_command: observing_executor)
+    start(restart: { "repositories" => both_targets }, executor: observing_executor)
     code, output = run_cli
     assert_equal SpecrelayRunner::CLI::SUCCESS, code, output
 
@@ -490,7 +498,7 @@ class MultiRepositoryContinuationTest < Minitest::Test
   def test_a_replacement_whose_second_recorded_head_moved_refuses_the_whole_continuation
     start(restart: { "repositories" => [ recorded_repository(WORKSPACE_SLUG),
                                          recorded_repository(CHILD_SLUG, head_commit: "b" * 40) ] },
-          executor_command: observing_executor)
+          executor: observing_executor)
     code, output = run_cli
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, code, output

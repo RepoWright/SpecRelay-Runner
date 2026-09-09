@@ -118,9 +118,9 @@ module DemoWorkspace
   # run the runner refuses: the document IS how a repository becomes publishable.
   #
   # `changed` is the caller's own expression, so each executor reports what it actually did.
-  # `FAKE_SELECTION_JSON` replaces the whole document with raw bytes, so a test can send a
+  # `FAKE_EXECUTOR_SELECTION_JSON` replaces the whole document with raw bytes, so a test can send a
   # malformed, escaping, or duplicated selection without this script sanitizing it first, and
-  # `FAKE_SELECTION_SKIP` writes none at all.
+  # `FAKE_EXECUTOR_SELECTION_SKIP` writes none at all.
   #
   # MAPIAI-93 — each entry also names the verification the executor selected for that repository.
   # This fixture selects the workspace's own `bin/test`, so the single-repository flow keeps
@@ -136,13 +136,13 @@ module DemoWorkspace
     reported = paths || %([ { "path" => ".", "commands" => [ [ "bin/test" ] ] } ])
     <<~RUBY.strip
       SELECTION = lambda do
-        unless ENV["FAKE_SELECTION_SKIP"]
+        unless ENV["FAKE_EXECUTOR_SELECTION_SKIP"]
           require "json"
           _prompt = ARGV.last.to_s
           _prompt = File.read(_prompt) if File.file?(_prompt)
           _selection = _prompt[%r{`([^`]*/#{SELECTION_FILENAME})`}, 1]
           abort "the prompt named no repository selection document" if _selection.nil?
-          _document = ENV["FAKE_SELECTION_JSON"] ||
+          _document = ENV["FAKE_EXECUTOR_SELECTION_JSON"] ||
                       JSON.generate({ "repositories" => ((#{changed}) ? #{reported} : []) })
           File.write(_selection + ".partial", _document)
           File.rename(_selection + ".partial", _selection)
@@ -167,7 +167,7 @@ module DemoWorkspace
   # writes one request, then blocks on the answer — so the test exercises the real
   # same-session wait rather than a stubbed one.
   #
-  # `FAKE_QUESTION_JSON` is the raw request bytes, so a test can send a malformed or oversized
+  # `FAKE_EXECUTOR_QUESTION_JSON` is the raw request bytes, so a test can send a malformed or oversized
   # document without this script sanitizing it first.
   def write_question_executor(root)
     path = File.join(root, "bin", "question-executor")
@@ -188,18 +188,18 @@ module DemoWorkspace
       # MVP-0036 Stage 2a: the real shape of the pause this MVP exists for — the provider has
       # already CHANGED files when it stops to ask, so the worktree a later resume must prove is
       # genuinely dirty rather than merely present.
-      if ENV["FAKE_QUESTION_EDIT_FIRST"]
+      if ENV["FAKE_EXECUTOR_QUESTION_EDIT_FIRST"]
         file = "demo-app/index.html"
         File.write(file, File.read(file).sub("Hello Demo", "Hello Interrupted Demo"))
         puts "[question-executor] edited before asking"
       end
 
       SELECTION.call
-      File.write("#{request}.partial", ENV.fetch("FAKE_QUESTION_JSON"))
+      File.write("#{request}.partial", ENV.fetch("FAKE_EXECUTOR_QUESTION_JSON"))
       File.rename("#{request}.partial", request)
       puts "[question-executor] asked"
 
-      deadline = Time.now + ENV.fetch("FAKE_QUESTION_TIMEOUT_SECONDS", "20").to_f
+      deadline = Time.now + ENV.fetch("FAKE_EXECUTOR_QUESTION_TIMEOUT_SECONDS", "20").to_f
       until Time.now > deadline
         if File.file?(answer)
           puts "[question-executor] answered #{JSON.parse(File.read(answer))['answers'].to_json}"
@@ -247,7 +247,7 @@ module DemoWorkspace
   # anything, which is what a provider given a complete handoff actually does. It never writes to
   # stdout or stderr, so output cannot stand in for "this process received its input".
   #
-  # With `FAKE_RESUME_NEXT_QUESTION` that first action is ordinal N+1, which Platform can only
+  # With `FAKE_EXECUTOR_RESUME_NEXT_QUESTION` that first action is ordinal N+1, which Platform can only
   # accept once the batch being continued has been acknowledged.
   def write_silent_resume_executor(root)
     path = File.join(root, "bin", "silent-resume-executor")
@@ -257,7 +257,7 @@ module DemoWorkspace
       prompt = File.read(ARGV.last.to_s)
       abort "the prompt carried no answers" unless prompt.include?("## Answers to your earlier questions")
 
-      if (asked = ENV["FAKE_RESUME_NEXT_QUESTION"])
+      if (asked = ENV["FAKE_EXECUTOR_RESUME_NEXT_QUESTION"])
         request = prompt[%r{`([^`]*/question-request\.json)`}, 1]
         abort "the prompt named no bridge" if request.nil?
         SELECTION.call
@@ -287,13 +287,13 @@ module DemoWorkspace
       request = prompt[%r{`([^`]*/question-request\.json)`}, 1]
       abort "[abandoning-executor] the prompt named no bridge" if request.nil?
       SELECTION.call
-      File.write("#{request}.partial", ENV.fetch("FAKE_QUESTION_JSON"))
+      File.write("#{request}.partial", ENV.fetch("FAKE_EXECUTOR_QUESTION_JSON"))
       File.rename("#{request}.partial", request)
       puts "[abandoning-executor] asked, then leaving"
       # Long enough for the parent to submit the batch to Platform, so the question really is
       # durable when this process disappears.
-      sleep ENV.fetch("FAKE_QUESTION_ASK_SECONDS", "3").to_f
-      exit ENV.fetch("FAKE_QUESTION_EXIT_CODE", "0").to_i
+      sleep ENV.fetch("FAKE_EXECUTOR_QUESTION_ASK_SECONDS", "3").to_f
+      exit ENV.fetch("FAKE_EXECUTOR_QUESTION_EXIT_CODE", "0").to_i
     RUBY
     File.write(path, with_selection_reporter(File.read(path)))
     FileUtils.chmod(0o755, path)

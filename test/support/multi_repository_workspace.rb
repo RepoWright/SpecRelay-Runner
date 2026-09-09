@@ -76,20 +76,20 @@ module MultiRepositoryWorkspace
     FileUtils.chmod(0o755, path)
   end
 
-  # The executor. `FAKE_EDITED` names the repositories it actually changes (comma-separated
-  # relative paths, "." for the workspace repository); `FAKE_SELECTED` names what it REPORTS,
+  # The executor. `FAKE_EXECUTOR_EDITED` names the repositories it actually changes (comma-separated
+  # relative paths, "." for the workspace repository); `FAKE_EXECUTOR_SELECTED` names what it REPORTS,
   # defaulting to what it edited — so "reported but unchanged" is expressible.
   #
   # MAPIAI-93 — it also reports the VERIFICATION it selected per repository, and (with
-  # `FAKE_RUN_SELECTED`) really runs it from that repository before it exits, repairing and
-  # rerunning when `FAKE_REPAIR` is set. That is the executor half of the contract: the runner's
+  # `FAKE_EXECUTOR_RUN_SELECTED`) really runs it from that repository before it exits, repairing and
+  # rerunning when `FAKE_EXECUTOR_REPAIR` is set. That is the executor half of the contract: the runner's
   # replay is the independent final gate, but the repair opportunity is here.
   #
-  #   FAKE_COMMANDS  - JSON object mapping a reported path to its ordered argv commands.
+  #   FAKE_EXECUTOR_COMMANDS  - JSON object mapping a reported path to its ordered argv commands.
   #                    Defaults to `bin/verify` for every reported component repository.
-  #   FAKE_BREAK     - comma-separated repositories whose edit is left in a state `bin/verify`
+  #   FAKE_EXECUTOR_BREAK     - comma-separated repositories whose edit is left in a state `bin/verify`
   #                    rejects, so an unresolved failure is expressible.
-  #   FAKE_REPAIR    - after a selected command fails, fix the edit and rerun it.
+  #   FAKE_EXECUTOR_REPAIR    - after a selected command fails, fix the edit and rerun it.
   def write_selecting_executor(root)
     path = File.join(root, "bin", "multi-executor")
     File.write(path, <<~'RUBY')
@@ -109,16 +109,16 @@ module MultiRepositoryWorkspace
       # repair and rerun its own selection — not merely that a document path was named.
       puts "[multi-executor] instructions #{prompt[/^- Run what you select.*$/].to_s.strip}"
 
-      broken = ENV.fetch("FAKE_BREAK", "").split(",").reject(&:empty?)
-      edited = ENV.fetch("FAKE_EDITED", "component-a,component-b").split(",").reject(&:empty?)
+      broken = ENV.fetch("FAKE_EXECUTOR_BREAK", "").split(",").reject(&:empty?)
+      edited = ENV.fetch("FAKE_EXECUTOR_EDITED", "component-a,component-b").split(",").reject(&:empty?)
       edited.each do |relative|
         marker = broken.include?(relative) ? "half-edited by the executor" : "edited by the executor"
         File.write(target(relative), "#{File.read(target(relative))}#{marker}\n")
         puts "[multi-executor] edited #{relative}"
       end
 
-      reported = ENV.fetch("FAKE_SELECTED", edited.join(",")).split(",").reject(&:empty?)
-      selected = JSON.parse(ENV.fetch("FAKE_COMMANDS", "{}"))
+      reported = ENV.fetch("FAKE_EXECUTOR_SELECTED", edited.join(",")).split(",").reject(&:empty?)
+      selected = JSON.parse(ENV.fetch("FAKE_EXECUTOR_COMMANDS", "{}"))
       commands_for = ->(relative) do
         selected.fetch(relative, relative == "." ? [] : [ [ "bin/verify" ] ])
       end
@@ -126,12 +126,12 @@ module MultiRepositoryWorkspace
       # The executor runs what it selected while it still controls the implementation, and
       # repairs what it can. Reported to stdout so "it ran, it diagnosed, it reran" is an
       # observable fact rather than an inference from a passing runner replay.
-      if ENV["FAKE_RUN_SELECTED"]
+      if ENV["FAKE_EXECUTOR_RUN_SELECTED"]
         reported.each do |relative|
           commands_for.call(relative).each do |argv|
             ok = system(*argv, chdir: (relative == "." ? "." : relative), out: File::NULL, err: File::NULL)
             puts "[multi-executor] ran #{argv.join(' ')} in #{relative}: #{ok ? 'passed' : 'failed'}"
-            next if ok || ENV["FAKE_REPAIR"].nil?
+            next if ok || ENV["FAKE_EXECUTOR_REPAIR"].nil?
 
             File.write(target(relative), File.read(target(relative)).sub("half-edited by the executor",
                                                                         "edited by the executor"))
@@ -141,11 +141,11 @@ module MultiRepositoryWorkspace
         end
       end
 
-      document = ENV["FAKE_SELECTION_JSON"] ||
+      document = ENV["FAKE_EXECUTOR_SELECTION_JSON"] ||
                  JSON.generate({ "repositories" => reported.map do |path|
                    { "path" => path, "commands" => commands_for.call(path) }
                  end })
-      unless ENV["FAKE_SELECTION_SKIP"]
+      unless ENV["FAKE_EXECUTOR_SELECTION_SKIP"]
         File.write("#{selection}.partial", document)
         File.rename("#{selection}.partial", selection)
       end

@@ -12,7 +12,7 @@ class LeaseTest < Minitest::Test
 
   def setup
     @root, @executor = DemoWorkspace.build
-    @platform = FakePlatform.new(claim_payload: claim_payload_for(task_id: TASK, executor_command: @executor)).start
+    @platform = FakePlatform.new(claim_payload: claim_payload_for(task_id: TASK)).start
     @config = build_config
   end
 
