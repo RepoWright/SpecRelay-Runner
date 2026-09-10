@@ -174,9 +174,14 @@ module SpecrelayRunner
       value.is_a?(Hash) ? value.transform_keys(&:to_s) : {}
     end
 
-    # The real IMPLEMENTATION profile this runner selected locally, or nil when it selected the
+    # The real provider profile this runner selected locally, or nil when it selected the
     # deterministic fixture or nothing at all — the offline regression path, which must never
-    # require either provider CLI to be installed.
+    # require either provider CLI to be installed. BOTH lanes read it: a machine has one selected
+    # AI provider, and the specification lane asking a narrower question of its own is how it came
+    # to launch a provider the operator had not chosen.
+    #
+    # A caller that must distinguish an EXPLICIT fixture selection from no selection at all reads
+    # {#executor_override} alongside it — nil answers "no real profile", which is true of both.
     #
     # `runner.executor:` is a PROVIDER-ONLY selection, the same shape Platform accepts and expands
     # from its own fixed map. It used to be a full profile here and a provider-only key there, so
@@ -193,16 +198,6 @@ module SpecrelayRunner
                    "belong to the profile, not to this file" unless extra.empty?
 
       ImplementationProfile.for(ImplementationProfile.canonical(selection[PROVIDER_KEY]))
-    end
-
-    # The real Claude Code profile this runner selected locally, or nil when it selected another
-    # provider or none. The SPECIFICATION lane is Claude-only until its own delivery, so it asks
-    # this narrower question rather than the implementation lane's closed choice — a Codex executor
-    # selection must leave specification generation exactly as it was.
-    def selected_claude_profile
-      return nil unless ImplementationProfile.provider_of(executor_override) == ClaudeProfile::PROVIDER
-
-      ClaudeProfile.new(ClaudeProfile::CANONICAL)
     end
 
     # Resolve the Platform API token from the environment (never the file). A

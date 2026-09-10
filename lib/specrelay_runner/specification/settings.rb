@@ -4,9 +4,13 @@ module SpecrelayRunner
   module Specification
     # The operator-owned, NON-SECRET local configuration for the specification lane
     # (MVP-0026). It answers the questions Platform deliberately cannot: where this machine
-    # keeps its clone of the specification repository, which generation provider it is
-    # allowed to run, and — for each capability the lane requires — whether it is available
-    # or has an explicitly recorded substitute.
+    # keeps its clone of the specification repository, and — for each capability the lane
+    # requires — whether it is available or has an explicitly recorded substitute.
+    #
+    # It does NOT choose a generation provider. That is one closed selection of an exact approved
+    # profile, made once for the whole machine under `runner.executor:` or in Platform's Project
+    # Setup, and read through {ImplementationProfile}. A second, lane-local answer here is what
+    # let a runner generate specifications with a writer its operator had not selected.
     #
     # It lives under `runner.specification:` in the same YAML the rest of the runner reads,
     # and every value may be overridden from the environment, so a guided connection (which
@@ -15,11 +19,6 @@ module SpecrelayRunner
     #
     #   runner:
     #     specification:
-    #       provider:
-    #         kind: composed             # composed | command  (`fake` is an accepted alias)
-    #         command: /abs/path/to/spec-writer
-    #         args: []
-    #         timeout_seconds: 900
     #       repository_roots:
     #         "SpecRelay/SpecRelay-Specs": /abs/path/to/specs-checkout   # a SEED, not a destination
     #       graphify:
@@ -48,47 +47,17 @@ module SpecrelayRunner
     # had been. Availability is now a FACT this runner can prove — a `command` is configured, and
     # {InputEvidence} actually ran it against the reference — never a flag taken on trust.
     #
-    # No secret is read here or stored here. The provider command is a local executable
+    # No secret is read here or stored here. The external-reference command is a local executable
     # path, and the credential the runner uses to reach Platform is resolved elsewhere.
     class Settings
-      Error = Class.new(StandardError)
-
-      # The built-in provider is `composed`, and it is named that everywhere an operator can
-      # see it: in the configuration, in the log, in the manifest, and in the diagnostics
-      # Platform persists.
-      #
-      # It used to be configured as `fake` while reporting itself as `composed`, so the run
-      # page told an operator the DEFAULT production path was a fake. It is not a fake — it
-      # composes real documents from the real bundle and the real source evidence, and it is a
-      # weak writer rather than a pretend one. `fake` stays accepted as an alias so no
-      # operator's existing config or env var breaks; it normalizes to `composed` on the way
-      # in, so there is exactly one value downstream.
-      PROVIDER_COMPOSED = "composed"
-      PROVIDER_FAKE = "fake"
-      PROVIDER_COMMAND = "command"
-      # MVP-0028 remediation — the operator's real Claude profile, the one already configured
-      # under `runner.executor` for the implementation lane, used to WRITE the specification.
-      # Before this existed the specification lane had no way to name the real provider at all,
-      # which is why an operator who selected "Claude Code (real provider)" in guided setup still
-      # got the deterministic composer: they had configured the only provider the product offered
-      # them, and the specification lane was not looking at it.
-      PROVIDER_CLAUDE = "claude"
-      PROVIDER_KINDS = [ PROVIDER_COMPOSED, PROVIDER_COMMAND, PROVIDER_CLAUDE ].freeze
-      PROVIDER_ALIASES = { PROVIDER_FAKE => PROVIDER_COMPOSED }.freeze
-
-      DEFAULT_TIMEOUT_SECONDS = 900
-
       # Per-repository root override, e.g.
       # SPECRELAY_RUNNER_SPEC_REPOSITORY_ROOT_SPECRELAY_SPECRELAY_SPECS. Mirrors the
       # established SPECRELAY_RUNNER_WORKSPACE_ROOT_<KEY> convention rather than inventing
       # a second shape, so an operator who has mapped a workspace already knows this one.
       REPOSITORY_ROOT_ENV = "SPECRELAY_RUNNER_SPEC_REPOSITORY_ROOT"
-      PROVIDER_KIND_ENV = "SPECRELAY_RUNNER_SPEC_PROVIDER"
-      PROVIDER_COMMAND_ENV = "SPECRELAY_RUNNER_SPEC_PROVIDER_COMMAND"
       # MVP-0028 remediation, defect 2 — the REAL tool/MCP boundary that fetches and analyses an
       # external reference (a Jam smart link, a Confluence page, a screenshot) a bundle defers to
-      # the runner. Named the same way `provider.command` is, because it is the same shape of
-      # boundary: an operator-configured local executable this runner launches through
+      # the runner. It is an operator-configured local executable this runner launches through
       # {CommandRunner}, never a live call this Ruby process makes itself.
       EXTERNAL_REFERENCE_COMMAND_ENV = "SPECRELAY_RUNNER_SPEC_EXTERNAL_REFERENCE_COMMAND"
       DEFAULT_EXTERNAL_REFERENCE_TIMEOUT_SECONDS = 60
@@ -117,8 +86,7 @@ module SpecrelayRunner
         end
       end
 
-      attr_reader :provider_kind, :provider_command, :provider_args, :provider_timeout_seconds,
-                  :repository_roots, :graphify, :context_plus, :external_references,
+      attr_reader :repository_roots, :graphify, :context_plus, :external_references,
                   :external_reference_command, :external_reference_timeout_seconds
 
       def self.from(config, env: ENV) = new(config.specification_settings, env: env)
@@ -126,11 +94,6 @@ module SpecrelayRunner
       def initialize(document, env: ENV)
         @document = document.is_a?(Hash) ? document.transform_keys(&:to_s) : {}
         @env = env
-        provider = subsection("provider")
-        @provider_kind = resolve_provider_kind(provider)
-        @provider_command = presence(env[PROVIDER_COMMAND_ENV]) || presence(provider["command"])
-        @provider_args = Array(provider["args"]).map(&:to_s)
-        @provider_timeout_seconds = positive_int(provider["timeout_seconds"]) || DEFAULT_TIMEOUT_SECONDS
         @repository_roots = string_map(@document["repository_roots"])
         @graphify = capability("graphify", default_available: true)
         @context_plus = capability("context_plus", default_available: false, operator_evidence: true)
@@ -159,35 +122,9 @@ module SpecrelayRunner
         "#{REPOSITORY_ROOT_ENV}_#{slug.to_s.upcase.gsub(/[^A-Z0-9]+/, '_')}"
       end
 
-      # NOT "is the kind unset or composed". An unset kind is a question for {Provider.resolve},
-      # which knows what else the operator configured; answering it here as `composed` is exactly
-      # the silent substitution this remediation removes.
-      def composed_provider? = provider_kind == PROVIDER_COMPOSED
-      def claude_provider? = provider_kind == PROVIDER_CLAUDE
-      def provider_kind_configured? = !provider_kind.nil?
-
       private
 
       attr_reader :document, :env
-
-      # nil when nothing selects a provider, and that is the whole point of this method.
-      #
-      # It used to default to `composed`. An absent `runner.specification` section is the ordinary
-      # state of a guided setup — which writes no runner YAML at all — so the default silently
-      # decided the most important question in the lane, and decided it wrongly for every operator
-      # who had configured a real provider elsewhere. Returning nil moves the decision to
-      # {Provider.resolve}, which can see the operator's executor profile; nothing downstream may
-      # read nil as "composed".
-      def resolve_provider_kind(provider)
-        configured = presence(env[PROVIDER_KIND_ENV]) || presence(provider["kind"])
-        return nil if configured.nil?
-
-        kind = PROVIDER_ALIASES.fetch(configured, configured)
-        raise Error, "runner.specification.provider.kind must be one of: #{PROVIDER_KINDS.join(', ')}" unless
-          PROVIDER_KINDS.include?(kind)
-
-        kind
-      end
 
       # Availability defaults differ on purpose. Graphify defaults to AVAILABLE because the
       # workspace ships the wrappers and the runner probes for them anyway — the probe, not

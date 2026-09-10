@@ -304,30 +304,42 @@ module SpecrelayRunner
       # out so the entry point stays a readable sequence rather than a nested chain of
       # early returns.
       #
+      # The exact profile is resolved FIRST, and resolved once. It is a pure comparison against a
+      # canonical hash that can refuse, and everything below it either reads the operator's disk
+      # or writes to this machine: `prepare_workspace_root` runs `FileUtils.mkdir_p` on the runner
+      # state root. An unknown, missing, extra or altered profile therefore refuses before any of
+      # it, which is what makes "a refused claim created nothing" a property of this order rather
+      # than a claim about the cleanup path.
+      #
+      # The seed and destination checks in {#call} stay ahead of it: both are pure reads that can
+      # each end the run on their own, and neither touches anything.
+      #
       # The source checkout is resolved BEFORE the state root is established, because the state
       # root cannot be judged without it: "is this directory inside a repository the operator
       # owns" is a question about both checkouts (review-001 F1).
       def finish(seed, package)
+        profile = selected_profile
+        return profile if profile.is_a?(Refusal)
+
         source_root = resolve_source_root
         return source_root if source_root.is_a?(Refusal)
 
         root = prepare_workspace_root(seed, source_root)
         return root if root.is_a?(Refusal)
 
-        gather_and_verify(seed, package, source_root)
+        gather_and_verify(seed, package, source_root, profile)
       end
 
-      def gather_and_verify(seed, package, source_root)
-        # Resolved ONCE, before anything reads it, because it can refuse: a profile Platform
-        # named but this runner will not launch has to become a refusal here rather than an
-        # exception raised from inside evidence gathering.
-        profile = claude_profile
-        return profile if profile.is_a?(Refusal)
-
-        # The SAME real Claude profile {resolve_provider} would use, offered here as the ordinary
-        # external-reference analyzer (MVP-0028 remediation, defect 2 — review-005 finding F2).
+      # `profile` arrives already resolved and already proven launchable. It is passed forward
+      # rather than asked for again: a second call would be a second judgement of the same claim,
+      # and the one place that decides which provider may run is the point of this lane.
+      def gather_and_verify(seed, package, source_root, profile)
+        # External-reference analysis is a separate OPTIONAL capability with a Claude-only
+        # analyzer, so it is offered the selected profile only when that profile IS Claude. A
+        # Codex-generating runner keeps the existing explicit refusal/substitute behaviour for
+        # that capability rather than gaining a second analyzer this ticket did not approve.
         inputs = InputEvidence.gather(assignment: assignment, settings: settings, env: env,
-                                      claude_profile: profile)
+                                      claude_profile: (profile if profile.is_a?(ClaudeProfile)))
         blocked = check_inputs(inputs)
         return blocked if blocked
 
@@ -714,42 +726,50 @@ module SpecrelayRunner
 
       # WHERE the real provider profile comes from, in precedence order:
       #
-      #   1. this runner's own `runner.executor:` block, when the operator hand-wrote one —
-      #      an operator who names a profile locally has decided, exactly as they have for
-      #      every other setting with both a local and a Platform source;
+      #   1. this runner's own `runner.executor:` block, when the operator selected a provider
+      #      locally — an operator who names one has decided, exactly as they have for every
+      #      other setting with both a local and a Platform source;
       #   2. otherwise the profile Platform's Project Setup selected and sent with this
       #      assignment (MVP-0028 remediation, defect 4).
       #
-      # Order 2 is the ordinary case and used to be missing entirely, which is what made a
-      # correctly configured project refuse: a guided connection writes no YAML, so step 1
-      # is nil for every runner set up the supported way.
-      def claude_profile
-        config.selected_claude_profile || assignment.selected_claude_profile
-      rescue ClaudeProfile::Error => e
+      # Order 2 is the ordinary case: a guided connection writes no YAML, so step 1 is absent for
+      # every runner set up the supported way.
+      #
+      # A LOCAL SELECTION IS READ AS PRESENT, NOT AS A PROFILE. Both an explicit local fixture and
+      # no local block at all resolve to no real profile, and falling through on the first would
+      # generate with Platform's provider on a machine whose operator had chosen the deterministic
+      # fixture. The selection block itself is what distinguishes them, so it is what is asked.
+      def selected_profile
+        return config.selected_implementation_profile unless config.executor_override.empty?
+
+        assignment.selected_implementation_profile
+      rescue ImplementationProfile::Error => e
         refuse(GENERATION_PROVIDER_UNAVAILABLE, e.message)
       end
 
       def resolve_provider(profile, working_directory)
-        # Provider.resolve turns a nil profile into a refusal rather than a quiet fixture. The
+        # Provider.resolve turns a nil profile into a refusal rather than a quiet substitute. The
         # message is Provider's own except when Platform selected a profile this lane has no
         # provider for — the fixture — where naming the selection is the difference between an
         # operator re-reading their YAML and going back to the screen they chose it on.
         #
         # `working_directory` is the prepared task workspace. It is bound
         # HERE, where the workspace is known, so no provider can be constructed without one.
-        @injected_provider || Provider.resolve(settings: settings, claude_profile: profile, env: env,
-                                               working_directory: working_directory)
-      rescue Provider::Unavailable, Settings::Error => e
+        @injected_provider || Provider.resolve(profile: profile, env: env, working_directory: working_directory)
+      rescue Provider::Unavailable => e
         refuse(GENERATION_PROVIDER_UNAVAILABLE, provider_unavailable_message(e))
       end
 
+      # When Platform named a profile this lane cannot generate with, its name REPLACES the general
+      # refusal rather than being appended to it: the operator needs one remedy, addressed to the
+      # screen they actually chose on, not the same advice twice.
       def provider_unavailable_message(error)
         profile = assignment.selected_provider_profile
-        return error.message if profile.empty? || profile == ClaudeProfile::PROVIDER
+        return error.message if profile.empty? || ImplementationProfile::OWNERS.key?(profile)
 
-        "#{error.message} This project's workspace is set to the `#{profile}` executor profile in " \
-          "Platform's Project Setup, and the specification lane has no provider for it: select " \
-          "\"Claude Code (real provider)\" there, or choose a specification provider explicitly."
+        "this project's workspace is set to the `#{profile}` executor profile in Platform's " \
+          "Project Setup, and the specification lane has no provider for it: select `claude` or " \
+          "`codex` there, or name one under runner.executor on this runner."
       end
 
       # Redaction is a pure function in this runner, so "unavailable" can only mean it is

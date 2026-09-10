@@ -89,14 +89,13 @@ class SpecificationGenerationRevisionTest < Minitest::Test
   def test_the_previous_packages_own_files_reach_the_provider_as_revision_context
     build_previous_package_on_branch
     capture = File.join(@temp, "captured-packet.json")
-    provider = SpecificationWorkspace.write_recording_provider(
-      File.join(@temp, "provider"), capture_to: capture, files: valid_generated_files
-    )
+    provider = SpecificationWorkspace.claude_stub(@temp, files: valid_generated_files,
+                                                         capture_prompt_to: capture)
     start_with_revision(provider: provider)
 
     assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
 
-    packet = JSON.parse(File.read(capture))
+    packet = SpecificationWorkspace.captured_packet(capture)
     previous = packet["revision"]["previous_files"]
     # `git show` returns trimmed content (`GitCommands#git_value`), so trailing whitespace is not
     # preserved byte-for-byte — irrelevant to revision context, which only needs the real text.
@@ -119,13 +118,12 @@ class SpecificationGenerationRevisionTest < Minitest::Test
   def test_the_current_answer_comment_and_the_previous_open_question_reach_one_revision_packet
     build_previous_package_on_branch
     capture = File.join(@temp, "captured-packet.json")
-    provider = SpecificationWorkspace.write_recording_provider(
-      File.join(@temp, "provider"), capture_to: capture, files: valid_generated_files
-    )
+    provider = SpecificationWorkspace.claude_stub(@temp, files: valid_generated_files,
+                                                         capture_prompt_to: capture)
     start_with_revision(provider: provider, bundle_markdown: BUNDLE_WITH_ANSWER)
 
     assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
-    packet = JSON.parse(File.read(capture))
+    packet = SpecificationWorkspace.captured_packet(capture)
 
     # The previous question, read off the pull request's own branch.
     assert_includes packet.dig("revision", "previous_files").fetch("open-questions.md"), "## OQ-001"
@@ -144,15 +142,15 @@ class SpecificationGenerationRevisionTest < Minitest::Test
   def test_a_first_specification_carries_no_revision_block_at_all
     # No branch, no gh fake needed: `existing_pull_request_url` is absent from the payload.
     capture = File.join(@temp, "captured-packet.json")
-    provider = SpecificationWorkspace.write_recording_provider(
-      File.join(@temp, "provider"), capture_to: capture, files: valid_generated_files
-    )
+    provider = SpecificationWorkspace.claude_stub(@temp, files: valid_generated_files,
+                                                         capture_prompt_to: capture)
     @platform = FakePlatform.new(claim_payload: spec_creation_payload_for(issue_key: ISSUE)).start
     @config = build_config(provider: provider)
 
-    assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli(env_extra: { "PATH" => ENV["PATH"] }), @io.string
+    assert_equal SpecrelayRunner::CLI::SUCCESS,
+                 run_cli(env_extra: { "PATH" => SpecificationWorkspace.provider_path(provider) }), @io.string
 
-    packet = JSON.parse(File.read(capture))
+    packet = SpecificationWorkspace.captured_packet(capture)
     assert_nil packet["revision"]
   end
 
@@ -251,6 +249,7 @@ class SpecificationGenerationRevisionTest < Minitest::Test
   end
 
   def start_with_revision(provider: nil, gh_seed: [], branch_exists: true, bundle_markdown: nil)
+    @provider_stub = provider
     ensure_remote_checkout
     head_sha = branch_exists ? git(@specs, "rev-parse", "origin/#{BRANCH}").strip : "0" * 40
     seed = gh_seed.empty? ? [ { "url" => PR_URL, "state" => "OPEN", "headRefName" => BRANCH,
@@ -264,6 +263,7 @@ class SpecificationGenerationRevisionTest < Minitest::Test
   end
 
   def build_config(provider: nil)
+    @provider_stub ||= provider
     path = File.join(Dir.mktmpdir("cfg"), "runner.yml")
     File.write(path, <<~YAML)
       platform:
@@ -275,9 +275,6 @@ class SpecificationGenerationRevisionTest < Minitest::Test
         claim_policy:
           mode: all_eligible
         specification:
-          provider:
-            kind: #{provider ? "command" : "fake"}
-            command: #{provider}
           repository_roots:
             "SpecRelay/SpecRelay-Specs": #{@specs}
           context_plus:
@@ -288,9 +285,13 @@ class SpecificationGenerationRevisionTest < Minitest::Test
     SpecrelayRunner::Config.load(path)
   end
 
+  # `gh` and the approved provider name both resolve from this run's own PATH prefix.
+  def provider_stub = @provider_stub ||= SpecificationWorkspace.claude_stub(@temp, compose: true)
+
   def run_cli(env_extra: {})
     env = { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN,
-            "PATH" => "#{@gh_dir}:#{ENV['PATH']}", "HOME" => @temp }
+            "PATH" => [ @gh_dir, provider_stub, ENV["PATH"] ].compact.join(File::PATH_SEPARATOR),
+            "HOME" => @temp }
           .merge(SpecificationWorkspace.lane_env(@temp)).merge(env_extra)
     SpecrelayRunner::CLI.run(%W[claim-once --config #{@config.source_path}], out: @io, err: @io, env: env)
   end

@@ -103,10 +103,13 @@ def spec_creation_payload_for(issue_key:, title: "Add an export button", inputs:
     # implementation. Null here so the fixture is the document Platform now produces; the tests
     # that care about a populated block set one.
     "previous_accepted_package" => nil,
-    # MVP-0028 remediation defect 4 — the profile Project Setup selected. Null here by default so
-    # the existing tests keep selecting their provider through `runner.specification.provider.kind`
-    # as they always have; specification_provider_propagation_test.rb populates it.
-    "specification_provider" => specification_provider || { "profile" => nil, "executor" => nil },
+    # The profile Project Setup selected, and the ONLY channel a
+    # specification provider can arrive through besides this runner's own `runner.executor:`
+    # selection. The exact approved Claude profile by default, because that is what Platform sends
+    # for an ordinary project; a test that needs another selection, or none, passes its own.
+    "specification_provider" => specification_provider ||
+      { "profile" => SpecrelayRunner::ClaudeProfile::PROVIDER,
+        "executor" => SpecrelayRunner::ClaudeProfile::CANONICAL },
     # The workspace's own worktree-create command, rendered by Platform exactly as it is for
     # the implementation lane.
     "workspace" => { "project_key" => "tiny-demo", "workspace_key" => "tiny-demo-workspace",

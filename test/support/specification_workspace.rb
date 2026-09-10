@@ -278,33 +278,148 @@ module SpecificationWorkspace
     git_init(specs, remote: remote)
   end
 
-  # A provider command that returns whatever `files` describes, as JSON on stdout. Used to
-  # exercise the Command provider without a model: the boundary is what is under test, not
-  # the writer behind it.
-  def write_provider(path, files:, exit_code: 0, stdout: nil)
-    body = stdout || JSON.generate(files)
-    write_executable(path, <<~SH)
-      #!/bin/sh
-      cat > /dev/null
-      cat <<'SPECRELAY_PROVIDER_EOF'
-      #{body}
-      SPECRELAY_PROVIDER_EOF
-      exit #{exit_code}
-    SH
-    path
+  # ------------------------------------------------------------ the real-provider PATH seam
+
+  # A stand-in for a real provider CLI, written to disk as an executable under the exact BARE name
+  # the approved profile launches, inside its own bin directory. A test prepends that directory to
+  # the child PATH, so the runner exercises its real code path — exact-profile resolution, PATH
+  # resolution, the approved argv, the profile's own prompt delivery and the provider's structured
+  # output — with no model, no network and no account.
+  #
+  # It is the explicit test seam that replaced configuring an arbitrary executable as the
+  # generation provider. There is no production bypass here: the profile is always the canonical
+  # one, and what a bare name resolves to on a host is the host's business.
+  #
+  # WHAT IT ANSWERS is one of three things. `files` or `answer` bake a fixed reply into the script,
+  # which is what the boundary tests need — a real model cannot be asked for malformed output on
+  # demand. `compose: true` instead runs the deterministic {Composer} over the packet the runner
+  # actually sent, which is how the lane tests that assert on generated CONTENT keep a stable,
+  # inspectable answer. The composer is no longer a production provider; standing in for one in a
+  # test is the utility role it keeps.
+  # A minimal but STRUCTURALLY VALID package: every required section present with enough body to
+  # clear the emptiness floor. One copy, because every lane test that needs a provider to succeed
+  # needs the same thing from it, and several drifting copies of the document contract would be
+  # several places to update when {DocumentSet} changes.
+  def valid_documents(issue_key = "SR-700")
+    sections = SpecrelayRunner::Specification::DocumentSet::REQUIRED_SECTIONS
+    body = "Filler content for this section, long enough to pass the minimum length check.\n\n"
+    {
+      "spec.md" => "# #{issue_key} — a specification\n\n" +
+        sections.fetch("spec.md").map { |heading| "## #{heading}\n\n#{body}" }.join,
+      "analysis/business.md" => "# Business analysis — #{issue_key}\n\n" +
+        sections.fetch("analysis/business.md").map { |heading| "## #{heading}\n\n#{body}" }.join,
+      "analysis/technical.md" => "# Technical analysis — #{issue_key}\n\n" +
+        sections.fetch("analysis/technical.md").map { |heading| "## #{heading}\n\n#{body}" }.join,
+      "analysis/input-evidence.md" => "# Input evidence\n\nNo supporting input beyond the ticket.\n"
+    }
   end
 
-  # A provider that records the packet it was handed, so a test can assert what actually
-  # crossed the boundary rather than what the Packet class says it builds.
-  def write_recording_provider(path, capture_to:, files:)
-    write_executable(path, <<~SH)
-      #!/bin/sh
-      cat > "#{capture_to}"
-      cat <<'SPECRELAY_PROVIDER_EOF'
-      #{JSON.generate(files)}
-      SPECRELAY_PROVIDER_EOF
-    SH
-    path
+  # `analyzer_answer` is what the SAME double replies with when it is asked the OTHER question
+  # this profile answers — the optional external-reference analysis. One bare name, two questions,
+  # exactly as a real host resolves them.
+  def claude_stub(root, files: nil, answer: nil, compose: false, exit_code: 0, capture_prompt_to: nil,
+                  analyzer_answer: nil)
+    provider_stub(root, "claude", delivery: :argument, exit_code: exit_code,
+                                  capture_prompt_to: capture_prompt_to, analyzer_answer: analyzer_answer,
+                                  answer: answer_source(files, answer, compose), emit: CLAUDE_FRAMES)
+  end
+
+  def codex_stub(root, files: nil, answer: nil, compose: false, exit_code: 0, capture_prompt_to: nil)
+    provider_stub(root, "codex", delivery: :stdin, exit_code: exit_code,
+                                 capture_prompt_to: capture_prompt_to, analyzer_answer: nil,
+                                 answer: answer_source(files, answer, compose), emit: CODEX_FRAMES)
+  end
+
+  # The structured shape the Claude profile is contracted for: an init frame, one PUBLIC narration
+  # line, and one terminal result carrying the answer. The tool it reports names a path OUTSIDE any
+  # repository, because this lane is assigned none — so a local path reaching the operator at all
+  # is a defect this double is able to expose.
+  CLAUDE_FRAMES = <<~RUBY
+    say("type" => "system", "subtype" => "init")
+    say("type" => "assistant", "message" => { "content" => [
+      { "type" => "tool_use", "name" => "Read", "input" => { "file_path" => "/elsewhere/notes.md" } } ] })
+    say("type" => "result", "subtype" => "success", "is_error" => false, "result" => answer)
+  RUBY
+
+  # The observed Codex thread shape: a started thread and turn, private reasoning the decoder must
+  # withhold, one public message carrying the answer, and exactly one terminal event.
+  CODEX_FRAMES = <<~RUBY
+    say("type" => "thread.started", "thread_id" => "th_fixture")
+    say("type" => "turn.started")
+    say("type" => "item.completed",
+        "item" => { "id" => "item_0", "type" => "reasoning", "text" => CODEX_PRIVATE_REASONING })
+    say("type" => "item.completed",
+        "item" => { "id" => "item_1", "type" => "agent_message", "text" => answer })
+    say("type" => "turn.completed", "usage" => { "input_tokens" => 12 })
+  RUBY
+
+  # The private reasoning a Codex stream carries and no surface may ever show.
+  CODEX_PRIVATE_REASONING = "private-codex-reasoning-do-not-publish"
+
+  # The safe version line the Codex readiness probe is contracted to accept, for the tests that
+  # select a provider LOCALLY and therefore cross that probe before claiming.
+  CODEX_VERSION_LINE = "codex-cli 9.9.9"
+
+  LIB_ROOT = File.expand_path("../../lib", __dir__)
+
+  # The Ruby expression the double evaluates to produce its terminal answer.
+  def answer_source(files, answer, compose)
+    return "JSON.generate(SpecrelayRunner::Specification::Composer.call(packet))" if compose
+    return answer.inspect if answer
+
+    JSON.generate(files || valid_documents).inspect
+  end
+
+  # The one prompt every generation carries, and the only reliable way a double can tell which
+  # question it was asked.
+  GENERATION_MARKER = "You are writing a software specification package"
+
+  def provider_stub(root, name, answer:, emit:, delivery:, exit_code:, capture_prompt_to:, analyzer_answer:)
+    dir = Dir.mktmpdir("#{name}-stub", root)
+    write_executable(File.join(dir, name), <<~RUBY)
+      #!/usr/bin/env ruby
+      # frozen_string_literal: true
+      require "json"
+
+      # The bounded readiness probes, answered so a LOCAL selection reaches generation.
+      if ARGV.first == "--version"
+        puts #{name == 'codex' ? CODEX_VERSION_LINE.inspect : '"1.0.0"'}
+        exit 0
+      end
+      exit 0 if %w[auth login].include?(ARGV.first)
+
+      CODEX_PRIVATE_REASONING = #{CODEX_PRIVATE_REASONING.inspect}
+      def say(event) = puts(JSON.generate(event))
+
+      prompt = #{delivery == :stdin ? '$stdin.read.to_s' : 'ARGV.last.to_s'}
+      #{capture_prompt_to ? "File.write(#{capture_prompt_to.inspect}, prompt)" : ''}
+      exit #{exit_code} unless #{exit_code}.zero?
+
+      if #{answer.include?('Composer').inspect}
+        $LOAD_PATH.unshift(#{LIB_ROOT.inspect})
+        require "specrelay_runner"
+        packet = JSON.parse(SpecrelayRunner::Specification::BalancedJson
+                              .extract_object(prompt.split("EVIDENCE (JSON):").last))
+      end
+      answer = #{answer}
+      #{analyzer_answer ? "answer = #{analyzer_answer.inspect} unless prompt.include?(#{GENERATION_MARKER.inspect})" : ''}
+
+      #{emit.gsub("\n", "\n      ")}
+    RUBY
+    dir
+  end
+
+  # The child PATH that resolves the approved provider name to a stub directory.
+  def provider_path(stub_dir, base: ENV["PATH"])
+    [ stub_dir, base.to_s ].reject { |entry| entry.to_s.empty? }.join(File::PATH_SEPARATOR)
+  end
+
+  # The packet a provider was handed, read back out of the captured prompt. The evidence travels
+  # inside the one reviewable prompt document, so a test asserting what crossed the boundary reads
+  # it the same way a provider would.
+  def captured_packet(prompt_path)
+    JSON.parse(SpecrelayRunner::Specification::BalancedJson
+                 .extract_object(File.read(prompt_path).split("EVIDENCE (JSON):").last))
   end
 
   # ---------------------------------------------------------- canonical task environment

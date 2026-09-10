@@ -165,29 +165,34 @@ module SpecrelayRunner
 
       # The real provider profile the operator selected in Platform's Project Setup, or nil when
       # they selected the deterministic fixture — which this lane cannot use, and which
-      # {Provider.resolve} must therefore refuse rather than quietly substitute the composer for.
+      # {Provider.resolve} must therefore refuse rather than quietly substitute a writer for.
       #
       # MVP-0028 remediation, defect 4. The specification lane LAUNCHES a provider, but until now
-      # it resolved one from this runner's own YAML alone (`Config#selected_claude_profile`). A
-      # guided connection writes no YAML at all, so a project whose operator had correctly selected
-      # "Claude Code (real provider)" in Project Setup refused every generation with
-      # `generation_provider_unavailable`. The selection is Platform's fact and had no channel to
-      # travel through; this is that channel, and it is the same one the implementation lane has
-      # always used (`payload["executor"]`).
+      # it resolved one from this runner's own YAML alone. A guided connection writes no YAML at
+      # all, so a project whose operator had correctly selected a real provider in Project Setup
+      # refused every generation with `generation_provider_unavailable`. The selection is
+      # Platform's fact and had no channel to travel through; this is that channel, and it is the
+      # same one the implementation lane has always used (`payload["executor"]`).
       #
-      # {ClaudeProfile} validates the argv it is handed and raises on anything it will not launch,
-      # so this reads a profile that Platform NAMED, not a command Platform may run. That
-      # independent refusal is what keeps a Platform-supplied block from being an arbitrary
-      # instruction — the same guarantee `Execution#guard_selected_executor!` relies on.
-      def selected_claude_profile
+      # {ImplementationProfile} compares the block with one of the exact approved hashes and raises
+      # on anything else, so this reads a profile that Platform NAMED, not a command Platform may
+      # run. That independent refusal is what keeps a Platform-supplied block from being an
+      # arbitrary instruction — the same guarantee `Execution#guard_selected_executor!` relies on,
+      # through the same authority, so the two lanes cannot disagree about what is launchable.
+      #
+      # Nil means "no real provider": either Platform sent no block at all, or it selected the
+      # deterministic fixture, which is not a model-backed specification writer.
+      # {#selected_provider_profile} is what tells those two apart for the operator.
+      def selected_implementation_profile
         executor = section("specification_provider")["executor"].to_h
+        return nil if executor.empty?
 
-        ClaudeProfile.selected?(executor) ? ClaudeProfile.new(executor) : nil
+        ImplementationProfile.for(executor)
       end
 
       # What Platform says was selected, for a refusal that can name it. "fake" is the ordinary
-      # reason `selected_claude_profile` is nil, and an operator reading "no provider is
-      # configured" when they DID configure one deserves to be told which one they picked.
+      # reason the resolved profile is nil, and an operator reading "no provider is configured"
+      # when they DID configure one deserves to be told which one they picked.
       def selected_provider_profile = section("specification_provider")["profile"].to_s
 
       # Every input the bundle recorded, as plain hashes with string keys. The runner reads

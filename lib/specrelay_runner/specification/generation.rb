@@ -180,21 +180,20 @@ module SpecrelayRunner
         DocumentSet.validate!(generated(ready, packet), issue_key: assignment.issue_key)
       end
 
-      # MAPIAI-60 — the real Claude provider reports safe progress through the SAME live-log
-      # stream the implementation lane uses, so this lane stops being silent while a model works
-      # and the operator watches one panel rather than two. The stream is started and finished
-      # around the provider call only: it is a record of the generation, not of the whole claim.
+      # The real provider reports safe progress through the SAME live-log stream the
+      # implementation lane uses, so this lane stops being silent while a model works and the
+      # operator watches one panel rather than two. The stream is started and finished around the
+      # provider call only: it is a record of the generation, not of the whole claim.
       #
       # A stop signal Platform returns on one of those events is treated exactly as the
       # heartbeater's is — the next {#checkpoint!} raises on it — so live delivery cannot become
       # a second way to decide whether this claim is still live.
       #
-      # Only the Claude provider gets a stream. The composer finishes in milliseconds and has no
-      # provider semantics to report, so giving it one would emit heartbeats about nothing.
+      # EVERY provider gets one, because every provider this lane can resolve is a real model
+      # whose work takes long enough to watch. The stream is labelled with the kind that actually
+      # resolved rather than a hard-coded name, so the panel names the provider that ran.
       def generated(ready, packet)
-        return ready.provider.generate(packet) unless ready.provider.kind == Provider::Claude::KIND
-
-        stream = start_log_stream
+        stream = start_log_stream(ready.provider.kind)
         begin
           ready.provider.generate(packet, on_output: stream.sink)
         ensure
@@ -203,10 +202,10 @@ module SpecrelayRunner
         end
       end
 
-      def start_log_stream
+      def start_log_stream(provider_kind)
         emitter = EventEmitter.new(client: client, run_id: assignment.run_id,
                                    attempt_id: assignment.runner_execution_id)
-        ExecutorLogStream.start(emitter: emitter, io: io, provider: Provider::Claude::KIND,
+        ExecutorLogStream.start(emitter: emitter, io: io, provider: provider_kind,
                                 task_id: assignment.issue_key)
       end
 
@@ -431,9 +430,13 @@ module SpecrelayRunner
         end
       end
 
-      # Sanitized, bounded, and non-secret by construction: the provider KIND (never its
-      # command line, which is a local path), and what the operator CONFIGURED. Enough to see
-      # which switch to flip, with nothing that describes this machine.
+      # Sanitized, bounded, and non-secret by construction: what the operator CONFIGURED, with
+      # nothing that describes this machine.
+      #
+      # It no longer names a provider. The provider is no longer a lane-local setting an operator
+      # could flip here — it is the machine's one selected profile — and every refusal that turns
+      # on it already names the selection in its own message, which a stale second copy alongside
+      # could only contradict.
       #
       # Each capability line reports its SUBSTITUTE, not its availability. That is a
       # deliberate correction: the configured availability of Graphify is a default this
@@ -443,7 +446,6 @@ module SpecrelayRunner
       # recorded — because that is the switch that changes the outcome.
       def diagnostics
         [
-          "provider: #{settings.provider_kind}",
           "package workspace retention: #{PackageWorkspaceStore::RETENTION_DAYS} days, " \
           "at most #{PackageWorkspaceStore::MAX_RETAINED} retained",
           *capability_diagnostics

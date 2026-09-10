@@ -13,10 +13,13 @@ require "digest"
 # MAPIAI-53 run is what exposed it; defect 1 had removed the silent composer fallback that was
 # previously hiding the same missing channel behind plausible output.
 #
-# Driven through the real `claim-once` CLI with a stub `claude` first on PATH, because the claim is
+# Driven through the real `claim-once` CLI with a stub provider first on PATH, because the claim is
 # that the selection survives the WHOLE trip: Platform's workspace config → the assignment →
-# {Assignment#selected_claude_profile} → {ClaudeProfile} validation → the process actually
-# launched. A unit test on any single link would have passed before the fix.
+# {Assignment#selected_implementation_profile} → the exact-profile comparison → the process
+# actually launched. A unit test on any single link would have passed before the fix.
+#
+# Both approved real providers make that trip here, because a second provider that resolved but
+# never launched would satisfy every unit test in the lane.
 #
 # The unit-level semantics of {Provider.resolve} stay in specification_provider_selection_test.rb.
 class SpecificationProviderPropagationTest < Minitest::Test
@@ -30,10 +33,16 @@ class SpecificationProviderPropagationTest < Minitest::Test
     "timeout_seconds" => 1800, "env" => {}
   }.freeze
 
-  FIXTURE_PROFILE = {
-    "provider" => "fake", "command" => "specrelay-fake-executor", "mode" => "print",
-    "args" => [], "prompt_delivery" => "file_argument", "timeout_seconds" => 120, "env" => {}
+  CODEX_PROFILE = {
+    "provider" => "codex", "command" => "codex", "mode" => "exec",
+    "args" => [ "exec", "--json", "--ephemeral", "--dangerously-bypass-approvals-and-sandbox" ],
+    "prompt_delivery" => "stdin", "timeout_seconds" => 1800, "env" => {}
   }.freeze
+
+  # The fixture's exact configuration, including the environment that IS its script — read from
+  # the one authority rather than restated, because a restated copy that drifts would test a
+  # profile Platform does not serve.
+  FIXTURE_PROFILE = SpecrelayRunner::ImplementationProfile::FIXTURE_CANONICAL
 
   def setup
     @source, @specs, @temp = SpecificationWorkspace.build
@@ -128,6 +137,50 @@ class SpecificationProviderPropagationTest < Minitest::Test
     assert_includes @io.string, "delivery may still have succeeded"
   end
 
+  # ------------------------------------------------------------------ the second real provider
+
+  # The whole trip for Codex: Platform's exact profile, the stdin prompt, the Codex turn contract,
+  # the same package validation and the same recorded provenance. A Codex adapter that resolved but
+  # never launched, or launched with the prompt in argv, would pass every unit test in this lane.
+  def test_the_codex_profile_selected_in_project_setup_generates_through_the_same_lane
+    stub_codex
+    start_platform(profile: "codex", executor: CODEX_PROFILE)
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
+
+    assert_equal "generated", @platform.last_specification_generation["outcome"], @io.string
+    assert_includes File.read(@prompt), "Return ONLY a JSON object",
+                    "the prompt must reach Codex on stdin"
+    manifest = JSON.parse(File.read(File.join(SpecificationWorkspace.isolated_worktree(@temp),
+                                              "specs/SR-700-add-an-export-button",
+                                              "generation-manifest.json")))
+    assert_equal "codex", manifest.dig("provider", "kind"), @io.string
+    assert_includes manifest.dig("provider", "description"), "codex"
+  end
+
+  # The live panel names the provider that actually ran, and shows only normalized public progress:
+  # no reasoning, no raw JSONL wrapper, no account identity.
+  def test_codex_progress_reaches_both_surfaces_under_its_own_provider_name_and_nothing_private_does
+    stub_codex
+    start_platform(profile: "codex", executor: CODEX_PROFILE)
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
+
+    [ "Provider started", "Provider completed" ].each do |status|
+      assert_includes @io.string, "[codex:status] #{status}"
+    end
+    chunks = @platform.protocol_events.select { |event| event["event_type"] == "log.chunk" }
+    refute_empty chunks, "the Codex lane must reach the run page's existing panel"
+    delivered = chunks.map { |event| event["sanitized_log_chunk"].to_s }.join("\n")
+    [ delivered, @io.string ].each do |surface|
+      refute_includes surface, SpecificationWorkspace::CODEX_PRIVATE_REASONING
+      refute_includes surface, %("type":"turn.completed"), "a raw JSONL wrapper reached a surface"
+      refute_includes surface, %("type":"thread.started")
+    end
+    # And the package still came only from the terminal message, through the same validation.
+    assert_equal "generated", @platform.last_specification_generation["outcome"]
+  end
+
   # ------------------------------------------------------------------ what must still refuse
 
   # The fixture is a real selection with no specification provider behind it. It must refuse —
@@ -144,7 +197,8 @@ class SpecificationProviderPropagationTest < Minitest::Test
     assert_equal "generation_provider_unavailable", generation["failure_class"]
     assert generation["zero_output_files_written"]
     assert_includes generation["message"], "`fake` executor profile"
-    assert_includes generation["message"], "Claude Code (real provider)"
+    assert_includes generation["message"], "`claude`"
+    assert_includes generation["message"], "`codex`"
     assert_equal before, snapshot(@specs), "a refusal must not write into the specification checkout"
   end
 
@@ -190,6 +244,58 @@ class SpecificationProviderPropagationTest < Minitest::Test
     assert_match(/only a provider/, @io.string)
   end
 
+  # One altered field is enough, on either real profile: the claim is compared as it arrived, and a
+  # profile that differs anywhere is refused before the process exists.
+  def test_a_codex_profile_with_one_altered_argument_is_refused_not_launched
+    stub_codex
+    start_platform(profile: "codex",
+                   executor: CODEX_PROFILE.merge("args" => CODEX_PROFILE.fetch("args") + [ "--output-schema" ]))
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
+
+    assert_equal "generation_provider_unavailable",
+                 @platform.last_specification_generation["failure_class"], @io.string
+    refute File.exist?(@prompt), "a refused profile must never be launched"
+    assert_no_package
+  end
+
+  # An operator who selected the deterministic fixture LOCALLY has decided this machine does not
+  # generate specifications. That decision must not fall through to whatever Platform selected —
+  # which is what "nil profile" would mean if absence and an explicit fixture were the same thing.
+  def test_an_explicit_local_fixture_refuses_instead_of_falling_through_to_the_platform_profile
+    stub_claude
+    start_platform(profile: "claude", executor: CLAUDE_PROFILE)
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED,
+                 run_cli(config: build_config(local_executor: { "provider" => "fake" })), @io.string
+
+    assert_equal "generation_provider_unavailable",
+                 @platform.last_specification_generation["failure_class"], @io.string
+    refute File.exist?(@prompt), "a local fixture selection must never launch Platform's provider"
+    assert_no_package
+  end
+
+  # The removed configuration surface selects nothing. A runner YAML that still names a provider
+  # kind and an arbitrary command is inert: with no real profile anywhere, the lane refuses, and
+  # the executable it names is never launched.
+  def test_a_configured_provider_kind_and_command_no_longer_select_anything
+    marker = File.join(@temp, "arbitrary-ran")
+    arbitrary = File.join(@temp, "arbitrary-writer")
+    File.write(arbitrary, "#!/bin/sh\ntouch #{marker}\n")
+    File.chmod(0o755, arbitrary)
+    payload = spec_creation_payload_for(issue_key: ISSUE,
+                                        specification_provider: { "profile" => nil, "executor" => nil })
+    @platform = FakePlatform.new(claim_payload: payload).start
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED,
+                 run_cli(config: build_config(provider_kind: "command", provider_command: arbitrary)), @io.string
+
+    assert_equal "generation_provider_unavailable",
+                 @platform.last_specification_generation["failure_class"], @io.string
+    refute File.exist?(marker), "a configured command must not be launched by the specification lane"
+    assert_empty SpecificationWorkspace.isolated_workspaces(@temp)
+  end
+
   # A Platform old enough to send no block at all must not crash a current runner: it refuses with
   # the ordinary unconfigured message, exactly as it did before this block existed.
   def test_an_assignment_with_no_provider_block_refuses_with_the_ordinary_message
@@ -207,34 +313,19 @@ class SpecificationProviderPropagationTest < Minitest::Test
 
   private
 
-  # A `claude` that satisfies the profile: named `claude`, taking the prompt as its LAST argv
-  # element (`prompt_delivery: argument`), answering in the supported structured format
-  # (MAPIAI-60) — activity while it works, then ONE terminal result carrying the JSON file map
-  # every provider answers with. Placed first on PATH so `Executor.resolve_command` resolves to
-  # this one.
-  #
-  # The tool it reports names a path OUTSIDE any repository, because this lane is assigned none:
-  # containment can never be proven here, so no path may ever be shown.
-  STUB_MESSAGES = lambda do |files|
-    [ { "type" => "system", "subtype" => "init" },
-      { "type" => "assistant", "message" => { "content" => [
-        { "type" => "tool_use", "name" => "Read", "input" => { "file_path" => "/elsewhere/notes.md" } } ] } },
-      { "type" => "result", "subtype" => "success", "is_error" => false, "result" => JSON.generate(files) } ]
-      .map { |message| JSON.generate(message) }.join("\n")
-  end
+  # Each double is the approved profile's own BARE name on its own bin directory, placed first on
+  # PATH so `Executor.resolve_command` resolves to it exactly as it would to a real CLI.
 
   def stub_claude
-    @stub_dir = Dir.mktmpdir("claude-stub", @temp)
-    path = File.join(@stub_dir, "claude")
-    File.write(path, <<~SH)
-      #!/bin/sh
-      eval "prompt=\\${$#}"
-      printf '%s' "$prompt" > "#{@prompt}"
-      cat <<'SPECRELAY_PROVIDER_EOF'
-      #{STUB_MESSAGES.call(valid_generated_files)}
-      SPECRELAY_PROVIDER_EOF
-    SH
-    File.chmod(0o755, path)
+    @stub_dir = SpecificationWorkspace.claude_stub(@temp, files: valid_generated_files,
+                                                          capture_prompt_to: @prompt)
+  end
+
+  # The Codex double: named `codex`, reading its prompt from STDIN as the approved profile
+  # delivers it, and answering with the same JSON file map every provider answers with.
+  def stub_codex
+    @stub_dir = SpecificationWorkspace.codex_stub(@temp, files: valid_generated_files,
+                                                         capture_prompt_to: @prompt)
   end
 
   def start_platform(profile:, executor:)
@@ -267,9 +358,19 @@ class SpecificationProviderPropagationTest < Minitest::Test
   # Deliberately the GUIDED-CONNECTION shape: no `runner.executor:` block and no
   # `specification.provider.kind`. That is what `specrelay-runner connect` leaves on disk, and the
   # configuration under which the live failure happened.
-  def build_config(local_executor: nil)
+  # A refusal writes no package at all: the isolated worktree the run would have used is never
+  # created, and the operator's checkout never had one.
+  def assert_no_package
+    assert_empty SpecificationWorkspace.isolated_workspaces(@temp)
+    refute File.exist?(File.join(@specs, "specs", "SR-700-add-an-export-button"))
+  end
+
+  def build_config(local_executor: nil, provider_kind: nil, provider_command: nil)
     path = File.join(Dir.mktmpdir("cfg", @temp), "runner.yml")
     executor_line = local_executor ? "  executor: #{JSON.generate(local_executor)}\n" : ""
+    # A flow mapping on one line, so the removed configuration keys can be written into the file
+    # without the surrounding heredoc's indentation deciding whether the test is valid YAML.
+    provider_block = provider_kind ? "provider: {kind: #{provider_kind}, command: #{provider_command}}" : ""
     File.write(path, <<~YAML)
       platform:
         base_url: #{@platform.base_url}
@@ -281,6 +382,7 @@ class SpecificationProviderPropagationTest < Minitest::Test
           mode: all_eligible
       #{executor_line.chomp}
         specification:
+          #{provider_block}
           repository_roots:
             "SpecRelay/SpecRelay-Specs": #{@specs}
           context_plus:

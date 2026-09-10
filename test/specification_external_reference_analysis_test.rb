@@ -26,11 +26,13 @@ class SpecificationExternalReferenceAnalysisTest < Minitest::Test
     FileUtils.remove_entry(@temp) if @temp && File.directory?(@temp)
   end
 
-  def deferred_reference_payload(name: "Export flow recording")
+  def deferred_reference_payload(name: "Export flow recording", provider: nil)
     inputs = [ { "kind" => "jam_recording", "name" => name, "reference" => REFERENCE_URL,
                  "read_status" => "deferred_to_runner_mcp",
                  "reason" => "a Jam recording a later capability must analyse" } ]
-    spec_creation_payload_for(issue_key: ISSUE, inputs: inputs)
+    selection = provider && { "profile" => provider,
+                              "executor" => SpecrelayRunner::ImplementationProfile.canonical(provider) }
+    spec_creation_payload_for(issue_key: ISSUE, inputs: inputs, specification_provider: selection)
   end
 
   # The per-input table — kind, name, recorded read status, used?, and the note this
@@ -57,9 +59,10 @@ class SpecificationExternalReferenceAnalysisTest < Minitest::Test
 
   # ------------------------------------------------------------------ unavailable tooling
 
-  # The exact defect this closes: an operator-set `available: true` with no analyzer configured
-  # used to be enough on its own. It must now refuse exactly as if nothing had been declared.
-  def test_available_true_with_no_command_configured_still_refuses
+  # The exact defect this closes: an operator-set `available: true` was enough on its own to mark
+  # a deferred reference readable, with nothing ever analysed. The flag decides nothing now — the
+  # only thing that can is an analysis this runner actually performed and could use.
+  def test_available_true_alone_cannot_make_a_reference_readable
     start_platform(deferred_reference_payload)
 
     exit_code = run_cli(config: build_config(external_references_available: true))
@@ -68,6 +71,33 @@ class SpecificationExternalReferenceAnalysisTest < Minitest::Test
     generation = @platform.last_specification_generation
     assert_equal "external_reference_analysis_unavailable", generation["failure_class"]
     assert_includes generation["message"], "external_references.substitute"
+  end
+
+  # A project whose selected provider is Codex has no external-reference analyzer at all: that
+  # analyzer is a separate optional capability with a Claude-only implementation, and this slice
+  # adds no second one. The existing explicit refusal — and its substitute remedy — is what such a
+  # runner gets, rather than a silently unanalysed reference.
+  def test_a_codex_selected_project_keeps_the_explicit_refusal_for_a_deferred_reference
+    start_platform(deferred_reference_payload(provider: SpecrelayRunner::CodexProfile::PROVIDER))
+
+    exit_code = run_cli(config: build_config, provider: :codex)
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, exit_code, @io.string
+    generation = @platform.last_specification_generation
+    assert_equal "external_reference_analysis_unavailable", generation["failure_class"]
+    assert_includes generation["message"], "external_references.substitute"
+  end
+
+  # And the approved way through it: a recorded substitute lets a Codex-selected runner generate,
+  # with the gap stated rather than hidden.
+  def test_a_codex_selected_project_proceeds_on_a_recorded_substitute
+    start_platform(deferred_reference_payload(provider: SpecrelayRunner::CodexProfile::PROVIDER))
+
+    exit_code = run_cli(config: build_config(external_references_substitute: "the reporter described the flow"),
+                        provider: :codex)
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, exit_code, @io.string
+    assert_includes spec_document, "Export flow recording"
   end
 
   # ------------------------------------------------------------------ unreadable required reference
@@ -139,12 +169,11 @@ class SpecificationExternalReferenceAnalysisTest < Minitest::Test
   # configured for generation and NO analyzer command, must be able to analyse a reference with
   # nothing further to install or configure.
   def test_the_ordinary_configured_claude_profile_analyses_the_reference_with_no_extra_configuration
-    claude = write_fake_claude(File.join(@temp, "claude"),
-                               response: { "contributed" => true,
-                                          "summary" => "Claude read the reference via its own tool access." })
     start_platform(deferred_reference_payload)
 
-    exit_code = run_cli(config: build_config(claude_command: claude))
+    exit_code = run_cli(config: build_config,
+                        analyzer_response: { "contributed" => true,
+                                            "summary" => "Claude read the reference via its own tool access." })
 
     assert_equal SpecrelayRunner::CLI::SUCCESS, exit_code, @io.string
     assert_includes spec_document, "Claude read the reference via its own tool access."
@@ -254,34 +283,12 @@ class SpecificationExternalReferenceAnalysisTest < Minitest::Test
     path
   end
 
-  # A minimal double for the real Claude Code CLI: it must be literally named `claude` for
-  # {SpecrelayRunner::ClaudeProfile} validation, and it ignores its prompt argument entirely —
-  # this test's only Claude invocation is the reference analysis, since generation is configured
-  # to use the deterministic `fake` provider explicitly.
-  #
-  # MAPIAI-60 — it answers in the supported structured format, because the profile is now
-  # structured-output-only: the analyzer's verdict travels in the ONE terminal result.
-  def write_fake_claude(path, response:)
-    messages = [ { "type" => "system", "subtype" => "init" },
-                 { "type" => "result", "subtype" => "success", "is_error" => false,
-                   "result" => JSON.generate(response) } ].map { |message| JSON.generate(message) }.join("\n")
-    File.write(path, <<~SH)
-      #!/bin/sh
-      cat <<'SPECRELAY_FAKE_CLAUDE_EOF'
-      #{messages}
-      SPECRELAY_FAKE_CLAUDE_EOF
-      exit 0
-    SH
-    FileUtils.chmod(0o755, path)
-    path
-  end
-
   def start_platform(payload)
     @platform = FakePlatform.new(claim_payload: payload).start
   end
 
   def build_config(external_reference_command: nil, external_references_available: nil,
-                   external_references_substitute: nil, claude_command: nil)
+                   external_references_substitute: nil)
     path = File.join(Dir.mktmpdir("cfg"), "runner.yml")
     File.write(path, <<~YAML)
       platform:
@@ -292,10 +299,7 @@ class SpecificationExternalReferenceAnalysisTest < Minitest::Test
         display_name: Test Runner
         claim_policy:
           mode: all_eligible
-        #{executor_block(claude_command)}
         specification:
-          provider:
-            kind: fake
           repository_roots:
             "SpecRelay/SpecRelay-Specs": #{@specs}
           context_plus:
@@ -310,28 +314,26 @@ class SpecificationExternalReferenceAnalysisTest < Minitest::Test
     SpecrelayRunner::Config.load(path)
   end
 
-  # The SAME real Claude profile a fixed D1 would use for generation — SELECTED here purely so the
-  # reference analyzer can be offered it, with `specification.provider.kind: fake` above keeping
-  # generation itself on the deterministic composer.
-  #
-  # The block names the provider and nothing else, which is the only shape either side accepts. The
-  # double is reached the way the real CLI is: under its own bare name on the child PATH.
-  def executor_block(claude_command)
-    return "" if claude_command.nil?
-
-    @claude_bin = claude_bin(claude_command)
-    "executor:\n      provider: claude"
+  # ONE `claude` double serves both questions this profile is asked: it composes the package for
+  # the generation prompt, and — when `analyzer_response` is set — answers the optional
+  # external-reference analysis with that verdict. That is the production shape: a project whose
+  # selected provider is Claude has the same profile available for both, and the analyzer is a
+  # separate optional capability rather than a second selection.
+  def provider_stub(analyzer_response = nil, provider: :claude)
+    @provider_stub ||= build_provider_stub(analyzer_response, provider)
   end
 
-  def claude_bin(script)
-    dir = Dir.mktmpdir("fake-claude-bin-")
-    File.symlink(File.expand_path(script), File.join(dir, "claude"))
-    dir
+  def build_provider_stub(analyzer_response, provider)
+    return SpecificationWorkspace.codex_stub(@temp, compose: true) if provider == :codex
+
+    SpecificationWorkspace.claude_stub(@temp, compose: true,
+                                              analyzer_answer: analyzer_response &&
+                                                JSON.generate(analyzer_response))
   end
 
-  def run_cli(config:)
-    path = [ @claude_bin, ENV["PATH"] ].compact.join(File::PATH_SEPARATOR)
-    env = { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN, "PATH" => path }
+  def run_cli(config:, analyzer_response: nil, provider: :claude)
+    env = { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN,
+            "PATH" => SpecificationWorkspace.provider_path(provider_stub(analyzer_response, provider: provider)) }
           .merge(SpecificationWorkspace.lane_env(@temp))
     SpecrelayRunner::CLI.run(%W[claim-once --config #{config.source_path}], out: @io, err: @io, env: env)
   end

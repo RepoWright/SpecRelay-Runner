@@ -337,26 +337,45 @@ class SpecificationTaskWorkspaceTest < Minitest::Test
       "SpecRelay/component-b" => "https://github.com/SpecRelay/component-b/pull/13" }
   end
 
-  # The provider under test: a real configured command that RECORDS its own working directory,
-  # what it can see there, and the packet it was handed, then answers with a document map.
+  # The provider under test: a real process that RECORDS its own working directory and what it
+  # can see there, then answers with a document map.
+  #
+  # It stands where the approved Claude CLI stands — its own bare name, first on the child PATH,
+  # answering the profile's structured-output contract — because that closed set of real profiles
+  # is now the only way a specification provider can be selected.
   #
   # `escape` makes it write one file outside its package directory, which is the only honest way
   # to exercise the change boundary — a test that planted the file itself would prove the check
   # runs, not that it catches a provider.
   def write_probe_provider(files:, escape:, sabotage: nil)
-    path = File.join(@built.temp, "probe-provider")
-    SpecificationWorkspace.write_executable(path, <<~RUBY)
+    dir = Dir.mktmpdir("claude-stub", @built.temp)
+    SpecificationWorkspace.write_executable(File.join(dir, "claude"), <<~RUBY)
       #!/usr/bin/env ruby
       require "json"
       require "fileutils"
-      packet = $stdin.read
-      packet = ARGV.last.to_s if packet.strip.empty?
+      if ARGV.first == "--version"
+        puts "1.0.0"
+        exit 0
+      end
+      exit 0 if %w[auth login].include?(ARGV.first)
+
+      # The packet travels inside the one reviewable prompt document, so it is read back out of
+      # the prompt exactly as a provider would read it.
+      $LOAD_PATH.unshift(#{SpecificationWorkspace::LIB_ROOT.inspect})
+      require "specrelay_runner"
+      packet = begin
+        SpecrelayRunner::Specification::BalancedJson
+          .extract_object(ARGV.last.to_s.split("EVIDENCE (JSON):").last.to_s)
+          .then { |object| JSON.parse(object) }
+      rescue StandardError
+        nil
+      end
       component = File.join(Dir.pwd, "component-a", "app", "services", "export_report.rb")
       File.write(#{@probe.inspect}, JSON.generate({
         "cwd" => Dir.pwd,
         "entries" => Dir.children(Dir.pwd).sort,
         "component_source" => (File.read(component) if File.file?(component)),
-        "packet" => (JSON.parse(packet) rescue nil)
+        "packet" => packet
       }))
       escape = #{escape.inspect}
       if escape
@@ -365,9 +384,11 @@ class SpecificationTaskWorkspaceTest < Minitest::Test
       end
       sabotage = #{sabotage.inspect}
       system("/bin/sh", "-c", sabotage) if sabotage
-      puts JSON.generate(#{files.to_json})
+      puts JSON.generate("type" => "system", "subtype" => "init")
+      puts JSON.generate("type" => "result", "subtype" => "success", "is_error" => false,
+                         "result" => JSON.generate(#{files.to_json}))
     RUBY
-    path
+    dir
   end
 
   def minimal_package
@@ -418,9 +439,6 @@ class SpecificationTaskWorkspaceTest < Minitest::Test
         claim_policy:
           mode: all_eligible
         specification:
-          provider:
-            kind: command
-            command: #{@provider}
           repository_roots:
             "#{SPECS_SLUG}": #{@root}
           context_plus:
@@ -433,7 +451,7 @@ class SpecificationTaskWorkspaceTest < Minitest::Test
 
   def run_cli(env_extra: {})
     env = { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN,
-            "PATH" => "#{@gh_dir}:#{ENV['PATH']}" }
+            "PATH" => "#{@provider}:#{@gh_dir}:#{ENV['PATH']}" }
           .merge(SpecificationWorkspace.lane_env(@built.temp)).merge(env_extra)
     SpecrelayRunner::CLI.run(%W[claim-once --config #{@config.source_path}], out: @io, err: @io, env: env)
   end

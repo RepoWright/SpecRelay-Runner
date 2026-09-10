@@ -203,9 +203,7 @@ class SpecificationPreflightTest < Minitest::Test
     exit_code = run_cli(config: build_config)
 
     assert_equal SpecrelayRunner::CLI::SUCCESS, exit_code, @io.string
-    technical = read_package("analysis/technical.md")
-    assert_includes technical, "Graphify is not installed for this checkout"
-    assert_includes technical, "Result: did NOT contribute evidence"
+    assert_includes provider_evidence, "Graphify is not installed for this checkout"
     warnings = @platform.last_specification_generation["warnings"]
     assert_includes warnings, "Graphify is not installed for this checkout; direct source inspection was used instead."
   end
@@ -239,15 +237,16 @@ class SpecificationPreflightTest < Minitest::Test
     refute tool["contributed"]
   end
 
-  def test_a_configured_provider_command_that_is_missing_refuses
-    assert_refusal "generation_provider_unavailable",
-                   provider: { kind: "command", command: File.join(@temp, "no-such-provider") }
-    assert_includes @io.string, "not an executable file"
-  end
+  # No selection at all — neither a local one nor one on the assignment — refuses. There is no
+  # writer left to fall back to, which is the point.
+  def test_an_assignment_with_no_selected_provider_refuses
+    start_platform(spec_creation_payload_for(issue_key: ISSUE,
+                                             specification_provider: { "profile" => nil, "executor" => nil }))
 
-  def test_a_command_provider_with_no_command_configured_refuses
-    assert_refusal "generation_provider_unavailable", provider: { kind: "command" }
-    assert_includes @io.string, "SPECRELAY_RUNNER_SPEC_PROVIDER_COMMAND"
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli(config: build_config), @io.string
+    assert_equal "generation_provider_unavailable",
+                 @platform.last_specification_generation["failure_class"], @io.string
+    assert_includes @io.string, "no specification generation provider is configured"
   end
 
   # The redaction guard is a precondition of writing, so it is verified rather than assumed.
@@ -279,12 +278,11 @@ class SpecificationPreflightTest < Minitest::Test
     exit_code = run_cli(config: build_config(graphify_substitute: "read the changed area directly"))
 
     assert_equal SpecrelayRunner::CLI::SUCCESS, exit_code, @io.string
-    technical = read_package("analysis/technical.md")
-    assert_includes technical, "read the changed area directly"
-    # See the note in specification_generation_test.rb: the verdict vocabulary changed under
-    # CR-001 must-fix 2; the property this line protects — a substituted tool is recorded as
-    # having contributed nothing — did not.
-    assert_includes technical, "Result: did NOT contribute evidence"
+    # The property this protects — a substituted tool is recorded as having contributed nothing,
+    # in the evidence a writer must work from — did not change; where it is asserted did, because
+    # the composer that used to copy it verbatim is no longer a provider.
+    assert_includes provider_evidence, "read the changed area directly"
+    assert_includes provider_evidence, "contributed"
     refute @platform.last_specification_generation["warnings"].any? { |warning| warning.include?("not installed") }
   end
 
@@ -295,9 +293,7 @@ class SpecificationPreflightTest < Minitest::Test
     exit_code = run_cli(config: build_config(external_references_substitute: "the reporter pasted the page inline"))
 
     assert_equal SpecrelayRunner::CLI::SUCCESS, exit_code, @io.string
-    business = read_package("analysis/business.md")
-    assert_includes business, "Needs product clarification"
-    assert_includes business, "Reporting requirements"
+    assert_includes provider_evidence, "Reporting requirements"
     warnings = @platform.last_specification_generation["warnings"]
     assert warnings.any? { |warning| warning.include?("Reporting requirements") }, warnings.inspect
   end
@@ -367,8 +363,7 @@ class SpecificationPreflightTest < Minitest::Test
   end
 
   def build_config(repository_roots: true, repository_root_override: nil, workspace_root: nil,
-                   context_plus: true, graphify_substitute: nil, external_references_substitute: nil,
-                   provider: { kind: "fake" })
+                   context_plus: true, graphify_substitute: nil, external_references_substitute: nil)
     root = repository_root_override || @specs
     path = File.join(Dir.mktmpdir("cfg"), "runner.yml")
     File.write(path, <<~YAML)
@@ -381,9 +376,6 @@ class SpecificationPreflightTest < Minitest::Test
         claim_policy:
           mode: all_eligible
         specification:
-          provider:
-            kind: #{provider.fetch(:kind)}
-            command: #{provider[:command] || '~'}
           repository_roots:
             #{repository_roots ? "\"SpecRelay/SpecRelay-Specs\": #{root}" : '{}'}
           context_plus:
@@ -398,8 +390,23 @@ class SpecificationPreflightTest < Minitest::Test
     SpecrelayRunner::Config.load(path)
   end
 
+  # The approved Claude profile's own bare name, first on the child PATH: the assignment carries
+  # the exact profile Platform serves, so every test here crosses the real selection path.
+  def provider_stub
+    @provider_stub ||= SpecificationWorkspace.claude_stub(@temp,
+                                                          files: SpecificationWorkspace.valid_documents(ISSUE),
+                                                          capture_prompt_to: prompt_path)
+  end
+
+  def prompt_path = @prompt_path ||= File.join(@temp, "prompt.txt")
+
+  # What the provider was actually handed. The recorded tool gaps used to be asserted against the
+  # composer's own prose; the evidence they belong to is the packet, and this reads it there.
+  def provider_evidence = File.read(prompt_path)
+
   def run_cli(config:, state_root: @temp)
-    env = { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN, "PATH" => ENV["PATH"] }
+    env = { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN,
+            "PATH" => SpecificationWorkspace.provider_path(provider_stub) }
           .merge(SpecificationWorkspace.lane_env(state_root))
     SpecrelayRunner::CLI.run(%W[claim-once --config #{config.source_path}], out: @io, err: @io, env: env)
   end

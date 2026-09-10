@@ -371,12 +371,21 @@ class SpecificationTaskStateTest < Minitest::Test
 
   # The provider records the package directory it found BEFORE it wrote anything, which is how a
   # revision's starting document is observed rather than inferred.
+  #
+  # It stands where the approved Claude CLI stands — its own bare name, first on the child PATH,
+  # answering the profile's structured-output contract — because that closed set of real profiles
+  # is now the only way a specification provider can be selected.
   def write_probe_provider
-    path = File.join(@built.temp, "probe-provider")
-    SpecificationWorkspace.write_executable(path, <<~RUBY)
+    dir = Dir.mktmpdir("claude-stub", @built.temp)
+    SpecificationWorkspace.write_executable(File.join(dir, "claude"), <<~RUBY)
       #!/usr/bin/env ruby
       require "json"
-      $stdin.read
+      if ARGV.first == "--version"
+        puts "1.0.0"
+        exit 0
+      end
+      exit 0 if %w[auth login].include?(ARGV.first)
+
       accepted = File.join(Dir.pwd, "component-a", "app", "services", "export_report.rb")
       package = Dir.glob(File.join(Dir.pwd, #{PACKAGE.inspect}, "**", "*")).select { |p| File.file?(p) }
       File.write(#{@probe.inspect}, JSON.generate({
@@ -384,9 +393,11 @@ class SpecificationTaskStateTest < Minitest::Test
         "accepted_source" => (File.read(accepted) if File.file?(accepted)),
         "package_before" => package.to_h { |p| [ p.delete_prefix(File.join(Dir.pwd, #{PACKAGE.inspect}) + "/"), File.read(p) ] }
       }))
-      puts JSON.generate(#{generated_package.to_json})
+      puts JSON.generate("type" => "system", "subtype" => "init")
+      puts JSON.generate("type" => "result", "subtype" => "success", "is_error" => false,
+                         "result" => JSON.generate(#{generated_package.to_json}))
     RUBY
-    path
+    dir
   end
 
   def generated_package
@@ -419,9 +430,6 @@ class SpecificationTaskStateTest < Minitest::Test
         claim_policy:
           mode: all_eligible
         specification:
-          provider:
-            kind: command
-            command: #{@provider}
           repository_roots:
             "#{SPECS_SLUG}": #{@root}
           context_plus:
@@ -434,7 +442,7 @@ class SpecificationTaskStateTest < Minitest::Test
 
   def run_cli(env_extra: {})
     env = { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN,
-            "PATH" => "#{@gh_dir}:#{ENV['PATH']}" }
+            "PATH" => "#{@provider}:#{@gh_dir}:#{ENV['PATH']}" }
           .merge(SpecificationWorkspace.lane_env(@built.temp)).merge(env_extra)
     SpecrelayRunner::CLI.run(%W[claim-once --config #{@config.source_path}], out: @io, err: @io, env: env)
   end

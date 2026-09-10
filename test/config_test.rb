@@ -128,25 +128,25 @@ class ConfigTest < Minitest::Test
     config = SpecrelayRunner::Config.load(write_config(valid_config))
 
     assert_empty config.executor_override
-    assert_nil config.selected_claude_profile
+    assert_nil config.selected_implementation_profile
   end
 
-  def test_a_non_claude_override_selects_no_real_profile
-    config = config_with_executor(<<~YAML)
-      provider: fake
-      command: specrelay-fake-executor
-    YAML
+  # The fixture and no selection at all both resolve to NO real profile, and a caller that must
+  # tell them apart — the specification lane, which refuses an explicit fixture rather than
+  # falling through — has the selection block itself to read.
+  def test_an_explicit_fixture_selection_stays_visible_as_a_selection
+    config = config_with_executor("provider: fake\n")
 
-    assert_equal "fake", config.executor_override["provider"]
-    assert_nil config.selected_claude_profile
+    assert_equal({ "provider" => "fake" }, config.executor_override)
+    assert_nil config.selected_implementation_profile
   end
 
-  # The local block is a PROVIDER-ONLY selection, so the specification lane resolves the canonical
-  # Claude profile from the provider name rather than from anything the file describes.
+  # The local block is a PROVIDER-ONLY selection, so the canonical profile is resolved from the
+  # provider name rather than from anything the file describes.
   def test_a_claude_selection_resolves_the_canonical_profile
     config = config_with_executor("provider: claude\n")
 
-    profile = config.selected_claude_profile
+    profile = config.selected_implementation_profile
     refute_nil profile
     assert_equal SpecrelayRunner::ClaudeProfile::CANONICAL.fetch("args"), profile.args
     assert_equal({ "provider" => "claude" }, config.executor_override)
