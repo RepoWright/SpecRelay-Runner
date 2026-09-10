@@ -59,9 +59,14 @@ module SpecrelayRunner
       # decided; otherwise the operator's real Claude profile is used if they configured one; and
       # if neither exists this REFUSES. Falling back to the composer is what this method must
       # never do again, because the composer's output is plausible enough that nobody notices.
-      def self.resolve(settings:, claude_profile: nil, env: ENV)
+      # `working_directory` is the prepared task workspace and is REQUIRED,
+      # not defaulted. Every provider that spawns a process runs there, so that a specification is
+      # written from the ticket's real multi-repository source state; a default would let one be
+      # built that quietly ran somewhere else, which is the exact defect this replaces.
+      def self.resolve(settings:, working_directory:, claude_profile: nil, env: ENV)
         return Composed.new if settings.composed_provider?
-        return Command.build(settings: settings, env: env) if settings.provider_kind == Settings::PROVIDER_COMMAND
+        return Command.build(settings: settings, env: env, working_directory: working_directory) if
+          settings.provider_kind == Settings::PROVIDER_COMMAND
         # `env` is forwarded, not defaulted. Process.spawn resolves the executable through the PATH
         # it is handed, so a Claude provider built without it would look `claude` up on the runner
         # PROCESS's environment while every other stage — the readiness probe, the executor
@@ -69,8 +74,10 @@ module SpecrelayRunner
         # about: "readiness pass against one CLI and execution run another". Found while proving
         # the defect-4 fix, when a test that put a stub `claude` first on its runner PATH launched
         # the host's real CLI instead.
-        return Claude.build(profile: claude_profile, settings: settings, env: env) if settings.claude_provider?
-        return Claude.new(profile: claude_profile, settings: settings, env: env) if claude_profile
+        return Claude.build(profile: claude_profile, settings: settings, env: env,
+                            working_directory: working_directory) if settings.claude_provider?
+        return Claude.new(profile: claude_profile, settings: settings, env: env,
+                          working_directory: working_directory) if claude_profile
 
         raise Unavailable, UNCONFIGURED
       end
@@ -125,16 +132,17 @@ module SpecrelayRunner
           "configure runner.executor with provider `claude`, or select another specification " \
           "provider kind."
 
-        def self.build(profile:, settings:, env: ENV)
+        def self.build(profile:, settings:, working_directory:, env: ENV)
           raise Unavailable, MISSING_PROFILE if profile.nil?
 
-          new(profile: profile, settings: settings, env: env)
+          new(profile: profile, settings: settings, env: env, working_directory: working_directory)
         end
 
-        def initialize(profile:, settings:, env: ENV, command_runner: CommandRunner)
+        def initialize(profile:, settings:, working_directory:, env: ENV, command_runner: CommandRunner)
           @profile = profile
           @settings = settings
           @env = env
+          @working_directory = working_directory.to_s
           @command_runner = command_runner
         end
 
@@ -171,7 +179,7 @@ module SpecrelayRunner
 
         private
 
-        attr_reader :profile, :settings, :env, :command_runner
+        attr_reader :profile, :settings, :env, :working_directory, :command_runner
 
         # PATH to find the executable and HOME to find the operator's own Claude credentials —
         # the same two the implementation lane forwards, and nothing else. The profile's own
@@ -179,13 +187,15 @@ module SpecrelayRunner
         # of the profile identity the readiness check already validated.
         FORWARDED_ENV = %w[PATH HOME].freeze
 
+        # In the prepared task workspace, not a throwaway directory. That is the whole of
+        # workspace-grounded generation at this boundary: the model's own tools resolve the
+        # ticket's real multi-repository source state, and what it may WRITE there is bounded
+        # afterwards by the change-boundary check rather than by giving it nothing to read.
         def run(prompt, stream)
-          Dir.mktmpdir("specrelay-spec-claude-") do |workdir|
-            command_runner.run([ profile.command, *profile.args, prompt ], chdir: workdir,
-                                                                          env: child_env,
-                                                                          timeout_seconds: profile.timeout_seconds,
-                                                                          on_output: stream.sink)
-          end
+          command_runner.run([ profile.command, *profile.args, prompt ], chdir: working_directory,
+                                                                        env: child_env,
+                                                                        timeout_seconds: profile.timeout_seconds,
+                                                                        on_output: stream.sink)
         end
 
         def child_env
@@ -217,6 +227,19 @@ module SpecrelayRunner
           <<~PROMPT
             You are writing a software specification package for SpecRelay, for a human reviewer
             with limited attention and no prior context on this ticket.
+
+            WORKING DIRECTORY — you are running inside this ticket's prepared task workspace. It
+            holds every repository the project registers, already on this ticket's canonical
+            branch and, when the ticket has one, already reconstructed at its previously accepted
+            implementation. READ FREELY: open source files, follow references, and ground the
+            technical analysis in what the code actually does rather than in the ticket alone. The
+            structural and semantic tooling in this workspace resolves against it.
+
+            The ONLY directory you may create, change, or delete anything in is
+            `#{packet.dig('package', 'relative_path')}`. A change anywhere else in the workspace — any
+            repository, any sibling path — ends this run with no specification written, so do not
+            edit, format, stage, commit, or clean anything outside it. You still return the
+            package as JSON below; writing the documents yourself is neither required nor useful.
 
             Return ONLY a JSON object mapping file paths to file contents, with no prose before or
             after it and no code fence. The keys must be exactly "spec.md", "#{PackagePath::INPUT_EVIDENCE_MD}",
@@ -389,7 +412,7 @@ module SpecrelayRunner
       class Command
         KIND = "command"
 
-        def self.build(settings:, env: ENV)
+        def self.build(settings:, working_directory:, env: ENV)
           command = settings.provider_command
           raise Unavailable, "runner.specification.provider.kind is `command` but no provider command is " \
                              "configured (set runner.specification.provider.command or " \
@@ -398,15 +421,17 @@ module SpecrelayRunner
             File.file?(command) && File.executable?(command)
 
           new(command: command, args: settings.provider_args, timeout_seconds: settings.provider_timeout_seconds,
-              env: env)
+              env: env, working_directory: working_directory)
         end
 
-        def initialize(command:, args: [], timeout_seconds: Settings::DEFAULT_TIMEOUT_SECONDS, env: ENV,
+        def initialize(command:, working_directory:, args: [],
+                       timeout_seconds: Settings::DEFAULT_TIMEOUT_SECONDS, env: ENV,
                        command_runner: CommandRunner)
           @command = command
           @args = Array(args).map(&:to_s)
           @timeout_seconds = timeout_seconds
           @env = env
+          @working_directory = working_directory.to_s
           @command_runner = command_runner
         end
 
@@ -425,17 +450,16 @@ module SpecrelayRunner
 
         private
 
-        attr_reader :command, :args, :timeout_seconds, :env, :command_runner
+        attr_reader :command, :args, :timeout_seconds, :env, :working_directory, :command_runner
 
-        # Run in a throwaway directory, not in either checkout. A provider that decides to
-        # write next to itself then cannot touch the specification repository or the source
-        # tree — the atomicity guarantee in scope 10 is only as strong as the set of places
-        # something can write.
+        # In the prepared task workspace, the same directory the Claude provider runs in. One rule
+        # for every provider that spawns a process: a configured command is a specification writer
+        # too, and one that could read the source state while another could not would make the two
+        # produce incomparable packages.
         def run(stdin_data)
-          Dir.mktmpdir("specrelay-spec-provider-") do |workdir|
-            command_runner.run([ command, *args ], chdir: workdir, env: { "PATH" => env["PATH"].to_s },
-                                                   timeout_seconds: timeout_seconds, stdin_data: stdin_data)
-          end
+          command_runner.run([ command, *args ], chdir: working_directory,
+                                                 env: { "PATH" => env["PATH"].to_s },
+                                                 timeout_seconds: timeout_seconds, stdin_data: stdin_data)
         end
 
         def parse(stdout)

@@ -52,7 +52,9 @@ class SpecificationClaudeProviderGenerationTest < Minitest::Test
 
   def provider_for(result:, lines: [], profile: build_profile, env: {})
     runner = FakeCommandRunner.new(result: result, lines: lines)
-    [ Provider::Claude.new(profile: profile, settings: settings, env: env, command_runner: runner), runner ]
+    [ Provider::Claude.new(profile: profile, settings: settings, env: env,
+                          working_directory: Dir.mktmpdir("specrelay-spec-task-"),
+                          command_runner: runner), runner ]
   end
 
   # A provider that worked and then answered: one `init`, one PUBLIC narration line the operator

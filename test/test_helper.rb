@@ -66,14 +66,19 @@ end
 
 def spec_creation_payload_for(issue_key:, title: "Add an export button", inputs: nil,
                               specification_root: "specs", complete: true, content: nil,
-                              existing_pull_request_url: nil, specification_provider: nil)
+                              existing_pull_request_url: nil, specification_provider: nil,
+                              worktree_create_command: nil)
   {
     "contract_version" => "mvp-0025",
     "claim" => { "runner_execution_id" => "rex_spec123", "runner_id" => "test-runner",
                  "runner_display_name" => "Test Runner", "claim_policy_mode" => "all_eligible",
                  "assignee_match_field" => nil, "claimed_at" => "2026-07-31T12:00:00Z" },
+    # The ticket's task identity, the same two fields the implementation lane already carries.
+    # The specification lane builds the ticket's canonical task worktree from them before a
+    # provider runs, so an assignment without them names work no runner can do.
     "run" => { "id" => "run_spec123", "type" => "spec_creation",
-               "state" => "AWAITING_SPECIFICATION_CREATION" },
+               "state" => "AWAITING_SPECIFICATION_CREATION",
+               "task_id" => issue_key, "canonical_branch" => issue_key },
     "work_item" => { "provider" => "jira", "issue_key" => issue_key,
                      "issue_url" => "https://example.atlassian.net/browse/#{issue_key}",
                      "title" => title },
@@ -102,8 +107,12 @@ def spec_creation_payload_for(issue_key:, title: "Add an export button", inputs:
     # the existing tests keep selecting their provider through `runner.specification.provider.kind`
     # as they always have; specification_provider_propagation_test.rb populates it.
     "specification_provider" => specification_provider || { "profile" => nil, "executor" => nil },
+    # The workspace's own worktree-create command, rendered by Platform exactly as it is for
+    # the implementation lane.
     "workspace" => { "project_key" => "tiny-demo", "workspace_key" => "tiny-demo-workspace",
-                     "display_name" => "Tiny Demo Workspace" },
+                     "display_name" => "Tiny Demo Workspace",
+                     "worktree_create_command" =>
+                       worktree_create_command || "./bin/worktree create #{issue_key}" },
     "links" => { "run_url" => "http://127.0.0.1:3200/runs/run_spec123",
                  "work_item_url" => "https://example.atlassian.net/browse/#{issue_key}" },
     "execution_policy" => { "timeout_seconds" => 120, "lease_renewal_seconds" => 30,
@@ -126,9 +135,13 @@ def spec_publication_payload_for(issue_key:, files:, package_path:, branch:, wor
                                  slug: "SpecRelay/SpecRelay-Specs", base_branch: "main",
                                  draft: true, title: "Add an export button",
                                  existing_pull_request_url: nil)
+  # The run block is REPLACED here, so the task identity has to be restated: Platform sends it on
+  # every specification assignment of either phase, and a fixture that dropped it would describe a
+  # document Platform does not produce.
   spec_creation_payload_for(issue_key: issue_key, title: title).merge(
     "run" => { "id" => "run_spec123", "type" => "spec_creation",
-               "state" => "AWAITING_SPECIFICATION_PUBLICATION" },
+               "state" => "AWAITING_SPECIFICATION_PUBLICATION",
+               "task_id" => issue_key, "canonical_branch" => issue_key },
     "assignment_boundary" => { "generation" => "generate_package_only",
                                "publication" => "publish_draft_pull_request_only",
                                "expected_runner_action" => "publish_specification_package",

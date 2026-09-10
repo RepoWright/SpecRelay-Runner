@@ -14,9 +14,11 @@ module SpecrelayRunner
   # the new work rather than the work itself. Mixing the two would let same-run authority be
   # overwritten by an older package, which is exactly the mistake the precedence rule forbids.
   #
-  # It runs only for a NEWLY CREATED workspace. A reused one may already hold this run's own
-  # partial publication, rework, restart or answered-resume state, and resetting it to the older
-  # accepted heads would move the run backward.
+  # It VERIFIES for every workspace and PLACES differently for two. A newly created one is put at
+  # the exact accepted heads. A reused one may already hold this run's own partial publication,
+  # rework, restart or answered-resume state, so it is reconciled rather than reset — proved to
+  # contain the accepted commit, moved forward only when that is an unambiguous fast-forward, and
+  # never rewound.
   #
   # It fails CLOSED, and it verifies EVERY target before it mutates any of them. Current GitHub
   # state is the safety authority: a package is Platform's record of what was accepted, and a
@@ -66,7 +68,17 @@ module SpecrelayRunner
 
     # Put every accepted repository of the task workspace on the canonical branch at its verified
     # head, or refuse. A package that changed nothing succeeds without touching git.
-    def materialize(task_root:)
+    def materialize(task_root:) = act(task_root) { |plans| place(plans) }
+
+    # PROVE a workspace this run did not build already contains the accepted implementation,
+    # without resetting it. Same targets, same verification, different placement — see {advance}.
+    def reconcile(task_root:) = act(task_root) { |plans| advance(plans) }
+
+    private
+
+    # Everything the two entry points share: read the targets, find them in the workspace, and
+    # prove every one of them before any of them is touched.
+    def act(task_root)
       targets = read_targets
       return refuse(targets) if targets.is_a?(String)
       return Result.new(ok: true, repositories: []) if targets.empty?
@@ -77,10 +89,8 @@ module SpecrelayRunner
       plans = plan(targets, contained)
       return refuse(plans) if plans.is_a?(String)
 
-      place(plans)
+      yield(plans)
     end
-
-    private
 
     attr_reader :block, :canonical_branch, :env, :github, :git
 
@@ -194,6 +204,55 @@ module SpecrelayRunner
                       "at its accepted head") unless result&.exit_code.to_i.zero?
       end
       Result.new(ok: true, repositories: plans.map { |plan| plan[:repository] })
+    end
+
+    # A reused workspace proved to CONTAIN the accepted head, and moved forward only when that
+    # is unambiguous.
+    #
+    # Newer work is preserved: a workspace that carries a descendant of the accepted commit
+    # already contains the accepted implementation, and rewinding it would delete the round that
+    # produced it. A workspace that is merely behind is fast-forwarded, which invents no commit.
+    # Divergence refuses — this reconstructs a base, it does not resolve one — and so does a
+    # workspace whose checkout is not on the canonical branch at all, because the branch the
+    # accepted head must be reachable from is the one the ticket works on.
+    def advance(plans)
+      plans.each do |plan|
+        refusal = advance_one(plan)
+        return refuse(refusal) if refusal
+      end
+      Result.new(ok: true, repositories: plans.map { |plan| plan[:repository] })
+    end
+
+    def advance_one(plan)
+      branch = value(plan[:path], %w[symbolic-ref --quiet --short HEAD])
+      return "the checkout of #{quoted(plan[:repository])} is not on the canonical branch " \
+             "#{quoted(canonical_branch)}" unless branch == canonical_branch
+
+      local = value(plan[:path], %w[rev-parse HEAD])
+      return "SpecRelay could not read the current head of #{quoted(plan[:repository])}" if local.nil?
+      return nil if local == plan[:head] || ancestor?(plan[:path], plan[:head], local)
+      return fast_forward(plan) if ancestor?(plan[:path], local, plan[:head])
+
+      "the checkout of #{quoted(plan[:repository])} has diverged from the accepted head " \
+        "#{plan[:head][0, 12]}; preserve or release the task workspace before retrying"
+    end
+
+    def fast_forward(plan)
+      result = run(plan[:path], [ "merge", "--ff-only", plan[:head] ])
+      return nil if result && result.exit_code.to_i.zero?
+
+      "#{quoted(plan[:repository])} could not be advanced to its accepted head #{plan[:head][0, 12]}"
+    end
+
+    def ancestor?(path, ancestor, descendant)
+      result = run(path, [ "merge-base", "--is-ancestor", ancestor, descendant ])
+      !result.nil? && result.exit_code.to_i.zero?
+    end
+
+    # Trimmed stdout of a successful read-only query, or nil. A failed query is never an answer.
+    def value(path, args)
+      result = run(path, args)
+      result && result.exit_code.to_i.zero? ? result.stdout.to_s.strip : nil
     end
 
     def clean?(path)

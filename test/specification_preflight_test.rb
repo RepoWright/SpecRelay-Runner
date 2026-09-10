@@ -210,9 +210,16 @@ class SpecificationPreflightTest < Minitest::Test
     assert_includes warnings, "Graphify is not installed for this checkout; direct source inspection was used instead."
   end
 
+  # The wrapper is removed AND COMMITTED, because Graphify is probed where the provider runs: the
+  # task environment is built from this checkout's history, so a deletion left only in the working
+  # tree would not be in the tree that is actually inspected.
   def test_a_partial_graphify_installation_still_refuses
     rebuild_source(graph: :fresh)
     FileUtils.rm(File.join(@source, "bin", "graph-query"))
+    SpecificationWorkspace.git!(@source, "add", "-A")
+    SpecificationWorkspace.git!(@source, "-c", "user.email=fixture@specrelay.local",
+                                "-c", "user.name=SpecRelay Fixture", "commit", "-q",
+                                "-m", "remove one graph wrapper")
 
     assert_refusal "graphify_unavailable"
     assert_includes @io.string, "incomplete or not executable"
