@@ -35,15 +35,19 @@ class SpecificationProviderSelectionTest < Minitest::Test
   # ------------------------------------------------------------------ S01: the two real providers
 
   def test_each_approved_real_profile_resolves_to_its_own_adapter
-    assert_equal "claude", Provider.resolve(profile: ImplementationProfile.for(CLAUDE), env: {}).kind
-    assert_equal "codex", Provider.resolve(profile: ImplementationProfile.for(CODEX), env: {}).kind
+    assert_equal "claude", Provider.resolve(profile: ImplementationProfile.for(CLAUDE), env: {},
+                                            working_directory: working_directory).kind
+    assert_equal "codex", Provider.resolve(profile: ImplementationProfile.for(CODEX), env: {},
+                                           working_directory: working_directory).kind
   end
 
   def test_the_assignments_exact_profile_selects_the_matching_provider
     assert_equal "claude",
-                 Provider.resolve(profile: assignment_for(CLAUDE).selected_implementation_profile, env: {}).kind
+                 Provider.resolve(profile: assignment_for(CLAUDE).selected_implementation_profile, env: {},
+                                  working_directory: working_directory).kind
     assert_equal "codex",
-                 Provider.resolve(profile: assignment_for(CODEX).selected_implementation_profile, env: {}).kind
+                 Provider.resolve(profile: assignment_for(CODEX).selected_implementation_profile, env: {},
+                                  working_directory: working_directory).kind
   end
 
   # The claim is compared AS IT ARRIVED. A padded, differently cased provider names nothing in the
@@ -121,7 +125,9 @@ class SpecificationProviderSelectionTest < Minitest::Test
   # ------------------------------------------------------------------ S04: nothing else can run
 
   def test_no_profile_refuses_and_names_only_the_two_real_providers
-    error = assert_raises(Provider::Unavailable) { Provider.resolve(profile: nil, env: {}) }
+    error = assert_raises(Provider::Unavailable) do
+      Provider.resolve(profile: nil, env: {}, working_directory: working_directory)
+    end
 
     assert_includes error.message, "no specification generation provider is configured"
     assert_includes error.message, "claude"
@@ -212,7 +218,7 @@ class SpecificationProviderSelectionTest < Minitest::Test
       assignment: assignment_for(executor),
       settings: Settings.new({ "repository_roots" => { "SpecRelay/SpecRelay-Specs" => specs } }, env: {}),
       config: config_with(nil),
-      env: { "SPECRELAY_RUNNER_WORKSPACE_ROOT" => source, "HOME" => source },
+      env: { "SPECRELAY_RUNNER_WORKSPACE_ROOT" => source, "HOME" => source, "PATH" => ENV["PATH"] },
       workspaces: workspaces
     )
   end
@@ -232,6 +238,11 @@ class SpecificationProviderSelectionTest < Minitest::Test
     YAML
     SpecrelayRunner::Config.load(path)
   end
+
+  # The prepared task environment a real run would hand the provider. These examples are about
+  # WHICH provider is resolved, so an ordinary directory is enough — what matters is that the
+  # boundary now requires one at all.
+  def working_directory = @working_directory ||= Dir.mktmpdir("specrelay-spec-task-")
 end
 
 # MVP-0028 remediation slice 1, defect 8 — what the runner tells an operator about Jira.

@@ -50,7 +50,8 @@ class SpecificationCodexProviderGenerationTest < Minitest::Test
 
   def provider_for(result:, lines: [], stderr_lines: [], env: {})
     runner = FakeCommandRunner.new(result: result, lines: lines, stderr_lines: stderr_lines)
-    [ Provider::Codex.new(profile: profile, env: env, command_runner: runner), runner ]
+    [ Provider::Codex.new(profile: profile, env: env, working_directory: working_directory,
+                          command_runner: runner), runner ]
   end
 
   def ok(duration_seconds: 1.2) =
@@ -165,7 +166,8 @@ class SpecificationCodexProviderGenerationTest < Minitest::Test
             "result" => JSON.generate(VALID_DOCUMENTS))
     ])
     Provider::Claude.new(profile: SpecrelayRunner::ClaudeProfile.new(SpecrelayRunner::ClaudeProfile::CANONICAL),
-                         env: {}, command_runner: claude_runner).generate(packet)
+                         env: {}, working_directory: working_directory,
+                         command_runner: claude_runner).generate(packet)
 
     assert_equal claude_runner.calls.fetch(0).argv.last, codex_runner.calls.fetch(0).stdin_data
   end
@@ -216,7 +218,8 @@ class SpecificationCodexProviderGenerationTest < Minitest::Test
   def test_a_launch_error_is_a_bounded_generation_failure
     runner = Object.new
     def runner.run(*, **) = raise(Errno::ENOENT, "/usr/local/bin/codex")
-    provider = Provider::Codex.new(profile: profile, env: {}, command_runner: runner)
+    provider = Provider::Codex.new(profile: profile, env: {}, working_directory: working_directory,
+                                   command_runner: runner)
 
     error = assert_raises(Provider::Failed) { provider.generate({}) }
 
@@ -300,4 +303,9 @@ class SpecificationCodexProviderGenerationTest < Minitest::Test
 
     assert_includes unusable(lines), SpecrelayRunner::CodexStream::FAILURE_INCOMPLETE
   end
+
+  # The prepared task environment a real run hands the provider. These examples are about the
+  # stream and the file map, so an ordinary directory is enough; what matters is that the
+  # boundary requires one at all.
+  def working_directory = @working_directory ||= Dir.mktmpdir("specrelay-spec-task-")
 end

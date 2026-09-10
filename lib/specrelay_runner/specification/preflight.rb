@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require "fileutils"
+
 module SpecrelayRunner
   module Specification
     # Everything that must be true BEFORE the first output byte exists (MVP-0026 scope 8).
@@ -19,6 +21,20 @@ module SpecrelayRunner
     # isolated workspace before launching the provider" as an ordering the code cannot get
     # wrong rather than a rule the orchestrator has to remember.
     #
+    # Workspace-grounded generation gave it a SECOND creation, and the two are different in
+    # kind. The ticket's
+    # canonical TASK WORKSPACE is the prepared multi-repository source state a specification is
+    # written from: the provider runs there, Graphify and Context+ resolve there, and the package
+    # is materialized there. It is built through the project's own `bin/worktree` — the same
+    # single authority the implementation lane uses, so the two lanes cannot disagree about what
+    # a task environment is — and it is deliberately built BEFORE evidence gathering, because
+    # evidence gathered anywhere else would describe a checkout the provider never sees.
+    #
+    # A refusal after that point therefore no longer means "nothing was created". It still means
+    # no output file was written, which is the property criterion 5 asks for; the task workspace
+    # is a durable, inspectable environment the operator's own tooling created and owns, and this
+    # class never cleans one up to make a failure look tidier.
+    #
     # The ORDER is deliberate and is part of the contract. Checks run cheapest-and-most-
     # fundamental first, so the operator is told the one thing they must fix first rather
     # than the last thing that happened to fail. An assignment that names no repository can
@@ -32,6 +48,13 @@ module SpecrelayRunner
       ASSIGNMENT_MALFORMED = "assignment_malformed"
       SPECIFICATION_REPOSITORY_UNRESOLVED = "specification_repository_unresolved"
       SPECIFICATION_FOLDER_UNSAFE = "specification_folder_unsafe"
+      # The source state a specification must be grounded in could not be resolved. It now covers
+      # three conditions, because all three are that one fact and each carries its own remedy in
+      # the message: the workspace mapping is missing, the ticket's canonical task environment
+      # could not be built or reused, or the ticket's accepted implementation could not be placed
+      # in it. They are deliberately NOT three tokens: the generation-result contract's failure
+      # classes are a closed set this delivery is not authorized to widen, and a class the
+      # contract refuses would be worse than one message an operator has to read.
       SOURCE_WORKSPACE_UNRESOLVED = "source_workspace_unresolved"
       # MAPIAI-62 — this runner cannot hold a package workspace: its state root is unusable, sits
       # inside one of the operator's checkouts (review-001 F1), the seed has no resolvable commit,
@@ -78,10 +101,173 @@ module SpecrelayRunner
       #
       # `seed_root` is the operator's checkout, and it is named that way on purpose: it is a
       # validated git seed and credential source, never a destination. `workspace` is the
-      # Runner-owned isolated worktree the package is written into (MAPIAI-62 design 1).
-      Ready = Struct.new(:package_path, :seed_root, :workspace, :source, :inputs, :provider, :revision,
+      # Runner-owned isolated worktree the package is SNAPSHOTTED into for publication, and
+      # `task_root` is the ticket's canonical task workspace the provider runs in and the package
+      # is materialized into.
+      #
+      # `task_reused` is false when THIS run built the environment. It is evidence rather than
+      # control flow by the time it reaches here — the one decision that depends on it, how an
+      # accepted implementation is placed, is already made below.
+      #
+      # `repository_state` is that environment as it stood the instant before the provider was
+      # launched, captured by {repository_state}. It travels forward because the only honest way
+      # to say what a provider changed is to compare with what was there first; asking the tree
+      # afterwards answers a different question, and answers it wrongly for any provider that
+      # committed.
+      # `workspace_root` is the operator's MAIN workspace checkout — the directory the task
+      # environment is built inside. It is carried for one reason: it is a private local path,
+      # the task workspace is no longer it, and a generated document that echoed it would put
+      # this machine's layout into a durable specification.
+      Ready = Struct.new(:package_path, :seed_root, :workspace_root, :task_root, :task_reused,
+                        :workspace, :source, :inputs, :provider, :revision, :repository_state,
                         keyword_init: true) do
         def refused? = false
+      end
+
+      BOUNDARY_TIMEOUT_SECONDS = 120
+
+      # THE STATE of a prepared task environment, and what it means for it to have changed.
+      #
+      # ONE authority, because three callers ask about the same environment at three moments and
+      # must not disagree: this class asks it to decide whether an EXISTING environment may be
+      # reused, it asks it again to record the state a provider is about to be let loose in, and
+      # {Generation} asks it afterwards to decide whether the result may be published. A second
+      # implementation is how a run could reuse an environment it would then refuse to publish
+      # from — or, worse, publish one it never actually measured.
+      #
+      # The state is captured PER REPOSITORY, over every git root the environment CONTAINS. The
+      # workspace repository's own status cannot see inside an independent checkout, and the
+      # inspected set is deliberately not derived from the identity map: a repository whose
+      # `origin` this product does not recognise is still a repository the provider can rewrite,
+      # and deriving the set from identity is what let a re-pointed remote remove one from
+      # measurement entirely.
+      #
+      # What is recorded is the minimum that makes a mutation detectable and nothing more: the
+      # branch, the head, the `origin` value, and the change set. A commit, a reset, a branch
+      # switch and a replaced remote all move one of the first three; ordinary work moves the
+      # last. No file contents, no index state, no timestamps — this is a comparison, not a
+      # backup, and it deliberately adds no watcher, lock or snapshot store.
+      #
+      # NIL is a refusal input, never an empty answer: an environment that cannot be inspected is
+      # not an unchanged one.
+      #
+      # `--untracked-files=all` is load-bearing rather than thorough. Git's DEFAULT collapses an
+      # untracked directory to its own name, so an environment whose specification root is itself
+      # untracked reports that root — the ANCESTOR of the allowed path — and every run would refuse
+      # for a directory it was told to write in. Asking for files makes each path comparable on its
+      # own terms, and a stray file beside the package is still seen individually.
+      #
+      # Read-only. Nothing here stages an intent-to-add, so asking leaves every index untouched.
+      def self.repository_state(task_root:, env: ENV)
+        contained = ContainedRepositories.discover(task_root)
+        return nil unless contained.ok?
+
+        ([ task_root ] + contained.roots.to_a).each_with_object({}) do |root, state|
+          prefix = contained_prefix(task_root, root)
+          return nil if prefix.nil?
+          # The task root is normally a git worktree and so is discovered as well; keying by its
+          # place in the environment is what makes the two spellings one repository.
+          next if state.key?(prefix)
+
+          facts = repository_facts(root, prefix, env)
+          return nil if facts.nil?
+
+          state[prefix] = facts
+        end
+      end
+
+      # The offending task-relative paths of a captured state, or `[]` when only the allowed
+      # directory changed. Kept separate from {repository_state} because the state is a fact about
+      # the environment while "allowed" is a fact about this run.
+      def self.changes_outside_package(state, allowed)
+        state.values.flat_map { |facts| facts[:changes] }
+             .reject { |path| path == allowed || path.start_with?("#{allowed}/") }
+      end
+
+      # WHAT CHANGED in a prepared task environment, outside one allowed directory, as a single
+      # question. This is the reuse-time form: there is no earlier state to compare against, so
+      # the environment is judged on what it currently holds.
+      def self.changes_outside(task_root:, allowed:, env: ENV)
+        state = repository_state(task_root: task_root, env: env)
+        state && changes_outside_package(state, allowed)
+      end
+
+      # WHAT THE PROVIDER DID, as the difference between the state captured before it ran and the
+      # state now, plus anything the environment holds outside the allowed directory.
+      #
+      # Both halves are needed and neither implies the other. A provider that COMMITS its change
+      # leaves a clean status and is only visible as a moved head; a provider that drops a scratch
+      # file leaves the head alone. Each entry names the repository by its task-relative path and
+      # states the fact, never the value — an `origin` can carry credential userinfo, and this
+      # text travels to Platform.
+      def self.state_differences(before:, after:, allowed:)
+        (before.keys - after.keys).map { |prefix| "#{named(prefix)}: the repository is gone" } +
+          (after.keys - before.keys).map { |prefix| "#{named(prefix)}: a repository appeared here" } +
+          (before.keys & after.keys).flat_map { |prefix| moved(prefix, before[prefix], after[prefix]) } +
+          changes_outside_package(after, allowed).sort
+      end
+
+      # The three facts a provider must leave exactly as it found them.
+      def self.moved(prefix, before, after)
+        { branch: "its checked-out branch", head: "its head commit",
+          origin: "its `origin` remote" }.filter_map do |fact, description|
+          "#{named(prefix)}: #{description} changed" unless before[fact] == after[fact]
+        end
+      end
+
+      def self.named(prefix) = prefix.empty? ? "the workspace repository" : prefix
+
+      # One repository's comparable state, or nil when git could not answer at all. A missing
+      # `origin` or an unborn head is a legitimate state and compares as such; a failed `status`
+      # is not, because it means the tree was not measured.
+      def self.repository_facts(root, prefix, env)
+        status = git_result(root, %w[status --porcelain --untracked-files=all], env)
+        return nil if status.nil?
+
+        { branch: git_value(root, %w[rev-parse --abbrev-ref HEAD], env),
+          head: git_value(root, %w[rev-parse HEAD], env),
+          origin: git_value(root, %w[remote get-url origin], env),
+          changes: changed_paths(status, prefix) }
+      end
+
+      def self.git_result(root, args, env)
+        result = CommandRunner.run(
+          [ "git", "-C", root, *args ], chdir: root,
+          env: { "PATH" => env["PATH"].to_s }, timeout_seconds: BOUNDARY_TIMEOUT_SECONDS
+        )
+        result.exit_code.to_i.zero? ? result.stdout.to_s : nil
+      rescue SystemCallError
+        nil
+      end
+
+      def self.git_value(root, args, env) = git_result(root, args, env)&.strip
+
+      def self.changed_paths(status, prefix)
+        status.each_line.filter_map do |line|
+          path = changed_path(line)
+          next if path.nil?
+
+          prefix.empty? ? path : "#{prefix}/#{path}"
+        end
+      end
+
+      # Where a contained repository sits inside the task environment. Resolved through real paths
+      # on both sides, so a symlinked or `/private`-prefixed root cannot make a contained
+      # repository look like a sibling of the environment.
+      def self.contained_prefix(task_root, root)
+        task = File.realpath(task_root)
+        resolved = File.realpath(root)
+        resolved == task ? "" : resolved.delete_prefix("#{task}/")
+      rescue SystemCallError
+        nil
+      end
+
+      # `XY <path>`, or `XY <old> -> <new>` for a rename, where the new name is the one on disk.
+      def self.changed_path(line)
+        entry = line.chomp[3..].to_s
+        return nil if entry.empty?
+
+        entry.include?(" -> ") ? entry.split(" -> ").last : entry
       end
 
       def self.call(**kwargs) = new(**kwargs).call
@@ -157,27 +343,135 @@ module SpecrelayRunner
         blocked = check_inputs(inputs)
         return blocked if blocked
 
-        source = source_gatherer.gather(root: source_root, settings: settings, env: env)
+        # The ticket's canonical task workspace, and the accepted implementation it
+        # must hold. Everything below reads and runs THERE: gathering evidence from the operator's
+        # main checkout and then launching the provider somewhere else would produce a technical
+        # analysis about a tree the writer never saw.
+        task = prepare_task_workspace(source_root, package)
+        return task if task.is_a?(Refusal)
+
+        accepted = materialize_previous_accepted(task)
+        return accepted if accepted
+
+        source = source_gatherer.gather(root: task.path, settings: settings, env: env)
         tools = check_tools(source)
         return tools if tools
 
-        provider = resolve_provider(profile)
+        provider = resolve_provider(profile, task.path)
         return provider if provider.is_a?(Refusal)
 
         redaction = check_redaction
         return redaction if redaction
 
-        revision = resolve_revision(seed, package)
+        revision = resolve_revision(seed, package, task)
         return revision if revision.is_a?(Refusal)
 
-        # LAST, and only once every read-only check has passed. The isolated workspace is the
-        # first and only thing this class creates, so "a refusal wrote nothing" stays a property
-        # of the control flow: there is no path from any `refuse` above to this line.
+        # The BASELINE, taken after everything this class legitimately places in the environment
+        # and before anything else can touch it. Later is not an option: from here on the only
+        # writer is the provider, and a baseline taken after it would describe its own work.
+        state = capture_repository_state(task)
+        return state if state.is_a?(Refusal)
+
+        # LAST, and only once every read-only check has passed. The isolated workspace holds the
+        # publication snapshot and nothing else, so it is created after everything that could
+        # still refuse: there is no path from any `refuse` above to this line.
         workspace = create_workspace(seed, package)
         return workspace if workspace.is_a?(Refusal)
 
-        Ready.new(package_path: package, seed_root: seed, workspace: workspace, source: source,
-                  inputs: inputs, provider: provider, revision: revision)
+        Ready.new(package_path: package, seed_root: seed, workspace_root: source_root,
+                  task_root: task.path, task_reused: !task.created?, workspace: workspace,
+                  source: source, inputs: inputs, provider: provider, revision: revision,
+                  repository_state: state)
+      end
+
+      # The ticket's canonical task workspace, created or reused through the project's own
+      # command — {Workspace} is the single authority for what a task environment IS, and the
+      # implementation lane builds one exactly this way. A project whose task environment is
+      # several repositories can only be assembled by the project itself, so nothing here knows
+      # or invents a layout.
+      #
+      # An existing worktree carrying uncommitted work is refused by that owner rather than
+      # reused: a specification written on top of somebody else's half-finished change would
+      # describe a tree that is not in any repository.
+      def prepare_task_workspace(source_root, package)
+        owner = task_workspace_owner(source_root)
+        existing = owner.existing
+        return reuse_task_workspace(existing, package) if existing
+
+        owner.create
+      rescue Workspace::Error => e
+        refuse(SOURCE_WORKSPACE_UNRESOLVED, task_unavailable_message(e.message))
+      end
+
+      def task_workspace_owner(source_root)
+        Workspace.new(root: source_root, canonical_branch: assignment.canonical_branch,
+                      task_id: assignment.task_id, create_command: assignment.worktree_create_command,
+                      env: { "PATH" => env["PATH"].to_s })
+      end
+
+      # An environment that already exists is REUSED when everything changed in it is inside this
+      # ticket's own package directory.
+      #
+      # `Workspace#create`'s own rule — refuse any uncommitted change — is right for the
+      # implementation lane and wrong here, and the difference is this lane's own output: a
+      # successful generation deliberately LEAVES the package in the environment, so that rule
+      # would refuse every re-run and every revision of a ticket this runner had already
+      # generated. What must not be reused is an environment holding work this lane did not do,
+      # which is exactly the boundary {changes_outside} draws — asked here with the same authority
+      # that will judge the result, so reuse and publication cannot disagree.
+      def reuse_task_workspace(existing, package)
+        outside = self.class.changes_outside(task_root: existing.path, env: env,
+                                             allowed: package.relative_package_path)
+        return refuse(SOURCE_WORKSPACE_UNRESOLVED, task_unavailable_message(UNINSPECTABLE)) if outside.nil?
+        return existing if outside.empty?
+
+        refuse(SOURCE_WORKSPACE_UNRESOLVED,
+               task_unavailable_message("it holds #{outside.length} change(s) outside " \
+                                        "#{package.relative_package_path}: " \
+                                        "#{outside.sort.first(5).join(', ')}. Preserve or release " \
+                                        "the task workspace before retrying"))
+      end
+
+      # An environment that cannot be measured cannot be handed to a provider: there would be no
+      # way afterwards to say what the provider did in it.
+      def capture_repository_state(task)
+        self.class.repository_state(task_root: task.path, env: env) ||
+          refuse(SOURCE_WORKSPACE_UNRESOLVED, task_unavailable_message(UNINSPECTABLE))
+      end
+
+      UNINSPECTABLE = "its repositories could not be inspected"
+
+      def task_unavailable_message(reason)
+        "the task workspace for #{assignment.task_id} could not be prepared: #{reason}. A " \
+          "specification is written from the ticket's own prepared source state, so generation " \
+          "stops here rather than inventing one."
+      end
+
+      # The implementation lane's own verification authority, reused rather than re-implemented:
+      # every accepted repository is proved against GitHub's CURRENT state before anything reads
+      # the tree.
+      #
+      # How it is PLACED depends on who built the environment, and only that. A workspace this run
+      # created is put at the exact accepted heads. A reused one is RECONCILED instead: it may
+      # already hold newer work for the ticket, and resetting it to the older heads would move the
+      # run backward. What a reused workspace does not get is a pass — skipping the proof for one
+      # is how a worktree left behind on another runner came to generate a specification from code
+      # this ticket never accepted.
+      def materialize_previous_accepted(task)
+        package = assignment.previous_accepted_claim(env: env).package
+        return nil if package.nil?
+
+        result = task.created? ? package.materialize(task_root: task.path)
+                               : package.reconcile(task_root: task.path)
+        result.ok? ? nil : refuse(SOURCE_WORKSPACE_UNRESOLVED, accepted_unusable_message(result))
+      end
+
+      # The accepted implementation is part of the ticket's CURRENT state, so a head this machine
+      # cannot confirm stops the run instead of being analysed around.
+      def accepted_unusable_message(result)
+        "#{result.reason}. The ticket's accepted implementation is part of the source state a " \
+          "specification for it must be written from, so generation stops here rather than " \
+          "analysing code it cannot confirm was shipped."
       end
 
       # The workspace, created from the seed at the seed's own resolved HEAD. A sweep runs first
@@ -222,7 +516,7 @@ module SpecrelayRunner
       # request must exist, be open, target the configured base, and belong to this repository)
       # against `specification_target`'s facts rather than `publication`'s — the only section
       # available this early — then reads the previous package off its branch.
-      def resolve_revision(seed, package)
+      def resolve_revision(seed, package, task)
         url = assignment.revision_pull_request_url
         return nil if url.empty?
 
@@ -239,7 +533,29 @@ module SpecrelayRunner
                                                      package_path: package.relative_package_path)
         return refuse(SPECIFICATION_REVISION_UNREADABLE, previous.message) unless previous.ok?
 
-        previous
+        materialize_revision(task, package, previous) || previous
+      end
+
+      # The pull request's CURRENT package, placed in the ticket package directory the provider
+      # works in. The packet already carries the previous text; this is what
+      # lets a provider that reads its working directory revise the real files rather than a copy
+      # of them, and it is the same directory the new package replaces, so nothing lands outside
+      # the one path this run is allowed to change.
+      #
+      # Every name comes from `git ls-tree` under the package path, so it is repository-relative
+      # and cannot traverse: git trees carry no `..` and no absolute entry.
+      def materialize_revision(task, package, previous)
+        destination = package.absolute_in(task.path)
+        FileUtils.rm_rf(destination)
+        previous.files.each do |name, content|
+          target = File.join(destination, name)
+          FileUtils.mkdir_p(File.dirname(target))
+          File.write(target, content)
+        end
+        nil
+      rescue PackagePath::Unsafe, SystemCallError, IOError => e
+        refuse(SPECIFICATION_REVISION_UNREADABLE,
+               "the previous specification package could not be placed in the task workspace: #{e.class}")
       end
 
       # The operator's local clone of the specification repository, resolved as a SEED
@@ -431,12 +747,15 @@ module SpecrelayRunner
         refuse(GENERATION_PROVIDER_UNAVAILABLE, e.message)
       end
 
-      def resolve_provider(profile)
+      def resolve_provider(profile, working_directory)
         # Provider.resolve turns a nil profile into a refusal rather than a quiet substitute. The
         # message is Provider's own except when Platform selected a profile this lane has no
         # provider for — the fixture — where naming the selection is the difference between an
         # operator re-reading their YAML and going back to the screen they chose it on.
-        @injected_provider || Provider.resolve(profile: profile, env: env)
+        #
+        # `working_directory` is the prepared task workspace. It is bound
+        # HERE, where the workspace is known, so no provider can be constructed without one.
+        @injected_provider || Provider.resolve(profile: profile, env: env, working_directory: working_directory)
       rescue Provider::Unavailable => e
         refuse(GENERATION_PROVIDER_UNAVAILABLE, provider_unavailable_message(e))
       end

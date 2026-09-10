@@ -408,7 +408,10 @@ class SpecificationGenerationTest < Minitest::Test
     assert_equal "failed", generation["outcome"]
     refute generation["zero_output_files_written"], "the package IS on disk; the report must say so"
     assert_includes generation["message"], PACKAGE
-    assert File.file?(File.join(worktree, PACKAGE, "spec.md")), "the package landed before the failure"
+    # The manifest digest is taken in the TASK environment, which is where the package lands
+    # first — so a failure there means the package is on disk and the publication snapshot is not.
+    assert File.file?(File.join(task_worktree, PACKAGE, "spec.md")), "the package landed before the failure"
+    refute File.exist?(File.join(worktree, PACKAGE)), "the snapshot is only taken after the digest"
     # The workspace is reported so the run page can say which machine holds it and until when.
     assert_match(/\Aswp_/, generation.dig("package_workspace", "id").to_s)
     assert_equal before, SpecificationWorkspace.checkout_snapshot(@specs)
@@ -431,16 +434,44 @@ class SpecificationGenerationTest < Minitest::Test
   # The package lives in the Runner-owned worktree, found through the store rather than at a
   # path a test could predict — the workspace id is opaque and random by design.
   def worktree = SpecificationWorkspace.isolated_worktree(@temp)
+
+  # The ticket's task environment, where the package is materialized.
+  def task_worktree = SpecificationWorkspace.task_worktree(@source, ISSUE)
   def read_package(name) = File.read(File.join(worktree, PACKAGE, name))
 
-  # Leaves the directory itself in place — the point is a checkout that RESOLVES and contains
-  # nothing readable, which is a different condition from a missing workspace root.
+  # A checkout that RESOLVES, can still build the ticket's task environment, and contains nothing
+  # readable to write a specification from. That is a different condition from a missing workspace
+  # root, and — since generation is grounded in the task environment — a different condition from
+  # a wiped directory: removing `.git` and the project's own `bin/worktree` would refuse for a
+  # missing environment rather than exercise the zero-source path this asserts about.
+  #
+  # The removal is COMMITTED, because the task environment is built from this checkout's history.
   def empty_the_source_checkout
     Dir.glob(File.join(@source, "*"), File::FNM_DOTMATCH).each do |path|
-      next if path.end_with?("/.", "/..")
+      next if path.end_with?("/.", "/..", "/.git")
 
       FileUtils.remove_entry(path)
     end
+    SpecificationWorkspace.git!(@source, "add", "-A")
+    SpecificationWorkspace.git!(@source, "-c", "user.email=fixture@specrelay.local",
+                                "-c", "user.name=SpecRelay Fixture", "commit", "-q",
+                                "-m", "empty the readable source")
+    restart_platform_without_project_tooling
+  end
+
+  # The workspace's OWN create command, because a checkout with nothing in it has no
+  # `bin/worktree` either — and that is the path the assignment's `worktree_create_command`
+  # exists for. Restated as a fresh claim so the runner reads it.
+  def restart_platform_without_project_tooling
+    @platform.stop
+    @platform = FakePlatform.new(
+      claim_payload: spec_creation_payload_for(
+        issue_key: ISSUE,
+        worktree_create_command: "git worktree add -b #{ISSUE} .runs/worktrees/#{ISSUE} HEAD"
+      )
+    ).start
+    @config = build_config
+    @io = StringIO.new
   end
 
   def rebuild_with(graph:, graphify_substitute: nil)

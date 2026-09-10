@@ -7,14 +7,20 @@ module SpecrelayRunner
     # Orchestrates ONE claimed specification-creation assignment end to end (MVP-0026).
     #
     # The specification lane's counterpart to {Execution}, and deliberately a sibling rather
-    # than a mode of it: the two share a claim identity, a lease, and an API client, and
-    # nothing else. This one creates no worktree, launches no executor, runs no project test
-    # command, uploads no execution report, publishes no branch, and touches no Jira field.
-    # Those absences are structural — there is no code here that could do them.
+    # than a mode of it: the two share a claim identity, a lease, an API client and the ticket's
+    # ONE canonical task workspace, and nothing else. This one launches
+    # no executor, runs no project test command, uploads no execution report, publishes no
+    # branch, creates no component pull request, and touches no Jira field. Those absences are
+    # structural — there is no code here that could do them.
     #
     # The order is the contract:
     #
-    #   preflight -> (refuse and stop) | gather -> generate -> validate -> write -> report
+    #   preflight -> (refuse and stop) | gather -> generate -> validate -> bound -> write -> report
+    #
+    # `bound` sits where it does deliberately. The provider ran with
+    # the prepared task workspace as its working directory, so it could have written anywhere in
+    # it; the boundary is measured after the provider and BEFORE the package is written, so a run
+    # that changed more than its own ticket package produces no package to publish at all.
     #
     # Preflight runs FIRST and writes nothing, so criterion 6's "proof that zero output files
     # were written" is a property of the control flow rather than of a cleanup routine. Every
@@ -93,17 +99,75 @@ module SpecrelayRunner
         start_heartbeater(assignment)
         log("Preflight passed. Generating with #{ready.provider.describe}.")
         documents = produce(ready)
+        check_change_boundary!(ready)
         checkpoint!
         written = write_package(assignment, ready, documents)
         checkpoint!
         report_success(assignment, ready, written, documents)
       rescue Aborted => e
         aborted(e)
-      rescue Provider::Failed, DocumentSet::Invalid, PackageWriter::Error, PackagePath::Unsafe,
-             PackageWorkspace::Error => e
+      rescue Provider::Failed, DocumentSet::Invalid, PackageWriter::Error,
+             PackagePath::Unsafe, PackageWorkspace::Error => e
         fail_generation(ready, e)
       ensure
         @heartbeater&.stop
+      end
+
+      # WHAT THE PROVIDER CHANGED in the prepared task workspace, and the refusal when it changed
+      # anything but this ticket's own package directory.
+      #
+      # Measured as a DIFFERENCE against the state preflight captured before launching it, not as
+      # a reading of the tree now. The tree alone cannot answer the question: a provider that
+      # commits its edit, replaces a remote or removes a whole checkout leaves a `git status` that
+      # is clean or silent, and every one of those changes the source state the specification
+      # claims to be grounded in.
+      #
+      # The provider ran with that workspace as its working directory — which is the point, since
+      # a specification has to be written from the real source state — so bounding what it may
+      # LEAVE BEHIND is what keeps that safe. The check runs after the provider and before the
+      # write, so a run that changed too much produces no package at all.
+      #
+      # It never reverts what it found. Cleaning an out-of-scope change to make a run succeed
+      # would destroy the only evidence of what the provider did, and would report a specification
+      # as generated from a tree nobody can now inspect.
+      #
+      # {Provider::Failed} is the failure this raises, and it is the existing boundary rather than
+      # a new one for the occasion: the provider ran and did not produce a usable package, which
+      # is exactly what that class means and exactly the `generation_provider_failed` the contract
+      # already closes over. What distinguishes this case from a provider that crashed is the
+      # message, which names the paths.
+      def check_change_boundary!(ready)
+        allowed = ready.package_path.relative_package_path
+        after = Preflight.repository_state(task_root: ready.task_root, env: env)
+        raise Provider::Failed, unmeasurable_message if after.nil?
+
+        changed = Preflight.state_differences(before: ready.repository_state, after: after,
+                                              allowed: allowed)
+        return if changed.empty?
+
+        raise Provider::Failed,
+              "the generation provider changed #{changed.length} thing(s) outside #{allowed}: " \
+              "#{changed.sort.first(10).join('; ')}. The prepared task workspace was left exactly " \
+              "as the provider left it so the change can be inspected."
+      end
+
+      # Nil from {Preflight.repository_state} means the environment could not be inspected, which is
+      # not the same as "nothing changed" — the distinction {Execution} keeps for its own change
+      # measurement, kept here for the same reason.
+      def unmeasurable_message
+        "the prepared task workspace could not be inspected, so this generation cannot be shown " \
+          "to have changed only its own package"
+      end
+
+      # The repositories the prepared environment was proved to hold, for the reported evidence.
+      # Discovered through the one authority that answers that question.
+      #
+      # The empty fallback is not a fail-open: an environment that could not be inspected has
+      # already ended the run at {#check_change_boundary!}, which refuses on the same discovery
+      # failure. By the time this is read, discovery has succeeded once for this workspace.
+      def contained_identities(ready)
+        discovered = ContainedRepositories.discover(ready.task_root)
+        discovered.ok? ? discovered.paths_by_identity.keys.sort : []
       end
 
       # Build the packet, call the provider, and validate what comes back — all before any
@@ -151,7 +215,9 @@ module SpecrelayRunner
       # authorized to publish, and the local copy says what this workspace was created to hold.
       def write_package(assignment, ready, documents)
         written = PackageWriter.call(package_path: ready.package_path,
-                                     destination_root: ready.workspace.worktree_root,
+                                     destination_root: ready.task_root,
+                                     snapshot_root: ready.workspace.worktree_root,
+                                     workspace_root: ready.workspace_root,
                                      documents: documents, assignment: assignment,
                                      provider: ready.provider, source: ready.source,
                                      inputs: ready.inputs, clock: clock)
@@ -176,9 +242,11 @@ module SpecrelayRunner
         written.files.each { |file| log("  #{file.path}  sha256:#{file.sha256[0, 16]}…  #{file.bytes} bytes") }
         written.warnings.each { |warning| log("  warning: #{warning}") }
         log("")
-        log("The package is held in this runner's own isolated worktree, not in your specification")
-        log("checkout, which is unchanged. Nothing was published: no branch, no commit, no push, no")
-        log("pull request, no Jira field write, and no approval transition.")
+        log("The package is in this ticket's task worktree at #{written.relative_package_path},")
+        log("beside the code it describes — open it there. This runner also holds a verified")
+        log("snapshot of the same bytes, which is what publication reads; you do not need to find")
+        log("it. Nothing was published: no branch, no commit, no push, no pull request, no Jira")
+        log("field write, and no approval transition.")
       end
 
       # A preflight refusal. Reported to Platform so the run leaves the claimable state and
@@ -277,6 +345,7 @@ module SpecrelayRunner
             "manifest" => written.manifest
           },
           "package_workspace" => workspace_block(ready.workspace),
+          "task_workspace" => task_workspace_block(ready),
           "tool_evidence" => tool_evidence(ready),
           # Source-inspection warnings travel with the rest. A zero-file inspection is the one
           # this exists for: it is the difference between a specification grounded in code and
@@ -332,6 +401,27 @@ module SpecrelayRunner
       end
 
       def claim_token = payload.dig("claim", "runner_execution_id").to_s
+
+      # WHICH task environment this specification was written in, and nothing about where it is on
+      # disk.
+      #
+      # The identity is Platform's own — the task id and canonical branch it assigned — plus the
+      # repositories the environment was PROVED to hold while the change boundary was measured.
+      # That pair is what makes "grounded in the real source state" checkable rather than claimed:
+      # a run reporting an empty repository list analysed an empty directory, whatever else it
+      # says. An absolute local path is deliberately absent, for the same reason the isolated
+      # workspace reports only an opaque id.
+      #
+      # `created` distinguishes an environment this run built from one it reused, because that is
+      # the fact a reviewer needs to know whether the accepted implementation was reconstructed.
+      def task_workspace_block(ready)
+        {
+          "task_id" => assignment.task_id,
+          "canonical_branch" => assignment.canonical_branch,
+          "created" => !ready.task_reused,
+          "repositories" => contained_identities(ready)
+        }
+      end
 
       def tool_evidence(ready)
         [ ready.source.graphify, ready.source.context_plus ].map do |tool|

@@ -47,15 +47,20 @@ module SpecrelayRunner
       # except which of the two decoders reads the process. A nil profile is the deterministic
       # fixture or no selection at all — neither is a model-backed specification writer, and both
       # refuse rather than falling back to something that would produce plausible prose.
-      def self.resolve(profile:, env: ENV)
+      #
+      # `working_directory` is the prepared task workspace and is REQUIRED, not defaulted. Every
+      # provider that spawns a process runs there, so that a specification is written from the
+      # ticket's real multi-repository source state; a default would let one be built that quietly
+      # ran somewhere else, which is the exact defect that replaced it.
+      def self.resolve(profile:, working_directory:, env: ENV)
         # `env` is forwarded, not defaulted. Process.spawn resolves the executable through the PATH
         # it is handed, so a provider built without it would look its command up on the runner
         # PROCESS's environment while every other stage — the readiness probe, the executor
         # mismatch guard — used the runner's own. That is the precise failure the profiles warn
         # about: "readiness pass against one CLI and execution run another".
         case profile
-        when ClaudeProfile then Claude.new(profile: profile, env: env)
-        when CodexProfile then Codex.new(profile: profile, env: env)
+        when ClaudeProfile then Claude.new(profile: profile, env: env, working_directory: working_directory)
+        when CodexProfile then Codex.new(profile: profile, env: env, working_directory: working_directory)
         else raise Unavailable, UNCONFIGURED
         end
       end
@@ -89,7 +94,7 @@ module SpecrelayRunner
 
         private
 
-        attr_reader :profile, :env, :command_runner
+        attr_reader :profile, :env, :working_directory, :command_runner
 
         # The provider's whole run, from the prompt to a parsed file map. Every rule about what a
         # usable answer IS lives here, once; the adapter supplies only its decoder and its launch.
@@ -139,6 +144,19 @@ module SpecrelayRunner
           <<~PROMPT
             You are writing a software specification package for SpecRelay, for a human reviewer
             with limited attention and no prior context on this ticket.
+
+            WORKING DIRECTORY — you are running inside this ticket's prepared task workspace. It
+            holds every repository the project registers, already on this ticket's canonical
+            branch and, when the ticket has one, already reconstructed at its previously accepted
+            implementation. READ FREELY: open source files, follow references, and ground the
+            technical analysis in what the code actually does rather than in the ticket alone. The
+            structural and semantic tooling in this workspace resolves against it.
+
+            The ONLY directory you may create, change, or delete anything in is
+            `#{packet.dig('package', 'relative_path')}`. A change anywhere else in the workspace — any
+            repository, any sibling path — ends this run with no specification written, so do not
+            edit, format, stage, commit, or clean anything outside it. You still return the
+            package as JSON below; writing the documents yourself is neither required nor useful.
 
             Return ONLY a JSON object mapping file paths to file contents, with no prose before or
             after it and no code fence. The keys must be exactly "spec.md", "#{PackagePath::INPUT_EVIDENCE_MD}",
@@ -312,9 +330,10 @@ module SpecrelayRunner
 
         KIND = "claude"
 
-        def initialize(profile:, env: ENV, command_runner: CommandRunner)
+        def initialize(profile:, working_directory:, env: ENV, command_runner: CommandRunner)
           @profile = profile
           @env = env
+          @working_directory = working_directory.to_s
           @command_runner = command_runner
         end
 
@@ -334,13 +353,16 @@ module SpecrelayRunner
 
         # The packet reaches the model as ONE argv element, exactly as the implementation lane
         # delivers this profile's prompt.
+        #
+        # In the prepared task workspace, not a throwaway directory. That is the whole of
+        # workspace-grounded generation at this boundary: the model's own tools resolve the
+        # ticket's real multi-repository source state, and what it may WRITE there is bounded
+        # afterwards by the change-boundary check rather than by giving it nothing to read.
         def launch(prompt, stream)
-          Dir.mktmpdir("specrelay-spec-claude-") do |workdir|
-            command_runner.run([ profile.command, *profile.args, prompt ], chdir: workdir,
-                                                                          env: child_env,
-                                                                          timeout_seconds: profile.timeout_seconds,
-                                                                          on_output: stream.sink)
-          end
+          command_runner.run([ profile.command, *profile.args, prompt ], chdir: working_directory,
+                                                                        env: child_env,
+                                                                        timeout_seconds: profile.timeout_seconds,
+                                                                        on_output: stream.sink)
         end
       end
 
@@ -356,9 +378,10 @@ module SpecrelayRunner
 
         KIND = "codex"
 
-        def initialize(profile:, env: ENV, command_runner: CommandRunner)
+        def initialize(profile:, working_directory:, env: ENV, command_runner: CommandRunner)
           @profile = profile
           @env = env
+          @working_directory = working_directory.to_s
           @command_runner = command_runner
         end
 
@@ -370,18 +393,17 @@ module SpecrelayRunner
 
         private
 
-        # Run in a throwaway directory, not in either checkout. A provider that decides to write
-        # next to itself then cannot touch the specification repository or the source tree — the
-        # atomicity guarantee in scope 10 is only as strong as the set of places something can
-        # write. The prompt goes on stdin because that is this profile's approved delivery.
+        # In the prepared task workspace, the same directory the Claude provider runs in. One rule
+        # for every provider that spawns a process: two packages written from different source
+        # state would not be comparable, and the boundary on what may be WRITTEN there is the
+        # change-boundary check rather than the absence of anything to read. The prompt goes on
+        # stdin because that is this profile's approved delivery.
         def launch(prompt, stream)
-          Dir.mktmpdir("specrelay-spec-codex-") do |workdir|
-            command_runner.run([ profile.command, *profile.args ], chdir: workdir,
-                                                                   env: child_env,
-                                                                   timeout_seconds: profile.timeout_seconds,
-                                                                   stdin_data: prompt,
-                                                                   on_output: stream.sink)
-          end
+          command_runner.run([ profile.command, *profile.args ], chdir: working_directory,
+                                                                 env: child_env,
+                                                                 timeout_seconds: profile.timeout_seconds,
+                                                                 stdin_data: prompt,
+                                                                 on_output: stream.sink)
         rescue SystemCallError => e
           # A Codex CLI that cannot be started is a bounded generation failure rather than an
           # exception escaping the lane, which would leave the claim held with no recorded reason

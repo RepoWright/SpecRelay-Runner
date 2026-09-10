@@ -35,7 +35,7 @@ class SpecificationSeedResolutionTest < Minitest::Test
   # ------------------------------------------------------ S01: the seed is only a seed
 
   def test_the_reused_workspace_checkout_is_a_seed_and_receives_no_package
-    SpecificationWorkspace.git_init(@source, remote: "https://github.com/#{TARGET_SLUG}.git")
+    SpecificationWorkspace.repoint(@source, remote: "https://github.com/#{TARGET_SLUG}.git")
     before_source = SpecificationWorkspace.checkout_snapshot(@source)
     before_specs = SpecificationWorkspace.checkout_snapshot(@specs)
     start_platform
@@ -55,7 +55,7 @@ class SpecificationSeedResolutionTest < Minitest::Test
   def test_an_explicit_mapping_seeds_from_that_repository_and_leaves_both_checkouts_unchanged
     # The workspace checkout is ALSO a real git repo, but for a different repository entirely —
     # proving the explicit mapping wins regardless of what the workspace checkout's remote is.
-    SpecificationWorkspace.git_init(@source, remote: "https://github.com/SpecRelay/tiny-demo-workspace.git")
+    SpecificationWorkspace.repoint(@source, remote: "https://github.com/SpecRelay/tiny-demo-workspace.git")
     before_source = SpecificationWorkspace.checkout_snapshot(@source)
     before_specs = SpecificationWorkspace.checkout_snapshot(@specs)
     start_platform
@@ -72,7 +72,7 @@ class SpecificationSeedResolutionTest < Minitest::Test
   # ----------------------------------------------------------- S04: unverifiable seed refuses
 
   def test_a_workspace_checkout_with_the_wrong_remote_is_not_reused
-    SpecificationWorkspace.git_init(@source, remote: "https://github.com/SpecRelay/some-unrelated-repo.git")
+    SpecificationWorkspace.repoint(@source, remote: "https://github.com/SpecRelay/some-unrelated-repo.git")
     before = SpecificationWorkspace.checkout_snapshot(@source)
     start_platform
 

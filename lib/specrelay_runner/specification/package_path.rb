@@ -85,12 +85,24 @@ module SpecrelayRunner
       # The absolute destination inside ONE root, re-validated for containment. Recomputed
       # rather than memoized because this is the value that is actually written to, and the
       # containment check has to run against the root the caller is using now.
+      #
+      # Containment is judged on the REAL path, not on the spelling. `File.expand_path` resolves
+      # `..` textually and knows nothing about symbolic links, so a linked `specs` produced a
+      # destination that looked contained and resolved somewhere else — and this value is what a
+      # caller then deletes, creates a staging sibling of, renames into and copies from.
+      #
+      # The ROOT itself is allowed to be reached through a link: an operator's checkout, a home
+      # directory and a macOS temporary directory legitimately are, and refusing the spelling
+      # would refuse ordinary machines. What is judged is containment within what the root
+      # RESOLVES TO. A root that cannot be resolved at all is refused rather than assumed,
+      # because there is no safe destination inside a directory this process cannot find.
       def absolute_in(root)
-        base = File.expand_path(root.to_s)
+        base = resolved_root(root)
         resolved = File.expand_path(File.join(base, relative_package_path))
         raise Unsafe, "the resolved specification package path escapes its root" unless
           resolved.start_with?("#{base}/")
 
+        contain!(base, resolved)
         resolved
       end
 
@@ -99,6 +111,31 @@ module SpecrelayRunner
       def relative_file_paths = ALL_FILES.map { |name| "#{relative_package_path}/#{name}" }
 
       private
+
+      def resolved_root(root)
+        File.realpath(root.to_s)
+      rescue SystemCallError
+        raise Unsafe, "the root a specification package would be written into cannot be resolved"
+      end
+
+      # Every segment between the resolved root and the destination, proved not to be a symbolic
+      # link. Checked segment by segment rather than only at the end, because a link ANYWHERE on
+      # the way — the configured folder, or the package folder itself — is enough to put the
+      # write outside the root; and checked BEFORE the caller touches anything, because a
+      # boundary discovered afterwards is not one.
+      #
+      # The walk stops at the first segment that does not exist: nothing below it can exist
+      # either, and the writer creates those itself, inside a parent this loop just proved real.
+      # A dangling link is still a link, so the link test comes first.
+      def contain!(base, resolved)
+        parent = base
+        resolved.delete_prefix("#{base}/").split("/").each do |segment|
+          parent = File.join(parent, segment)
+          raise Unsafe, "a specification package may not be written through the symbolic link " \
+                        "#{parent.delete_prefix("#{base}/")} inside its root" if File.symlink?(parent)
+          break unless File.exist?(parent)
+        end
+      end
 
       def validate_issue_key!(key)
         raise Unsafe, "the assignment's Jira issue key is not a usable path component: #{key.inspect}" unless

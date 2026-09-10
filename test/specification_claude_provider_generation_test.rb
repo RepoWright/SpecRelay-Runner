@@ -49,7 +49,9 @@ class SpecificationClaudeProviderGenerationTest < Minitest::Test
 
   def provider_for(result:, lines: [], profile: build_profile, env: {})
     runner = FakeCommandRunner.new(result: result, lines: lines)
-    [ Provider::Claude.new(profile: profile, env: env, command_runner: runner), runner ]
+    [ Provider::Claude.new(profile: profile, env: env,
+                           working_directory: Dir.mktmpdir("specrelay-spec-task-"),
+                           command_runner: runner), runner ]
   end
 
   # A provider that worked and then answered: one `init`, one PUBLIC narration line the operator
@@ -215,7 +217,9 @@ class SpecificationClaudeProviderGenerationTest < Minitest::Test
   def test_a_launch_error_propagates_unchanged_rather_than_being_reclassified
     runner = Object.new
     def runner.run(*, **) = raise(Errno::ENOENT, "/usr/local/bin/claude")
-    provider = Provider::Claude.new(profile: build_profile, env: {}, command_runner: runner)
+    provider = Provider::Claude.new(profile: build_profile, env: {},
+                                    working_directory: Dir.mktmpdir("specrelay-spec-task-"),
+                                    command_runner: runner)
 
     assert_raises(Errno::ENOENT) { provider.generate({}) }
   end

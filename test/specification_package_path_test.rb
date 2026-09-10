@@ -18,6 +18,7 @@ class SpecificationPackagePathTest < Minitest::Test
 
   def teardown
     FileUtils.remove_entry(@checkout) if File.directory?(@checkout)
+    FileUtils.remove_entry(@outside) if @outside && File.directory?(@outside)
   end
 
   # ------------------------------------------------------------------- determinism
@@ -65,7 +66,7 @@ class SpecificationPackagePathTest < Minitest::Test
   def test_the_absolute_path_stays_inside_the_root_it_is_resolved_in
     path = build.absolute_in(@checkout)
 
-    assert path.start_with?("#{File.expand_path(@checkout)}/")
+    assert path.start_with?("#{File.realpath(@checkout)}/")
   end
 
   # MAPIAI-62 — the same identity resolves in whichever root the caller names, and each
@@ -76,9 +77,9 @@ class SpecificationPackagePathTest < Minitest::Test
     other = Dir.mktmpdir("specrelay-worktree-")
     package = build
 
-    assert_equal File.join(File.expand_path(@checkout), "specs/SR-700-add-an-export-button"),
+    assert_equal File.join(File.realpath(@checkout), "specs/SR-700-add-an-export-button"),
                  package.absolute_in(@checkout)
-    assert_equal File.join(File.expand_path(other), "specs/SR-700-add-an-export-button"),
+    assert_equal File.join(File.realpath(other), "specs/SR-700-add-an-export-button"),
                  package.absolute_in(other)
   ensure
     FileUtils.remove_entry(other) if other && File.directory?(other)
@@ -117,6 +118,58 @@ class SpecificationPackagePathTest < Minitest::Test
     define_method("test_#{description.tr(' ', '_')}_is_refused") do
       assert_raises(PackagePath::Unsafe) { build(issue_key: key) }
     end
+  end
+
+  # ------------------------------------------------------ real-path containment
+
+  # The boundary is where the destination REALLY is, not how it is spelled. `File.expand_path`
+  # resolves `..` textually and knows nothing about symbolic links, so a `specs` link pointing
+  # out of the checkout produced a path that looked contained and would have been deleted,
+  # copied into and written through — outside the root the caller named.
+  def test_a_symlinked_ancestor_of_the_package_is_refused
+    outside = link_specs_outside
+
+    error = assert_raises(PackagePath::Unsafe) { build.absolute_in(@checkout) }
+    assert_includes error.message, "specs"
+    assert_equal "sentinel\n", File.read(File.join(outside, "sentinel.txt"))
+  end
+
+  # The package folder itself is an ancestor of every file the writer creates, so a link there
+  # escapes exactly as completely as one higher up.
+  def test_a_symlinked_package_folder_is_refused
+    outside = Dir.mktmpdir("specrelay-outside-")
+    FileUtils.mkdir_p(File.join(@checkout, "specs"))
+    File.symlink(outside, File.join(@checkout, "specs", "SR-700-add-an-export-button"))
+
+    assert_raises(PackagePath::Unsafe) { build.absolute_in(@checkout) }
+  ensure
+    FileUtils.remove_entry(outside) if outside && File.directory?(outside)
+  end
+
+  # A root an operator reaches through a link is an ordinary root, and refusing it would refuse
+  # every checkout under a symlinked home or a macOS temporary directory. What is judged is
+  # containment within what the root RESOLVES TO, never the spelling of the root itself.
+  def test_a_root_reached_through_a_symlink_is_usable_and_resolves_to_its_real_location
+    linked = File.join(Dir.mktmpdir("specrelay-link-"), "checkout")
+    File.symlink(@checkout, linked)
+
+    assert_equal File.join(File.realpath(@checkout), "specs/SR-700-add-an-export-button"),
+                 build.absolute_in(linked)
+  end
+
+  # An unresolvable root is refused rather than assumed: this method's answer is a destination
+  # something is about to be deleted at and written into.
+  def test_a_root_that_cannot_be_resolved_is_refused
+    assert_raises(PackagePath::Unsafe) { build.absolute_in(File.join(@checkout, "no-such-root")) }
+  end
+
+  # A directory OUTSIDE the checkout, reachable only through a `specs` symlink inside it, with a
+  # sentinel file whose bytes prove nothing was written or deleted there.
+  def link_specs_outside
+    outside = Dir.mktmpdir("specrelay-outside-")
+    File.write(File.join(outside, "sentinel.txt"), "sentinel\n")
+    File.symlink(outside, File.join(@checkout, "specs"))
+    @outside = outside
   end
 
   def test_a_trailing_slash_on_the_root_is_normalized_rather_than_doubling_the_separator

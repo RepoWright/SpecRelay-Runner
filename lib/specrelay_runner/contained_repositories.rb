@@ -29,7 +29,13 @@ module SpecrelayRunner
     # and none of them is a repository this run may publish.
     SKIPPED = %w[node_modules vendor tmp log .bundle .runs].freeze
 
-    Result = Struct.new(:paths_by_identity, :error, keyword_init: true) do
+    # `roots` is EVERY contained git root, whatever it currently claims to be, and
+    # `paths_by_identity` is the subset that declares a supported GitHub identity. They are
+    # separate members because they answer different questions: an accepted target is looked up
+    # by identity, while a safety boundary has to cover the repositories the environment HOLDS —
+    # deriving the second from the first is what let a changed `origin` remove a whole checkout
+    # from measurement.
+    Result = Struct.new(:roots, :paths_by_identity, :error, keyword_init: true) do
       def ok? = error.nil?
 
       # The single contained checkout with this identity. `:missing` and `:duplicate` are
@@ -52,7 +58,7 @@ module SpecrelayRunner
       return Result.new(error: "the prepared task workspace holds more than #{MAX_REPOSITORIES} " \
                                "git repositories") if roots.length > MAX_REPOSITORIES
 
-      Result.new(paths_by_identity: identify(roots, git))
+      Result.new(roots: roots, paths_by_identity: identify(roots, git))
     end
 
     # Depth-first, bounded twice, and containment-checked at every step. A repository root is
