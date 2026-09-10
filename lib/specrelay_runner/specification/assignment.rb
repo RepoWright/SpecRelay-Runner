@@ -33,7 +33,16 @@ module SpecrelayRunner
         [ %w[input_bundle content_markdown], "input_bundle.content_markdown" ],
         [ %w[specification_target repository_url], "specification_target.repository_url" ],
         [ %w[specification_target specification_root], "specification_target.specification_root" ],
-        [ %w[workspace workspace_key], "workspace.workspace_key" ]
+        [ %w[workspace workspace_key], "workspace.workspace_key" ],
+        # The TASK ENVIRONMENT the analysis is performed in, and the project's own command for
+        # building it. Required rather than optional: workspace-grounded generation reconstructs
+        # the ticket's canonical task worktree and reads the real multi-repository source there,
+        # so an assignment naming no task and no branch describes work this build cannot do, and
+        # reading a missing one as "no task" would point the worktree owner at an empty branch.
+        # They are the SAME three fields the implementation lane already carries.
+        [ %w[run task_id], "run.task_id" ],
+        [ %w[run canonical_branch], "run.canonical_branch" ],
+        [ %w[workspace worktree_create_command], "workspace.worktree_create_command" ]
       ].freeze
 
       # True when this payload is a specification assignment. Reads the discriminator
@@ -101,6 +110,15 @@ module SpecrelayRunner
       def issue_title = section("work_item")["title"].to_s
       def workspace_key = section("workspace")["workspace_key"].to_s
       def workspace_display_name = section("workspace")["display_name"].to_s
+
+      # The task environment this specification is analysed in, in the implementation lane's own
+      # vocabulary. Read here so {Workspace} can be built from ONE checked object: the runner
+      # never derives a task id from an issue key, never invents a branch, and never composes a
+      # create command — a runner that did would be maintaining a second layout convention
+      # alongside the project's own `bin/worktree`.
+      def task_id = section("run")["task_id"].to_s
+      def canonical_branch = section("run")["canonical_branch"].to_s
+      def worktree_create_command = section("workspace")["worktree_create_command"].to_s
       def run_url = section("links")["run_url"].to_s
       def bundle_markdown = section("input_bundle")["content_markdown"].to_s
       def bundle_url = section("input_bundle")["url"].to_s
@@ -132,6 +150,18 @@ module SpecrelayRunner
       # and pushes to no implementation repository, and the packet deliberately carries no clone
       # url so a provider has nothing to act on even if it tried.
       def previous_accepted_package = payload["previous_accepted_package"]
+
+      # The SAME field as an AUTHORITY rather than as context, read through the one reader both
+      # lanes use.
+      #
+      # `#previous_accepted_package` above hands the packet bounded read-only facts. This hands
+      # preflight the object that can place those heads in the ticket's task environment, because
+      # a workspace-grounded revision must analyse the code that was actually shipped rather than
+      # a description of it. Reached for rather than reimplemented: a second continuation
+      # implementation is how two lanes come to disagree about which head is current.
+      #
+      # Still a pure read. Nothing is verified and nothing is placed until a caller materializes.
+      def previous_accepted_claim(env: ENV) = PreviousAcceptedPackage.read(payload, env: env)
 
       # The real provider profile the operator selected in Platform's Project Setup, or nil when
       # they selected the deterministic fixture — which this lane cannot use, and which

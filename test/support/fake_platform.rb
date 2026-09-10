@@ -261,7 +261,32 @@ class FakePlatform
   # What the runner reported about a specification-generation attempt, and — just
   # as load-bearing for criterion 15 — the fact that nothing was sent to /reports.
   def specification_generations = requests_to("/api/runner/specification_generations")
-  def last_specification_generation = specification_generations.last&.dig(:body, "generation")
+
+  # What Platform would have KEPT of the last generation result, not the raw body.
+  #
+  # The distinction is a real defect this closes. Platform's controller takes an allowlist and the
+  # result contract closes the document with `additionalProperties: false`, so a field the
+  # contract does not declare is dropped on arrival and never stored. This fake used to hand back
+  # whatever it was sent, which meant a runner test could assert a field that Platform silently
+  # discards and pass — the runner looked correct while the operator's run page showed nothing.
+  #
+  # Raising rather than quietly filtering, because the quiet version fails a later assertion with
+  # a bare nil and sends the reader looking in the wrong place. A test may only assert what the
+  # published contract admits; widening that is a contract change, which is reviewed.
+  def last_specification_generation
+    body = specification_generations.last&.dig(:body, "generation")
+    return nil if body.nil?
+
+    undeclared = body.keys - self.class.generation_result_keys
+    unless undeclared.empty?
+      raise "the runner reported #{undeclared.sort.join(', ')}, which " \
+            "contracts/runner/v1/specification-generation-result.schema.json does not declare. " \
+            "Platform drops an undeclared field on arrival, so asserting it here would prove " \
+            "nothing about what an operator sees."
+    end
+
+    body
+  end
   # What the runner reported about a publication attempt, and the fact that a
   # publication claim sent nothing to the generation endpoint.
   def specification_publications = requests_to("/api/runner/specification_publications")
@@ -457,6 +482,24 @@ class FakePlatform
   # rules (Platform's own request specs cover the real state transitions) but NOT dumb about
   # the run state it reports back: the runner prints it, and a fake that always said the same
   # thing would let a generated run and a refused one look identical in the runner's output.
+  # The committed result contract's declared top-level keys.
+  #
+  # This fake records whatever body it is handed, which is what made it possible for a runner
+  # test to assert a field the REAL Platform silently drops on arrival and still pass. Platform's
+  # controller takes an allowlist and the contract closes the document with
+  # `additionalProperties: false`; mirroring that here is what keeps a green runner test a
+  # statement about something Platform would actually store.
+  #
+  # Read from the workspace contract rather than restated, so the only way to widen what a runner
+  # test may assert is to widen the published contract — which is reviewed.
+  GENERATION_RESULT_CONTRACT =
+    File.expand_path("../../../contracts/runner/v1/specification-generation-result.schema.json", __dir__)
+
+  def self.generation_result_keys
+    @generation_result_keys ||=
+      JSON.parse(File.read(GENERATION_RESULT_CONTRACT)).fetch("properties").keys.freeze
+  end
+
   def specification_generation(request)
     outcome = request.dig(:body, "generation", "outcome").to_s
     return [ 422, { error: "generation outcome is required" } ] if outcome.empty?

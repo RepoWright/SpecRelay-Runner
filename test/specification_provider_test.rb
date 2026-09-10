@@ -42,7 +42,7 @@ class SpecificationProviderTest < Minitest::Test
 
       assert_equal resolved, settings.provider_kind, "configured #{configured.inspect}"
       assert_equal settings.provider_kind,
-                   SpecrelayRunner::Specification::Provider.resolve(settings: settings).kind,
+                   SpecrelayRunner::Specification::Provider.resolve(settings: settings, working_directory: working_directory).kind,
                    "resolved provider disagrees with the configured kind for #{configured.inspect}"
     end
   end
@@ -62,7 +62,7 @@ class SpecificationProviderTest < Minitest::Test
     settings = SpecrelayRunner::Specification::Settings.new({}, env: env)
 
     assert_equal "composed", settings.provider_kind
-    assert_equal "composed", SpecrelayRunner::Specification::Provider.resolve(settings: settings).kind
+    assert_equal "composed", SpecrelayRunner::Specification::Provider.resolve(settings: settings, working_directory: working_directory).kind
   end
 
   def test_the_environment_override_wins_over_the_config_file
@@ -421,4 +421,8 @@ class SpecificationProviderTest < Minitest::Test
     YAML
     SpecrelayRunner::Config.load(path)
   end
+
+  # The prepared task environment a real run hands the provider. Stated because the boundary now
+  # requires one; these examples are about the resolved KIND and about output handling.
+  def working_directory = @working_directory ||= Dir.mktmpdir("specrelay-spec-task-")
 end
