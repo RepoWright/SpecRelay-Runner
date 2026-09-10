@@ -16,7 +16,14 @@ require "open3"
 class SpecificationGenerationRevisionTest < Minitest::Test
   ISSUE = "SR-700"
   PACKAGE = "specs/SR-700-add-an-export-button"
-  BRANCH = "specrelay/spec/SR-700-add-an-export-button"
+  BRANCH = "SR-700-add-an-export-button"
+  # A pull request that is open, on this repository, against the right base — and on a branch
+  # this ticket does not own. Everything ExistingPullRequest checks passes; the identity does not.
+  FOREIGN_BRANCH = "specrelay/spec/SR-700-a-second-identity"
+  # The same case, with a head branch shaped like a credential. A ref name is free text an
+  # operator's pasted pull request can carry anything in, and the refusal travels to a Platform
+  # record, a run page and a log.
+  SECRET_SHAPED_BRANCH = "ghp_NOTAREALTOKEN0151AAAAAAAAAAAAAAAAAAAA"
   PR_URL = "https://github.com/SpecRelay/SpecRelay-Specs/pull/7"
 
   PREVIOUS_FILES = {
@@ -168,6 +175,85 @@ class SpecificationGenerationRevisionTest < Minitest::Test
                  "a revision refusal must happen before any isolated workspace is created"
   end
 
+  # One ticket owns one branch. A pull request that passes every other reuse check but sits on
+  # another branch is not this ticket's pull request, and reading a "previous package" off it
+  # would hand the provider a specification from a history this ticket does not own. Refused
+  # before the previous package is read and before the provider is launched.
+  def test_a_spec_pr_on_another_branch_refuses_before_the_provider_runs
+    build_previous_package_on_branch
+    git(@specs, "push", "-q", "origin", "#{BRANCH}:refs/heads/#{FOREIGN_BRANCH}")
+    capture = File.join(@temp, "captured-packet.json")
+    provider = SpecificationWorkspace.claude_stub(@temp, files: valid_generated_files,
+                                                         capture_prompt_to: capture)
+    start_with_revision(
+      provider: provider,
+      gh_seed: [ { "url" => PR_URL, "state" => "OPEN", "headRefName" => FOREIGN_BRANCH,
+                   "baseRefName" => "main",
+                   "headRefOid" => git(@specs, "rev-parse", "origin/#{FOREIGN_BRANCH}").strip } ]
+    )
+
+    refute_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
+
+    assert_includes @io.string, "specification_revision_pull_request_unusable"
+    assert_includes @io.string, BRANCH
+    refute_path_exists capture, "the provider must not run on a refused revision"
+    assert_empty Dir.glob(File.join(@specs, PACKAGE, "*"))
+    assert_empty SpecificationWorkspace.isolated_workspaces(@temp),
+                 "a revision refusal must happen before any isolated workspace is created"
+  end
+
+  # The message reaches an operator through Platform, so it may name the ticket and the branch
+  # this ticket owns — and nothing about this machine, and nothing GitHub reported.
+  def test_the_branch_mismatch_refusal_carries_no_local_path_or_observed_branch
+    build_previous_package_on_branch
+    git(@specs, "push", "-q", "origin", "#{BRANCH}:refs/heads/#{FOREIGN_BRANCH}")
+    start_with_revision(
+      gh_seed: [ { "url" => PR_URL, "state" => "OPEN", "headRefName" => FOREIGN_BRANCH,
+                   "baseRefName" => "main",
+                   "headRefOid" => git(@specs, "rev-parse", "origin/#{FOREIGN_BRANCH}").strip } ]
+    )
+
+    run_cli
+
+    message = @platform.last_specification_generation["message"].to_s
+    assert_includes message, ISSUE
+    assert_includes message, BRANCH
+    refute_includes message, FOREIGN_BRANCH
+    refute_includes message, @specs
+    refute_includes message, Dir.home
+  end
+
+  # A ref name is free text, so the branch GitHub reports for a pasted pull request can be
+  # shaped like a credential. Redaction is the last line, not the first: the value must never
+  # enter the message, which is why the redaction marker must be absent too — its presence would
+  # mean the refusal did interpolate the value and was merely rescued afterwards.
+  def test_a_refused_revision_never_carries_a_secret_shaped_head_branch
+    capture = File.join(@temp, "captured-packet.json")
+    provider = SpecificationWorkspace.claude_stub(@temp, files: valid_generated_files,
+                                                         capture_prompt_to: capture)
+    # `branch_exists: false` only skips resolving a head this seed states outright: the refusal
+    # lands before any branch is read, so there is nothing on the remote for it to have read.
+    start_with_revision(
+      provider: provider, branch_exists: false,
+      gh_seed: [ { "url" => PR_URL, "state" => "OPEN", "headRefName" => SECRET_SHAPED_BRANCH,
+                   "baseRefName" => "main", "headRefOid" => "a" * 40 } ]
+    )
+
+    refute_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
+
+    result = @platform.last_specification_generation
+    assert_equal "specification_revision_pull_request_unusable", result["failure_class"]
+    message = result["message"].to_s
+    assert_includes message, ISSUE
+    assert_includes message, BRANCH
+    refute_includes message, SECRET_SHAPED_BRANCH
+    refute_includes message, SpecrelayRunner::Redaction::REDACTION
+    refute_includes @io.string, SECRET_SHAPED_BRANCH
+    refute_path_exists capture, "the provider must not run on a refused revision"
+    assert_empty SpecificationWorkspace.isolated_workspaces(@temp),
+                 "a revision refusal must happen before any isolated workspace is created"
+  end
+
   def test_a_spec_pr_against_the_wrong_base_refuses
     build_previous_package_on_branch
     start_with_revision(gh_seed: [ { "url" => PR_URL, "state" => "OPEN", "headRefName" => BRANCH,
@@ -257,6 +343,7 @@ class SpecificationGenerationRevisionTest < Minitest::Test
     @gh_dir, = FakeGithub.gh_bin(mode: "ok", pull_request_url: PR_URL, bare: @bare, seed: seed)
     @platform = FakePlatform.new(
       claim_payload: spec_creation_payload_for(issue_key: ISSUE, content: bundle_markdown,
+                                               canonical_branch: BRANCH,
                                                existing_pull_request_url: PR_URL)
     ).start
     @config = build_config(provider: provider)

@@ -13,12 +13,12 @@ module SpecrelayRunner
     # still OPEN, still targets the right base, or exists at all. Only the runner can ask GitHub,
     # so the runner asks, and this is where.
     #
-    # What it returns on success is the one fact the rest of the publication needs: **the branch**.
-    # That is the point of asking rather than deriving. The ticket-owned branch name contains a
-    # slug of the ticket TITLE, and a ticket can be renamed after its pull request is open; the
-    # open pull request stays the source of truth and its head branch keeps the old name. Deriving
-    # the branch from the current title would open a second pull request for the same ticket,
-    # which is exactly what criterion 3 forbids.
+    # What it returns on success is a FACT ABOUT GITHUB, not a decision: the head branch that
+    # pull request is actually on. It used to be the decision — the branch the publication would
+    # then commit to — because the two lanes derived different names for one ticket and only the
+    # open pull request could say which one existed. A ticket now owns ONE branch for its whole
+    # lifecycle, so this answer is something to CHECK rather than to follow, and
+    # {GitPublisher#verify_branch} refuses the publication when it is not the ticket's branch.
     #
     # It FAILS CLOSED on every uncertainty. A pull request that is closed, merged, missing, on the
     # wrong repository, against the wrong base, or simply unreadable produces a failure with an
