@@ -529,11 +529,44 @@ module SpecrelayRunner
                                            base_branch: assignment.default_branch, url: url)
         return refuse(SPECIFICATION_REVISION_PULL_REQUEST_UNUSABLE, existing.message) unless existing.ok?
 
+        foreign = check_revision_branch(existing.branch)
+        return foreign if foreign
+
         previous = PreviousSpecificationPackage.call(commands: commands, branch: existing.branch,
                                                      package_path: package.relative_package_path)
         return refuse(SPECIFICATION_REVISION_UNREADABLE, previous.message) unless previous.ok?
 
         materialize_revision(task, package, previous) || previous
+      end
+
+      # A ticket owns ONE branch, so the pull request Jira links must be on it.
+      #
+      # {ExistingPullRequest} answers "is this a pull request SpecRelay may push to" — open, on
+      # this repository, against this base, not a fork. It cannot answer "is it THIS TICKET's",
+      # because that is Platform's fact and arrives in the assignment. A pull request that passes
+      # every other check while sitting on another branch is a different ticket's review object,
+      # or a leftover from when the two lanes named branches separately; reading a "previous
+      # package" off it would hand the provider a specification from a history this ticket does
+      # not own, and publication would then refuse it after a provider had already run.
+      #
+      # Refused HERE, before the previous package is read and before the provider is launched, so
+      # a mismatch costs one `gh` call and leaves nothing behind. It reuses the revision refusal
+      # class rather than adding a wire token: this IS the linked pull request being unusable for
+      # this revision, which is exactly what that class already names.
+      #
+      # The OBSERVED head branch is deliberately not in the message. It is a value GitHub
+      # reported for a pull request an operator pasted into a Jira field — external input on its
+      # way to a Platform record, a run page and a log — and this refusal is already fully
+      # actionable from the two facts SpecRelay itself owns: which ticket, and which branch that
+      # ticket may be revised on.
+      def check_revision_branch(head_branch)
+        return nil if head_branch == assignment.canonical_branch
+
+        refuse(SPECIFICATION_REVISION_PULL_REQUEST_UNUSABLE,
+               "the specification pull request #{assignment.issue_key} links is not on that " \
+               "ticket's branch #{assignment.canonical_branch}, so it is not this ticket's pull " \
+               "request. Clear the Jira Spec PR field to start one on " \
+               "#{assignment.canonical_branch}, then run specification creation again")
       end
 
       # The pull request's CURRENT package, placed in the ticket package directory the provider

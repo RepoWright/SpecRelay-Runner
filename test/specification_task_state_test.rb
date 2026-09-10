@@ -17,12 +17,16 @@ require "open3"
 # to fetch it.
 class SpecificationTaskStateTest < Minitest::Test
   ISSUE = "SR-700"
-  TASK = ISSUE
   FOLDER = "SR-700-add-an-export-button"
+  # One ticket, one branch: the task environment, the component repository and the specification
+  # pull request are all on it. `TASK` and `SPEC_BRANCH` are the same string on purpose — a
+  # fixture that gave the specification lane its own name would describe the split this product
+  # no longer has.
+  TASK = FOLDER
+  SPEC_BRANCH = TASK
   PACKAGE = "specs/#{FOLDER}"
   SPECS_SLUG = "SpecRelay/SpecRelay-Specs"
   COMPONENT_SLUG = "SpecRelay/component-a"
-  SPEC_BRANCH = "specrelay/spec/SR-700-add-an-export-button"
   SPEC_PR = "https://github.com/SpecRelay/SpecRelay-Specs/pull/7"
   ACCEPTED_PR = "https://github.com/SpecRelay/component-a/pull/12"
 
@@ -353,20 +357,29 @@ class SpecificationTaskStateTest < Minitest::Test
     git(clone, "rev-parse", "HEAD").strip
   end
 
-  # The previous specification package, on the pull request's own branch in the remote.
+  # The previous specification package, on the ticket's branch in the remote.
+  #
+  # Pushed from a SEPARATE clone, exactly as {#publish_accepted_round} does, because the previous
+  # round was published by a runner rather than by this checkout. It also keeps the operator's
+  # checkout free of a local branch named after the ticket — `git worktree add -b` refuses to
+  # create one that already exists locally, so a fixture that left one behind would block the
+  # very task environment this test is about.
   def build_previous_package_on_spec_branch(package: PACKAGE)
-    git(@root, "checkout", "-q", "-b", SPEC_BRANCH)
+    clone = File.join(@built.temp, "spec-round-one-clone")
+    system("git", "clone", "-q", @built.bares.fetch("."), clone, exception: true)
+    git(clone, "config", "user.email", "runner@example.test")
+    git(clone, "config", "user.name", "Runner Test")
+    git(clone, "config", "commit.gpgsign", "false")
+    git(clone, "checkout", "-q", "-b", SPEC_BRANCH)
     PREVIOUS_FILES.each do |name, body|
-      path = File.join(@root, package, name)
+      path = File.join(clone, package, name)
       FileUtils.mkdir_p(File.dirname(path))
       File.write(path, body)
-      git(@root, "add", File.join(package, name))
+      git(clone, "add", File.join(package, name))
     end
-    git(@root, "commit", "-q", "-m", "#{ISSUE}: generated specification package")
-    git(@root, "push", "-q", "origin", "#{SPEC_BRANCH}:refs/heads/#{SPEC_BRANCH}")
-    git(@root, "checkout", "-q", "main")
-    git(@root, "fetch", "-q", "origin", SPEC_BRANCH)
-    git(@root, "update-ref", "refs/remotes/origin/#{SPEC_BRANCH}", "FETCH_HEAD")
+    git(clone, "commit", "-q", "-m", "#{ISSUE}: generated specification package")
+    git(clone, "push", "-q", "origin", "#{SPEC_BRANCH}:refs/heads/#{SPEC_BRANCH}")
+    git(@root, "fetch", "-q", "origin", "#{SPEC_BRANCH}:refs/remotes/origin/#{SPEC_BRANCH}")
   end
 
   # The provider records the package directory it found BEFORE it wrote anything, which is how a

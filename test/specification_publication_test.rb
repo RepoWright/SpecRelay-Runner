@@ -18,7 +18,7 @@ require "time"
 class SpecificationPublicationTest < Minitest::Test
   ISSUE = "SR-700"
   PACKAGE = "specs/SR-700-add-an-export-button"
-  BRANCH = "specrelay/spec/SR-700-0123456789ab"
+  BRANCH = "SR-700-add-an-export-button"
   PR_URL = "https://github.com/SpecRelay/SpecRelay-Specs/pull/7"
 
   def setup
@@ -174,27 +174,30 @@ class SpecificationPublicationTest < Minitest::Test
     assert_includes @io.string, "could not remove its local package workspace"
   end
 
-  # ------------------------------------------------- MVP-0028 criteria 3 and 4: the ticket's PR
+  # ------------------------------------------------- the ticket's ONE pull request
   #
-  # A ticket that already has a `Spec PR` gets its specification added to THAT pull request. The
-  # branch comes from GitHub rather than from Platform, and the case that proves why is a RENAMED
-  # ticket: the open pull request's head still carries the old title's slug, so re-deriving the
-  # branch from the current title would open a second pull request for one ticket.
+  # A ticket that already has a `Spec PR` gets its specification added to THAT pull request —
+  # provided the pull request really is the ticket's. A ticket owns one branch for its whole
+  # lifecycle, so a linked pull request whose head is some OTHER branch is not this ticket's
+  # review object, and publishing onto it would give one ticket two Git identities.
   EXISTING_PR_URL = "https://github.com/SpecRelay/SpecRelay-Specs/pull/3"
-  OLD_TITLE_BRANCH = "specrelay/spec/SR-700-the-title-it-had-before"
+  ANOTHER_BRANCH = "specrelay/spec/SR-700-a-second-identity"
+  # The same case with a head branch shaped like a credential. A ref name is free text, and this
+  # refusal travels to a Platform record, a run page and a log.
+  SECRET_SHAPED_BRANCH = "ghp_NOTAREALTOKEN0151AAAAAAAAAAAAAAAAAAAA"
 
-  def existing_pr(state: "OPEN", base: "main", fork: false, branch: OLD_TITLE_BRANCH)
+  def existing_pr(state: "OPEN", base: "main", fork: false, branch: BRANCH)
     { "url" => EXISTING_PR_URL, "state" => state, "headRefName" => branch, "baseRefName" => base,
       "isDraft" => true, "isCrossRepository" => fork, "headRefOid" => "live" }
   end
 
-  # Neither the derived branch nor the linked pull request's branch reached the remote. Asserted
-  # against BOTH names rather than "the remote is empty": the bare remote legitimately carries
-  # `main`, which this lane never touches.
+  # Neither the ticket's branch nor the foreign one reached the remote. Asserted against BOTH
+  # names rather than "the remote is empty": the bare remote legitimately carries `main`, which
+  # this lane never touches.
   def refute_publication_branches
     branches = FakeGithub.remote_branches(@bare).keys
     refute_includes branches, BRANCH
-    refute_includes branches, OLD_TITLE_BRANCH
+    refute_includes branches, ANOTHER_BRANCH
   end
 
   def start_with_existing_pr(gh_mode: "ok", **overrides)
@@ -205,16 +208,57 @@ class SpecificationPublicationTest < Minitest::Test
                    ))
   end
 
-  def test_a_ticket_with_an_existing_spec_pr_pushes_to_that_pull_requests_branch
+  def test_a_ticket_with_an_existing_spec_pr_updates_it_on_the_tickets_own_branch
     start_with_existing_pr
 
     assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
 
     result = @platform.last_specification_publication
     assert_equal "published", result["outcome"], @io.string
-    assert_equal OLD_TITLE_BRANCH, result["branch"], "the branch must come from the pull request, not the title"
+    assert_equal BRANCH, result["branch"], "one ticket, one branch, in both lanes"
     assert_equal EXISTING_PR_URL, result["pull_request_url"]
     assert_equal true, result["reused_pull_request"]
+  end
+
+  # The wrong-head-branch refusal. A pull request the Jira field links that sits on some other
+  # branch — a leftover from when the two lanes named branches separately, or a value pasted in
+  # by hand — is not this ticket's pull request. It must be refused BEFORE anything is committed,
+  # pushed or opened, or the ticket acquires a second branch and a second review history.
+  def test_a_spec_pr_on_another_branch_refuses_before_any_git_mutation
+    start_with_existing_pr(branch: ANOTHER_BRANCH)
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
+
+    result = @platform.last_specification_publication
+    assert_equal "specification_checkout_mismatch", result["failure_class"]
+    assert_includes result["message"], ISSUE
+    assert_includes result["message"], BRANCH
+    # The branch GitHub reported is external input on its way to a durable record, so the
+    # refusal names what SpecRelay owns and withholds what it observed.
+    refute_includes result["message"], ANOTHER_BRANCH
+    refute_publication_branches
+    assert_equal 0, FakeGithub.pr_creates(@gh_log)
+  end
+
+  # Redaction is the last line, not the first. The observed head branch must never enter the
+  # message, which is why the redaction marker must be absent too — its presence would mean the
+  # refusal did interpolate the value and was merely rescued afterwards.
+  def test_a_secret_shaped_head_branch_is_neither_published_to_nor_reported
+    start_with_existing_pr(branch: SECRET_SHAPED_BRANCH)
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
+
+    result = @platform.last_specification_publication
+    assert_equal "specification_checkout_mismatch", result["failure_class"]
+    message = result["message"].to_s
+    assert_includes message, ISSUE
+    assert_includes message, BRANCH
+    refute_includes message, SECRET_SHAPED_BRANCH
+    refute_includes message, SpecrelayRunner::Redaction::REDACTION
+    refute_includes @io.string, SECRET_SHAPED_BRANCH
+    refute_includes FakeGithub.remote_branches(@bare).keys, SECRET_SHAPED_BRANCH
+    refute_publication_branches
+    assert_equal 0, FakeGithub.pr_creates(@gh_log)
   end
 
   # The duplicate this MVP exists to prevent, asserted as a fact about invocations.
@@ -225,13 +269,30 @@ class SpecificationPublicationTest < Minitest::Test
     assert_equal 0, FakeGithub.pr_creates(@gh_log), "the ticket's pull request must be updated, not duplicated"
   end
 
-  def test_the_derived_branch_is_never_pushed_when_a_pull_request_already_owns_one
+  def test_a_reused_pull_request_produces_no_second_branch_for_the_ticket
     start_with_existing_pr
     run_cli
 
     branches = FakeGithub.remote_branches(@bare).keys
-    assert_includes branches, OLD_TITLE_BRANCH
-    refute_includes branches, BRANCH, "a second branch for one ticket is the duplicate, one step earlier"
+    assert_includes branches, BRANCH
+    refute_includes branches, ANOTHER_BRANCH, "a second branch for one ticket is the duplicate, one step earlier"
+  end
+
+  # The risk one shared branch introduces, and the reason publication never rebuilds from the
+  # base: by the time a specification is revised, the ticket branch can already carry
+  # implementation commits. The specification commit must be added ON TOP of them.
+  def test_publication_appends_to_implementation_work_already_on_the_ticket_branch
+    implementation = seed_implementation_commit
+    start_with_existing_pr
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
+
+    head = @platform.last_specification_publication["head_commit"]
+    assert_equal head, FakeGithub.remote_branches(@bare)[BRANCH]
+    git(@implementation_clone, "fetch", "-q", "origin", BRANCH)
+    assert ancestor?(@implementation_clone, implementation, head),
+           "the specification commit must build on the implementation commit, not replace it"
+    assert_includes git(@implementation_clone, "ls-tree", "--name-only", head), "implementation.rb"
   end
 
   # Criterion 4, one row per way a linked pull request can be unusable. Every one of them must
@@ -931,6 +992,30 @@ class SpecificationPublicationTest < Minitest::Test
     yield
   ensure
     FileUtils.define_singleton_method(:remove_entry, original)
+  end
+
+  # A commit on the ticket's branch that this specification run did not make — the implementation
+  # lane's half of the same ticket. Pushed through a second clone so the operator's checkout and
+  # the runner's isolated worktree are both unaware of it until they fetch, exactly as they would
+  # be when another machine did the work.
+  def seed_implementation_commit
+    @implementation_clone = File.join(@temp, "implementation-clone")
+    system("git", "clone", "-q", @bare, @implementation_clone, exception: true)
+    git(@implementation_clone, "config", "user.email", "test@specrelay.local")
+    git(@implementation_clone, "config", "user.name", "SpecRelay Test")
+    git(@implementation_clone, "checkout", "-q", "-b", BRANCH)
+    File.write(File.join(@implementation_clone, "implementation.rb"), "# shipped for this ticket\n")
+    git(@implementation_clone, "add", "implementation.rb")
+    commit(@implementation_clone, "implementation work on the ticket branch")
+    git(@implementation_clone, "push", "-q", "origin", BRANCH)
+    git(@implementation_clone, "rev-parse", "HEAD").strip
+  end
+
+  # `--is-ancestor` answers through its exit status, which the `git` helper turns into an
+  # exception, so it is asked here rather than there.
+  def ancestor?(root, older, newer)
+    _, status = Open3.capture2e("git", "-C", root, "merge-base", "--is-ancestor", older, newer)
+    status.success?
   end
 
   def git_init(root)

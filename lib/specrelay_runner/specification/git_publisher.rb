@@ -45,10 +45,11 @@ module SpecrelayRunner
 
       def self.call(**kwargs) = new(**kwargs).call
 
-      # +branch+ is passed explicitly rather than read off the assignment, because MVP-0028 gave
-      # it two possible sources: the branch Platform derived for a first publication, or the head
-      # branch of the pull request this ticket already has. The caller resolves which; this class
-      # commits and pushes to whatever it is handed, and never chooses.
+      # +branch+ is still passed explicitly, but it is no longer a CHOICE. It used to have two
+      # possible sources — the branch Platform assigned, or the head branch of the pull request
+      # this ticket already had — and this class committed to whichever it was handed. A ticket
+      # now has ONE branch for its whole lifecycle, so the two sources must agree and #verify_branch
+      # refuses when they do not, before anything is committed or pushed.
       def initialize(commands:, assignment:, branch:, files:, io: $stdout)
         @commands = commands
         @assignment = assignment
@@ -58,7 +59,7 @@ module SpecrelayRunner
       end
 
       def call
-        mismatch = verify_remote
+        mismatch = verify_branch || verify_remote
         return mismatch if mismatch
 
         base = resolve_base
@@ -79,6 +80,34 @@ module SpecrelayRunner
       attr_reader :commands, :assignment, :branch, :files, :io
 
       Base = Struct.new(:commit, :reused, keyword_init: true)
+
+      # The branch must be the ONE branch this ticket owns.
+      #
+      # The reuse path reads the head branch of the pull request Jira links, and that answer is
+      # GitHub's rather than Platform's: a pull request opened before the ticket had a single
+      # identity, or one an operator pasted into the Jira field by hand, can sit on some other
+      # branch entirely. Publishing onto it would give the ticket a second Git identity and a
+      # second review history — the exact split one canonical branch exists to remove.
+      #
+      # Refused HERE rather than trusted, and refused FIRST: this runs before the remote is even
+      # read, so a mismatch costs no git command and leaves no branch, commit or pull request
+      # behind. It reports the assignment's repository-mismatch class rather than a new one,
+      # because it is the same fact from the operator's side — this publication is aimed at
+      # something Platform did not assign.
+      #
+      # The OBSERVED branch is deliberately not in the message. It reaches here from a pull
+      # request an operator pasted into a Jira field, and the message travels to a Platform
+      # record, a run page and a log; the refusal is already fully actionable from the two facts
+      # SpecRelay itself owns — which ticket, and which branch that ticket publishes to.
+      def verify_branch
+        assigned = assignment.publication_branch.to_s
+        return nil if branch.to_s == assigned
+
+        failure(CHECKOUT_MISMATCH,
+                "#{assignment.issue_key} publishes to #{assigned}, and the pull request this ticket " \
+                "links is on another branch, so it is not this ticket's pull request. Clear the Jira " \
+                "Spec PR field to open one on #{assigned}, then retry publication")
+      end
 
       # The checkout must be a clone of the repository Platform assigned. Without this a runner
       # whose `SPECRELAY_RUNNER_SPEC_REPOSITORY_ROOT_*` points at the wrong clone would commit a

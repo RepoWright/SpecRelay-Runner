@@ -67,7 +67,7 @@ end
 def spec_creation_payload_for(issue_key:, title: "Add an export button", inputs: nil,
                               specification_root: "specs", complete: true, content: nil,
                               existing_pull_request_url: nil, specification_provider: nil,
-                              worktree_create_command: nil)
+                              worktree_create_command: nil, canonical_branch: nil)
   {
     "contract_version" => "mvp-0025",
     "claim" => { "runner_execution_id" => "rex_spec123", "runner_id" => "test-runner",
@@ -76,9 +76,14 @@ def spec_creation_payload_for(issue_key:, title: "Add an export button", inputs:
     # The ticket's task identity, the same two fields the implementation lane already carries.
     # The specification lane builds the ticket's canonical task worktree from them before a
     # provider runs, so an assignment without them names work no runner can do.
+    #
+    # `canonical_branch` defaults to the issue key only because most cases here are not ABOUT
+    # branch identity. Platform sends the ticket's own branch, so any case that reasons about
+    # which branch this ticket owns must state it — see the revision and publication fixtures.
     "run" => { "id" => "run_spec123", "type" => "spec_creation",
                "state" => "AWAITING_SPECIFICATION_CREATION",
-               "task_id" => issue_key, "canonical_branch" => issue_key },
+               "task_id" => canonical_branch || issue_key,
+               "canonical_branch" => canonical_branch || issue_key },
     "work_item" => { "provider" => "jira", "issue_key" => issue_key,
                      "issue_url" => "https://example.atlassian.net/browse/#{issue_key}",
                      "title" => title },
@@ -141,10 +146,15 @@ def spec_publication_payload_for(issue_key:, files:, package_path:, branch:, wor
   # The run block is REPLACED here, so the task identity has to be restated: Platform sends it on
   # every specification assignment of either phase, and a fixture that dropped it would describe a
   # document Platform does not produce.
-  spec_creation_payload_for(issue_key: issue_key, title: title).merge(
+  #
+  # It is the PUBLICATION BRANCH, not the issue key. A ticket owns one branch and Platform
+  # publishes onto it, so a fixture whose run identity disagreed with its own publication block
+  # would describe a document Platform cannot produce — and would let a test claim a long
+  # canonical branch while the wire carried a bare key.
+  spec_creation_payload_for(issue_key: issue_key, title: title, canonical_branch: branch).merge(
     "run" => { "id" => "run_spec123", "type" => "spec_creation",
                "state" => "AWAITING_SPECIFICATION_PUBLICATION",
-               "task_id" => issue_key, "canonical_branch" => issue_key },
+               "task_id" => branch, "canonical_branch" => branch },
     "assignment_boundary" => { "generation" => "generate_package_only",
                                "publication" => "publish_draft_pull_request_only",
                                "expected_runner_action" => "publish_specification_package",
