@@ -11,16 +11,17 @@ module SpecrelayRunner
     #   describe -> String                       # what an operator sees in the log and the manifest
     #   generate(packet, on_output:) -> Hash      # { "spec.md" => "...", "analysis/business.md" => ... }
     #
-    # `on_output` (MAPIAI-60) is an OPTIONAL consumer of live progress, the same `(stream, line)`
-    # shape CommandRunner uses. Only the Claude provider has provider semantics to report through
-    # it; the composer and a configured command ignore it rather than manufacture events they do
-    # not have, so their existing lifecycle output stays truthful.
+    # `on_output` is the OPTIONAL consumer of live progress, the same `(stream, line)`
+    # shape CommandRunner uses. Both providers report through it, because both are real models
+    # whose work is worth watching.
     #
-    # Two implementations ship. `Composed` is the default and is deterministic: same packet,
-    # same bytes, no network, no model — which is what lets the digests, the atomic replace,
-    # and the Platform evidence be asserted in tests instead of smoke-checked. `Command` runs
-    # an operator-configured local executable, which is where a real model-backed writer
-    # plugs in.
+    # TWO implementations ship, and they are the two APPROVED REAL PROFILES — Claude and Codex —
+    # resolved by {ImplementationProfile}, the same exact whole-hash authority the implementation
+    # lane launches against. There is deliberately no third: no built-in composer, no
+    # operator-configured executable, no registry, no base class and no discovery. A lane that
+    # could reach a deterministic writer or an arbitrary command by configuration is a lane whose
+    # output an operator cannot attribute, and the live run that exposed this proved the plausible
+    # substitute is the one nobody notices.
     #
     # The boundary is narrow on purpose. Scope 9 requires that "the runner must not embed
     # unreviewable prompt strings deep inside command glue", so the entire input a provider
@@ -30,163 +31,84 @@ module SpecrelayRunner
     # through this interface, because none of them is passed to it.
     #
     # Neither implementation writes a file. Writing is PackageWriter's job and happens after
-    # validation, so a provider failure — including a command that dies halfway through its
+    # validation, so a provider failure — including a model that dies halfway through its
     # output — cannot leave a partial package anywhere.
     module Provider
-      # Raised at PREFLIGHT: the configured provider cannot be used at all. Distinct from
-      # Failed because it must refuse before any staging happens.
+      # Raised at PREFLIGHT: no approved provider can be used at all. Distinct from Failed because
+      # it must refuse before any staging happens.
       Unavailable = Class.new(StandardError)
       # Raised DURING generation: the provider ran and did not produce usable output.
       Failed = Class.new(StandardError)
 
-      # Read from the configured command's stdout. Bounded so a runaway provider cannot
-      # exhaust runner memory, and small enough that anything larger is a bug rather than a
-      # very thorough specification.
-      MAX_OUTPUT_BYTES = 4_000_000
-
-      # The configured kind and the resolved provider's own `kind` are the SAME vocabulary —
-      # `composed`, `command` and `claude` — so the diagnostics Platform persists cannot
-      # contradict the manifest. They used to: the default was configured as `fake` and reported
-      # itself as `composed`, and the run page told operators the production default was a fake.
+      # The adapter for one already-validated real profile, or a refusal.
       #
-      # **An unset kind is a question, not a default** (MVP-0028 remediation, defect 1). It used
-      # to resolve to `Composed`, so an operator whose guided setup wrote no runner YAML — the
-      # ordinary case — got the deterministic composer while believing they had selected the real
-      # provider. The live MAPIAI-52 run proved it: `runner.executor` named the real Claude
-      # profile and the specification lane never looked at it.
-      #
-      # So the precedence is: an EXPLICIT kind always wins, because an operator who names one has
-      # decided; otherwise the operator's real Claude profile is used if they configured one; and
-      # if neither exists this REFUSES. Falling back to the composer is what this method must
-      # never do again, because the composer's output is plausible enough that nobody notices.
-      def self.resolve(settings:, claude_profile: nil, env: ENV)
-        return Composed.new if settings.composed_provider?
-        return Command.build(settings: settings, env: env) if settings.provider_kind == Settings::PROVIDER_COMMAND
+      # The profile is the WHOLE selection: it arrived as one of the exact canonical hashes and was
+      # compared byte for byte before this method saw it, so there is nothing left here to decide
+      # except which of the two decoders reads the process. A nil profile is the deterministic
+      # fixture or no selection at all — neither is a model-backed specification writer, and both
+      # refuse rather than falling back to something that would produce plausible prose.
+      def self.resolve(profile:, env: ENV)
         # `env` is forwarded, not defaulted. Process.spawn resolves the executable through the PATH
-        # it is handed, so a Claude provider built without it would look `claude` up on the runner
+        # it is handed, so a provider built without it would look its command up on the runner
         # PROCESS's environment while every other stage — the readiness probe, the executor
-        # mismatch guard — used the runner's own. That is the precise failure ClaudeProfile warns
-        # about: "readiness pass against one CLI and execution run another". Found while proving
-        # the defect-4 fix, when a test that put a stub `claude` first on its runner PATH launched
-        # the host's real CLI instead.
-        return Claude.build(profile: claude_profile, settings: settings, env: env) if settings.claude_provider?
-        return Claude.new(profile: claude_profile, settings: settings, env: env) if claude_profile
-
-        raise Unavailable, UNCONFIGURED
+        # mismatch guard — used the runner's own. That is the precise failure the profiles warn
+        # about: "readiness pass against one CLI and execution run another".
+        case profile
+        when ClaudeProfile then Claude.new(profile: profile, env: env)
+        when CodexProfile then Codex.new(profile: profile, env: env)
+        else raise Unavailable, UNCONFIGURED
+        end
       end
 
-      # Named here rather than inlined because it is the sentence an operator reads when the lane
-      # cannot proceed, and it has to name every way out — including the fixture, so that choosing
-      # the composer stays a real option rather than something only the source reveals.
+      # The sentence an operator reads when the lane cannot proceed. It names both ways out, and
+      # only ways that still exist: the selection is a provider name, on the screen they chose it
+      # on or in this runner's own file — never a command, a kind, or a fixture.
       UNCONFIGURED =
-        "no specification generation provider is configured. Set runner.specification.provider.kind " \
-        "to `claude` to use this runner's configured Claude profile, to `command` with " \
-        "runner.specification.provider.command for another executable, or to `composed` to use the " \
-        "built-in deterministic composer as an explicit fixture. Configuring a runner.executor " \
-        "Claude profile also selects `claude` for specifications."
+        "no specification generation provider is configured. Select `claude` or `codex` as this " \
+        "workspace's AI provider in Platform's Project Setup, or name one under runner.executor " \
+        "on this runner."
 
-      # The deterministic, built-in provider. It composes the documents from the packet with
-      # no model call, which makes it both the test double the spec asks for and a genuinely
-      # usable default: its output is grounded in the real bundle and the real source
-      # evidence, so it is a weak writer rather than a fake one — which is why the
-      # configuration value that selects it is `composed`.
-      class Composed
-        KIND = "composed"
-
-        def describe = "built-in deterministic composer (no model, no network)"
-        def kind = KIND
-
-        def generate(packet, on_output: nil)
-          _ = on_output
-          Composer.call(packet)
-        rescue StandardError => e
-          # A composer bug must surface as a generation failure the run records, not as an
-          # unhandled crash that leaves the claim held and the operator with a backtrace.
-          raise Failed, "the built-in composer could not produce a package: #{e.class}"
-        end
-      end
-
-      # The operator's REAL Claude profile, writing the specification.
+      # The ONE content contract both real providers answer to: the same specification prompt, the
+      # same balanced JSON file map, and the same sentences when a provider does not deliver one.
       #
-      # It is a distinct kind from {Command} even though both spawn a process, because the two
-      # answer to different configuration and different failure advice: `command` is "an
-      # executable I chose for this lane", while this is "the Claude profile this runner already
-      # validated for execution". Collapsing them would make the refusal messages wrong for one of
-      # them, and would hide the fact that no separate configuration is needed at all.
-      #
-      # The profile owns the argv, the timeout, the prompt delivery and the child environment —
-      # this class adds none of them. That is what makes the provider that writes a specification
-      # verifiably the same one an operator configured and the readiness check probed.
-      class Claude
-        KIND = "claude"
-
-        MISSING_PROFILE =
-          "runner.specification.provider.kind is `claude` but this runner has no Claude profile: " \
-          "configure runner.executor with provider `claude`, or select another specification " \
-          "provider kind."
-
-        def self.build(profile:, settings:, env: ENV)
-          raise Unavailable, MISSING_PROFILE if profile.nil?
-
-          new(profile: profile, settings: settings, env: env)
-        end
-
-        def initialize(profile:, settings:, env: ENV, command_runner: CommandRunner)
-          @profile = profile
-          @settings = settings
-          @env = env
-          @command_runner = command_runner
-        end
-
-        def kind = KIND
+      # It is shared rather than copied because it is one rule, not two: a Codex package and a
+      # Claude package are the same artifact, validated by the same {DocumentSet}, and a second
+      # prompt or a second parser could only ever drift from the first. What is NOT shared is what
+      # genuinely differs — how each provider is launched, and which decoder reads its output.
+      module PackageContract
+        # PATH to find the executable and HOME to find the operator's own provider credentials —
+        # the same two the implementation lane forwards, and nothing else. The profile's own
+        # `extra_env` is merged last because it is part of the profile identity the exact-profile
+        # comparison already validated.
+        FORWARDED_ENV = %w[PATH HOME].freeze
 
         # Already redacted by the profile, and it names the executable and how the prompt is
         # delivered — enough for an operator to recognise which provider ran, with nothing that
         # could carry a credential.
-        def describe = "Claude profile — #{profile.describe}"
+        def describe = "#{kind.capitalize} profile — #{profile.describe}"
 
-        # The packet reaches the model as ONE argv element, exactly as the implementation lane
-        # delivers its prompt, and the model must answer with the same JSON file map every
-        # provider answers with. Both halves are deliberate: the instruction lives here in
-        # reviewable source rather than "deep inside command glue" (MVP-0026 scope 9), and the
-        # output contract is the provider boundary's, not this class's, so {DocumentSet} validates
-        # a Claude package exactly as it validates any other.
-        # MAPIAI-60 — the profile is structured-output-only, so the process is read through the
-        # SAME {ClaudeStream} the implementation lane uses. Progress reaches `on_output` while the
-        # model works; the document map still comes only from the terminal result, and still goes
-        # only to {DocumentSet}. One decoder, two lanes, no second normalization rule.
-        def generate(packet, on_output: nil)
-          # No repository is assigned to this lane, so containment can never be proven and the
-          # decoder shows no path at all — the same projection rule, applied to a lane with no root.
-          stream = ClaudeStream.new(sink: on_output)
-          result = run(prompt_for(packet), stream)
-          raise Failed, "the Claude specification provider timed out" if result.timed_out?
-          raise Failed, "the Claude specification provider exited #{result.exit_code}" unless result.success?
+        private
+
+        attr_reader :profile, :env, :command_runner
+
+        # The provider's whole run, from the prompt to a parsed file map. Every rule about what a
+        # usable answer IS lives here, once; the adapter supplies only its decoder and its launch.
+        # What happens once the process has STARTED is one rule for both providers. What happens
+        # when it cannot be started at all is not: Claude's accepted behaviour is that the
+        # operating system's own error escapes, and this slice may not change it. Each adapter
+        # therefore owns its own `launch`, and only Codex's classifies a failure to start.
+        def generate_package(packet, stream)
+          result = launch(prompt_for(packet), stream)
+          raise Failed, "#{failure_prefix} timed out" if result.timed_out?
+          raise Failed, "#{failure_prefix} exited #{result.exit_code}" unless result.success?
 
           failure = stream.close.failure
-          raise Failed, "the Claude specification provider's output could not be read: #{failure}" if failure
+          raise Failed, "#{failure_prefix}'s output could not be read: #{failure}" if failure
 
           parse(stream.final_text)
         end
 
-        private
-
-        attr_reader :profile, :settings, :env, :command_runner
-
-        # PATH to find the executable and HOME to find the operator's own Claude credentials —
-        # the same two the implementation lane forwards, and nothing else. The profile's own
-        # `extra_env` is merged last because it is the operator's explicit choice, and it is part
-        # of the profile identity the readiness check already validated.
-        FORWARDED_ENV = %w[PATH HOME].freeze
-
-        def run(prompt, stream)
-          Dir.mktmpdir("specrelay-spec-claude-") do |workdir|
-            command_runner.run([ profile.command, *profile.args, prompt ], chdir: workdir,
-                                                                          env: child_env,
-                                                                          timeout_seconds: profile.timeout_seconds,
-                                                                          on_output: stream.sink)
-          end
-        end
+        def failure_prefix = "the #{kind.capitalize} specification provider"
 
         def child_env
           FORWARDED_ENV.each_with_object({}) { |name, acc| acc[name] = env[name].to_s unless env[name].nil? }
@@ -354,18 +276,17 @@ module SpecrelayRunner
         end
 
         # A model may wrap JSON in a fence or add a sentence despite being asked not to, so the
-        # first balanced object is extracted rather than the whole stdout parsed. Anything else is
+        # first balanced object is extracted rather than the whole answer parsed. Anything else is
         # a failure the run records — never a partial package.
-        # The size bound belongs to {ClaudeStream}, which is where the bytes now arrive; a second
-        # check here would be a second owner of the same rule, and an unreachable one.
+        # The size bound belongs to the decoder, which is where the bytes arrive; a second check
+        # here would be a second owner of the same rule, and an unreachable one.
         def parse(text)
           document = JSON.parse(json_object(text))
-          raise Failed, "the Claude specification provider did not return a JSON object of file paths" unless
-            document.is_a?(Hash)
+          raise Failed, "#{failure_prefix} did not return a JSON object of file paths" unless document.is_a?(Hash)
 
           document.to_h { |name, content| [ name.to_s, content.to_s ] }
         rescue JSON::ParserError
-          raise Failed, "the Claude specification provider did not return valid JSON"
+          raise Failed, "#{failure_prefix} did not return valid JSON"
         end
 
         # Genuinely balanced, not "first `{` to last `}`" (review-004 non-blocking note): a
@@ -377,86 +298,96 @@ module SpecrelayRunner
         def json_object(text)
           BalancedJson.extract_object(text)
         rescue BalancedJson::NotFound
-          raise Failed, "the Claude specification provider returned no JSON object"
+          raise Failed, "#{failure_prefix} returned no JSON object"
         end
       end
 
-      # An operator-configured local executable. The packet is handed to it as JSON on
-      # stdin; it must return the file map as JSON on stdout. No shell is involved (argv
-      # array), no environment is inherited beyond PATH, and the working directory is the
-      # operator's own choice of a temporary directory — the provider is never given the
-      # specification checkout to write into, because writing is not its job.
-      class Command
-        KIND = "command"
+      # The operator's REAL Claude profile, writing the specification.
+      #
+      # The profile owns the argv, the timeout, the prompt delivery and the child environment —
+      # this class adds none of them. That is what makes the provider that writes a specification
+      # verifiably the same one an operator selected and the readiness check probed.
+      class Claude
+        include PackageContract
 
-        def self.build(settings:, env: ENV)
-          command = settings.provider_command
-          raise Unavailable, "runner.specification.provider.kind is `command` but no provider command is " \
-                             "configured (set runner.specification.provider.command or " \
-                             "#{Settings::PROVIDER_COMMAND_ENV})" if command.nil?
-          raise Unavailable, "the configured generation provider is not an executable file: #{command}" unless
-            File.file?(command) && File.executable?(command)
+        KIND = "claude"
 
-          new(command: command, args: settings.provider_args, timeout_seconds: settings.provider_timeout_seconds,
-              env: env)
-        end
-
-        def initialize(command:, args: [], timeout_seconds: Settings::DEFAULT_TIMEOUT_SECONDS, env: ENV,
-                       command_runner: CommandRunner)
-          @command = command
-          @args = Array(args).map(&:to_s)
-          @timeout_seconds = timeout_seconds
+        def initialize(profile:, env: ENV, command_runner: CommandRunner)
+          @profile = profile
           @env = env
           @command_runner = command_runner
         end
 
         def kind = KIND
-        def describe = "configured provider command `#{File.basename(command)}`"
 
+        # The profile is structured-output-only, so the process is read through the
+        # SAME {ClaudeStream} the implementation lane uses. Progress reaches `on_output` while the
+        # model works; the document map still comes only from the terminal result, and still goes
+        # only to {DocumentSet}. One decoder per provider, two lanes, no second normalization rule.
         def generate(packet, on_output: nil)
-          _ = on_output
-          result = run(JSON.generate(packet))
-          raise Failed, "the generation provider timed out after #{timeout_seconds}s" if result.timed_out?
-          raise Failed, "the generation provider exited #{result.exit_code}: #{first_line(result)}" unless
-            result.success?
-
-          parse(result.stdout)
+          # No repository is assigned to this lane, so containment can never be proven and the
+          # decoder shows no path at all — the same projection rule, applied to a lane with no root.
+          generate_package(packet, ClaudeStream.new(sink: on_output))
         end
 
         private
 
-        attr_reader :command, :args, :timeout_seconds, :env, :command_runner
-
-        # Run in a throwaway directory, not in either checkout. A provider that decides to
-        # write next to itself then cannot touch the specification repository or the source
-        # tree — the atomicity guarantee in scope 10 is only as strong as the set of places
-        # something can write.
-        def run(stdin_data)
-          Dir.mktmpdir("specrelay-spec-provider-") do |workdir|
-            command_runner.run([ command, *args ], chdir: workdir, env: { "PATH" => env["PATH"].to_s },
-                                                   timeout_seconds: timeout_seconds, stdin_data: stdin_data)
+        # The packet reaches the model as ONE argv element, exactly as the implementation lane
+        # delivers this profile's prompt.
+        def launch(prompt, stream)
+          Dir.mktmpdir("specrelay-spec-claude-") do |workdir|
+            command_runner.run([ profile.command, *profile.args, prompt ], chdir: workdir,
+                                                                          env: child_env,
+                                                                          timeout_seconds: profile.timeout_seconds,
+                                                                          on_output: stream.sink)
           end
         end
+      end
 
-        def parse(stdout)
-          raise Failed, "the generation provider produced more output than the runner will accept" if
-            stdout.to_s.bytesize > MAX_OUTPUT_BYTES
+      # The operator's REAL Codex profile, writing the specification.
+      #
+      # It is a sibling of {Claude}, not a subclass and not a registry entry: the two share the
+      # prompt and the file-map contract through {PackageContract} and differ only in the two
+      # things that genuinely differ — Codex takes its prompt on STDIN, so the specification never
+      # becomes a process argument, and its turn is read by {CodexStream}, whose terminal contract
+      # is materially different from Claude's single `result` frame.
+      class Codex
+        include PackageContract
 
-          document = JSON.parse(stdout.to_s)
-          raise Failed, "the generation provider did not return a JSON object of file paths" unless
-            document.is_a?(Hash)
+        KIND = "codex"
 
-          document.to_h { |name, content| [ name.to_s, content.to_s ] }
-        rescue JSON::ParserError
-          raise Failed, "the generation provider did not return valid JSON on stdout"
+        def initialize(profile:, env: ENV, command_runner: CommandRunner)
+          @profile = profile
+          @env = env
+          @command_runner = command_runner
         end
 
-        # Only the FIRST line of the provider's stderr reaches the failure message, redacted.
-        # A provider's full output may contain anything, including its own configuration, and
-        # this string is persisted by Platform and shown on the run page.
-        def first_line(result)
-          text = [ result.stderr, result.stdout ].map { |value| value.to_s.strip }.find { |value| !value.empty? }
-          Redaction.redact(text.to_s.each_line.first.to_s.strip)[0, 300].to_s
+        def kind = KIND
+
+        def generate(packet, on_output: nil)
+          generate_package(packet, CodexStream.new(sink: on_output))
+        end
+
+        private
+
+        # Run in a throwaway directory, not in either checkout. A provider that decides to write
+        # next to itself then cannot touch the specification repository or the source tree — the
+        # atomicity guarantee in scope 10 is only as strong as the set of places something can
+        # write. The prompt goes on stdin because that is this profile's approved delivery.
+        def launch(prompt, stream)
+          Dir.mktmpdir("specrelay-spec-codex-") do |workdir|
+            command_runner.run([ profile.command, *profile.args ], chdir: workdir,
+                                                                   env: child_env,
+                                                                   timeout_seconds: profile.timeout_seconds,
+                                                                   stdin_data: prompt,
+                                                                   on_output: stream.sink)
+          end
+        rescue SystemCallError => e
+          # A Codex CLI that cannot be started is a bounded generation failure rather than an
+          # exception escaping the lane, which would leave the claim held with no recorded reason
+          # (S07). The underlying error names a host path, so this names the condition and the
+          # error CLASS and nothing else.
+          raise Failed, "#{failure_prefix} could not be launched (#{e.class})"
         end
       end
     end

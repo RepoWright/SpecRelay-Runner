@@ -4,11 +4,12 @@ require_relative "test_helper"
 
 # MVP-0026 scope 9 — the generation-provider boundary.
 #
-# Exercised through the CONFIGURED COMMAND provider rather than the built-in composer,
-# because the properties under test are properties of the boundary, not of the writer behind
-# it: what crosses it going in, what is accepted coming back, and what happens to the
-# destination when a provider misbehaves. The built-in composer can never return malformed
-# output, so a test that used it would prove the validation runs, not that it works.
+# Exercised through the approved Claude profile with a stubbed CLI first on PATH, because the
+# properties under test are properties of the boundary rather than of the model behind it: what
+# crosses it going in, what is accepted coming back, and what happens to the destination when a
+# provider misbehaves. A real model cannot be asked to return malformed output on demand, and the
+# lane no longer has a deterministic writer to substitute — so the double stands where the CLI
+# stands, under the approved profile's own bare name, and everything else is the real code path.
 class SpecificationProviderTest < Minitest::Test
   ISSUE = "SR-700"
   PACKAGE_DIR = "SR-700-add-an-export-button"
@@ -24,86 +25,17 @@ class SpecificationProviderTest < Minitest::Test
     FileUtils.remove_entry(@temp) if @temp && File.directory?(@temp)
   end
 
-  # ------------------------------------------------------- the operator-facing vocabulary
-
-  # CR-001 should-fix 6. The default provider was CONFIGURED as `fake` and REPORTED itself as
-  # `composed`, so the diagnostics Platform persists told an operator that the intended
-  # production path was a fake. One vocabulary, and this asserts the two halves agree rather
-  # than trusting that they happen to.
-  # EVERY kind, including `command`. CR-002 should-fix 6.2: this test used to `next` past
-  # `command`, so "asserts it for every kind" was true of two kinds out of three — and
-  # `command` is the one whose resolution can actually fail, because it builds an executable.
-  def test_the_configured_provider_kind_and_the_resolved_provider_agree
-    command = SpecificationWorkspace.write_provider(File.join(@temp, "agreement-provider"),
-                                                    files: valid_documents)
-
-    { "composed" => "composed", "fake" => "composed", "command" => "command" }.each do |configured, resolved|
-      settings = settings_for(configured, command: command)
-
-      assert_equal resolved, settings.provider_kind, "configured #{configured.inspect}"
-      assert_equal settings.provider_kind,
-                   SpecrelayRunner::Specification::Provider.resolve(settings: settings).kind,
-                   "resolved provider disagrees with the configured kind for #{configured.inspect}"
-    end
-  end
-
-  # `fake` stays accepted so an operator's existing config keeps working; it normalizes on the
-  # way in, so nothing downstream ever sees the old word.
-  def test_the_legacy_fake_alias_is_accepted_and_normalized
-    assert_equal "composed", settings_for("fake").provider_kind
-    assert settings_for("fake").composed_provider?
-  end
-
-  # The ENVIRONMENT path had no coverage at all, and it is the one a guided connection uses —
-  # a guided connection writes no YAML, so `SPECRELAY_RUNNER_SPEC_PROVIDER` is the only way it
-  # can name a provider.
-  def test_the_provider_kind_environment_override_is_read_and_normalized
-    env = { SpecrelayRunner::Specification::Settings::PROVIDER_KIND_ENV => "fake" }
-    settings = SpecrelayRunner::Specification::Settings.new({}, env: env)
-
-    assert_equal "composed", settings.provider_kind
-    assert_equal "composed", SpecrelayRunner::Specification::Provider.resolve(settings: settings).kind
-  end
-
-  def test_the_environment_override_wins_over_the_config_file
-    env = { SpecrelayRunner::Specification::Settings::PROVIDER_KIND_ENV => "composed" }
-    settings = SpecrelayRunner::Specification::Settings.new({ "provider" => { "kind" => "command" } }, env: env)
-
-    assert_equal "composed", settings.provider_kind
-  end
-
-  def test_an_unknown_provider_kind_in_the_environment_is_refused_by_name
-    env = { SpecrelayRunner::Specification::Settings::PROVIDER_KIND_ENV => "magic" }
-    error = assert_raises(SpecrelayRunner::Specification::Settings::Error) do
-      SpecrelayRunner::Specification::Settings.new({}, env: env)
-    end
-
-    assert_includes error.message, "composed, command"
-  end
-
-  def test_an_unknown_provider_kind_is_refused_by_name
-    error = assert_raises(SpecrelayRunner::Specification::Settings::Error) { settings_for("magic") }
-
-    assert_includes error.message, "composed, command"
-  end
-
-  def settings_for(kind, command: nil)
-    provider = { "kind" => kind }
-    provider["command"] = command if command
-    SpecrelayRunner::Specification::Settings.new({ "provider" => provider }, env: {})
-  end
-
   # ------------------------------------------------------------------ what goes in
 
   def test_the_packet_carries_sanitized_bundle_and_source_evidence
     capture = File.join(@temp, "packet.json")
-    provider = SpecificationWorkspace.write_recording_provider(
-      File.join(@temp, "provider"), capture_to: capture, files: valid_documents
-    )
+    provider = provider_stub(files: valid_documents, capture_prompt_to: capture)
 
     assert_equal SpecrelayRunner::CLI::SUCCESS, run_with(provider), @io.string
 
-    packet = JSON.parse(File.read(capture))
+    # The evidence travels inside the one reviewable prompt document, so it is read back out of
+    # the prompt exactly as a provider would read it.
+    packet = SpecificationWorkspace.captured_packet(capture)
     assert_equal ISSUE, packet.dig("issue", "key")
     assert_includes packet.dig("input_bundle", "content_markdown"), "retype it by hand"
     assert_includes packet.dig("source", "entry_points"), "app/services/export_report.rb"
@@ -121,9 +53,7 @@ class SpecificationProviderTest < Minitest::Test
                "https://user:s3cr3t@internal.example.com/reports for the nightly pull.\n"
     )
     restart_platform(payload)
-    provider = SpecificationWorkspace.write_recording_provider(
-      File.join(@temp, "provider"), capture_to: capture, files: valid_documents
-    )
+    provider = provider_stub(files: valid_documents, capture_prompt_to: capture)
     run_with(provider)
 
     packet = File.read(capture)
@@ -137,8 +67,7 @@ class SpecificationProviderTest < Minitest::Test
   # ---------------------------------------------------------------- what comes back
 
   def test_a_provider_failure_leaves_no_partial_package
-    provider = SpecificationWorkspace.write_provider(File.join(@temp, "provider"),
-                                                     files: {}, exit_code: 1, stdout: "boom")
+    provider = provider_stub(exit_code: 1)
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_with(provider), @io.string
     assert_no_package "no package, and no staging leftovers"
@@ -149,7 +78,7 @@ class SpecificationProviderTest < Minitest::Test
   def test_output_missing_a_required_section_is_rejected_before_anything_is_written
     documents = valid_documents
     documents["spec.md"] = documents["spec.md"].sub(/^## Acceptance criteria$.*?(?=^## )/m, "")
-    provider = SpecificationWorkspace.write_provider(File.join(@temp, "provider"), files: documents)
+    provider = provider_stub(files: documents)
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_with(provider), @io.string
     assert_no_package
@@ -160,7 +89,7 @@ class SpecificationProviderTest < Minitest::Test
   def test_output_missing_a_required_file_is_rejected
     documents = valid_documents
     documents.delete("analysis/technical.md")
-    provider = SpecificationWorkspace.write_provider(File.join(@temp, "provider"), files: documents)
+    provider = provider_stub(files: documents)
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_with(provider), @io.string
     assert_no_package
@@ -177,7 +106,7 @@ class SpecificationProviderTest < Minitest::Test
     documents = valid_documents
     documents["analysis/technical.md"] = documents["analysis/technical.md"]
       .sub(/\A# .*$/, "# Source entry points inspected\n\n(placeholder-free content follows)")
-    provider = SpecificationWorkspace.write_provider(File.join(@temp, "provider"), files: documents)
+    provider = provider_stub(files: documents)
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_with(provider), @io.string
     assert_no_package "no package, and no staging leftovers"
@@ -191,7 +120,7 @@ class SpecificationProviderTest < Minitest::Test
     documents = valid_documents
     documents["analysis/technical.md"] = documents["analysis/technical.md"]
       .sub(/\A# .*$/, "# Source entry points inspected")
-    provider = SpecificationWorkspace.write_provider(File.join(@temp, "provider"), files: documents)
+    provider = provider_stub(files: documents)
 
     run_with(provider)
 
@@ -205,7 +134,7 @@ class SpecificationProviderTest < Minitest::Test
     documents = valid_documents
     documents["analysis/business.md"] = documents["analysis/business.md"]
       .sub("\n\n##", "\n\n(placeholder-free content follows)\n\n##")
-    provider = SpecificationWorkspace.write_provider(File.join(@temp, "provider"), files: documents)
+    provider = provider_stub(files: documents)
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_with(provider), @io.string
     assert_no_package
@@ -217,7 +146,7 @@ class SpecificationProviderTest < Minitest::Test
   def test_missing_input_evidence_is_rejected
     documents = valid_documents
     documents.delete("analysis/input-evidence.md")
-    provider = SpecificationWorkspace.write_provider(File.join(@temp, "provider"), files: documents)
+    provider = provider_stub(files: documents)
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_with(provider), @io.string
     assert_no_package
@@ -232,7 +161,7 @@ class SpecificationProviderTest < Minitest::Test
                                        "does not say.\n- Decision required: confirm the scope.\n" \
                                        "- Consequence: an implementer would guess.\n"
     )
-    provider = SpecificationWorkspace.write_provider(File.join(@temp, "provider"), files: documents)
+    provider = provider_stub(files: documents)
 
     assert_equal SpecrelayRunner::CLI::SUCCESS, run_with(provider), @io.string
     assert File.exist?(File.join(package_root, "analysis", "open-questions.md"))
@@ -249,7 +178,7 @@ class SpecificationProviderTest < Minitest::Test
       "analysis/open-questions.md" => "# Open questions\n\nNothing here names a question, but this " \
                                        "text is long enough to clear the minimum length floor.\n"
     )
-    provider = SpecificationWorkspace.write_provider(File.join(@temp, "provider"), files: documents)
+    provider = provider_stub(files: documents)
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_with(provider), @io.string
     assert_no_package
@@ -265,7 +194,7 @@ class SpecificationProviderTest < Minitest::Test
       "analysis/open-questions.md" => "# Open questions\n\n## OQ-001\n\n- Why it blocks: the ticket " \
                                        "does not say.\n- Consequence: an implementer would guess.\n"
     )
-    provider = SpecificationWorkspace.write_provider(File.join(@temp, "provider"), files: documents)
+    provider = provider_stub(files: documents)
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_with(provider), @io.string
     assert_no_package
@@ -280,7 +209,7 @@ class SpecificationProviderTest < Minitest::Test
                                        "does not say.\n- Decision required: confirm the scope.\n" \
                                        "- Consequence: an implementer would guess.\n- Owner: PO\n"
     )
-    provider = SpecificationWorkspace.write_provider(File.join(@temp, "provider"), files: documents)
+    provider = provider_stub(files: documents)
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_with(provider), @io.string
     assert_no_package
@@ -291,7 +220,7 @@ class SpecificationProviderTest < Minitest::Test
   # its folder. The allowlist rejects the file rather than sanitizing the name.
   def test_a_provider_that_returns_an_unexpected_file_is_rejected
     documents = valid_documents.merge("../../escaped.md" => "x" * 500)
-    provider = SpecificationWorkspace.write_provider(File.join(@temp, "provider"), files: documents)
+    provider = provider_stub(files: documents)
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_with(provider), @io.string
     assert_no_package
@@ -300,12 +229,11 @@ class SpecificationProviderTest < Minitest::Test
   end
 
   def test_non_json_provider_output_is_rejected
-    provider = SpecificationWorkspace.write_provider(File.join(@temp, "provider"),
-                                                     files: {}, stdout: "<html>not json</html>")
+    provider = provider_stub(answer: "<html>not json</html>")
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_with(provider), @io.string
     assert_equal "generation_provider_failed", @platform.last_specification_generation["failure_class"]
-    assert_includes @io.string, "valid JSON"
+    assert_includes @io.string, "returned no JSON object"
   end
 
   # A provider CAN return a secret — it may have quoted its own configuration, or echoed an
@@ -314,7 +242,7 @@ class SpecificationProviderTest < Minitest::Test
     documents = valid_documents
     documents["spec.md"] = documents["spec.md"].sub("## Problem\n",
                                                     "## Problem\n\nUse token=ghp_abcdefghijklmnop1234 to call it.\n")
-    provider = SpecificationWorkspace.write_provider(File.join(@temp, "provider"), files: documents)
+    provider = provider_stub(files: documents)
 
     assert_equal SpecrelayRunner::CLI::SUCCESS, run_with(provider), @io.string
     written = File.read(File.join(package_root, "spec.md"))
@@ -330,7 +258,7 @@ class SpecificationProviderTest < Minitest::Test
   def test_a_host_path_in_provider_output_fails_without_writing
     documents = valid_documents
     documents["analysis/technical.md"] += "\nInspected at #{@source}/app/services/export_report.rb\n"
-    provider = SpecificationWorkspace.write_provider(File.join(@temp, "provider"), files: documents)
+    provider = provider_stub(files: documents)
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_with(provider), @io.string
     assert_no_package
@@ -374,10 +302,19 @@ class SpecificationProviderTest < Minitest::Test
     @platform = FakePlatform.new(claim_payload: payload).start
   end
 
-  def run_with(provider_command)
-    config = build_config(provider_command)
+  # The approved Claude profile's own bare name, first on the child PATH. The assignment carries
+  # the exact profile Platform serves, so this is the ordinary production selection path with a
+  # double where the CLI would be.
+  def provider_stub(files: valid_documents, answer: nil, exit_code: 0, capture_prompt_to: nil)
+    SpecificationWorkspace.claude_stub(@temp, files: files, answer: answer, exit_code: exit_code,
+                                       capture_prompt_to: capture_prompt_to)
+  end
+
+  def run_with(stub_dir)
+    config = build_config
     SpecrelayRunner::CLI.run(%W[claim-once --config #{config.source_path}], out: @io, err: @io,
-                             env: { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN, "PATH" => ENV["PATH"] }
+                             env: { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN,
+                                    "PATH" => SpecificationWorkspace.provider_path(stub_dir) }
                                     .merge(SpecificationWorkspace.lane_env(@temp)))
   end
 
@@ -396,7 +333,7 @@ class SpecificationProviderTest < Minitest::Test
     refute File.exist?(File.join(@specs, "specs", PACKAGE_DIR)), "the operator checkout must stay empty"
   end
 
-  def build_config(provider_command)
+  def build_config
     path = File.join(Dir.mktmpdir("cfg"), "runner.yml")
     File.write(path, <<~YAML)
       platform:
@@ -408,10 +345,6 @@ class SpecificationProviderTest < Minitest::Test
         claim_policy:
           mode: all_eligible
         specification:
-          provider:
-            kind: command
-            command: #{provider_command}
-            timeout_seconds: 60
           repository_roots:
             "SpecRelay/SpecRelay-Specs": #{@specs}
           context_plus:

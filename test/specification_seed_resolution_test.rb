@@ -106,10 +106,13 @@ class SpecificationSeedResolutionTest < Minitest::Test
 
   def run_cli(repository_roots:)
     config = build_config(repository_roots: repository_roots)
-    env = { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN, "PATH" => ENV["PATH"] }
+    env = { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN,
+            "PATH" => SpecificationWorkspace.provider_path(provider_stub) }
           .merge(SpecificationWorkspace.lane_env(@temp))
     SpecrelayRunner::CLI.run(%W[claim-once --config #{config.source_path}], out: @io, err: @io, env: env)
   end
+
+  def provider_stub = @provider_stub ||= SpecificationWorkspace.claude_stub(@temp, compose: true)
 
   def build_config(repository_roots:)
     path = File.join(Dir.mktmpdir("cfg"), "runner.yml")
@@ -123,8 +126,6 @@ class SpecificationSeedResolutionTest < Minitest::Test
         claim_policy:
           mode: all_eligible
         specification:
-          provider:
-            kind: fake
           repository_roots:
             #{repository_roots ? "\"#{TARGET_SLUG}\": #{@specs}" : '{}'}
           context_plus:

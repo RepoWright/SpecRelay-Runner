@@ -117,11 +117,17 @@ class SpecificationMarkdownTest < Minitest::Test
     config = write_config
     exit_code = SpecrelayRunner::CLI.run(
       %W[claim-once --config #{config.source_path}], out: @io, err: @io,
-      env: { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN, "PATH" => ENV["PATH"] }
+      env: { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN,
+             "PATH" => SpecificationWorkspace.provider_path(provider_stub) }
             .merge(SpecificationWorkspace.lane_env(@temp))
     )
     assert_equal SpecrelayRunner::CLI::SUCCESS, exit_code, @io.string
   end
+
+  # The composer answers for the provider here: this file is about how a BUNDLE renders into the
+  # generated documents, which needs a deterministic writer over the real packet rather than a
+  # canned reply.
+  def provider_stub = SpecificationWorkspace.claude_stub(@temp, compose: true)
 
   def read_package(name)
     File.read(File.join(SpecificationWorkspace.isolated_worktree(@temp), PACKAGE, name))
@@ -137,8 +143,6 @@ class SpecificationMarkdownTest < Minitest::Test
         id: test-runner
         display_name: Test Runner
         specification:
-          provider:
-            kind: composed
           repository_roots:
             "SpecRelay/SpecRelay-Specs": #{@specs}
           context_plus:

@@ -2,135 +2,235 @@
 
 require_relative "test_helper"
 
-# MVP-0028 remediation slice 1, defect 1 — WHICH provider generates a specification, and how an
-# operator finds out.
+# WHICH provider generates a specification, and what happens to everything else that once could.
 #
-# The live clean E2E selected "Claude Code (real provider)" and the run printed
-# "Generating with built-in deterministic composer (no model, no network)". The cause was not a
-# bug in the composer: `runner.specification` was absent from the operator's config, and an absent
-# section resolved silently to `composed`. The implementation lane's real Claude profile was
-# configured and simply never consulted by the specification lane.
+# The lane used to answer this question twice: `runner.specification.provider.kind` selected a
+# deterministic composer or an arbitrary configured executable, while a separate Claude-only
+# narrowing of the operator's real profile answered it for the real provider. Two answers to one
+# question is how the live run that exposed this generated plausible prose from the composer while the
+# operator believed they had selected a real model.
 #
-# So the property under test is not "the composer works". It is that the composer can only be
-# reached by ASKING for it, and that anything else is either the operator's real provider or a
-# loud refusal — never a quiet substitution nobody sees until they read the generated prose.
+# There is now ONE authority — {SpecrelayRunner::ImplementationProfile}, the same exact whole-hash
+# comparison the implementation lane launches against — and exactly two real providers behind it.
+# The property under test is that nothing else can reach generation: not the fixture, not an
+# unknown provider, not a profile that differs from the approved one by a single field, and not the
+# configuration keys that used to name an arbitrary command.
 class SpecificationProviderSelectionTest < Minitest::Test
-  Settings = SpecrelayRunner::Specification::Settings
   Provider = SpecrelayRunner::Specification::Provider
+  Settings = SpecrelayRunner::Specification::Settings
+  ImplementationProfile = SpecrelayRunner::ImplementationProfile
+  Assignment = SpecrelayRunner::Specification::Assignment
 
-  def settings_for(specification, env: {})
-    Settings.new(specification, env: env)
+  CLAUDE = SpecrelayRunner::ClaudeProfile::CANONICAL
+  CODEX = SpecrelayRunner::CodexProfile::CANONICAL
+  FIXTURE = ImplementationProfile::FIXTURE_CANONICAL
+
+  def assignment_for(executor, profile: nil)
+    Assignment.parse(spec_creation_payload_for(
+                       issue_key: "SR-700",
+                       specification_provider: { "profile" => profile, "executor" => executor }
+                     ))
   end
 
-  def claude_profile(command: "claude", args: [ "--print", "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions" ])
-    SpecrelayRunner::ClaudeProfile.new("provider" => "claude", "command" => command, "args" => args)
+  # ------------------------------------------------------------------ S01: the two real providers
+
+  def test_each_approved_real_profile_resolves_to_its_own_adapter
+    assert_equal "claude", Provider.resolve(profile: ImplementationProfile.for(CLAUDE), env: {}).kind
+    assert_equal "codex", Provider.resolve(profile: ImplementationProfile.for(CODEX), env: {}).kind
   end
 
-  # ------------------------------------------------------------------ the silent substitution
-
-  # The exact shape of the operator's live config: a real executor profile, and no
-  # `runner.specification` section at all.
-  def test_an_unconfigured_specification_provider_is_not_silently_the_composer
-    settings = settings_for({})
-
-    refute settings.composed_provider?,
-           "an absent runner.specification must not silently select the deterministic composer"
-    assert_nil settings.provider_kind,
-               "an unconfigured provider must read as UNSET so the caller can decide, not as `composed`"
+  def test_the_assignments_exact_profile_selects_the_matching_provider
+    assert_equal "claude",
+                 Provider.resolve(profile: assignment_for(CLAUDE).selected_implementation_profile, env: {}).kind
+    assert_equal "codex",
+                 Provider.resolve(profile: assignment_for(CODEX).selected_implementation_profile, env: {}).kind
   end
 
-  def test_an_unconfigured_provider_resolves_to_the_operators_real_claude_profile
-    provider = Provider.resolve(settings: settings_for({}), claude_profile: claude_profile, env: {})
-
-    assert_equal "claude", provider.kind
-    assert_includes provider.describe, "claude"
-    refute_includes provider.describe, "deterministic composer"
-  end
-
-  # No specification provider and no real profile is not a state to guess in. The operator gets a
-  # refusal naming both ways out, which is what "never a silent substitute" means when there is
-  # nothing to substitute WITH.
-  def test_an_unconfigured_provider_with_no_real_profile_refuses_with_both_remedies
-    error = assert_raises(Provider::Unavailable) do
-      Provider.resolve(settings: settings_for({}), claude_profile: nil, env: {})
+  # The claim is compared AS IT ARRIVED. A padded, differently cased provider names nothing in the
+  # closed set; folding it into a match would be comparing what the gate wishes the claim had said.
+  def test_a_decorated_provider_is_refused_rather_than_normalized
+    error = assert_raises(ImplementationProfile::Error) do
+      assignment_for(CODEX.merge("provider" => " Codex ")).selected_implementation_profile
     end
 
-    assert_includes error.message, "runner.specification.provider.kind"
-    assert_includes error.message, "composed"
+    assert_includes error.message, "not supported by this runner"
+  end
+
+  # ------------------------------------------------------------------ S02: one field is enough
+
+  def test_every_missing_extra_or_altered_codex_field_is_refused
+    {
+      "a missing timeout" => CODEX.reject { |key, _| key == "timeout_seconds" },
+      "a missing environment" => CODEX.reject { |key, _| key == "env" },
+      "an extra top-level key" => CODEX.merge("model" => "o4"),
+      "an altered argument list" => CODEX.merge("args" => CODEX.fetch("args") + [ "--output-schema" ]),
+      "an altered command" => CODEX.merge("command" => "/tmp/codex"),
+      "an altered prompt delivery" => CODEX.merge("prompt_delivery" => "argument"),
+      "an altered timeout" => CODEX.merge("timeout_seconds" => 60),
+      "an added environment entry" => CODEX.merge("env" => { "OPENAI_API_KEY" => "sk-live-000" })
+    }.each do |described, executor|
+      assert_raises(ImplementationProfile::Error, described) do
+        assignment_for(executor).selected_implementation_profile
+      end
+    end
+  end
+
+  # A refusal names the dimension, never the claimed value: the claim is remote input and may
+  # itself be the thing that must not be repeated into a log Platform stores.
+  def test_a_refusal_never_echoes_the_claimed_environment_value
+    error = assert_raises(ImplementationProfile::Error) do
+      assignment_for(CODEX.merge("env" => { "OPENAI_API_KEY" => "sk-live-must-not-appear" }))
+        .selected_implementation_profile
+    end
+
+    refute_includes error.message, "sk-live-must-not-appear"
+  end
+
+  def test_an_unknown_provider_is_refused_rather_than_treated_as_the_fixture
+    error = assert_raises(ImplementationProfile::Error) do
+      assignment_for(CLAUDE.merge("provider" => "wishful")).selected_implementation_profile
+    end
+
     assert_includes error.message, "claude"
+    assert_includes error.message, "codex"
   end
 
-  # ------------------------------------------------------------------ explicit selection
+  # ------------------------------------------------------------------ S03: fixture is not absence
 
-  def test_the_composer_is_still_available_when_it_is_explicitly_asked_for
-    settings = settings_for({ "provider" => { "kind" => "composed" } })
+  # The fixture and an absent selection both resolve to NO real profile, and the lane has to tell
+  # them apart: an operator who explicitly selected the deterministic fixture has decided this
+  # machine does not generate specifications, and that decision must not fall through to whatever
+  # Platform selected. The distinguishing fact is the selection block itself.
+  def test_an_explicit_local_fixture_is_distinguishable_from_no_local_selection
+    explicit = config_with("provider" => ImplementationProfile::FIXTURE)
+    absent = config_with(nil)
 
-    assert settings.composed_provider?
-    provider = Provider.resolve(settings: settings, claude_profile: claude_profile, env: {})
-
-    assert_equal "composed", provider.kind
+    assert_nil explicit.selected_implementation_profile
+    assert_nil absent.selected_implementation_profile
+    refute_empty explicit.executor_override, "an explicit fixture selection must remain visible as a selection"
+    assert_empty absent.executor_override
   end
 
-  # The historical alias must keep working: an operator who wrote `fake` chose the fixture, and
-  # this change must not turn their explicit choice into a refusal.
-  def test_the_fake_alias_still_selects_the_composer_explicitly
-    provider = Provider.resolve(settings: settings_for({ "provider" => { "kind" => "fake" } }),
-                                claude_profile: nil, env: {})
+  def test_the_assignments_fixture_selection_yields_no_real_provider
+    assignment = assignment_for(FIXTURE, profile: ImplementationProfile::FIXTURE)
 
-    assert_equal "composed", provider.kind
+    assert_nil assignment.selected_implementation_profile
+    assert_equal ImplementationProfile::FIXTURE, assignment.selected_provider_profile
   end
 
-  def test_an_explicit_claude_kind_selects_the_real_profile
-    provider = Provider.resolve(settings: settings_for({ "provider" => { "kind" => "claude" } }),
-                                claude_profile: claude_profile, env: {})
+  # ------------------------------------------------------------------ S04: nothing else can run
 
-    assert_equal "claude", provider.kind
-  end
+  def test_no_profile_refuses_and_names_only_the_two_real_providers
+    error = assert_raises(Provider::Unavailable) { Provider.resolve(profile: nil, env: {}) }
 
-  # Asking for the real provider without having configured one is a refusal, not a fallback.
-  def test_an_explicit_claude_kind_without_a_profile_refuses
-    error = assert_raises(Provider::Unavailable) do
-      Provider.resolve(settings: settings_for({ "provider" => { "kind" => "claude" } }),
-                       claude_profile: nil, env: {})
-    end
-
-    assert_includes error.message, "runner.executor"
-  end
-
-  def test_the_environment_override_still_selects_a_kind
-    settings = settings_for({}, env: { Settings::PROVIDER_KIND_ENV => "composed" })
-
-    assert_equal "composed", settings.provider_kind
-  end
-
-  def test_an_unknown_kind_is_refused_by_name
-    error = assert_raises(Settings::Error) { settings_for({ "provider" => { "kind" => "wishful" } }) }
-
-    assert_includes error.message, "composed"
+    assert_includes error.message, "no specification generation provider is configured"
     assert_includes error.message, "claude"
-  end
-
-  # ------------------------------------------------------------------ the evidence
-
-  # An operator must be able to answer "what wrote this?" from the recorded package rather than by
-  # recognising the prose style. The manifest already carried the pair; what it must never do is
-  # carry a value that disagrees with the provider that actually ran.
-  def test_the_provider_reports_a_kind_and_description_that_agree
-    [ Provider.resolve(settings: settings_for({ "provider" => { "kind" => "composed" } }),
-                       claude_profile: nil, env: {}),
-      Provider.resolve(settings: settings_for({}), claude_profile: claude_profile, env: {}) ].each do |provider|
-      assert_includes Settings::PROVIDER_KINDS, provider.kind
-      refute_empty provider.describe
+    assert_includes error.message, "codex"
+    [ "composed", "command", "runner.specification.provider" ].each do |removed|
+      refute_includes error.message, removed,
+                      "the refusal must not send an operator to a configuration key that no longer selects anything"
     end
   end
 
-  # The real profile's description is redacted and names the executable, so the run log and the
-  # manifest identify the provider without disclosing argv the profile may carry.
-  def test_the_claude_provider_description_is_non_secret_and_identifies_the_profile
-    provider = Provider.resolve(settings: settings_for({}), claude_profile: claude_profile, env: {})
+  # The removed surface is removed, not merely unreachable: a configuration file or environment
+  # variable that still names a kind or an arbitrary command selects nothing at all.
+  def test_the_generation_provider_configuration_surface_no_longer_exists
+    settings = Settings.new({ "provider" => { "kind" => "command", "command" => "/tmp/anything" } },
+                            env: { "SPECRELAY_RUNNER_SPEC_PROVIDER" => "composed",
+                                   "SPECRELAY_RUNNER_SPEC_PROVIDER_COMMAND" => "/tmp/anything" })
 
-    assert_includes provider.describe, "claude"
-    refute_includes provider.describe, "ANTHROPIC"
+    %i[provider_kind provider_command provider_args provider_timeout_seconds
+       composed_provider? claude_provider? provider_kind_configured?].each do |removed|
+      refute_respond_to settings, removed
+    end
+    refute Settings.const_defined?(:PROVIDER_KIND_ENV), "the provider-kind environment override is gone"
+    refute Settings.const_defined?(:PROVIDER_KINDS), "the lane has no provider-kind vocabulary of its own"
+  end
+
+  def test_the_composer_and_the_configured_command_are_no_longer_providers
+    %i[Composed Command].each do |removed|
+      refute Provider.const_defined?(removed, false),
+             "#{removed} must not remain reachable as a production generation provider"
+    end
+  end
+
+  # --------------------------------------------------- S02: a refused profile prepares nothing
+
+  # Records what it was asked to do and does none of it, so "the exact profile was judged first"
+  # becomes a statement about the operator's disk rather than about a return value. The real
+  # store's `prepare!` runs `FileUtils.mkdir_p`, and `create` builds a git worktree — an ordering
+  # regression therefore CREATES state on this machine for a claim the runner is about to refuse.
+  class RecordingWorkspaceStore
+    def initialize = @touched = []
+
+    attr_reader :touched
+
+    def root = File.join(Dir.tmpdir, "specrelay-recording-store-never-created")
+    def overlaps?(_checkout) = false
+    def prepare! = @touched << :prepare!
+    def sweep(**) = @touched << :sweep
+    def create(**) = @touched << :create
+  end
+
+  # Required behavior 1: an unknown, missing, extra or ALTERED profile refuses before source or
+  # workspace preparation. The seed and the destination path are validated first because both are
+  # pure reads that can each end the run on their own; everything after them that touches this
+  # machine must come after the profile is known to be launchable.
+  #
+  # The profile here differs from the approved Codex hash by one field, which is the cheapest
+  # thing a compromised or mis-built payload can be, and the hardest to notice.
+  def test_an_altered_assignment_profile_refuses_before_the_workspace_root_is_prepared
+    source, specs, temp = SpecificationWorkspace.build
+    store = RecordingWorkspaceStore.new
+
+    result = preflight_for(CODEX.merge("timeout_seconds" => 60), source: source, specs: specs,
+                                                                 workspaces: store)
+
+    assert result.refused?
+    assert_equal "generation_provider_unavailable", result.failure_class
+    assert_empty store.touched,
+                 "an altered profile must be refused before the package workspace root is touched"
+  ensure
+    FileUtils.remove_entry(temp) if temp && File.directory?(temp)
+  end
+
+  # The same call with the APPROVED profile must still reach the workspace root, or the test above
+  # would pass just as well against a preflight that refused everything.
+  def test_the_approved_profile_still_reaches_the_workspace_root
+    source, specs, temp = SpecificationWorkspace.build
+    store = RecordingWorkspaceStore.new
+
+    preflight_for(CODEX, source: source, specs: specs, workspaces: store)
+
+    assert_includes store.touched, :prepare!
+  ensure
+    FileUtils.remove_entry(temp) if temp && File.directory?(temp)
+  end
+
+  def preflight_for(executor, source:, specs:, workspaces:)
+    SpecrelayRunner::Specification::Preflight.call(
+      assignment: assignment_for(executor),
+      settings: Settings.new({ "repository_roots" => { "SpecRelay/SpecRelay-Specs" => specs } }, env: {}),
+      config: config_with(nil),
+      env: { "SPECRELAY_RUNNER_WORKSPACE_ROOT" => source, "HOME" => source },
+      workspaces: workspaces
+    )
+  end
+
+  def config_with(executor)
+    path = File.join(Dir.mktmpdir("cfg"), "runner.yml")
+    block = executor.nil? ? "" : "\n  executor: #{JSON.generate(executor)}"
+    File.write(path, <<~YAML)
+      platform:
+        base_url: http://127.0.0.1:3200
+        token_env: TEST_TOKEN
+      runner:
+        id: test-runner
+        display_name: Test Runner#{block}
+      workspace_roots:
+        tiny-demo-workspace: /tmp/tiny-demo
+    YAML
+    SpecrelayRunner::Config.load(path)
   end
 end
 

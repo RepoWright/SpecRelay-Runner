@@ -341,12 +341,14 @@ class SpecificationGenerationTest < Minitest::Test
   def test_nothing_is_committed_pushed_published_or_sent_to_jira
     run_cli
 
-    # The wire: only claim, heartbeat, and the generation result. No execution report, and no
-    # protocol events (this lane emits none).
+    # The wire: only claim, heartbeat, the provider's live-log events and the generation result.
+    # No execution report — this lane uploads none — and the events carry nothing but the
+    # normalized progress the run page's existing panel shows.
     paths = @platform.requests.map { |request| request[:path] }.uniq
-    assert_equal [ "/api/runner/claim", "/api/runner/specification_generations" ], paths - [ "/api/runner/heartbeat" ]
+    assert_equal [ "/api/runner/claim", "/api/runner/events", "/api/runner/specification_generations" ],
+                 paths - [ "/api/runner/heartbeat" ]
     assert_empty @platform.requests_to("/api/runner/reports")
-    assert_empty @platform.requests_to("/api/runner/events")
+    assert_equal [ "log.chunk" ], @platform.protocol_events.map { |event| event["event_type"] }.uniq
 
     # The disk: the isolated worktree gained a package and nothing else. No branch was created
     # and no commit was made anywhere.
@@ -489,8 +491,6 @@ class SpecificationGenerationTest < Minitest::Test
         claim_policy:
           mode: all_eligible
         specification:
-          provider:
-            kind: fake
           repository_roots:
             "SpecRelay/SpecRelay-Specs": #{@specs}
           context_plus:
@@ -505,8 +505,14 @@ class SpecificationGenerationTest < Minitest::Test
     SpecrelayRunner::Config.load(path)
   end
 
+  # The approved Claude profile's bare name first on the child PATH, answering with the
+  # deterministic composer's own documents so the CONTENT assertions above stay inspectable
+  # without a model. Everything between the claim and the write is the real code path.
+  def provider_stub = @provider_stub ||= SpecificationWorkspace.claude_stub(@temp, compose: true)
+
   def run_cli(env_extra: {})
-    env = { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN, "PATH" => ENV["PATH"] }
+    env = { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN,
+            "PATH" => SpecificationWorkspace.provider_path(provider_stub) }
           .merge(SpecificationWorkspace.lane_env(@temp)).merge(env_extra)
     SpecrelayRunner::CLI.run(%W[claim-once --config #{@config.source_path}], out: @io, err: @io, env: env)
   end

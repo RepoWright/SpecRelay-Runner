@@ -15,7 +15,6 @@ require_relative "test_helper"
 # failure handling, and JSON extraction) is proven directly and fast.
 class SpecificationClaudeProviderGenerationTest < Minitest::Test
   Provider = SpecrelayRunner::Specification::Provider
-  Settings = SpecrelayRunner::Specification::Settings
   Result = SpecrelayRunner::CommandRunner::Result
 
   # Records every call it receives and returns a pre-baked Result, so a test can assert on
@@ -48,11 +47,9 @@ class SpecificationClaudeProviderGenerationTest < Minitest::Test
                                       "timeout_seconds" => timeout_seconds, "env" => env)
   end
 
-  def settings = Settings.new({}, env: {})
-
   def provider_for(result:, lines: [], profile: build_profile, env: {})
     runner = FakeCommandRunner.new(result: result, lines: lines)
-    [ Provider::Claude.new(profile: profile, settings: settings, env: env, command_runner: runner), runner ]
+    [ Provider::Claude.new(profile: profile, env: env, command_runner: runner), runner ]
   end
 
   # A provider that worked and then answered: one `init`, one PUBLIC narration line the operator
@@ -205,6 +202,22 @@ class SpecificationClaudeProviderGenerationTest < Minitest::Test
     error = assert_raises(Provider::Failed) { provider.generate({}) }
 
     assert_includes error.message, "exited 1"
+  end
+
+  # Claude's launch-error behaviour is UNCHANGED, and this test exists to hold it that way.
+  #
+  # An absent or unexecutable CLI raises the operating system's own error out of this adapter,
+  # exactly as it did before the second provider existed. Classifying it as a bounded
+  # `Provider::Failed` would be an improvement to Claude's failure boundary, and this slice is
+  # not allowed to make one: the accepted boundary is that Claude's argv, stream, parser and
+  # FAILURE behaviour are byte-for-byte what they were. The bounded classification is Codex's
+  # own, proven in its own suite, and the asymmetry is deliberate rather than an oversight.
+  def test_a_launch_error_propagates_unchanged_rather_than_being_reclassified
+    runner = Object.new
+    def runner.run(*, **) = raise(Errno::ENOENT, "/usr/local/bin/claude")
+    provider = Provider::Claude.new(profile: build_profile, env: {}, command_runner: runner)
+
+    assert_raises(Errno::ENOENT) { provider.generate({}) }
   end
 
   def test_a_timeout_is_a_generation_failure_naming_the_timeout

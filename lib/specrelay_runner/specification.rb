@@ -20,8 +20,8 @@ module SpecrelayRunner
   #   SourceEvidence  read-only source inspection + Graphify/Context+ evidence
   #   Preflight       every check that must pass BEFORE a byte is written
   #   Packet          the sanitized input handed to a provider
-  #   Composer        the deterministic built-in document author
-  #   Provider        the provider boundary (built-in composer, or a configured command)
+  #   Composer        the deterministic document author focused evidence tests compose with
+  #   Provider        the provider boundary — the two approved real profiles, and nothing else
   #   DocumentSet     structural validation of whatever a provider returned
   #   PackageWriter   stage, redact, verify, digest, and ONE atomic rename into place
   #   Generation      the orchestrator that runs the above against a live claim
