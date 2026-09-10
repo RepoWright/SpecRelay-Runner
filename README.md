@@ -292,9 +292,8 @@ F2, second pass): Platform now reads each linked issue's key, title, and descrip
 deep (`Jira::SpecCreation::EnrichLinkedIssues`) before classifying the bundle, and an issue whose
 content could not be read BLOCKS intake through the same terminally-blocked, marked-comment path
 as any other unreadable required input — it never reaches generation looking complete. A linked
-issue that does reach generation therefore always carries real content, which the built-in
-composer excerpts (its first paragraph) and a real provider is asked to genuinely analyse,
-including its own stated acceptance criteria. A ticket with no linked issues produces no entry at
+issue that does reach generation therefore always carries real content, which the selected real
+provider is asked to genuinely analyse, including its own stated acceptance criteria. A ticket with no linked issues produces no entry at
 all, the same as any other absent supporting input.
 
 The folder name is deterministic — the same issue always produces the same
@@ -402,7 +401,7 @@ a property of the control flow rather than of a cleanup routine that might fail.
 | `external_reference_analysis_unavailable` | A Confluence page or screenshot was deferred to this runner. Enable the capability or record a substitute. |
 | `graphify_unavailable` | Graphify is present but incomplete, not executable, stale, or unhealthy. Repair it with `bin/graph-build`, or record a substitute. A repository with neither wrapper installed continues with direct source inspection and records that Graphify contributed nothing. |
 | `context_plus_unavailable` | Legacy result from older runners. Current runners continue with an explicit warning when Context+ is unavailable. |
-| `generation_provider_unavailable` | The configured provider command is missing or not executable. |
+| `generation_provider_unavailable` | No approved real profile could be used: none was selected, or the selection is the fixture, unknown, or altered from the approved profile. Select `claude` or `codex` (Project Setup, or `runner.executor:` here) and make sure that CLI is installed and authenticated on this machine. |
 | `redaction_validation_unavailable` | The redaction guard failed its own self-check; generated output cannot be proven safe. |
 
 After preflight passes, three more classes can occur, and they are distinguished
@@ -429,15 +428,15 @@ bin/platform runner requeue-specification <run-id|ticket-key>
 #### Configuration
 
 Under `runner.specification:` in the config file, or from the environment. No secret
-belongs here — the provider is a local executable path.
+belongs here — the external-reference command is a local executable path.
+
+This section does **not** choose a generation provider. That is one closed selection of an
+approved profile, made once for the whole machine under `runner.executor:` or in Platform's
+Project Setup — see [the two approved profiles](#the-real-providers-two-approved-profiles).
 
 ```yaml
 runner:
   specification:
-    provider:
-      kind: composed        # composed (built-in deterministic composer) | claude | command
-      command: /abs/path/to/spec-writer   # required for kind: command
-      timeout_seconds: 900
     repository_roots:
       # A SEED, not a destination: the runner reads git objects, `origin` and your
       # credential helper from here and writes the package into its own worktree.
@@ -454,15 +453,8 @@ runner:
       substitute: "why, when the bundle defers a reference to this runner"
 ```
 
-`provider.kind: fake` is still accepted as an alias for `composed` and normalizes on
-the way in, so an existing config keeps working. The value was renamed because the
-built-in composer is not a fake: it composes from the real bundle and the real source
-evidence, and an operator reading `provider: fake` in a run page's diagnostics was
-being told the intended default was a stub.
-
 Environment overrides: `SPECRELAY_RUNNER_SPEC_REPOSITORY_ROOT_<OWNER>_<REPO>` (or the
-unsuffixed `SPECRELAY_RUNNER_SPEC_REPOSITORY_ROOT`), `SPECRELAY_RUNNER_SPEC_PROVIDER`,
-`SPECRELAY_RUNNER_SPEC_PROVIDER_COMMAND`.
+unsuffixed `SPECRELAY_RUNNER_SPEC_REPOSITORY_ROOT`).
 
 ### Where a generated package lives
 
@@ -505,76 +497,24 @@ having contributed, because the contributor was a person, not this process.
 
 Everything that turns evidence into prose goes through one interface with two
 methods — `describe` and `generate(packet)` — and the entire input a provider
-receives is one reviewable, redacted packet. Three implementations ship:
+receives is one reviewable, redacted packet. Exactly **two** implementations ship, and they are
+the two approved real profiles: `claude` and `codex`. There is no built-in deterministic writer,
+no operator-configured executable, no registry and no discovery — a lane that could reach a
+plausible substitute by configuration is a lane whose output an operator cannot attribute.
 
-- **`composed`** (the default when nothing else is configured) is the built-in
-  deterministic composer: same packet, same bytes, no model, no network. It is both
-  the test double and a genuinely usable default, because it composes from the real
-  bundle and the real source evidence.
-- **`claude`** is the operator's real, already-validated Claude profile (the same one
-  `runner.executor` configures) writing the specification directly — the ordinary path
-  for an operator who wants model-authored synthesis, requiring no separate
-  configuration. Its prompt (reviewable in full in `provider.rb`) states the document
-  contract below and the required synthesis discipline: describe the
-  requested product behaviour rather than Jira labels, resolve a vague ticket
-  reference (e.g. "the text") from the title and the evidence, avoid raw
-  input-bundle or transcript dumps, and never claim a current publication or Jira
-  state a later reader could find false.
-- **`command`** runs an operator-configured local executable with the packet as JSON
-  on stdin, expecting the file map as JSON on stdout. No shell, no inherited
-  environment beyond `PATH`, and a throwaway working directory — the provider is
-  never handed either checkout, because writing is not its job.
+Both are the operator's own already-validated profile writing the specification directly,
+requiring no separate configuration. They share one prompt and one file-map parser (reviewable in
+full in `provider.rb`), which state the document contract below and the required synthesis
+discipline: describe the requested product behaviour rather than Jira labels, resolve a vague
+ticket reference (e.g. "the text") from the title and the evidence, avoid raw input-bundle or
+transcript dumps, and never claim a current publication or Jira state a later reader could find
+false. They differ only in what genuinely differs: Claude takes its prompt as one argv element and
+is decoded by `ClaudeStream`; Codex takes it on stdin and is decoded by `CodexStream`.
 
-An explicit `provider.kind` always wins; otherwise a configured Claude profile is used;
-otherwise generation refuses rather than silently falling back to the composer.
-
-#### What the built-in composer takes from the ticket
-
-Where the Jira ticket states something, the generated specification **quotes it** rather
-than paraphrasing it. These sections are read out of the reporter's own description:
-
-| Ticket heading (case-insensitive) | Where it lands |
-|---|---|
-| `Problem`, `Context`, `Background`, `Why` | `## Problem`, as a blockquote |
-| `Outcome`, `What we want`, `Goal`, `Expected behaviour` | `## Outcome`, verbatim and attributed |
-| `Acceptance criteria`, `Acceptance`, `Criteria`, `Definition of done` | `## Acceptance criteria`, verbatim and attributed |
-| `Out of scope`, `Non-goals`, `Not in scope`, `Exclusions` | `## Non-goals`, verbatim and attributed |
-
-Every other heading the ticket carries — `Edge cases that matter`, say — is reproduced
-under `## Proposed behavior`, because it is material an implementer needs and dropping
-it for want of a name for it would be the same mistake in a smaller form.
-
-Headings are recognised by shape, not by markup: Jira stores ADF and the conversion to
-text loses heading formatting, so a heading arrives as a short line alone between blank
-lines. Ordered list items arrive as `#`, which is renumbered to `1.` on the way out —
-left alone, a bare `#` is a level-1 heading and would destroy the document's outline.
-
-**Where the ticket says nothing, the document says so** — and where it says something, the
-composer does not add to it.
-
-- A ticket that states its own acceptance criteria gets **no derived numbered criteria and no
-  derived numbered behaviour list**. The reproduced material plus the standing conditions is the
-  section. A ticket that has written six testable criteria does not need a machine to add four
-  more.
-- **No requirement is derived from a keyword.** An earlier version treated the word "again"
-  as a request for idempotency, and on a real bug about a file becoming "readable again" it
-  produced four statements telling an implementer to build and test idempotency for a stateless
-  read handler. No generated sentence claims the ticket asked for something it did not.
-  One keyword heuristic survives: `user_facing?` matches a list of UI words over the title and
-  the ticket's included sections, and it decides one row of `analysis/technical.md`. It states
-  what the recorded inputs do or do not imply, never what the ticket requires.
-- Where a specification needs a decision the ticket never made, the output is an **open
-  question**, never a requirement. **A ticket that supplies its own acceptance criteria raises
-  neither standing question** — not the repeat one, not the failure-path one. Where it supplies
-  none, both are raised, worded as what this generation found rather than as a finding about the
-  ticket. Nothing reads the criteria text for keywords to decide this; a generator cannot tell
-  whether a reporter made a decision, and both directions of that guess have now shipped a
-  defect — a false requirement in round 003, a false absence in round 004.
-- A ticket with no criteria at all produces a section that opens "The ticket states no
-  acceptance criteria" and labels what follows as derived and needing confirmation.
-
-A fabricated acceptance criterion is worse than a missing one, because a reviewer cannot tell it
-from a real one.
+The selection is the machine's one AI provider, read through `ImplementationProfile`: an explicit
+local `runner.executor:` selection wins, otherwise the profile Platform's Project Setup sent with
+the assignment. A fixture, unknown or altered profile refuses before any process starts and before
+any package byte is written — generation never falls back to a substitute writer.
 
 Whatever a provider returns is validated before anything is written, so a
 plausible-looking document that silently omits acceptance criteria is rejected rather
