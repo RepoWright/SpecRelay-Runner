@@ -1,7 +1,5 @@
 # frozen_string_literal: true
 
-require "fileutils"
-
 module SpecrelayRunner
   module Specification
     # Returns the ticket's task environment once Platform has ACCEPTED a specification
@@ -31,9 +29,10 @@ module SpecrelayRunner
     # advanced; reporting the run as failed because a worktree could not be returned would tell an
     # operator their specification was not published while a reviewer was already reading it.
     class TaskEnvironmentCleanup
-      # `released` is the only success. `removed` says whether the package is still on disk, which
-      # is the one fact an operator reading a refusal needs and cannot infer from the reason.
-      # Both nil with no reason means there was no environment to return.
+      # `released` is the only success. `removed` says whether the accepted package is still the
+      # environment's own uncommitted work, which is the one fact an operator reading a refusal
+      # needs and cannot infer from the reason. Both nil with no reason means there was no
+      # environment to return.
       Result = Struct.new(:released, :removed, :reason, keyword_init: true) do
         def released? = released ? true : false
         def removed? = removed ? true : false
@@ -109,14 +108,30 @@ module SpecrelayRunner
       # exactly the accepted files and is reached without following a link. The environment's own
       # repositories and working trees are the project's to take down, which is what the release
       # command below is for.
+      #
+      # What must be true afterwards is that the folder holds NO UNCOMMITTED WORK, and that is not
+      # the same as holding no files. The accepted package arrives in the environment two ways: as
+      # output lying beside the branch on a first round, and as the branch's OWN HISTORY on a round
+      # that continued a published specification, whose files are tracked at the head the
+      # environment was put on. Deleting the second kind would leave four deleted tracked files —
+      # an uncommitted change, which is precisely the state the project's release authority refuses
+      # — so a cleanup that removed it would make the environment unreleasable.
+      #
+      # So the folder is returned to what the branch records: untracked files in it are cleaned
+      # away, tracked ones are restored from HEAD. A first round's package is untracked in full and
+      # is therefore simply gone, exactly as before; a continued round's is left as the committed
+      # evidence it already was. Both are scoped to the recorded path, so nothing outside the one
+      # folder this run is allowed to touch is read or written.
       def remove_package(task)
         directory = File.join(task, package_path)
         return false if File.symlink?(directory) || !File.directory?(directory)
 
-        FileUtils.remove_entry(directory)
-        true
-      rescue SystemCallError, IOError
-        false
+        commands = GitCommands.new(checkout_root: task, env: env)
+        return false unless commands.success?([ "clean", "--quiet", "-fd", "--", package_path ])
+        return true unless commands.success?([ "rev-parse", "--verify", "--quiet",
+                                               "HEAD:#{package_path}" ])
+
+        commands.success?([ "checkout", "--quiet", "HEAD", "--", package_path ])
       end
 
       # The project's own task-environment authority, invoked exactly as the implementation lane

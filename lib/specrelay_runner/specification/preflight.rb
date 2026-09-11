@@ -569,16 +569,134 @@ module SpecrelayRunner
                "#{assignment.canonical_branch}, then run specification creation again")
       end
 
-      # The pull request's CURRENT package, placed in the ticket package directory the provider
-      # works in. The packet already carries the previous text; this is what
-      # lets a provider that reads its working directory revise the real files rather than a copy
-      # of them, and it is the same directory the new package replaces, so nothing lands outside
-      # the one path this run is allowed to change.
+      # The ticket's canonical branch in the task environment, put ON the published head the
+      # previous package was just read from.
       #
-      # Every name comes from `git ls-tree` under the package path, so it is repository-relative
-      # and cannot traverse: git trees carry no `..` and no absolute entry.
+      # It used to COPY those files into the package directory instead, and that is wrong in the
+      # shape the product actually runs: publication builds its commit with plumbing and pushes
+      # it, so an accepted round leaves the package on the remote branch and no local branch at
+      # all. A task environment built afterwards branches from the base, the copy lands as
+      # UNTRACKED files, and the round that revises a published specification cannot see the
+      # history it is revising — `git status`, `git log` and every diff describe a first draft.
+      # Checking the branch out at the published head makes the same bytes TRACKED, which is what
+      # the provider, the change boundary and publication all already assume.
+      #
+      # PLACED for an environment this run built and RECONCILED for one it reused — the same
+      # distinction, for the same reason, as {materialize_previous_accepted}: a created
+      # environment has nothing to lose, while a reused one may already carry the ticket's later
+      # work and must never be rewound.
+      #
+      # It imports the validated pull request's branch and nothing else. Every check that decides
+      # WHICH history this is has already run — the pull request is open, on this repository,
+      # against the configured base, not a fork, and on this ticket's own branch — and the exact
+      # commit is required to be present here afterwards, so a branch that moved, was
+      # force-pushed, or belongs to another clone refuses instead of being checked out.
+      #
+      # CONTAINMENT is resolved FIRST, before either path acts, and it guards both. A
+      # specification root that resolves through a symbolic link puts the package directory
+      # outside the task environment, and a checkout is not the harmless half of that: `git reset
+      # --hard` replaces whatever stands at the package path with the published tree, so a link an
+      # operator committed is discarded by the very step that would otherwise never have been
+      # reached. The same {PackagePath} judgment that refuses to WRITE through such a root
+      # therefore refuses to reset onto it.
       def materialize_revision(task, package, previous)
         destination = package.absolute_in(task.path)
+        commands = GitCommands.new(checkout_root: task.path, env: env)
+        return place_revision_files(destination, previous) unless specification_checkout?(commands)
+
+        return revision_refusal(unreachable_head_message(previous)) unless available?(commands, previous)
+
+        return reset_to(commands, previous) if task.created?
+        return nil if ancestor?(commands, previous.commit, "HEAD")
+        return reset_to(commands, previous) if ancestor?(commands, "HEAD", previous.commit)
+
+        revision_refusal(diverged_message(previous))
+      rescue PackagePath::Unsafe, SystemCallError, IOError => e
+        revision_refusal("the previous specification package could not be placed in the task " \
+                         "workspace: #{e.class}")
+      end
+
+      # The validated head, in THIS checkout. An environment created for this run has never seen
+      # the published branch, so one fetch is the ordinary path rather than a repair: the package
+      # is read through the specification checkout, and `repository_roots` and `workspace_roots`
+      # are separate settings, so the environment need not be built from that same clone.
+      #
+      # A fetch that still cannot produce the commit is refused rather than fallen through, and
+      # the refusal has to be its own: the checks below would read a commit this checkout has
+      # never seen as a divergence, which is a different thing to tell an operator.
+      def available?(commands, previous)
+        return true if commit?(commands, previous.commit)
+
+        commands.git([ "fetch", "--quiet", PreviousSpecificationPackage::REMOTE, previous.branch ])
+        commit?(commands, previous.commit)
+      end
+
+      def commit?(commands, commit) = commands.success?([ "cat-file", "-e", "#{commit}^{commit}" ])
+
+      def ancestor?(commands, ancestor, descendant)
+        commands.success?([ "merge-base", "--is-ancestor", ancestor, descendant ])
+      end
+
+      # `reset --hard` rather than `checkout` or `merge --ff-only`, because the package directory
+      # legitimately holds an earlier round's untracked copy of these very files and both of those
+      # abort rather than replace one. What it can discard is bounded before this runs:
+      # {reuse_task_workspace} already refused every environment carrying a change outside this
+      # ticket's package directory.
+      def reset_to(commands, previous)
+        return nil if commands.success?([ "reset", "--hard", "--quiet", previous.commit ])
+
+        revision_refusal("this ticket's task environment could not be put on " \
+                         "#{assignment.canonical_branch} at the published specification head " \
+                         "#{previous.commit[0, 12]}. Release the task environment, then run " \
+                         "specification creation again")
+      end
+
+      def unreachable_head_message(previous)
+        "the specification pull request #{assignment.issue_key} links was read at " \
+          "#{previous.commit[0, 12]}, and this ticket's task environment cannot reach that commit. " \
+          "Check that #{assignment.canonical_branch} still carries the published specification, " \
+          "then run specification creation again"
+      end
+
+      def diverged_message(previous)
+        "this ticket's task environment has diverged from the published specification head " \
+          "#{previous.commit[0, 12]} on #{assignment.canonical_branch}. Preserve or release the " \
+          "task environment, then run specification creation again"
+      end
+
+      def revision_refusal(message) = refuse(SPECIFICATION_REVISION_UNREADABLE, message)
+
+      # Is the environment's own repository the one this specification is published to?
+      #
+      # It is in the shape the product deploys: the workspace whose `bin/worktree` builds the task
+      # environment IS the specification repository, so the ticket's canonical branch in that
+      # environment is the branch the package is published on. An operator who configures a
+      # SEPARATE specification clone has no checkout of it in the environment at all — there is no
+      # published history to check out there, and the validated files are placed as files below.
+      # That is a different topology rather than an older path: both are supported today, and
+      # only one of them HAS a branch to track the package in.
+      #
+      # Asked of the checkout's own `origin` and resolved to a GitHub `owner/repo`, exactly as
+      # {GitPublisher#verify_remote} and {#reuse_source_workspace_checkout} ask it, so the
+      # answers cannot disagree. An unresolvable remote is "not it", which keeps the file path —
+      # never the reset — as the answer to a question this cannot settle.
+      def specification_checkout?(commands)
+        slug = RepositorySlug.for(commands.git_value(%w[remote get-url origin]))
+        !slug.nil? && slug == assignment.target_slug
+      end
+
+      # The pull request's CURRENT package, placed in the ticket package directory the provider
+      # works in, for an environment that holds no checkout of the specification repository. The
+      # packet already carries the previous text; this is what lets a provider that reads its
+      # working directory revise the real files rather than a copy of them, and it is the same
+      # directory the new package replaces, so nothing lands outside the one path this run is
+      # allowed to change.
+      #
+      # Every name comes from `git ls-tree` under the package path, so it is repository-relative
+      # and cannot traverse: git trees carry no `..` and no absolute entry. `destination` is the
+      # contained path {materialize_revision} already resolved, and a write failure surfaces
+      # through its refusal.
+      def place_revision_files(destination, previous)
         FileUtils.rm_rf(destination)
         previous.files.each do |name, content|
           target = File.join(destination, name)
@@ -586,9 +704,6 @@ module SpecrelayRunner
           File.write(target, content)
         end
         nil
-      rescue PackagePath::Unsafe, SystemCallError, IOError => e
-        refuse(SPECIFICATION_REVISION_UNREADABLE,
-               "the previous specification package could not be placed in the task workspace: #{e.class}")
       end
 
       # The operator's local clone of the specification repository, resolved as a SEED
