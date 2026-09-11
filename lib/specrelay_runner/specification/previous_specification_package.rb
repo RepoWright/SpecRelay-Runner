@@ -21,7 +21,10 @@ module SpecrelayRunner
 
       UNREADABLE = "specification_revision_unreadable"
 
-      Result = Struct.new(:files, :branch, :failure_class, :message, keyword_init: true) do
+      # `commit` is the branch tip the files were read from — ONE moment, reported rather than
+      # re-derived. The caller puts the task environment on that exact commit, so "the package the
+      # provider revises" and "the history it is tracked in" cannot be two different things.
+      Result = Struct.new(:files, :branch, :commit, :failure_class, :message, keyword_init: true) do
         def ok? = failure_class.nil?
       end
 
@@ -82,7 +85,7 @@ module SpecrelayRunner
 
           files[path.delete_prefix("#{package_path}/")] = content
         end
-        Result.new(files: files, branch: branch)
+        Result.new(files: files, branch: branch, commit: commit)
       end
 
       def failure(message) = Result.new(failure_class: UNREADABLE, message: Redaction.redact(message.to_s))
