@@ -604,8 +604,6 @@ module SpecrelayRunner
         commands = GitCommands.new(checkout_root: task.path, env: env)
         return place_revision_files(destination, previous) unless specification_checkout?(commands)
 
-        return revision_refusal(off_branch_message) unless
-          commands.git_value(%w[symbolic-ref --quiet --short HEAD]) == assignment.canonical_branch
         return revision_refusal(unreachable_head_message(previous)) unless available?(commands, previous)
 
         return reset_to(commands, previous) if task.created?
@@ -619,7 +617,13 @@ module SpecrelayRunner
       end
 
       # The validated head, in THIS checkout. An environment created for this run has never seen
-      # the published branch, so one fetch is the ordinary path rather than a repair.
+      # the published branch, so one fetch is the ordinary path rather than a repair: the package
+      # is read through the specification checkout, and `repository_roots` and `workspace_roots`
+      # are separate settings, so the environment need not be built from that same clone.
+      #
+      # A fetch that still cannot produce the commit is refused rather than fallen through, and
+      # the refusal has to be its own: the checks below would read a commit this checkout has
+      # never seen as a divergence, which is a different thing to tell an operator.
       def available?(commands, previous)
         return true if commit?(commands, previous.commit)
 
@@ -645,12 +649,6 @@ module SpecrelayRunner
                          "#{assignment.canonical_branch} at the published specification head " \
                          "#{previous.commit[0, 12]}. Release the task environment, then run " \
                          "specification creation again")
-      end
-
-      def off_branch_message
-        "this ticket's task environment is not on #{assignment.canonical_branch}, so the " \
-          "specification published for #{assignment.issue_key} cannot be continued in it. Release " \
-          "the task environment, then run specification creation again"
       end
 
       def unreachable_head_message(previous)

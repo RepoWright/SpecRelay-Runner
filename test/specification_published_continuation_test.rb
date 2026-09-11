@@ -85,9 +85,75 @@ class SpecificationPublishedContinuationTest < Minitest::Test
     refute_path_exists task_workspace, "the continued round must release the environment too"
     refute local_branch?(TASK), "a released ticket must leave no local branch behind"
     assert_equal 2, worktree_invocations.count("release #{TASK}")
+
+    # The SAME pull request, and only it. Each phase runs its own `gh` over the shared
+    # pull-request state, so "opened nothing new" is counted from the invocations the continuation
+    # really made rather than inferred from the url it reported back.
+    assert_equal PR_URL, @platform.last_specification_publication["pull_request_url"]
+    assert_equal 1, FakeGithub.pr_creates(@first_round_gh_log), "the first round opens exactly one"
+    assert_equal 0, FakeGithub.pr_creates(@generation_gh_log), "generation opens none"
+    assert_equal 0, FakeGithub.pr_creates(@second_round_gh_log),
+                 "the continuation must commit onto the existing pull request, not open a second"
+  end
+
+
+  # ---------------------------------------------------------------- refusals on the same chain
+
+  # An environment carrying a commit of its own beside the published head is RECONCILED only when
+  # one head contains the other. Divergence is refused rather than merged: this reconstructs a
+  # base, it does not resolve one.
+  def test_a_reused_environment_diverged_from_the_published_head_refuses
+    published = publish_the_accepted_package
+    create_task_environment
+    commit_beside_the_published_head
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, continue_from_the_pull_request, @io.string
+    assert_refused("has diverged from the published specification head #{published[0, 12]}")
+  end
+
+  # The published head is present but cannot be checked out. A `reset --hard` that fails leaves
+  # the environment on some other commit, so the run must stop rather than hand a provider a tree
+  # that is not the specification it was asked to revise.
+  #
+  # The index is locked, which is the state a crashed or concurrent git leaves behind, and is the
+  # one condition that stops `reset` without touching the repository's content.
+  def test_an_environment_the_published_head_cannot_be_checked_out_into_refuses
+    published = publish_the_accepted_package
+    create_task_environment
+    lock_the_task_environment_index
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, continue_from_the_pull_request, @io.string
+    assert_refused("could not be put on #{TASK} at the published specification head " \
+                   "#{published[0, 12]}")
+  end
+
+  # The environment's own checkout cannot reach the commit the pull request was read at.
+  #
+  # `repository_roots` and `workspace_roots` are separate settings, so the specification checkout
+  # and the checkout the task environment is built from need not be the same clone. When they are
+  # not, the published head has to be fetched into the environment — and when that fetch cannot
+  # deliver it, "diverged" would be a lie about a commit this checkout has simply never seen.
+  def test_a_published_head_the_environments_checkout_cannot_fetch_refuses
+    detached = build_detached_workspace_checkout
+    published = publish_the_accepted_package
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED,
+                 continue_from_the_pull_request(workspace_root: detached), @io.string
+    assert_refused("was read at #{published[0, 12]}, and this ticket's task environment cannot " \
+                   "reach that commit")
   end
 
   private
+
+  # Every refusal above must satisfy the same three things: the reason reaches Platform, no
+  # provider ran, and the environment and its contents are still there.
+  def assert_refused(reason)
+    generation = @platform.last_specification_generation.to_h
+    assert_includes generation["message"].to_s, reason
+    refute_path_exists @probe, "no provider may run once the revision base could not be built"
+    assert_path_exists task_workspace, "a refusal must leave the task environment alone"
+    assert_path_exists File.join(task_workspace, "README.md")
+  end
 
   # ---------------------------------------------------------------- phase 1: accepted round
 
@@ -100,8 +166,8 @@ class SpecificationPublishedContinuationTest < Minitest::Test
     write_package(task_package_root)
     build_isolated_workspace
 
-    @gh_dir, _log, @gh_state = FakeGithub.gh_bin(mode: "ok", pull_request_url: PR_URL,
-                                                 bare: @built.bares["."])
+    @gh_dir, @first_round_gh_log, @gh_state = FakeGithub.gh_bin(mode: "ok", pull_request_url: PR_URL,
+                                                                bare: @built.bares["."])
     start_platform(spec_publication_payload_for(issue_key: ISSUE, files: @package_files,
                                                 package_path: PACKAGE, branch: TASK,
                                                 workspace_id: @workspace.id))
@@ -117,15 +183,17 @@ class SpecificationPublishedContinuationTest < Minitest::Test
   # ---------------------------------------------------------------- phase 2: the next round
 
   # The same ticket, the same pull request, a task environment that does not exist yet.
-  def continue_from_the_pull_request
+  def continue_from_the_pull_request(workspace_root: nil)
+    @workspace_root = workspace_root
     @platform.stop
     @io = StringIO.new
     @provider = write_probe_provider
     # A fresh invocation log and the SAME pull-request state: this round must find the pull
     # request the accepted round really created.
-    @gh_dir, = FakeGithub.gh_bin(mode: "ok", pull_request_url: PR_URL, bare: @built.bares["."],
-                                 state: @gh_state)
-    start_platform(spec_creation_payload_for(issue_key: ISSUE, existing_pull_request_url: PR_URL))
+    @gh_dir, @generation_gh_log = FakeGithub.gh_bin(mode: "ok", pull_request_url: PR_URL,
+                                                    bare: @built.bares["."], state: @gh_state)
+    start_platform(spec_creation_payload_for(issue_key: ISSUE, existing_pull_request_url: PR_URL),
+                   workspace_root: workspace_root)
     run_cli
   end
 
@@ -178,8 +246,8 @@ class SpecificationPublishedContinuationTest < Minitest::Test
     @platform.stop
     @io = StringIO.new
     @provider = nil
-    @gh_dir, = FakeGithub.gh_bin(mode: "ok", pull_request_url: PR_URL, bare: @built.bares["."],
-                                 state: @gh_state)
+    @gh_dir, @second_round_gh_log = FakeGithub.gh_bin(mode: "ok", pull_request_url: PR_URL,
+                                                      bare: @built.bares["."], state: @gh_state)
     start_platform(spec_publication_payload_for(
                      issue_key: ISSUE, files: generated.fetch("files"),
                      package_path: generated.fetch("path"), branch: TASK,
@@ -200,7 +268,9 @@ class SpecificationPublishedContinuationTest < Minitest::Test
     probe["status"].select { |line| line.start_with?("??") && line.include?(PACKAGE) }
   end
 
-  def task_workspace = @built.task_workspace(TASK)
+  # The environment the run under way is building, which is not always the one the accepted round
+  # used: a refusal test may point the run at a different checkout of the same repository.
+  def task_workspace = File.join(@workspace_root || @root, ".runs", "worktrees", TASK)
   def task_package_root = File.join(task_workspace, PACKAGE)
 
   def worktree_invocations
@@ -282,6 +352,64 @@ class SpecificationPublishedContinuationTest < Minitest::Test
     SH
   end
 
+  # ---------------------------------------------------------------- the refused states
+
+  # A commit of the environment's own, on the canonical branch, that the published head does not
+  # contain and which does not contain it.
+  def commit_beside_the_published_head
+    File.write(File.join(task_workspace, "beside.md"), "work this environment did on its own\n")
+    SpecificationWorkspace.git!(task_workspace, "add", "-A")
+    SpecificationWorkspace.git!(task_workspace, "-c", "user.email=someone@specrelay.local",
+                                "-c", "user.name=Someone Else", "commit", "-q",
+                                "-m", "work beside the published head")
+  end
+
+  # What a crashed or concurrent git leaves behind. `reset` cannot write the index while it is
+  # there, and nothing else this run does before the reset needs to.
+  def lock_the_task_environment_index
+    git_dir = SpecificationWorkspace.git!(task_workspace, "rev-parse", "--absolute-git-dir").strip
+    File.write(File.join(git_dir, "index.lock"), "")
+  end
+
+  # A checkout of the ticket's repository that is NOT the one the specification is read from: same
+  # GitHub identity, so it is still the specification repository as far as the run is concerned,
+  # but served by a remote that never received the publication. Built BEFORE the accepted round
+  # pushes, so the published commit is in neither its object database nor its remote.
+  def build_detached_workspace_checkout
+    root = File.join(@built.temp, "workspace-checkout")
+    stale = File.join(@built.temp, "stale-origin.git")
+    SpecificationWorkspace.git!(@built.temp, "clone", "--quiet", @built.bares["."], root)
+    SpecificationWorkspace.git!(@built.temp, "clone", "--quiet", "--bare", root, stale)
+    FakeGithub.add_remote(root, name: SpecificationWorkspace::SPECS_REPOSITORY)
+    FakeGithub.serve_locally(root, stale)
+    install_workspace_only_project_command(root)
+    root
+  end
+
+  # The project command for that checkout. It owns no component repositories, so it builds the
+  # workspace worktree and nothing else — a project defines its own task environment, and this one
+  # is a single repository.
+  def install_workspace_only_project_command(root)
+    SpecificationWorkspace.write_executable(File.join(root, "bin", "worktree"), <<~SH)
+      #!/usr/bin/env sh
+      set -eu
+      ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+      WT="$ROOT_DIR/.runs/worktrees/${2:-}"
+      case "${1:-}" in
+        create)
+          mkdir -p "$ROOT_DIR/.runs/worktrees"
+          if git -C "$ROOT_DIR" show-ref --verify --quiet "refs/heads/$2"; then
+            git -C "$ROOT_DIR" worktree add -q "$WT" "$2"
+          else
+            git -C "$ROOT_DIR" worktree add -q -b "$2" "$WT" HEAD
+          fi
+          ;;
+        release) git -C "$ROOT_DIR" worktree remove "$WT"; git -C "$ROOT_DIR" branch -d "$2" ;;
+        *) echo "usage: worktree create|release <task>" >&2; exit 1 ;;
+      esac
+    SH
+  end
+
   def create_task_environment
     out, status = Open3.capture2e(File.join(@root, "bin", "worktree"), "create", TASK, chdir: @root)
     raise "bin/worktree create failed: #{out}" unless status.success?
@@ -337,12 +465,12 @@ class SpecificationPublishedContinuationTest < Minitest::Test
     end)
   end
 
-  def start_platform(payload)
+  def start_platform(payload, workspace_root: nil)
     @platform = FakePlatform.new(claim_payload: payload).start
-    @config = build_config
+    @config = build_config(workspace_root: workspace_root)
   end
 
-  def build_config
+  def build_config(workspace_root: nil)
     path = File.join(Dir.mktmpdir("cfg", @built.temp), "runner.yml")
     File.write(path, <<~YAML)
       platform:
@@ -359,7 +487,7 @@ class SpecificationPublishedContinuationTest < Minitest::Test
           context_plus:
             available: true
       workspace_roots:
-        tiny-demo-workspace: #{@root}
+        tiny-demo-workspace: #{workspace_root || @root}
     YAML
     SpecrelayRunner::Config.load(path)
   end
