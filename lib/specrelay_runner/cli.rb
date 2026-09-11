@@ -274,6 +274,7 @@ module SpecrelayRunner
         poll_seconds: interval.seconds, on_failure: policy,
         presence: loop_presence(config, client, interval),
         connector: loop_connector(config),
+        status_reporter: loop_status_reporter(config, client),
         claim: -> { client.claim(config.claim_runner_params) },
         execute: ->(payload) { loop_disposition(config, client, payload) }
       )
@@ -312,6 +313,23 @@ module SpecrelayRunner
                    interval_seconds: interval.seconds,
                    on_notice: ->(message) { presenter.line("[loop] #{message}") })
     end
+
+    # This loop session's independent provider status signal.
+    #
+    # Like presence, it is addressed per connected machine, so an advanced `--config`
+    # invocation — which has no connection record and therefore no runner identity — reports
+    # none. `claim-once` gets none at all for the same reason it gets no presence: a single
+    # controlled shot is not a machine being watched over time.
+    def loop_status_reporter(config, client)
+      return StatusReporter::NONE if config.connection.nil?
+
+      StatusReporter.new(client: client, reader: ClaudeStatusReader.new(command: status_probe),
+                         on_notice: ->(message) { presenter.line("[loop] #{message}") })
+    end
+
+    # The status reader launches through the runner's EFFECTIVE environment, so it inspects the
+    # same installation the executor will later run.
+    def status_probe = ClaudeStatusReader.default_command(env: env)
 
     # This loop session's own preview connector, read from the token the guided connection stored
     # under this machine's identity.

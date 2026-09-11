@@ -89,11 +89,13 @@ module SpecrelayRunner
     def initialize(out:, err:, claim:, execute:, poll_seconds:, on_failure: ON_FAILURE_CONTINUE,
                    install_signals: true, max_iterations: nil, sleeper: nil, presenter: nil,
                    clock: Process, label: nil, presence: Presence::NONE,
-                   connector: PreviewConnector::NONE)
+                   connector: PreviewConnector::NONE,
+                   status_reporter: StatusReporter::NONE)
       @claim = claim
       @execute = execute
       @presence = presence
       @connector = connector
+      @status_reporter = status_reporter
       @poll_seconds = poll_seconds
       @on_failure = on_failure
       @install_signals = install_signals
@@ -119,10 +121,17 @@ module SpecrelayRunner
     def call
       trap_signals
       announce_start
+      # Started here and never consulted again. It runs on its own thread with its own cadence,
+      # so from this point the session cannot wait on it, be slowed by it, or fail because of
+      # it — which is the whole reason status is not on the presence or lease path.
+      status_reporter.start(executing: -> { @execution_active })
       status = session_status
       announce_stop
       status
     ensure
+      # Stopped FIRST and under its own bound: it is the one collaborator here that nothing
+      # waits on, so it must not be between the session and any of the endings below.
+      status_reporter.stop
       # The connector is this session's own child, and this is the only place that runs on every
       # exit path — so it is stopped here rather than beside the start, and before the goodbye
       # that ends the session's presence.
@@ -141,7 +150,7 @@ module SpecrelayRunner
     private
 
     attr_reader :claim, :execute, :poll_seconds, :on_failure, :max_iterations, :sleeper, :presenter,
-                :clock, :label, :presence, :connector
+                :clock, :label, :presence, :connector, :status_reporter
 
     # The session's two preconditions, LOCAL before remote: a machine that cannot run its own
     # preview connector is told so before it asks Platform for anything, so it never holds work it
