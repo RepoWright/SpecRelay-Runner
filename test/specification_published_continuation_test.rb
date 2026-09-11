@@ -48,12 +48,18 @@ class SpecificationPublishedContinuationTest < Minitest::Test
     FileUtils.remove_entry(@built.temp) if @built && File.directory?(@built.temp)
   end
 
-  # THE chain. The accepted round leaves only `origin/EXAMPLE-1`; the round after it starts from
-  # that published head, so the package it revises is tracked history in the ticket's own branch
-  # rather than a copy of the same bytes lying untracked beside it.
+  # THE chain, end to end: an accepted publication, the release that follows it, a task
+  # environment built afterwards, the SAME pull request continued in it, and the release of that
+  # second round.
   #
-  # Every fact is read from the environment as the PROVIDER saw it — that is the moment the
-  # revision context has to be real, and it is before this round writes a package of its own.
+  # The accepted round leaves only `origin/EXAMPLE-1`; the round after it starts from that
+  # published head, so the package it revises is tracked history in the ticket's own branch rather
+  # than a copy of the same bytes lying untracked beside it. And because it is tracked, the second
+  # round's cleanup has to leave the environment releasable — which is what the closing phase
+  # proves, through a project command that refuses a dirty worktree and an unmerged branch.
+  #
+  # Every mid-chain fact is read from the environment as the PROVIDER saw it — that is the moment
+  # the revision context has to be real, and it is before this round writes a package of its own.
   def test_a_round_after_an_accepted_publication_continues_from_the_published_branch
     published = publish_the_accepted_package
     plant_unrelated_branch
@@ -71,6 +77,14 @@ class SpecificationPublishedContinuationTest < Minitest::Test
     # Only this ticket's branch was imported.
     refute probe["unrelated_file_present"], "unrelated branch content must stay out"
     assert_includes remote_branches, UNRELATED_BRANCH
+
+    # The second round publishes onto the same branch and hands the environment back.
+    revised = publish_the_continued_package
+    refute_equal published, revised
+    assert_equal revised, remote_head(TASK)
+    refute_path_exists task_workspace, "the continued round must release the environment too"
+    refute local_branch?(TASK), "a released ticket must leave no local branch behind"
+    assert_equal 2, worktree_invocations.count("release #{TASK}")
   end
 
   private
@@ -149,6 +163,35 @@ class SpecificationPublishedContinuationTest < Minitest::Test
     dir
   end
 
+  # ---------------------------------------------------------------- phase 3: publishing round two
+
+  # The package the continuation round actually generated, published onto the SAME pull request
+  # and accepted — so the cleanup and the release run over a task environment whose package is the
+  # branch's own tracked history. Returns the new published head.
+  #
+  # Everything the publication claim carries is read back from what the generation round REPORTED,
+  # because that is what Platform would hand a runner here; a hand-built package would describe a
+  # round this chain did not run.
+  def publish_the_continued_package
+    generated = @platform.last_specification_generation.fetch("package")
+    workspace_id = @platform.last_specification_generation.dig("package_workspace", "id")
+    @platform.stop
+    @io = StringIO.new
+    @provider = nil
+    @gh_dir, = FakeGithub.gh_bin(mode: "ok", pull_request_url: PR_URL, bare: @built.bares["."],
+                                 state: @gh_state)
+    start_platform(spec_publication_payload_for(
+                     issue_key: ISSUE, files: generated.fetch("files"),
+                     package_path: generated.fetch("path"), branch: TASK,
+                     workspace_id: workspace_id, existing_pull_request_url: PR_URL
+                   ))
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
+    publication = @platform.last_specification_publication
+    assert_equal "published", publication["outcome"], @io.string
+    publication["head_commit"]
+  end
+
   # ---------------------------------------------------------------- observation
 
   def probe = @probe_read ||= JSON.parse(File.read(@probe))
@@ -159,6 +202,10 @@ class SpecificationPublishedContinuationTest < Minitest::Test
 
   def task_workspace = @built.task_workspace(TASK)
   def task_package_root = File.join(task_workspace, PACKAGE)
+
+  def worktree_invocations
+    File.exist?(@built.worktree_log) ? File.read(@built.worktree_log).lines.map(&:strip) : []
+  end
 
   def local_branch?(branch)
     _out, status = SpecificationWorkspace.git(@root, "rev-parse", "--verify", "--quiet",
@@ -177,13 +224,26 @@ class SpecificationPublishedContinuationTest < Minitest::Test
 
   # ---------------------------------------------------------------- harness
 
-  # A project command that can build the SAME ticket's environment twice.
+  # A project command that can build the SAME ticket's environment twice, and that refuses to
+  # release one it is not safe to release.
   #
   # The shared fixture command always creates with `-b` and releases only the workspace worktree,
   # so a second `create` fails on the branch and the components the first one left behind. The
   # real engine reuses an existing canonical branch and releases every worktree it made, which is
   # the only reason a ticket can be worked on again after a round — and this chain is about what
   # the second round inherits, so the command has to behave like the engine it stands in for.
+  #
+  # Two of those behaviours are load-bearing HERE and are therefore git's own, not a fixture's
+  # imitation of the engine's release blockers:
+  #
+  #   * `worktree remove` WITHOUT `--force` refuses a worktree holding modified or untracked
+  #     files, which is the engine's "uncommitted task artifacts" blocker;
+  #   * `branch -d` refuses a branch whose commits are not contained in its upstream or in HEAD,
+  #     which is the engine's "ahead of its upstream" blocker.
+  #
+  # `--set-upstream-to` mirrors the engine for the same reason: a ticket whose branch is already
+  # published gets the tracking relationship, without which a branch put on that published head
+  # reads as unpushed local work.
   def install_two_round_project_command
     components = SpecificationWorkspace::TASK_COMPONENTS.join(" ")
     SpecificationWorkspace.write_executable(File.join(@root, "bin", "worktree"), <<~SH)
@@ -199,6 +259,9 @@ class SpecificationPublishedContinuationTest < Minitest::Test
         else
           git -C "$1" worktree add -q -b "$3" "$2" HEAD
         fi
+        if git -C "$1" show-ref --verify --quiet "refs/remotes/origin/$3"; then
+          git -C "$1" branch -q --set-upstream-to "origin/$3" "$3"
+        fi
       }
       case "${1:-}" in
         create)
@@ -209,10 +272,10 @@ class SpecificationPublishedContinuationTest < Minitest::Test
         release)
           for repo in #{components}; do
             git -C "$ROOT_DIR/$repo" worktree remove --force "$WT/$repo" || true
-            git -C "$ROOT_DIR/$repo" branch -d "$2" || true
+            git -C "$ROOT_DIR/$repo" branch -D "$2" || true
           done
-          git -C "$ROOT_DIR" worktree remove --force "$WT"
-          git -C "$ROOT_DIR" branch -d "$2" || true
+          git -C "$ROOT_DIR" worktree remove "$WT"
+          git -C "$ROOT_DIR" branch -d "$2"
           ;;
         *) echo "usage: worktree create|release <task>" >&2; exit 1 ;;
       esac

@@ -273,8 +273,8 @@ module SpecrelayRunner
           result.released?
         return if result.reason.nil?
 
-        log(result.removed? ? "The accepted package was removed, but this ticket's task " \
-                              "environment was NOT released:"
+        log(result.removed? ? "The accepted package was cleared from this ticket's task " \
+                              "environment, which was NOT released:"
                             : "The accepted package was left in this ticket's task environment " \
                               "and the environment was NOT released:")
         log("  #{result.reason}")

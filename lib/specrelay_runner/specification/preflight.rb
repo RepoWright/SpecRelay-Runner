@@ -591,9 +591,18 @@ module SpecrelayRunner
       # against the configured base, not a fork, and on this ticket's own branch — and the exact
       # commit is required to be present here afterwards, so a branch that moved, was
       # force-pushed, or belongs to another clone refuses instead of being checked out.
+      #
+      # CONTAINMENT is resolved FIRST, before either path acts, and it guards both. A
+      # specification root that resolves through a symbolic link puts the package directory
+      # outside the task environment, and a checkout is not the harmless half of that: `git reset
+      # --hard` replaces whatever stands at the package path with the published tree, so a link an
+      # operator committed is discarded by the very step that would otherwise never have been
+      # reached. The same {PackagePath} judgment that refuses to WRITE through such a root
+      # therefore refuses to reset onto it.
       def materialize_revision(task, package, previous)
+        destination = package.absolute_in(task.path)
         commands = GitCommands.new(checkout_root: task.path, env: env)
-        return place_revision_files(task, package, previous) unless specification_checkout?(commands)
+        return place_revision_files(destination, previous) unless specification_checkout?(commands)
 
         return revision_refusal(off_branch_message) unless
           commands.git_value(%w[symbolic-ref --quiet --short HEAD]) == assignment.canonical_branch
@@ -604,6 +613,9 @@ module SpecrelayRunner
         return reset_to(commands, previous) if ancestor?(commands, "HEAD", previous.commit)
 
         revision_refusal(diverged_message(previous))
+      rescue PackagePath::Unsafe, SystemCallError, IOError => e
+        revision_refusal("the previous specification package could not be placed in the task " \
+                         "workspace: #{e.class}")
       end
 
       # The validated head, in THIS checkout. An environment created for this run has never seen
@@ -683,9 +695,10 @@ module SpecrelayRunner
       # allowed to change.
       #
       # Every name comes from `git ls-tree` under the package path, so it is repository-relative
-      # and cannot traverse: git trees carry no `..` and no absolute entry.
-      def place_revision_files(task, package, previous)
-        destination = package.absolute_in(task.path)
+      # and cannot traverse: git trees carry no `..` and no absolute entry. `destination` is the
+      # contained path {materialize_revision} already resolved, and a write failure surfaces
+      # through its refusal.
+      def place_revision_files(destination, previous)
         FileUtils.rm_rf(destination)
         previous.files.each do |name, content|
           target = File.join(destination, name)
@@ -693,9 +706,6 @@ module SpecrelayRunner
           File.write(target, content)
         end
         nil
-      rescue PackagePath::Unsafe, SystemCallError, IOError => e
-        refuse(SPECIFICATION_REVISION_UNREADABLE,
-               "the previous specification package could not be placed in the task workspace: #{e.class}")
       end
 
       # The operator's local clone of the specification repository, resolved as a SEED

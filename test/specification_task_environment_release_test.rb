@@ -70,6 +70,45 @@ class SpecificationTaskEnvironmentReleaseTest < Minitest::Test
     assert_includes @io.string, "still allocated"
   end
 
+  # ---------------------------------------------------------------- a TRACKED accepted package
+
+  # The package reached the environment as the branch's own history rather than as output lying
+  # beside it — the shape a round that continued a published specification leaves behind.
+  #
+  # The cleanup still has to end with a tree the project's release authority will take down, and
+  # that authority refuses an environment with uncommitted changes in it. Deleting tracked files
+  # would produce exactly that, so the recorded folder is returned to the branch head instead: the
+  # accepted evidence stays where the branch says it is, and nothing is left uncommitted.
+  def test_a_tracked_accepted_package_is_returned_to_the_branch_head_and_leaves_a_clean_tree
+    commit_the_package_on_the_task_branch
+    start_platform(release_mode: "refuse")
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
+
+    assert_equal "", git(task_workspace, "status", "--porcelain", "--untracked-files=all").strip
+    assert_equal PACKAGE_CONTENTS["spec.md"], File.read(File.join(task_package_root, "spec.md"))
+  end
+
+  # The revised round in one environment: the previous package is tracked, this round's bytes are
+  # a modification of it plus one file the branch has never carried. Both are cleared, because
+  # either one left behind is an uncommitted change release refuses.
+  def test_a_revised_tracked_package_leaves_no_modification_and_no_new_file
+    published = PACKAGE_CONTENTS.except("generation-manifest.json")
+                                .merge("spec.md" => "# EXAMPLE-1\n\nRound one, as published.\n")
+    FileUtils.rm_rf(task_package_root)
+    write_package_contents(task_package_root, published)
+    commit_the_package_on_the_task_branch
+    write_package(task_package_root)
+    build_isolated_workspace
+    start_platform(release_mode: "refuse")
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
+
+    assert_equal "", git(task_workspace, "status", "--porcelain", "--untracked-files=all").strip
+    assert_equal published["spec.md"], File.read(File.join(task_package_root, "spec.md"))
+    refute_path_exists File.join(task_package_root, "generation-manifest.json")
+  end
+
   # ---------------------------------------------------------------- user-dirty protection
 
   # Somebody else's uncommitted work. The environment is not this run's to take down, and the
@@ -194,13 +233,23 @@ class SpecificationTaskEnvironmentReleaseTest < Minitest::Test
     File.write(path, "#{File.read(path)}# my own half-finished change\n")
   end
 
-  def write_package(root)
-    @package_files = PACKAGE_CONTENTS.map do |name, body|
+  def write_package(root) = @package_files = write_package_contents(root, PACKAGE_CONTENTS)
+
+  def write_package_contents(root, contents)
+    contents.map do |name, body|
       path = File.join(root, name)
       FileUtils.mkdir_p(File.dirname(path))
       File.write(path, body)
       { "path" => name, "sha256" => Digest::SHA256.hexdigest(body), "bytes" => body.bytesize }
     end
+  end
+
+  # The package as COMMITTED history on the ticket's own branch, which is what a round continuing
+  # a published specification inherits.
+  def commit_the_package_on_the_task_branch
+    git(task_workspace, "add", "--", PACKAGE)
+    git(task_workspace, "-c", "user.email=runner@example.test", "-c", "user.name=Runner Test",
+        "commit", "-qm", "#{ISSUE}: generated specification package")
   end
 
   WrittenFile = SpecrelayRunner::Specification::PackageWriter::WrittenFile
