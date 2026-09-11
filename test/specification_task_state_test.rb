@@ -64,16 +64,25 @@ class SpecificationTaskStateTest < Minitest::Test
     assert_equal PREVIOUS_FILES["spec.md"].strip, probe["package_before"]["spec.md"].to_s.strip
   end
 
-  # It does not MERGE that pull request. The task environment stays on the canonical branch at
-  # the default branch's commit; only the package directory carries the previous round.
+  # It does not MERGE that pull request. The task environment is the ticket's canonical branch AT
+  # the published head — the specification's own history, whose single parent is the default
+  # branch — rather than the default branch with the pull request merged into it.
+  #
+  # It used to assert the environment stayed at the DEFAULT branch's commit, with only the package
+  # directory carrying the previous round as untracked files. A round that continues a published
+  # specification now starts from the published head instead, so the same bytes are tracked
+  # history; the "no merge" property this test exists for is unchanged and is asserted over the
+  # commit's parents.
   def test_the_revision_is_not_merged_into_the_task_environment
     build_previous_package_on_spec_branch
     start(revision: SPEC_PR)
     assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
 
     assert_equal TASK, git(task_workspace, "symbolic-ref", "--quiet", "--short", "HEAD").strip
-    assert_equal git(@root, "rev-parse", "main").strip,
+    assert_equal git(@root, "rev-parse", "refs/remotes/origin/#{SPEC_BRANCH}").strip,
                  git(task_workspace, "rev-parse", "HEAD").strip
+    assert_equal [ git(@root, "rev-parse", "main").strip ],
+                 git(task_workspace, "rev-parse", "HEAD^@").split
   end
 
   # ------------------------------------------------------------------ S04
@@ -156,9 +165,15 @@ class SpecificationTaskStateTest < Minitest::Test
   # the repository, so the environment `bin/worktree` builds carries it and nothing about the
   # workspace looks dirty — which is exactly the shape a lexical containment check waves through.
   #
-  # The revision path reaches it first: the previous package is placed BEFORE the provider runs,
-  # so a link here deletes and writes outside the task workspace while every later boundary check
-  # still reports a clean tree.
+  # The revision path reaches it first: the previous package is reconstructed BEFORE the provider
+  # runs, so a link here deletes and writes outside the task workspace while every later boundary
+  # check still reports a clean tree.
+  #
+  # The environment IS the specification repository here, so the reconstruction is a checkout of
+  # the published head — and that is the other half of the same boundary. A `reset --hard` would
+  # replace whatever stands at the package path with the published tree, so the link the operator
+  # committed is discarded by the very step the refusal has to come before. Both the untouched
+  # directory outside and the untouched branch inside are therefore asserted.
   def test_a_revision_may_not_place_the_previous_package_through_a_symlinked_root
     build_previous_package_on_spec_branch(package: "lane/#{FOLDER}")
     outside = link_specification_root_outside("lane")
@@ -166,6 +181,9 @@ class SpecificationTaskStateTest < Minitest::Test
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
     assert_outside_untouched(outside)
+    assert_equal git(@root, "rev-parse", "main").strip,
+                 git(task_workspace, "rev-parse", "HEAD").strip
+    assert File.symlink?(File.join(task_workspace, "lane")), "the committed link must survive"
   end
 
   # The same link, on a FIRST specification: the write of the generated package itself must not
