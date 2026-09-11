@@ -243,11 +243,41 @@ module SpecrelayRunner
       # already looking at it; the retention sweep collects the workspace later anyway.
       #
       # Already inside the workspace lock (see #publish), so this cannot race the sweep.
+      #
+      # TWO things are cleaned up, because generation left the package in two places: this
+      # runner's own publication snapshot, and the ticket's task environment the analysis ran in.
+      # Both are duplicates of committed history once Platform has accepted, and the second one
+      # is a whole worktree the preview lane addresses by the same task id.
       def clean_up(workspace)
+        remove_snapshot(workspace)
+        return_task_environment
+      end
+
+      def remove_snapshot(workspace)
         return if workspace.remove!(commands_for: ->(root) { GitCommands.new(checkout_root: root, env: env) })
 
         log("The publication succeeded; this runner could not remove its local package workspace.")
         log("It is retained and the next generation's retention sweep will collect it.")
+      end
+
+      # The ticket's task environment, handed back through the project's own release command.
+      #
+      # {TaskEnvironmentCleanup} fails closed — an environment holding somebody's own uncommitted
+      # work, or a package that is no longer the accepted one, is left exactly as it is and never
+      # released. That is reported as a WARNING for the same reason a snapshot-removal failure is:
+      # the pull request exists and the run has advanced, and an operator told the publication
+      # failed would go looking for a specification a reviewer is already reading.
+      def return_task_environment
+        result = TaskEnvironmentCleanup.call(assignment: assignment, config: config, env: env)
+        return log("Removed the accepted package from this ticket's task environment and released it.") if
+          result.released?
+        return if result.reason.nil?
+
+        log(result.removed? ? "The accepted package was removed, but this ticket's task " \
+                              "environment was NOT released:"
+                            : "The accepted package was left in this ticket's task environment " \
+                              "and the environment was NOT released:")
+        log("  #{result.reason}")
       end
 
       # Platform never answered, so it holds no record and will offer this run again. Keeping the

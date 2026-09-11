@@ -85,4 +85,8 @@ require_relative "specification/git_commands"
 require_relative "specification/existing_pull_request"
 require_relative "specification/git_publisher"
 require_relative "specification/pull_request_publisher"
+# Returning the ticket's task environment once Platform has accepted a publication. Required
+# before Publication, which is the only caller: acceptance is the one state in which the local
+# package is a duplicate of committed history.
+require_relative "specification/task_environment_cleanup"
 require_relative "specification/publication"
