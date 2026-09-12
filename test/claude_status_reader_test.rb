@@ -11,19 +11,16 @@ require_relative "test_helper"
 # provider's prose on an operator's screen — and every one of those arrives in the output
 # these two commands produce.
 class ClaudeStatusReaderTest < Minitest::Test
-  # The documented two-window shape, as the operator-facing command prints it.
+  # The documented two-window shape, exactly as the AUTHENTICATED CLI prints it — captured from
+  # a real `claude -p /usage` run, middle dot and all. The account prose above the measurements
+  # and the model-specific line below them are part of that output, so they stay: walking past
+  # both without reading either is the behaviour under test, not noise the fixture may tidy up.
   USAGE_OUTPUT = <<~TEXT
-    Current session
-    ███░░░░░░░░░░░░  14% used
-    Resets 4:50pm
+    You are currently using your subscription to power your Claude Code usage
 
-    Current week (all models)
-    ███████░░░░░░░░  50% used
-    Resets Sun 10pm
-
-    Current week (Opus)
-    ██░░░░░░░░░░░░░  8% used
-    Resets Sun 10pm
+    Current session: 14% used · resets Sep 12 at 1:10pm (Europe/Berlin)
+    Current week (all models): 77% used · resets Sep 14 at 10pm (Europe/Berlin)
+    Current week (Fable): 0% used · resets Sep 14 at 10pm (Europe/Berlin)
   TEXT
 
   # `claude mcp list` names each server and, after a health check, says how it answered. The
@@ -38,10 +35,9 @@ class ClaudeStatusReaderTest < Minitest::Test
     legacy: /opt/legacy/bin/mcp - Disabled
   TEXT
 
-  # 2026-09-11 is a Friday, so "Sun 10pm" resolves forward two days and "4:50pm" resolves
-  # later the same afternoon. Fixed here so every reset assertion is an exact instant rather
-  # than a relative phrase.
-  NOW = Time.utc(2026, 9, 11, 9, 0, 0)
+  # Before both printed resets, so each resolves within the observation year. Fixed here, and
+  # in UTC, so every reset assertion is an exact instant rather than a relative phrase.
+  NOW = Time.utc(2026, 9, 12, 8, 0, 0)
 
   # Answers each argv from a table and records what it was asked to run, so a test can assert
   # the exact argv AND that nothing else was ever launched.
@@ -87,26 +83,84 @@ class ClaudeStatusReaderTest < Minitest::Test
     capacity = reader.capacity(now: NOW)
 
     assert_equal 14, capacity.dig("windows", "five_hour", "used_percent")
-    assert_equal 50, capacity.dig("windows", "weekly_all_models", "used_percent")
-    # The provider prints the OPERATOR's wall clock, so the expected instants are built from
-    # this machine's own zone rather than written as UTC literals — an assertion that assumed
-    # UTC would pass only where the developer happens to sit.
-    assert_equal utc("4:50pm today", Time.new(2026, 9, 11, 16, 50, 0)),
-                 capacity.dig("windows", "five_hour", "resets_at")
-    assert_equal utc("10pm on the coming Sunday", Time.new(2026, 9, 13, 22, 0, 0)),
-                 capacity.dig("windows", "weekly_all_models", "resets_at")
+    assert_equal 77, capacity.dig("windows", "weekly_all_models", "used_percent")
+    # 1:10pm and 10pm in Europe/Berlin, which was +02:00 on both printed dates. Written as UTC
+    # literals rather than built from this machine's zone, because the provider PRINTS the zone
+    # it means: the instant is the same wherever the developer running this happens to sit.
+    assert_equal "2026-09-12T11:10:00Z", capacity.dig("windows", "five_hour", "resets_at")
+    assert_equal "2026-09-14T20:00:00Z", capacity.dig("windows", "weekly_all_models", "resets_at")
   end
 
-  def utc(_description, local) = local.utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+  # The zone in the output is the OPERATOR's, and this machine's is a different fact that merely
+  # tends to agree with it. Reading the same output under two unrelated host zones is what tells
+  # those two apart: a reader that quietly used the host's would answer differently here.
+  def test_the_printed_zone_is_read_rather_than_this_machines_own
+    instants = %w[UTC America/Los_Angeles Asia/Kolkata].map do |zone|
+      in_host_zone(zone) do
+        reader, = reader_for
+        reader.capacity(now: NOW)["windows"]["five_hour"]["resets_at"]
+      end
+    end
 
-  # The model-specific block is explicitly out of scope. It carries the same two field shapes
-  # as the ones that are in scope, so a parser that scanned for percentages rather than for
-  # the two documented HEADINGS would silently report an Opus window as the weekly one.
-  def test_the_model_specific_block_is_not_read_as_a_window
+    assert_equal [ "2026-09-12T11:10:00Z" ] * 3, instants
+  end
+
+  # The reset is resolved by setting TZ, which is process-wide. The variable this program was
+  # started with therefore has to survive the read — including the case where it was never set,
+  # which must be left unset rather than turned into an empty string.
+  def test_the_host_timezone_setting_survives_a_read
+    [ "America/Los_Angeles", nil ].each do |setting|
+      in_host_zone(setting) do
+        reader, = reader_for
+        reader.capacity(now: NOW)
+
+        setting.nil? ? assert_nil(ENV["TZ"]) : assert_equal(setting, ENV["TZ"])
+      end
+    end
+  end
+
+  def in_host_zone(zone)
+    previous = ENV["TZ"]
+    zone.nil? ? ENV.delete("TZ") : ENV["TZ"] = zone
+    yield
+  ensure
+    previous.nil? ? ENV.delete("TZ") : (ENV["TZ"] = previous)
+  end
+
+  # Nothing used is a measurement, not a missing one. A reader that treated 0 as absent would
+  # report a fresh week as `Unavailable` — the one moment the number is least in doubt.
+  def test_a_zero_percentage_is_a_measurement_rather_than_an_absence
+    output = "Current session: 0% used · resets Sep 12 at 1:10pm (Europe/Berlin)\n" \
+             "Current week (all models): 0% used · resets Sep 14 at 10pm (Europe/Berlin)\n"
+    reader, = reader_for(usage: ok(output))
+    capacity = reader.capacity(now: NOW)
+
+    assert_equal 0, capacity.dig("windows", "five_hour", "used_percent")
+    assert_equal "available", capacity["state"]
+  end
+
+  # The model-specific line is explicitly out of scope. It carries the SAME two field shapes as
+  # the lines that are in scope, so a parser that scanned for percentages rather than for the
+  # two documented HEADINGS would silently report the Fable window as the weekly one — and in
+  # this fixture that would read as 0% used on a week that is 77% gone.
+  def test_the_model_specific_line_is_not_read_as_a_window
     reader, = reader_for
     capacity = reader.capacity(now: NOW)
 
     assert_equal %w[five_hour weekly_all_models], capacity["windows"].keys.sort
+    assert_equal 77, capacity.dig("windows", "weekly_all_models", "used_percent")
+  end
+
+  # The provider prints no year, so one is resolved — forward, never backward. Observed in
+  # December, a January reset belongs to the year after the observation.
+  def test_a_reset_past_the_year_end_resolves_into_the_following_year
+    output = "Current session: 14% used · resets Jan 2 at 10pm (Europe/Berlin)\n" \
+             "Current week (all models): 77% used · resets Jan 4 at 10pm (Europe/Berlin)\n"
+    reader, = reader_for(usage: ok(output))
+
+    capacity = reader.capacity(now: Time.utc(2026, 12, 28, 9, 0, 0))
+
+    assert_equal "2027-01-02T21:00:00Z", capacity.dig("windows", "five_hour", "resets_at")
   end
 
   def test_the_documented_command_is_launched_through_argv_with_no_shell
@@ -124,26 +178,49 @@ class ClaudeStatusReaderTest < Minitest::Test
   # would be reporting a number the provider never gave.
   def test_every_unrecognised_usage_shape_reports_no_capacity_and_never_a_guess
     {
-      "a missing weekly block" => "Current session\n12% used\nResets 4:50pm\n",
-      "a missing session block" => "Current week (all models)\n12% used\nResets 4:50pm\n",
-      "a duplicated heading" => USAGE_OUTPUT + "\nCurrent session\n99% used\nResets 5pm\n",
-      "two percentages in one block" => "Current session\n12% used\n13% used\nResets 4:50pm\n" \
-                                        "Current week (all models)\n50% used\nResets Sun 10pm\n",
-      "two reset lines in one block" => "Current session\n12% used\nResets 4:50pm\nResets 5:50pm\n" \
-                                        "Current week (all models)\n50% used\nResets Sun 10pm\n",
-      "a localised heading" => "Aktuelle Sitzung\n12% benutzt\nZurücksetzen 16:50\n",
-      "an out-of-range percentage" => "Current session\n120% used\nResets 4:50pm\n" \
-                                      "Current week (all models)\n50% used\nResets Sun 10pm\n",
-      "an unparseable reset" => "Current session\n12% used\nResets whenever\n" \
-                                "Current week (all models)\n50% used\nResets Sun 10pm\n",
-      "a missing reset line" => "Current session\n12% used\n" \
-                                "Current week (all models)\n50% used\nResets Sun 10pm\n",
+      "a missing weekly line" => session,
+      "a missing session line" => weekly,
+      "a duplicated measurement" => USAGE_OUTPUT + session,
+      "a localised measurement" => "Aktuelle Sitzung: 12% benutzt · Zurücksetzen 16:50\n" + weekly,
+      "an out-of-range percentage" => session(percent: 120) + weekly,
+      "a missing percentage" => "Current session: used · resets Sep 12 at 1:10pm (Europe/Berlin)\n" +
+                                weekly,
+      "two percentages on one line" => session(percent: "12% used · 13") + weekly,
+      "a missing reset" => "Current session: 12% used\n" + weekly,
+      "an unparseable reset" => session(reset: "whenever") + weekly,
+      "a reset with no printed zone" => session(reset: "Sep 12 at 1:10pm") + weekly,
+      "a bare weekday reset" => session(reset: "Sun 10pm") + weekly,
+      # Each of these would be RESOLVED rather than refused by a parser that handed the printed
+      # fields to Time.local: an impossible day and a common-year Feb 29 silently roll into the
+      # next month, and an unknown zone name silently resolves to UTC. Every one of them would
+      # then render as a confident instant that the provider never named.
+      "an impossible day" => session(reset: "Sep 31 at 1:10pm (Europe/Berlin)") + weekly,
+      "Feb 29 in a common year" => session(reset: "Feb 29 at 1:10pm (Europe/Berlin)") + weekly,
+      "a zero day" => session(reset: "Sep 0 at 1:10pm (Europe/Berlin)") + weekly,
+      "an unknown month" => session(reset: "Foo 12 at 1:10pm (Europe/Berlin)") + weekly,
+      "an unknown zone" => session(reset: "Sep 12 at 1:10pm (Europe/Berlinn)") + weekly,
+      "an out-of-range hour" => session(reset: "Sep 12 at 13pm (Europe/Berlin)") + weekly,
+      "an out-of-range minute" => session(reset: "Sep 12 at 1:70pm (Europe/Berlin)") + weekly,
+      "a 24-hour clock with no half named" => session(reset: "Sep 12 at 13:10 (Europe/Berlin)") +
+                                              weekly,
+      "trailing material after the zone" => session(reset: "Sep 12 at 1:10pm (Europe/Berlin) or so") +
+                                            weekly,
       "empty output" => ""
     }.each do |shape, text|
       reader, = reader_for(usage: ok(text))
 
       assert_nil reader.capacity(now: NOW), "#{shape} must report no capacity"
     end
+  end
+
+  # The two in-scope measurements, each overridable in one field, so a refusal fixture differs
+  # from the documented shape in exactly the way its name claims and in nothing else.
+  def session(percent: 14, reset: "Sep 12 at 1:10pm (Europe/Berlin)")
+    "Current session: #{percent}% used · resets #{reset}\n"
+  end
+
+  def weekly(percent: 77, reset: "Sep 14 at 10pm (Europe/Berlin)")
+    "Current week (all models): #{percent}% used · resets #{reset}\n"
   end
 
   def test_a_timeout_or_nonzero_exit_reports_no_capacity
@@ -160,23 +237,19 @@ class ClaudeStatusReaderTest < Minitest::Test
   # whole safety argument here is that it never does. Both blocks present, in this order, or no
   # capacity at all.
   def test_a_reordered_result_is_not_the_documented_output_and_reports_no_capacity
-    reordered = "Current week (all models)\n50% used\nResets Sun 10pm\n\n" \
-                "Current session\n14% used\nResets 4:50pm\n"
-    reader, = reader_for(usage: ok(reordered))
+    reader, = reader_for(usage: ok(weekly + session))
 
     assert_nil reader.capacity(now: NOW)
   end
 
-  # The same two blocks the other way round ARE read, so the example above is failing on the order
-  # itself rather than on some other property of the fixture.
-  def test_the_documented_order_of_the_same_two_blocks_is_read
-    ordered = "Current session\n14% used\nResets 4:50pm\n\n" \
-              "Current week (all models)\n50% used\nResets Sun 10pm\n"
-    reader, = reader_for(usage: ok(ordered))
+  # The same two measurements the other way round ARE read, so the example above is failing on
+  # the order itself rather than on some other property of the fixture.
+  def test_the_documented_order_of_the_same_two_measurements_is_read
+    reader, = reader_for(usage: ok(session + weekly))
     capacity = reader.capacity(now: NOW)
 
     assert_equal 14, capacity.dig("windows", "five_hour", "used_percent")
-    assert_equal 50, capacity.dig("windows", "weekly_all_models", "used_percent")
+    assert_equal 77, capacity.dig("windows", "weekly_all_models", "used_percent")
   end
 
   # --- capacity: privacy ----------------------------------------------------
@@ -191,7 +264,9 @@ class ClaudeStatusReaderTest < Minitest::Test
     capacity = reader.capacity(now: NOW)
 
     serialized = capacity.to_json
-    %w[operator@example.invalid Example\ GmbH 412.19 Opus ███].each do |leak|
+    # The provider's own prose and the model-specific line are in the fixture too: neither is an
+    # account detail, and both must be just as absent from a result that carries four numbers.
+    [ "operator@example.invalid", "Example GmbH", "412.19", "Fable", "subscription" ].each do |leak|
       refute_includes serialized, leak
     end
   end
