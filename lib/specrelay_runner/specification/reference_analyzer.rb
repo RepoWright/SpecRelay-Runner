@@ -147,6 +147,12 @@ module SpecrelayRunner
       # of that already, which is what makes the analyzer that reads a reference verifiably the
       # same one the readiness check probed.
       class Claude
+        PARSE_ATTEMPTS = 2
+        RETRIABLE_PARSE_FAILURES = [
+          "the analyzer returned no JSON object",
+          "the analyzer did not return valid JSON"
+        ].freeze
+
         def initialize(profile:, settings:, env: ENV, command_runner: CommandRunner)
           @profile = profile
           @settings = settings
@@ -161,6 +167,19 @@ module SpecrelayRunner
         # not a lane the operator watches, and giving it a live stream would be a third surface
         # nothing asked for.
         def analyze(kind:, reference:)
+          outcome = nil
+          PARSE_ATTEMPTS.times do
+            outcome = analyze_once(kind: kind, reference: reference)
+            return outcome unless retriable_parse_failure?(outcome)
+          end
+          outcome
+        end
+
+        private
+
+        attr_reader :profile, :settings, :env, :command_runner
+
+        def analyze_once(kind:, reference:)
           stream = ClaudeStream.new
           result = run(prompt_for(kind, reference), stream)
           return Outcome.new(verdict: :failed, summary: "the analyzer timed out") if result.timed_out?
@@ -172,9 +191,9 @@ module SpecrelayRunner
           parse(stream.final_text)
         end
 
-        private
-
-        attr_reader :profile, :settings, :env, :command_runner
+        def retriable_parse_failure?(outcome)
+          outcome.verdict == :failed && RETRIABLE_PARSE_FAILURES.include?(outcome.summary)
+        end
 
         # The same two variables {Provider::Claude} forwards, and for the same reason: PATH to
         # find the executable, HOME to find the operator's own Claude credentials. The profile's
