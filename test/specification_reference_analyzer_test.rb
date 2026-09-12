@@ -21,9 +21,9 @@ class SpecificationReferenceAnalyzerTest < Minitest::Test
   class FakeCommandRunner
     Call = Struct.new(:argv, :chdir, :env, :timeout_seconds, keyword_init: true)
 
-    def initialize(result:, lines: [])
-      @result = result
-      @lines = lines
+    def initialize(result: nil, results: nil)
+      @results = results || [ result ]
+      @fallback = @results.last
       @calls = []
     end
 
@@ -33,8 +33,14 @@ class SpecificationReferenceAnalyzerTest < Minitest::Test
     # delivers JSONL lines the way the real CommandRunner does rather than a stdout blob.
     def run(argv, chdir:, env:, timeout_seconds:, on_output: nil)
       @calls << Call.new(argv: argv, chdir: chdir, env: env, timeout_seconds: timeout_seconds)
-      @lines.each { |line| on_output&.call("stdout", line) }
-      @result
+      result = @results.shift || @fallback
+      lines = result.success? ? [
+        JSON.generate("type" => "system", "subtype" => "init"),
+        JSON.generate("type" => "result", "subtype" => "success", "is_error" => false,
+                      "result" => result.stdout)
+      ] : []
+      lines.each { |line| on_output&.call("stdout", line) }
+      result
     end
   end
 
@@ -232,11 +238,8 @@ class SpecificationReferenceAnalyzerTest < Minitest::Test
 
   # ------------------------------------------------------------------ the Claude adapter, direct execution
 
-  def build_claude_analyzer(result:, profile: claude_profile, env: {}, settings: settings_for({}))
-    lines = [ JSON.generate("type" => "system", "subtype" => "init"),
-              JSON.generate("type" => "result", "subtype" => "success", "is_error" => false,
-                            "result" => result.stdout) ]
-    runner = FakeCommandRunner.new(result: result, lines: result.success? ? lines : [])
+  def build_claude_analyzer(result: nil, results: nil, profile: claude_profile, env: {}, settings: settings_for({}))
+    runner = FakeCommandRunner.new(result: result, results: results)
     [ ReferenceAnalyzer::Claude.new(profile: profile, settings: settings, env: env, command_runner: runner),
       runner ]
   end
@@ -297,6 +300,39 @@ class SpecificationReferenceAnalyzerTest < Minitest::Test
 
     assert_equal :failed, outcome.verdict
     assert_includes outcome.summary, "no JSON object"
+  end
+
+  def test_a_single_malformed_json_answer_is_retried_and_recovers
+    malformed = '{"contributed": true, "summary": "Read PR #200 via gh.}'
+    valid = JSON.generate("contributed" => true, "summary" => "Read PR #200 via gh.")
+    analyzer, runner = build_claude_analyzer(results: [ success(stdout: malformed), success(stdout: valid) ])
+
+    outcome = analyzer.analyze(kind: "summary_link", reference: "https://github.com/acme/widgets/pull/200")
+
+    assert outcome.contributed?
+    assert_equal 2, runner.calls.length
+  end
+
+  def test_two_malformed_json_answers_still_fail_closed
+    malformed = '{"contributed": true, "summary": "Read PR #200 via gh.}'
+    analyzer, runner = build_claude_analyzer(results: [ success(stdout: malformed), success(stdout: malformed) ])
+
+    outcome = analyzer.analyze(kind: "summary_link", reference: "https://github.com/acme/widgets/pull/200")
+
+    assert_equal :failed, outcome.verdict
+    assert_includes outcome.summary, "no JSON object"
+    assert_equal 2, runner.calls.length
+  end
+
+  def test_a_timeout_is_not_retried
+    timeout = Result.new(exit_code: nil, stdout: "", stderr: "", duration_seconds: 60.0, timed_out: true)
+    analyzer, runner = build_claude_analyzer(result: timeout)
+
+    outcome = analyzer.analyze(kind: "summary_link", reference: "https://github.com/acme/widgets/pull/200")
+
+    assert_equal :failed, outcome.verdict
+    assert_includes outcome.summary, "timed out"
+    assert_equal 1, runner.calls.length
   end
 
   def test_malformed_json_is_a_failure
