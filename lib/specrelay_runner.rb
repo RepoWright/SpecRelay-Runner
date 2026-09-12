@@ -121,6 +121,11 @@ require_relative "specrelay_runner/specification"
 require_relative "specrelay_runner/package_preflight"
 require_relative "specrelay_runner/poll_interval"
 require_relative "specrelay_runner/presence"
+# The independent status signal and its one reader of the local Claude installation. Beside
+# `presence` because both are collaborators the loop session owns for exactly as long as it
+# runs — and separate from it because a status report is on no critical path at all.
+require_relative "specrelay_runner/claude_status_reader"
+require_relative "specrelay_runner/status_reporter"
 # The one outbound connector a connected machine runs while its loop is active, started from the
 # token the guided connection stored. Beside `presence` because both are collaborators the loop
 # session owns for exactly as long as it runs.

@@ -224,6 +224,22 @@ module SpecrelayRunner
       status == 200 ? body : raise_for(status, body)
     end
 
+    # POST /api/runner/status. The machine's latest provider status snapshot.
+    #
+    # A third sibling of #heartbeat and #report_presence, and separate from both for the same
+    # reason they are separate from each other: those two are LIVENESS on a cadence Platform
+    # enforces, and this is a DESCRIPTION nobody waits on. Sharing an endpoint would put an
+    # optional, slow-to-collect payload on a path whose deadline keeps a claim alive.
+    #
+    # The whole object is offered or none of it — Platform validates and stores it atomically,
+    # so a refusal changes nothing and needs no local repair. Not retried here: the reporter's
+    # next cycle sends the current state again, which is a better answer than re-sending a
+    # measurement that has since aged.
+    def report_status(snapshot:)
+      status, body = post_json("/api/runner/status", { status: snapshot })
+      status == 200 ? body : raise_for(status, body)
+    end
+
     # POST /api/runner/preview_results (MAPIAI-97). One step of the live preview this runner
     # holds: the sources it resolved, the environment it started, the boundary that failed, or
     # the outcome of releasing.
