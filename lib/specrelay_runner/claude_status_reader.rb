@@ -36,20 +36,31 @@ module SpecrelayRunner
     TIMEOUT_SECONDS = 20
 
     # The two windows this product reports, keyed by the EXACT English heading that identifies
-    # each. Matching on the heading rather than on block order is what stops a reordered result
-    # from swapping the two numbers, and what keeps the model-specific blocks — which carry an
+    # each. Matching on the heading rather than on line order is what stops a reordered result
+    # from swapping the two numbers, and what keeps every model-specific line — which carries an
     # identical percentage and reset shape — out of the answer entirely.
     WINDOW_HEADINGS = { "Current session" => "five_hour",
                         "Current week (all models)" => "weekly_all_models" }.freeze
 
-    # Exactly one of each per block, or the block is not the documented shape.
-    USAGE_PERCENT = /(\d{1,3})%\s+used/
-    USAGE_RESET = /^\s*Resets\s+(.+?)\s*$/
+    # One measurement, whole, on one line: `<heading>: <n>% used · resets <when>`. Anchored end
+    # to end, so a line carrying a second percentage, a second reset, or any trailing material
+    # is not this shape at all. There is no sub-scan that could lift one value out of a line
+    # this does not match.
+    MEASUREMENT = /\A(.+?):\s+(\d{1,3})%\s+used\s+·\s+resets\s+(\S.*?)\z/
 
-    # The reset instants the documented output is allowed to name: a time today, or a weekday
-    # and a time. Anything else is unparseable, which makes the whole capacity unavailable.
-    RESET_TIME = /\A(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\z/i
-    RESET_WEEKDAY_TIME = /\A(#{Date::ABBR_DAYNAMES.join('|')})\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\z/i
+    # The reset instant the documented output names: a printed month and day, a 12-hour clock
+    # time, and the operator's own IANA zone. The month is matched against the known
+    # abbreviations rather than any three letters, so `Foo 12` is refused instead of resolved.
+    MONTH = Date::ABBR_MONTHNAMES.compact.join("|")
+    ZONE = %r{[A-Za-z][A-Za-z0-9+_-]*(?:/[A-Za-z0-9+_-]+)*}
+    RESET = /\A(#{MONTH})\s+(\d{1,2})\s+at\s+(\d{1,2})(?::(\d{2}))?(?i:(am|pm))\s+\((#{ZONE})\)\z/
+
+    # The host's own copy of the tz database, and the only thing that makes a printed zone name
+    # real. Setting TZ to a name this host does not know does NOT fail — it silently resolves to
+    # UTC — so an unrecognised name would turn a foreign wall clock into a confidently wrong
+    # instant. Checked before any time is built, so an unknown zone is a refusal rather than a
+    # shifted answer.
+    ZONE_DATABASE = "/usr/share/zoneinfo"
 
     # `name: <command or url> - <health>`. The middle group is captured only so it can be
     # DISCARDED: it is the server's command line or URL, and it is the single most sensitive
@@ -104,16 +115,20 @@ module SpecrelayRunner
       @command = command
     end
 
-    # The two documented capacity windows, or nil. `now` resolves a reset's wall-clock text to
-    # an instant; it is supplied rather than read so the resolution is deterministic.
+    # The two documented capacity windows, or nil. `now` resolves each printed date to an exact
+    # instant; it is supplied rather than read so the resolution is deterministic.
     def capacity(now:)
       text = output_of(USAGE_ARGV)
       return nil if text.nil?
 
-      lines = text.lines.map { |line| line.rstrip }
-      return nil unless documented_order?(lines)
+      measured = text.lines.filter_map { |line| measurement(line) }
+      # Both windows, each exactly once, in the order the documented output prints them. One
+      # comparison answers every way that can fail — an absent line, a duplicated one, a
+      # reordered pair — and it is asked before any value is read, so output that is not the
+      # documented shape yields no capacity at all rather than one window.
+      return nil unless measured.map(&:first) == WINDOW_HEADINGS.values
 
-      windows = WINDOW_HEADINGS.to_h { |heading, key| [ key, window_in(lines, heading, now) ] }
+      windows = measured.to_h { |key, percent, reset| [ key, window(percent, reset, now) ] }
       return nil if windows.value?(nil)
 
       { "state" => "available", "windows" => windows }
@@ -150,98 +165,84 @@ module SpecrelayRunner
       result.stdout.to_s.gsub(ANSI, "")
     end
 
-    # Both documented headings, each appearing EXACTLY ONCE and in the order the documented
-    # output prints them. Order is part of the contract rather than an incidental property: a
-    # result whose blocks are not in that order is not the documented output, and reading it
-    # anyway would be this reader deciding that something close enough is close enough. It is
-    # checked before any value is read, so a reordered result yields no capacity at all rather
-    # than one window.
-    def documented_order?(lines)
-      starts = WINDOW_HEADINGS.keys.map { |heading| sole_heading_index(lines, heading) }
-      starts.none?(&:nil?) && starts == starts.sort
+    # One line reduced to the window it measures, or nil when it is not a measurement this
+    # reader reports. A model-specific line — `Current week (Fable): 0% used · …` — is a
+    # perfectly well-formed measurement whose heading is simply not in the table, so it is
+    # dropped here and can never lend its percentage or its reset to a window that is.
+    def measurement(line)
+      match = MEASUREMENT.match(line.strip)
+      return nil if match.nil?
+
+      key = WINDOW_HEADINGS[match[1]]
+      key.nil? ? nil : [ key, match[2].to_i, match[3] ]
     end
 
-    # The line a heading opens, when it appears EXACTLY ONCE. A missing heading has no block, and
-    # a duplicated one means the output is not the documented one — choosing either occurrence
-    # would be a guess about which the provider meant.
-    def sole_heading_index(lines, heading)
-      found = lines.each_index.select { |index| lines[index].strip == heading }
-      found.length == 1 ? found.first : nil
+    # `0%` is a measurement like any other: the provider reported that nothing has been used,
+    # which is a fact about this account and not an absence of one.
+    def window(percent, reset, now)
+      instant = reset_instant(reset, now)
+      return nil if instant.nil? || !percent.between?(0, 100)
+
+      { "used_percent" => percent, "resets_at" => instant }
     end
 
-    # One window, read from the block its own heading opens. The block ends at the next heading
-    # of any kind, so a following model-specific section can never lend this one its values.
-    def window_in(lines, heading, now)
-      block = block_for(lines, heading)
-      return nil if block.nil?
-
-      percent = sole_match(block, USAGE_PERCENT)&.to_i
-      reset = reset_instant(sole_match(block, USAGE_RESET), now)
-      return nil if percent.nil? || reset.nil? || !percent.between?(0, 100)
-
-      { "used_percent" => percent, "resets_at" => reset }
-    end
-
-    # The lines under a heading, up to the next heading of any kind.
-    def block_for(lines, heading)
-      start = sole_heading_index(lines, heading)
-      return nil if start.nil?
-
-      following = lines[(start + 1)..] || []
-      following.take_while { |line| !heading?(line) }
-    end
-
-    def heading?(line) = WINDOW_HEADINGS.key?(line.strip) || line.strip.start_with?("Current ")
-
-    # The captured value when the pattern matches exactly once in the block, else nil. Two
-    # percentages or two reset lines mean the block is not the documented shape, and taking
-    # the first would be choosing one of two contradictory facts.
-    def sole_match(lines, pattern)
-      matches = lines.filter_map { |line| line[pattern, 1] }
-      matches.length == 1 ? matches.first : nil
-    end
-
-    # A reset's wall-clock text as an exact UTC instant: the NEXT occurrence of the time it
-    # names, in this machine's own zone. That is normalisation rather than estimation — the
-    # provider named a time, and a window's reset is always ahead of the observation.
+    # A reset's printed wall clock as an exact UTC instant, or nil. Every field is checked
+    # against what it is allowed to be BEFORE a time is built, because `Time.local` does not
+    # refuse an impossible date — it ROLLS IT OVER, turning `Sep 31` into October and `Feb 29`
+    # in a common year into March. A rolled-over date is a confidently wrong instant, which is
+    # the one answer this reader may never give.
     def reset_instant(text, now)
-      return nil if text.nil?
+      match = RESET.match(text.strip)
+      return nil if match.nil?
 
-      parts = reset_parts(text.strip)
-      return nil if parts.nil?
+      hour = clock_hour(match[3], match[5])
+      minute = match[4].to_i
+      zone = match[6]
+      return nil if hour.nil? || !minute.between?(0, 59) || !known_zone?(zone)
 
-      weekday, hour, minute = parts
-      return nil unless hour.between?(0, 23) && minute.between?(0, 59)
-
-      next_occurrence(now, weekday, hour, minute)&.utc&.strftime("%Y-%m-%dT%H:%M:%SZ")
+      next_occurrence(now, zone, Date::ABBR_MONTHNAMES.index(match[1]), match[2].to_i,
+                      hour, minute)
     end
 
-    # `[weekday or nil, hour, minute]` for the two documented shapes, else nil.
-    def reset_parts(text)
-      if (match = RESET_WEEKDAY_TIME.match(text))
-        [ Date::ABBR_DAYNAMES.index(match[1].capitalize), clock_hour(match[2], match[4]), match[3].to_i ]
-      elsif (match = RESET_TIME.match(text))
-        [ nil, clock_hour(match[1], match[3]), match[2].to_i ]
-      end
-    end
-
-    # A 12-hour reading only when the output actually said am/pm; otherwise the hour is already
-    # the 24-hour one and must not be shifted.
+    # The printed clock is a 12-hour one and always names its half, so 1..12 is the only reading
+    # this parser has. `13pm` is not a late hour to be repaired; it is not the documented shape.
     def clock_hour(hour, meridiem)
       value = hour.to_i
-      return value if meridiem.nil?
-      return value % 12 if meridiem.casecmp("am").zero?
+      return nil unless value.between?(1, 12)
 
-      (value % 12) + 12
+      meridiem.casecmp("am").zero? ? value % 12 : (value % 12) + 12
     end
 
-    # The soonest instant at or after `now` that matches the named weekday and time. Local
-    # rather than UTC, because the provider prints the operator's own wall clock.
-    def next_occurrence(now, weekday, hour, minute)
-      local = now.getlocal
-      candidate = Time.new(local.year, local.month, local.day, hour, minute, 0, local.utc_offset)
-      candidate += 86_400 while weekday && candidate.wday != weekday
-      candidate <= local ? candidate + (weekday ? 604_800 : 86_400) : candidate
+    def known_zone?(name) = File.file?(File.join(ZONE_DATABASE, name))
+
+    # The soonest instant at or after `now` that the printed month and day can name: the
+    # observation year, or the one after it once that date has already passed. The provider
+    # prints no year, and a window's reset is always ahead of the observation that reported it.
+    def next_occurrence(now, zone, month, day, hour, minute)
+      [ now.year, now.year + 1 ].each do |year|
+        next unless Date.valid_date?(year, month, day)
+
+        instant = in_zone(zone) { Time.local(year, month, day, hour, minute, 0) }
+        return instant.getutc.strftime("%Y-%m-%dT%H:%M:%SZ") if instant >= now
+      end
+      nil
+    end
+
+    # The block evaluated with the PRINTED zone in force, with TZ restored however it ends.
+    # Ruby's standard library resolves an IANA zone name through this variable and nothing else,
+    # and the provider names the operator's zone rather than this machine's — which are only
+    # usually the same, so reading the host's would be an assumption rather than a measurement.
+    #
+    # TZ is process-wide, which is why this is contained around a single construction: no other
+    # code in this program builds a time from a local wall clock or reads a zone, so nothing
+    # else can observe the swap, and an absolute instant — what everything here reports — does
+    # not depend on TZ at all.
+    def in_zone(name)
+      previous = ENV["TZ"]
+      ENV["TZ"] = name
+      yield
+    ensure
+      previous.nil? ? ENV.delete("TZ") : (ENV["TZ"] = previous)
     end
 
     # One inventory line reduced to the two fields that may travel. The command line or URL
