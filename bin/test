@@ -21,10 +21,9 @@ class FullSuite
   # derived function of the host's processor count: an unbounded suite competes with itself.
   ALLOWED_WORKERS = [ 1, 2, 4 ].freeze
 
-  # The measured default: the smallest bounded mode whose three-run median beat the serial median
-  # by more than the required margin. Four workers is faster still, but the rule is the smallest
-  # mode that clears the bar, not the fastest one — a suite that competes with the machine it runs
-  # on buys wall-clock time with timing-sensitive failures.
+  # The measured default: the smallest bounded mode whose three-run median cleared the approved
+  # threshold against the serial median. Four workers measured faster still and remains available
+  # as an explicit mode; the rule selects the smallest qualifying mode, not the fastest.
   DEFAULT_WORKERS = 2
 
   # The last of a failing file's output — the part that diagnoses it. A child writes into a pipe

@@ -1329,9 +1329,9 @@ It keeps the suite's own isolation contract — each file still runs in its own
 - **Bounded workers.** Only `1`, `2`, and `4` are accepted, and anything else is
   rejected (exit `2`) before a single test process starts. The worker count is
   not derived from the host's processor count. Two is the default because it is
-  the smallest mode measured to beat the serial suite by a wide margin — four is
-  faster again, but the suite deliberately leaves the machine room rather than
-  buying wall-clock time with timing-sensitive failures.
+  the smallest mode whose measured median cleared the approved threshold against
+  the serial suite; four measured faster still and remains available as an
+  explicit mode.
 - **Attributable output.** Each file's stdout and stderr are captured and printed
   as one delimited block naming that file, its result, and its duration, so
   concurrent output never interleaves anonymously.
