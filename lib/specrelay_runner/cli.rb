@@ -45,7 +45,6 @@ module SpecrelayRunner
       command, *rest = argv
       case command
       when "connect" then connect(rest)
-      when "register" then register(rest)
       when "claim-once" then claim_once(rest)
       when "loop" then loop_mode(rest)
       when "connections" then connections(rest)
@@ -149,46 +148,6 @@ module SpecrelayRunner
       err.puts "Platform recorded this connection as #{result.state}" \
                "#{" (#{result.failure_class})" if result.failure_class}."
       err.puts "Remedy: #{Redaction.redact(result.detail.to_s)}" if result.detail.to_s.strip != ""
-    end
-
-    # ADVANCED / LEGACY (MVP-0011). Enroll with a one-time registration token read from
-    # the environment and receive the durable credential, printed EXACTLY ONCE for the
-    # operator to export. Superseded by `connect`, which needs no file and no exported
-    # credential — and, unlike this command, grants access to a specific workspace. A
-    # runner enrolled here holds no workspace grant and can claim nothing until it
-    # completes `connect`.
-    def register(args)
-      config = load_config(args)
-      return USAGE_ERROR if config.nil?
-
-      token = config.registration_token(env: env)
-      client = PlatformClient.new(base_url: config.base_url, token: token)
-      out.puts "Registering runner #{config.runner['display_name']} (#{config.runner['id']}) with #{config.base_url}…"
-      print_registration(config, client.register(config.registration_identity))
-      SUCCESS
-    rescue Config::Error => e
-      err.puts "Invalid runner config: #{e.message}"
-      USAGE_ERROR
-    rescue PlatformClient::Error => e
-      err.puts "Registration failed: #{e.message}"
-      RUN_FAILED
-    end
-
-    # Show the returned credential a single time with clear, secret-safe guidance.
-    # This is the ONE place the runner prints a raw secret (never via the redacting
-    # logger) because the operator must capture it now — Platform cannot re-show it.
-    def print_registration(config, result)
-      runner = result.fetch("runner")
-      out.puts "Registered. Runner identity: #{runner['public_id']} (#{runner['id']})."
-      out.puts ""
-      out.puts "Per-runner credential (shown once — store it, do not commit it):"
-      out.puts "  #{result.fetch('credential')}"
-      out.puts ""
-      out.puts "Export it before claiming work:"
-      out.puts "  export #{config.credential_env}=<the value above>"
-      out.puts ""
-      out.puts "This runner has NO workspace access yet. Registration alone authorizes nothing:"
-      out.puts "run `specrelay-runner connect <enrollment-code>` for the workspace it should execute."
     end
 
     def claim_once(args)
@@ -938,15 +897,6 @@ module SpecrelayRunner
 
         Advanced / legacy — supported for an existing hand-written setup, and NOT the
         documented way to set a machine up:
-
-          specrelay-runner register --config <path>
-              Enroll with a one-time registration token (read from the env var named
-              by runner.registration_token_env, default
-              SPECRELAY_RUNNER_REGISTRATION_TOKEN) and PRINT the durable credential
-              once for you to export as SPECRELAY_RUNNER_CREDENTIAL. Unlike
-              `connect`, it grants no workspace access on its own: a runner enrolled
-              this way shows as `legacy setup` in Platform and can claim nothing
-              until it completes `connect` for a workspace.
 
           specrelay-runner claim-once --config <path>
               Claim using a hand-written config file and a credential from the

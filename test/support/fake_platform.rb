@@ -14,7 +14,6 @@ require "json"
 # bearer token, returns a scripted claim payload, and 201/200s the rest.
 class FakePlatform
   EXPECTED_TOKEN = "fake-dev-token"
-  EXPECTED_REGISTRATION_TOKEN = "srt_fake-registration-token"
   ISSUED_CREDENTIAL = "src_fake-issued-credential"
   # The machine's own preview connector token, issued alongside the credential on every
   # successful exchange — including a reconnect, which replaces only this one.
@@ -96,11 +95,10 @@ class FakePlatform
 
   attr_reader :requests
 
-  # `token` is the shared development token (fallback mode). `registration_token`
-  # is the one-time token the runner presents to /registration; on success the
-  # fake issues ISSUED_CREDENTIAL, which it then also accepts as a registered
-  # bearer for the remaining endpoints (registered mode).
-  def initialize(claim_payload:, token: EXPECTED_TOKEN, registration_token: EXPECTED_REGISTRATION_TOKEN,
+  # `token` is the shared development token (fallback mode). A guided connection issues
+  # ISSUED_CREDENTIAL, which the fake then accepts as a registered bearer for the remaining
+  # endpoints (registered mode).
+  def initialize(claim_payload:, token: EXPECTED_TOKEN,
                  enrollment_code: nil, claim_limit: nil, release_status: 201,
                  lease_signal: { "state" => "active", "cancel_requested" => false })
     @claim_payload = claim_payload
@@ -108,7 +106,6 @@ class FakePlatform
     @claims_served = 0
     @release_status = release_status
     @token = token
-    @registration_token = registration_token
     @enrollment_code = enrollment_code
     @enrollment_status = 201
     @runner_public_id = "rnr_fake"
@@ -254,7 +251,6 @@ class FakePlatform
   # held, and only on their own connection thread — a delay that also stalled this fake's accept
   # loop would postpone the result-path requests the test measures and prove nothing.
   attr_accessor :log_event_delay
-  def last_registration = requests_to("/api/runner/registration").last
   def last_enrollment = requests_to("/api/runner/enrollment").last
   def last_enrollment_preview = requests_to("/api/runner/enrollment_preview").last
   def last_readiness_report = requests_to("/api/runner/workspace_connections").last
@@ -371,13 +367,12 @@ class FakePlatform
     {}
   end
 
-  # The registration endpoint authenticates the one-time registration token; every
-  # other endpoint accepts the shared development token OR the issued registered
-  # credential, mirroring Platform's two authentication modes.
+  # The enrollment endpoints authenticate the one-time connection code; every other
+  # endpoint accepts the shared development token OR the issued registered credential,
+  # mirroring Platform's two authentication modes.
   def authorized?(request)
     presented = request[:headers]["authorization"].to_s
     case request[:path].to_s.split("?").first
-    when "/api/runner/registration" then presented == "Bearer #{@registration_token}"
     when "/api/runner/enrollment", "/api/runner/enrollment_preview"
       presented == "Bearer #{@enrollment_code}"
     else presented == "Bearer #{@token}" || presented == "Bearer #{ISSUED_CREDENTIAL}"
@@ -386,7 +381,6 @@ class FakePlatform
 
   def route(request)
     case request[:path]
-    when "/api/runner/registration" then registration
     when "/api/runner/enrollment" then enrollment(request)
     when "/api/runner/enrollment_preview" then code_spent? ? spent_code : [ 200, assignment ]
     when "/api/runner/workspace_connections" then workspace_connection(request)
@@ -603,13 +597,6 @@ class FakePlatform
                              routing_label: removed ? "tiny-demo/#{key}" : nil,
                              detail: removed ? "Platform removed this runner's grant for tiny-demo/#{key}." :
                                        "Platform holds no grant for this runner on '#{key}'." } } ]
-  end
-
-  def registration
-    [ 201, { contract_version: "mvp-0010",
-             runner: { id: "local-dev-runner-1", public_id: "rnr_fake", display_name: "Local Developer Runner",
-                       registered_at: "2026-07-24T00:00:00Z" },
-             credential: ISSUED_CREDENTIAL, credential_env: "SPECRELAY_RUNNER_CREDENTIAL" } ]
   end
 
   # The non-secret assignment, identical for the preview and the exchange. The workspace block

@@ -101,15 +101,6 @@ module SpecrelayRunner
       @http = http
     end
 
-    # POST /api/runner/registration. The bearer for THIS call is the one-time
-    # registration token (not a runner credential — the runner has none yet).
-    # Returns the parsed body, which carries the per-runner credential exactly
-    # once. Raises Unauthorized (401) for an invalid/expired/used token.
-    def register(runner_params)
-      status, body = post_json("/api/runner/registration", { runner: runner_params })
-      status == 201 ? body : raise_for(status, body)
-    end
-
     # POST /api/runner/enrollment_preview (round 002). The bearer is the one-time enrollment
     # code, and the call does NOT consume it: it returns only the non-secret assignment, with no
     # credential. It exists so `connect` can validate the local checkout and provider readiness
