@@ -17,7 +17,6 @@ module SpecrelayRunner
   #     id: local-dev-runner-1
   #     display_name: Local Developer Runner
   #     credential_env: SPECRELAY_RUNNER_CREDENTIAL          # registered-mode credential
-  #     registration_token_env: SPECRELAY_RUNNER_REGISTRATION_TOKEN  # for `register`
   #     operator_email: hrmohseni@example.com   # optional (assigned_to_me)
   #     operator_account_id: 5b10ac...          # optional (assigned_to_me)
   #     claim_policy:
@@ -30,7 +29,7 @@ module SpecrelayRunner
   # Two authentication modes, clearly separated (MVP-0011):
   #   - registered mode (primary): the per-runner credential is read from the env
   #     var named by `runner.credential_env`. The credential is issued once by
-  #     Platform (`specrelay-runner register`) and NEVER stored in this file.
+  #     Platform (`specrelay-runner connect`) and NEVER stored in this file.
   #   - development-token mode (fallback): the single shared token from
   #     `platform.token_env`, used only when no registered credential is present.
   #
@@ -42,7 +41,6 @@ module SpecrelayRunner
 
     TOKEN_ENV_DEFAULT = "SPECRELAY_RUNNER_API_TOKEN"
     CREDENTIAL_ENV_DEFAULT = "SPECRELAY_RUNNER_CREDENTIAL"
-    REGISTRATION_TOKEN_ENV_DEFAULT = "SPECRELAY_RUNNER_REGISTRATION_TOKEN"
     # The canonical config-path env var. `SPECRELAY_RUNNER_SPIKE_CONFIG` is the
     # name the spike shipped with (MVP-0010); MVP-0015 made the runner a real
     # product component, so the "spike" name is kept working as a deprecated
@@ -59,7 +57,7 @@ module SpecrelayRunner
     # (mode: :registered) or the shared development token (mode: :development).
     Auth = Struct.new(:mode, :token, keyword_init: true)
 
-    attr_reader :base_url, :token_env, :credential_env, :registration_token_env,
+    attr_reader :base_url, :token_env, :credential_env,
                 :runner, :workspace_roots, :source_path, :connection, :selection_source
 
     def self.load(path, env: ENV)
@@ -132,7 +130,6 @@ module SpecrelayRunner
       raise Error, "runner.id is required" if presence(@runner["id"]).nil?
       raise Error, "runner.display_name is required" if presence(@runner["display_name"]).nil?
       @credential_env = presence(@runner["credential_env"]) || CREDENTIAL_ENV_DEFAULT
-      @registration_token_env = presence(@runner["registration_token_env"]) || REGISTRATION_TOKEN_ENV_DEFAULT
       @workspace_roots = fetch_hash(document, "workspace_roots")
     end
 
@@ -209,27 +206,6 @@ module SpecrelayRunner
       raise Error, "no Platform API token in $#{token_env} (set it in your environment; never commit it)" if token.empty?
 
       token
-    end
-
-    # The identity block a runner posts to register itself. Only non-secret fields;
-    # the credential is issued by Platform, never sent by the runner.
-    def registration_identity
-      identity = { "id" => runner["id"], "display_name" => runner["display_name"] }
-      identity["operator_email"] = presence(runner["operator_email"]) if presence(runner["operator_email"])
-      identity["operator_account_id"] = presence(runner["operator_account_id"]) if presence(runner["operator_account_id"])
-      identity
-    end
-
-    # The one-time registration token, read from the environment (never the file),
-    # used only by `specrelay-runner register`.
-    def registration_token(env: ENV)
-      value = env[registration_token_env].to_s.strip
-      if value.empty?
-        raise Error, "no registration token in $#{registration_token_env} " \
-                     "(get a one-time token from `bin/platform runners issue-registration-token`)"
-      end
-
-      value
     end
 
     # Resolve the runner API bearer credential and its mode. Registered mode is

@@ -75,7 +75,6 @@ class ConfigTest < Minitest::Test
         id: r1
         display_name: Runner One
         credential_env: MY_CREDENTIAL
-        registration_token_env: MY_REG_TOKEN
         claim_policy:
           mode: all_eligible
     YAML
@@ -98,12 +97,6 @@ class ConfigTest < Minitest::Test
   def test_resolve_auth_requires_one_of_the_two
     config = SpecrelayRunner::Config.load(write_config(registered_config))
     assert_raises(SpecrelayRunner::Config::Error) { config.resolve_auth(env: {}) }
-  end
-
-  def test_registration_token_reads_from_env_never_the_file
-    config = SpecrelayRunner::Config.load(write_config(registered_config))
-    assert_equal "srt_one-time", config.registration_token(env: { "MY_REG_TOKEN" => "srt_one-time" })
-    assert_raises(SpecrelayRunner::Config::Error) { config.registration_token(env: {}) }
   end
 
   # --- selecting the real executor profile (MVP-0016) ------------------------

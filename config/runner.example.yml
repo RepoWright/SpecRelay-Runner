@@ -24,10 +24,8 @@ runner:
   id: local-dev-runner-1
   display_name: Local Developer Runner
   # PRIMARY: the env var holding this runner's registered credential, issued once
-  # by `specrelay-runner register` and never stored in this file.
+  # by `specrelay-runner connect` and never stored in this file.
   credential_env: SPECRELAY_RUNNER_CREDENTIAL
-  # The env var holding the one-time registration token, read only by `register`.
-  registration_token_env: SPECRELAY_RUNNER_REGISTRATION_TOKEN
   # For an assigned_to_me policy, set one of these to match the Jira assignee
   # identity Platform normalized (account id preferred). Omit for all_eligible.
   # operator_email: you@example.com

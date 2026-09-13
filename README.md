@@ -848,32 +848,28 @@ write it atomically and preserve mode `0600`.
 ## ADVANCED / LEGACY: the hand-written config path
 
 Supported for an operator who already runs this setup. It is **not** the way to
-set a new machine up, and `register` alone authorizes no work.
+set a new machine up.
+
+There is no command that enrols a machine from this file. A machine gets its
+identity from `connect`, which is the one path that also tells Platform which
+project the machine joins and which member owns it; a hand-written config only
+says how to *use* a credential that already exists.
 
 Copy [`config/runner.example.yml`](config/runner.example.yml) to a real path (for
 example `~/.specrelay/runner.yml`) and edit it. The config carries **no secret**:
-the registration token, the runner credential, and the development token are all
-read from environment variables the config only *names*. Point the runner at it
-with `--config <path>` or `SPECRELAY_RUNNER_CONFIG`; an explicit `--config` always
-wins over a stored connection.
+the runner credential and the development token are both read from environment
+variables the config only *names*. Point the runner at it with `--config <path>`
+or `SPECRELAY_RUNNER_CONFIG`; an explicit `--config` always wins over a stored
+connection.
 
 ```bash
-# On Platform: issue a one-time registration token (printed once).
-bin/platform runners issue-registration-token
+# Connect the machine once; the credential is stored in the OS secret store.
+bin/specrelay-runner connect <connection-code>
 
-# Here: enroll with it and capture the credential (printed exactly once).
-export SPECRELAY_RUNNER_REGISTRATION_TOKEN=<the one-time token>
-bin/specrelay-runner register --config ~/.specrelay/runner.yml
-export SPECRELAY_RUNNER_CREDENTIAL=<the credential from the output>
-
-# Claim with that config and credential.
+# Claim with a hand-written config and that credential in the environment.
+export SPECRELAY_RUNNER_CREDENTIAL=<the credential for this machine>
 bin/specrelay-runner claim-once --config ~/.specrelay/runner.yml
 ```
-
-`register` exits `0` on success, `1` on a rejected/expired/used token, `2` on a
-config/usage error. A machine enrolled this way displays as `legacy setup` in
-Platform and can claim **nothing** until it also completes
-`connect` for a workspace.
 
 On this path the physical local workspace root is resolved, in order, from
 `SPECRELAY_RUNNER_WORKSPACE_ROOT_<WORKSPACE_KEY>`,
@@ -892,7 +888,7 @@ pointer here. Platform keeps only the commands that operate on **its own state**
 bin/platform runner release <run-id|task-id|ticket-key>   # free a stuck/stale claim
 bin/platform runner cancel  <run-id|task-id|ticket-key>   # terminally stop a run
 bin/platform runner sweep-leases               # reclaim lapsed leases
-bin/platform runners issue-registration-token|list|revoke|rotate-credential
+bin/platform runners list|revoke|rotate-credential
 ```
 
 ## The real providers: two approved profiles
@@ -1324,7 +1320,7 @@ Or individually:
 ruby -Itest test/config_test.rb
 ruby -Itest test/repository_boundary_test.rb
 ruby -Itest test/runner_flow_test.rb
-ruby -Itest test/registration_flow_test.rb
+ruby -Itest test/registered_credential_flow_test.rb
 ruby -Itest test/lease_test.rb
 ruby -Itest test/protocol_flow_test.rb
 ruby -Itest test/publication_flow_test.rb
@@ -1358,10 +1354,11 @@ What each suite proves:
   a real hermetic git workspace with a deterministic fake executor, then drives the
   full claim → events/heartbeat → worktree + executor + tests → report-upload flow
   over real HTTP — proving the process boundary end to end.
-- **`registration_flow_test.rb`** proves the runner `register`s over HTTP with a
-  one-time registration token, receives its credential once, and then drives the
-  full claim-once flow authenticated by that **registered credential** — never
-  storing a secret in the config file.
+- **`registered_credential_flow_test.rb`** proves a machine holding a per-runner
+  credential drives the full claim-once flow over HTTP authenticated by that
+  **registered credential** — never storing a secret in the config file. There is
+  no command that mints one from a token: a machine receives its credential by
+  connecting, the one path that also names its project and its owner.
 - **`protocol_flow_test.rb`** proves the ordered v1 event stream (dense monotonic
   sequence, well-formed envelope), the out-of-order/duplicate/conflict controls,
   and the terminal-result envelope submitted with the report.
