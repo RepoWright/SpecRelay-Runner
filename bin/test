@@ -1,0 +1,234 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# The canonical complete-suite command for this repository. Like the runner itself it is plain
+# Ruby on the standard library: no Bundler, no gems, no test runner to install.
+#
+# It replaces the serial shell loop this README used to document. The loop's isolation contract is
+# preserved exactly — every test file still runs in its own Ruby process with `-Itest` — and the
+# command adds only what a shell loop cannot state truthfully: one refusal when a second full
+# suite would consume the same checkout, bounded concurrency, per-file attribution, and one
+# accounting of what actually ran.
+
+require "digest"
+require "fileutils"
+require "rbconfig"
+require "tmpdir"
+
+# Runs this checkout's test files, one Ruby process per file, up to `workers` at a time.
+class FullSuite
+  # The one authoritative bound on concurrency. The values are the benchmarked modes, not a
+  # derived function of the host's processor count: an unbounded suite competes with itself.
+  ALLOWED_WORKERS = [ 1, 2, 4 ].freeze
+
+  # The measured default: the smallest bounded mode whose three-run median cleared the approved
+  # threshold against the serial median. Four workers measured faster still and remains available
+  # as an explicit mode; the rule selects the smallest qualifying mode, not the fastest.
+  DEFAULT_WORKERS = 2
+
+  # The last of a failing file's output — the part that diagnoses it. A child writes into a pipe
+  # the parent keeps draining into a ring of exactly this size, so neither a file on disk nor the
+  # parent's memory grows with a runaway child's output.
+  MAX_CAPTURED_BYTES = 64 * 1024
+  POLL_SECONDS = 0.05
+
+  DELIMITER = "====="
+
+  Child = Struct.new(:file, :pid, :reader, :ring, :cursor, :filled, :started_at, :duration,
+                     :status, keyword_init: true)
+
+  def initialize(checkout:, workers:)
+    @checkout = checkout
+    @workers = workers
+    @running = {}
+    @scratch = String.new
+  end
+
+  # The process exit status: zero only when every discovered file launched, completed and passed.
+  def call
+    started_at = monotonic
+    files = discover
+    completed = drain(files)
+    summarize(files, completed, monotonic - started_at)
+  ensure
+    terminate_survivors
+  end
+
+  # The refusal is a non-blocking advisory lock on this physical checkout. A second invocation
+  # stops here rather than queueing, attaching or waiting: two full suites on one checkout
+  # produce ambiguous evidence and compete for the same host.
+  def self.lock(checkout)
+    directory = File.join(Dir.tmpdir, "specrelay-runner-suite-locks")
+    FileUtils.mkdir_p(directory)
+    lock = File.open(File.join(directory, "#{Digest::SHA256.hexdigest(checkout)}.lock"),
+                     File::RDWR | File::CREAT, 0o600)
+    return lock if lock.flock(File::LOCK_EX | File::LOCK_NB)
+
+    lock.close
+    nil
+  end
+
+  def self.workers(argv)
+    return DEFAULT_WORKERS if argv.empty?
+
+    usage unless argv.length == 2 && argv.first == "--workers"
+    selected = Integer(argv.last, exception: false)
+    usage unless ALLOWED_WORKERS.include?(selected)
+    selected
+  end
+
+  def self.usage
+    warn "usage: bin/test [--workers #{ALLOWED_WORKERS.join('|')}]"
+    exit 2
+  end
+
+  private
+
+  # The closed set, decided once at the start. An empty set is a broken checkout, not a green run.
+  def discover
+    files = Dir.glob("test/*_test.rb", base: @checkout).sort
+    abort "bin/test: no test file matched test/*_test.rb in #{@checkout}" if files.empty?
+
+    files
+  end
+
+  # Keep `workers` children alive, reporting each as it finishes. Children complete out of order,
+  # so a child's own record — not the launch order — carries its duration and result.
+  def drain(files)
+    pending = files.dup
+    completed = []
+    until pending.empty? && @running.empty?
+      start(pending.shift) while @running.size < @workers && !pending.empty?
+      pump
+      harvest.each do |child|
+        completed << child
+        report(child)
+      end
+    end
+    completed
+  end
+
+  def start(file)
+    reader, writer = IO.pipe
+    pid = Process.spawn(RbConfig.ruby, "-Itest", file,
+                        chdir: @checkout, out: writer, err: %i[child out])
+    writer.close
+    @running[pid] = Child.new(file: file, pid: pid, reader: reader,
+                              ring: "\0".b * MAX_CAPTURED_BYTES, cursor: 0, filled: 0,
+                              started_at: monotonic)
+  end
+
+  # Move whatever the children have written so far into their own bounded buffers. Draining is
+  # continuous so that no child stalls on a full pipe and no buffer grows with what a child emits.
+  def pump
+    ready, = IO.select(@running.values.map(&:reader), nil, nil, POLL_SECONDS)
+    Array(ready).each { |reader| absorb(child_for(reader)) }
+  end
+
+  # Read what is available right now, never more. `read_nonblock` ends the loop at the first
+  # would-block or end of stream, so a child that is still writing cannot hold the parent here.
+  #
+  # Each read is limited to the space left before the ring wraps, so the oldest bytes are simply
+  # overwritten in place: one reused scratch string, no growing buffer, and no per-read garbage.
+  # A child's whole stream therefore never exists at once, however much it writes.
+  def absorb(child)
+    loop do
+      child.reader.read_nonblock(MAX_CAPTURED_BYTES - child.cursor, @scratch)
+      bytes = @scratch.bytesize
+      child.ring[child.cursor, bytes] = @scratch
+      child.cursor = (child.cursor + bytes) % MAX_CAPTURED_BYTES
+      child.filled += bytes
+    end
+  rescue IO::WaitReadable, EOFError
+    nil
+  end
+
+  # The ring read oldest-first: everything when the child stayed inside the bound, the final
+  # MAX_CAPTURED_BYTES when it did not.
+  def tail_of(child)
+    return child.ring.byteslice(0, child.filled) if child.filled < MAX_CAPTURED_BYTES
+
+    child.ring.byteslice(child.cursor, MAX_CAPTURED_BYTES - child.cursor) +
+      child.ring.byteslice(0, child.cursor)
+  end
+
+  # Every child that has exited, with its last buffered output taken before its pipe is closed.
+  def harvest
+    finished = []
+    until @running.empty?
+      reaped = Process.wait2(-1, Process::WNOHANG)
+      break unless reaped
+
+      pid, status = reaped
+      child = @running.delete(pid)
+      # Accounting the command cannot explain is a failure, never a silent omission from the total.
+      raise "bin/test: reaped an unexpected child process (pid #{pid})" if child.nil?
+
+      absorb(child)
+      child.reader.close
+      child.duration = monotonic - child.started_at
+      child.status = status
+      finished << child
+    end
+    finished
+  end
+
+  def child_for(reader)
+    @running.each_value { |child| return child if child.reader.equal?(reader) }
+    raise "bin/test: read from a stream belonging to no running test file"
+  end
+
+  def report(child)
+    puts "#{DELIMITER} #{child.file}: BEGIN #{DELIMITER}"
+    discarded = child.filled - MAX_CAPTURED_BYTES
+    puts "[bin/test: #{discarded} earlier bytes discarded]" if discarded.positive?
+    text = tail_of(child)
+    print text
+    puts unless text.empty? || text.end_with?("\n")
+    puts format("%s %s: %s %s duration=%.2fs %s", DELIMITER, child.file, outcome(child),
+                detail(child.status), child.duration, DELIMITER)
+  end
+
+  def summarize(files, completed, wall)
+    failed = completed.reject { |child| child.status.success? }
+    unless failed.empty?
+      puts "Failed files:"
+      failed.sort_by(&:file).each { |child| puts "  #{child.file} (#{detail(child.status)})" }
+    end
+    passed = completed.length - failed.length
+    puts format("Summary: discovered=%d completed=%d passed=%d failed=%d workers=%d wall=%.2fs",
+                files.length, completed.length, passed, failed.length, @workers, wall)
+    passed == files.length && completed.length == files.length ? 0 : 1
+  end
+
+  def outcome(child) = child.status.success? ? "PASS" : "FAIL"
+
+  def detail(status) = status.exitstatus ? "exit=#{status.exitstatus}" : "signal=#{status.termsig}"
+
+  def monotonic = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
+  # An interrupted or failed command leaves no test process behind holding this host. Each pipe is
+  # closed with its child, so a child stopped mid-write cannot keep the command waiting on it.
+  def terminate_survivors
+    @running.each_value do |child|
+      begin
+        Process.kill("TERM", child.pid)
+      rescue Errno::ESRCH
+        nil
+      end
+      child.reader.close unless child.reader.closed?
+    end
+    Process.waitall
+    @running.clear
+  end
+end
+
+checkout = File.expand_path("..", __dir__)
+workers = FullSuite.workers(ARGV)
+lock = FullSuite.lock(checkout)
+if lock.nil?
+  warn "bin/test: a complete test suite is already running in #{checkout}; refusing to start a second one"
+  exit 3
+end
+
+exit FullSuite.new(checkout: checkout, workers: workers).call

@@ -1252,6 +1252,8 @@ prints this command.
 ```text
 bin/specrelay-runner            # plain-Ruby executable (no Bundler/Rails)
 bin/specrelay-fake-executor     # deterministic demo executor (NOT the real executor)
+bin/test                        # the complete suite: one process per file, bounded
+                                #   workers, one suite per checkout, one truthful total
 config/runner.example.yml       # the one operator-facing config example
 lib/specrelay_runner.rb         # requires
 lib/specrelay_runner/
@@ -1308,11 +1310,43 @@ test/                           # minitest: fake Platform HTTP server + real git
 
 ## Tests
 
-No gems and no test runner to install — plain minitest on the standard library:
+No gems and no test runner to install — plain minitest on the standard library.
+`bin/test` is the one command that runs the complete suite:
 
 ```bash
-for t in test/*_test.rb; do ruby -Itest "$t"; done
+bin/test                 # every test/*_test.rb file, two at a time, one process each
+bin/test --workers 1     # the same closed set, serially
+bin/test --workers 4
 ```
+
+It keeps the suite's own isolation contract — each file still runs in its own
+`ruby -Itest` process — and adds what a shell loop cannot state truthfully:
+
+- **One suite per checkout.** The command holds a non-blocking advisory lock on
+  the physical checkout for its whole run. A second invocation against the same
+  checkout refuses immediately (exit `3`) instead of queueing, attaching, or
+  competing for the host. Two checkouts are independent.
+- **Bounded workers.** Only `1`, `2`, and `4` are accepted, and anything else is
+  rejected (exit `2`) before a single test process starts. The worker count is
+  not derived from the host's processor count. Two is the default because it is
+  the smallest mode whose measured median cleared the approved threshold against
+  the serial suite; four measured faster still and remains available as an
+  explicit mode.
+- **Attributable output.** Each file's stdout and stderr are captured and printed
+  as one delimited block naming that file, its result, and its duration, so
+  concurrent output never interleaves anonymously.
+- **Bounded capture.** The command drains each file's output as it is produced
+  into a fixed 64 KiB ring, and writes none of it to disk. A file that prints
+  less than that is shown in full; a file that prints more keeps only its final
+  65 536 bytes, prefixed by the exact number of earlier bytes discarded. What a
+  flooding file costs the command is therefore constant, not proportional to
+  what it printed — and the tail, where a failure reports itself, is what
+  survives.
+- **One truthful total.** The run ends with
+  `Summary: discovered=… completed=… passed=… failed=… workers=… wall=…s`, and
+  every failed file is named above it. Exit status is `0` only when every
+  discovered file launched, completed, and passed exactly once — a discovery,
+  launch, or accounting failure is never reported as a green run.
 
 Or individually:
 
