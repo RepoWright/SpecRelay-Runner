@@ -12,12 +12,21 @@ module SpecrelayRunner
   # panel, a model breakdown, an MCP server's command line, its environment and its URL — and
   # the only protection against carrying one is a parser that recognises the documented shape
   # and NOTHING else. So every method here returns either the exact documented fields or nil.
-  # There is no partial result, no repair, no "best effort", and no path on which raw output
-  # is stored, returned, logged or interpolated into a message.
+  # There is no repair, no "best effort", and no path on which raw output is stored, returned,
+  # logged or interpolated into a message.
   #
-  # A refusal is also never an estimate. An unrecognised, localised, duplicated, reordered,
-  # out-of-range or absent value means this machine measured nothing, and nil says exactly
-  # that. A number inferred from anything else would be a fact the provider never reported.
+  # Capacity IS reported per window, and that is not a relaxation of the above. Each documented
+  # window is recognised by its own exact heading and stands on its own line, so a window this
+  # reader cannot resolve is omitted while a window it read perfectly well is still reported.
+  # Order carries no meaning — the heading identifies the window, so the two cannot be swapped
+  # by printing them the other way round. Only when NO known window survives is there nothing
+  # to report at all.
+  #
+  # A refusal is still never an estimate. An unrecognised, localised, duplicated, out-of-range
+  # or absent measurement means this machine measured THAT window not at all, and its absence
+  # says exactly that. A number inferred from anything else — from the other window, from a
+  # clock, or from the better-formed of two copies — would be a fact the provider never
+  # reported.
   #
   # `command` is the one seam: it takes an argv array and returns a CommandRunner::Result, or
   # nil when the executable could not be launched at all. Tests drive it with fixtures, so no
@@ -42,11 +51,20 @@ module SpecrelayRunner
     WINDOW_HEADINGS = { "Current session" => "five_hour",
                         "Current week (all models)" => "weekly_all_models" }.freeze
 
-    # One measurement, whole, on one line: `<heading>: <n>% used · resets <when>`. Anchored end
-    # to end, so a line carrying a second percentage, a second reset, or any trailing material
-    # is not this shape at all. There is no sub-scan that could lift one value out of a line
-    # this does not match.
-    MEASUREMENT = /\A(.+?):\s+(\d{1,3})%\s+used\s+·\s+resets\s+(\S.*?)\z/
+    # One measurement, whole, on one line: `<heading>: <n>% used` and, when the provider prints
+    # one, `· resets <when>`. Anchored end to end, so a line carrying a second percentage, a
+    # second reset, or any trailing material is not this shape at all. There is no sub-scan that
+    # could lift one value out of a line this does not match.
+    #
+    # The reset clause is OPTIONAL because an unused window genuinely has none to print — there
+    # is nothing to reset yet. Its absence is part of the documented output, not a damaged line,
+    # and the percentage beside it is a measurement like any other.
+    MEASUREMENT = /\A(.+?):\s+(\d{1,3})%\s+used(?:\s+·\s+resets\s+(\S.*?))?\z/
+
+    # The heading alone: everything before the first colon, whatever follows it. Used only to
+    # count how many times the output names a known window, which is a question about the
+    # heading and not about the measurement beside it.
+    HEADING = /\A(.+?):/
 
     # The reset instant the documented output names: a printed month and day, a 12-hour clock
     # time, and the operator's own IANA zone. The month is matched against the known
@@ -121,15 +139,24 @@ module SpecrelayRunner
       text = output_of(USAGE_ARGV)
       return nil if text.nil?
 
-      measured = text.lines.filter_map { |line| measurement(line) }
-      # Both windows, each exactly once, in the order the documented output prints them. One
-      # comparison answers every way that can fail — an absent line, a duplicated one, a
-      # reordered pair — and it is asked before any value is read, so output that is not the
-      # documented shape yields no capacity at all rather than one window.
-      return nil unless measured.map(&:first) == WINDOW_HEADINGS.values
+      lines = text.lines
+      # A window the output NAMES twice is not a measurement this reader can resolve: there is no
+      # basis for preferring either copy, so every copy goes.
+      #
+      # Counted over the exact known HEADINGS rather than over the lines that parse, because a
+      # repeat whose measurement is malformed still makes the window ambiguous. Counting only
+      # the readable copies would let that twin hide: one clean line would look unique, and the
+      # reported number would be decided by which copy happened to be well formed.
+      duplicated = lines.filter_map { |line| heading(line) }.tally
+                        .select { |_, count| count > 1 }.keys
+      kept = lines.filter_map { |line| measurement(line) }
+                  .reject { |key, _, _| duplicated.include?(key) }
 
-      windows = measured.to_h { |key, percent, reset| [ key, window(percent, reset, now) ] }
-      return nil if windows.value?(nil)
+      # Each window stands or falls on its OWN line. A window this reader cannot resolve is
+      # dropped alone, because the window beside it was measured perfectly well and hiding it
+      # would report an absence the provider never described.
+      windows = kept.to_h { |key, percent, reset| [ key, window(percent, reset, now) ] }.compact
+      return nil if windows.empty?
 
       { "state" => "available", "windows" => windows }
     end
@@ -165,6 +192,15 @@ module SpecrelayRunner
       result.stdout.to_s.gsub(ANSI, "")
     end
 
+    # One line reduced to the known window it NAMES, or nil. This reads only the heading, so a
+    # line that names a documented window but states its measurement in a shape this reader does
+    # not recognise is still counted as naming that window. Exact headings only: a model-specific
+    # line names a window this product does not report and is not counted at all.
+    def heading(line)
+      match = HEADING.match(line.strip)
+      match.nil? ? nil : WINDOW_HEADINGS[match[1]]
+    end
+
     # One line reduced to the window it measures, or nil when it is not a measurement this
     # reader reports. A model-specific line — `Current week (Fable): 0% used · …` — is a
     # perfectly well-formed measurement whose heading is simply not in the table, so it is
@@ -179,11 +215,19 @@ module SpecrelayRunner
 
     # `0%` is a measurement like any other: the provider reported that nothing has been used,
     # which is a fact about this account and not an absence of one.
+    #
+    # A reset the provider never PRINTED and one this reader cannot RESOLVE are different facts
+    # and get different answers. The first is the documented unused shape, so the percentage is
+    # reported with no reset beside it — nil here is the absence itself, never a time inferred
+    # from the other window or from this machine's clock. The second is a line whose shape is
+    # wrong, and a percentage read off it would be a number from output this reader does not
+    # recognise, so the whole window goes.
     def window(percent, reset, now)
-      instant = reset_instant(reset, now)
-      return nil if instant.nil? || !percent.between?(0, 100)
+      return nil unless percent.between?(0, 100)
+      return { "used_percent" => percent, "resets_at" => nil } if reset.nil?
 
-      { "used_percent" => percent, "resets_at" => instant }
+      instant = reset_instant(reset, now)
+      instant.nil? ? nil : { "used_percent" => percent, "resets_at" => instant }
     end
 
     # A reset's printed wall clock as an exact UTC instant, or nil. Every field is checked
