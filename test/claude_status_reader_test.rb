@@ -171,22 +171,83 @@ class ClaudeStatusReaderTest < Minitest::Test
     assert(command.invocations.flatten.none? { |arg| arg.include?("|") || arg.include?(";") })
   end
 
+  # --- capacity: a window the provider has not yet reset --------------------
+
+  # The documented no-usage shape. An unused window prints its percentage and NO reset, because
+  # there is nothing to reset yet. The percentage is a real measurement and must survive; the
+  # absent reset must STAY absent rather than being taken from the other window or from a clock,
+  # which would be this reader inventing the one fact the provider declined to give.
+  def test_a_window_with_no_printed_reset_keeps_its_percentage_and_invents_no_reset
+    reader, = reader_for(usage: ok("Current session: 0% used\n" + weekly))
+    capacity = reader.capacity(now: NOW)
+
+    assert_equal "available", capacity["state"]
+    assert_equal 0, capacity.dig("windows", "five_hour", "used_percent")
+    assert_nil capacity.dig("windows", "five_hour", "resets_at")
+    assert_equal 77, capacity.dig("windows", "weekly_all_models", "used_percent")
+  end
+
+  # The SAME window once usage has begun: the provider now prints a reset beside the percentage,
+  # and it is read exactly as before.
+  def test_the_same_window_carries_its_reset_once_the_provider_prints_one
+    output = "Current session: 4% used · resets Sep 13 at 12:10pm (Europe/Berlin)\n" + weekly
+    reader, = reader_for(usage: ok(output))
+    capacity = reader.capacity(now: NOW)
+
+    assert_equal 4, capacity.dig("windows", "five_hour", "used_percent")
+    assert_equal "2026-09-13T10:10:00Z", capacity.dig("windows", "five_hour", "resets_at")
+  end
+
+  # The weekly window prints the same no-usage shape and is read the same way, so neither window
+  # depends on the other having been used.
+  def test_the_weekly_window_follows_the_same_no_reset_shape
+    reader, = reader_for(usage: ok(session + "Current week (all models): 0% used\n"))
+    capacity = reader.capacity(now: NOW)
+
+    assert_equal 0, capacity.dig("windows", "weekly_all_models", "used_percent")
+    assert_nil capacity.dig("windows", "weekly_all_models", "resets_at")
+    assert_equal 14, capacity.dig("windows", "five_hour", "used_percent")
+  end
+
+  # Both windows unused at once — what a freshly authenticated machine reports, and the reading
+  # the deployed parser threw away in full.
+  def test_both_windows_can_be_unused_with_no_reset_printed
+    reader, = reader_for(usage: ok("Current session: 0% used\nCurrent week (all models): 0% used\n"))
+    capacity = reader.capacity(now: NOW)
+
+    assert_equal %w[five_hour weekly_all_models], capacity["windows"].keys
+    assert_equal [ 0, 0 ], capacity["windows"].values.map { |window| window["used_percent"] }
+    assert_equal [ nil, nil ], capacity["windows"].values.map { |window| window["resets_at"] }
+  end
+
+  # A window the provider did not print at all is simply not reported, and the one it did print
+  # is — at its own measured value and on its own.
+  def test_one_printed_window_is_reported_on_its_own
+    reader, = reader_for(usage: ok(session))
+    capacity = reader.capacity(now: NOW)
+
+    assert_equal [ "five_hour" ], capacity["windows"].keys
+    assert_equal 14, capacity.dig("windows", "five_hour", "used_percent")
+  end
+
   # --- capacity: every refusal shape ----------------------------------------
 
-  # Each of these is a DIFFERENT way the documented contract can fail to hold, and every one of
-  # them has to produce the same answer: no capacity at all. A parser that repaired any of them
-  # would be reporting a number the provider never gave.
-  def test_every_unrecognised_usage_shape_reports_no_capacity_and_never_a_guess
+  # Each of these is a DIFFERENT way ONE window's line can fail to hold, and every one of them
+  # has to produce the same answer: that window is not reported, and the window the provider
+  # measured perfectly well beside it still is. A parser that repaired any of these would report
+  # a number the provider never gave; one that discarded the whole reading — which is what the
+  # deployed parser does — hides a number the provider DID give.
+  def test_every_unrecognised_session_shape_drops_only_that_window
     {
-      "a missing weekly line" => session,
-      "a missing session line" => weekly,
       "a duplicated measurement" => USAGE_OUTPUT + session,
       "a localised measurement" => "Aktuelle Sitzung: 12% benutzt · Zurücksetzen 16:50\n" + weekly,
       "an out-of-range percentage" => session(percent: 120) + weekly,
       "a missing percentage" => "Current session: used · resets Sep 12 at 1:10pm (Europe/Berlin)\n" +
                                 weekly,
       "two percentages on one line" => session(percent: "12% used · 13") + weekly,
-      "a missing reset" => "Current session: 12% used\n" + weekly,
+      # A reset the provider PRINTED but this reader cannot resolve is not the same fact as a
+      # reset it never printed. The first is a line whose shape is wrong, so that window goes;
+      # the second is the documented no-usage shape, and its percentage survives.
       "an unparseable reset" => session(reset: "whenever") + weekly,
       "a reset with no printed zone" => session(reset: "Sep 12 at 1:10pm") + weekly,
       "a bare weekday reset" => session(reset: "Sun 10pm") + weekly,
@@ -204,8 +265,50 @@ class ClaudeStatusReaderTest < Minitest::Test
       "a 24-hour clock with no half named" => session(reset: "Sep 12 at 13:10 (Europe/Berlin)") +
                                               weekly,
       "trailing material after the zone" => session(reset: "Sep 12 at 1:10pm (Europe/Berlin) or so") +
-                                            weekly,
-      "empty output" => ""
+                                            weekly
+    }.each do |shape, text|
+      reader, = reader_for(usage: ok(text))
+      capacity = reader.capacity(now: NOW)
+
+      assert_equal [ "weekly_all_models" ], capacity["windows"].keys,
+                   "#{shape} must drop only that window"
+      assert_equal 77, capacity.dig("windows", "weekly_all_models", "used_percent"), shape
+    end
+  end
+
+  # A repeated heading is what makes a window unresolvable, and that is true however the second
+  # occurrence is spelled. Counting only the copies that PARSE would let a malformed twin hide:
+  # the reader would see one clean measurement, call it unique, and report a number chosen by
+  # which copy happened to be well formed. So the count is over the exact known headings in the
+  # output, not over the lines this reader could read.
+  def test_a_valid_session_line_beside_a_malformed_duplicate_drops_only_that_window
+    output = session + "Current session: used · resets Sep 12 at 1:10pm (Europe/Berlin)\n" + weekly
+    reader, = reader_for(usage: ok(output))
+    capacity = reader.capacity(now: NOW)
+
+    assert_equal [ "weekly_all_models" ], capacity["windows"].keys
+    assert_equal 77, capacity.dig("windows", "weekly_all_models", "used_percent")
+  end
+
+  # The weekly window is duplicated the same way and answers the same way, so neither window is
+  # protected by being the one the documented output happens to print second.
+  def test_a_valid_weekly_line_beside_a_malformed_duplicate_drops_only_that_window
+    output = session + weekly + "Current week (all models): used · resets Sep 14 at 10pm (Europe/Berlin)\n"
+    reader, = reader_for(usage: ok(output))
+    capacity = reader.capacity(now: NOW)
+
+    assert_equal [ "five_hour" ], capacity["windows"].keys
+    assert_equal 14, capacity.dig("windows", "five_hour", "used_percent")
+  end
+
+  # Capacity is unavailable only when NEITHER known window survives. Then this machine really did
+  # measure nothing, and nil says exactly that rather than an empty set of rows.
+  def test_capacity_is_unavailable_only_when_no_known_window_is_valid
+    {
+      "empty output" => "",
+      "both measurements localised" => "Aktuelle Sitzung: 12% benutzt\nAktuelle Woche: 30% benutzt\n",
+      "both percentages out of range" => session(percent: 120) + weekly(percent: 101),
+      "only a model-specific line" => "Current week (Fable): 3% used · resets Sep 14 at 10pm (Europe/Berlin)\n"
     }.each do |shape, text|
       reader, = reader_for(usage: ok(text))
 
@@ -231,25 +334,17 @@ class ClaudeStatusReaderTest < Minitest::Test
     end
   end
 
-  # Order is part of the documented contract, not an incidental property of the output. Reading a
-  # reordered result by matching each heading would recover the right numbers, but it would also
-  # mean this reader deciding that output the provider never documents is close enough — and the
-  # whole safety argument here is that it never does. Both blocks present, in this order, or no
-  # capacity at all.
-  def test_a_reordered_result_is_not_the_documented_output_and_reports_no_capacity
-    reader, = reader_for(usage: ok(weekly + session))
+  # Each window is identified by its HEADING, never by its position, so the order the two are
+  # printed in cannot lend one window's number to the other. Both orders are read, and each
+  # window keeps its own identity and its own value in both.
+  def test_both_windows_keep_their_identities_whichever_order_they_are_printed_in
+    [ session + weekly, weekly + session ].each do |text|
+      reader, = reader_for(usage: ok(text))
+      capacity = reader.capacity(now: NOW)
 
-    assert_nil reader.capacity(now: NOW)
-  end
-
-  # The same two measurements the other way round ARE read, so the example above is failing on
-  # the order itself rather than on some other property of the fixture.
-  def test_the_documented_order_of_the_same_two_measurements_is_read
-    reader, = reader_for(usage: ok(session + weekly))
-    capacity = reader.capacity(now: NOW)
-
-    assert_equal 14, capacity.dig("windows", "five_hour", "used_percent")
-    assert_equal 77, capacity.dig("windows", "weekly_all_models", "used_percent")
+      assert_equal 14, capacity.dig("windows", "five_hour", "used_percent")
+      assert_equal 77, capacity.dig("windows", "weekly_all_models", "used_percent")
+    end
   end
 
   # --- capacity: privacy ----------------------------------------------------
