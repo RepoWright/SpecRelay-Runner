@@ -173,7 +173,7 @@ class FullSuiteCommandTest < Minitest::Test
     output = File.read(log)
 
     assert_equal 0, status.exitstatus, output[0, 2000]
-    assert_includes output, "discovered=1 completed=1 passed=1 failed=0 workers=1"
+    assert_includes output, "discovered=1 completed=1 passed=1 failed=0 workers=2"
     # The tail is what diagnoses a failure, so the tail is what survives.
     block = block_for(output, "test/loud_test.rb")
 

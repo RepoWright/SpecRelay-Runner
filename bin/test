@@ -20,7 +20,12 @@ class FullSuite
   # The one authoritative bound on concurrency. The values are the benchmarked modes, not a
   # derived function of the host's processor count: an unbounded suite competes with itself.
   ALLOWED_WORKERS = [ 1, 2, 4 ].freeze
-  DEFAULT_WORKERS = 1
+
+  # The measured default: the smallest bounded mode whose three-run median beat the serial median
+  # by more than the required margin. Four workers is faster still, but the rule is the smallest
+  # mode that clears the bar, not the fastest one — a suite that competes with the machine it runs
+  # on buys wall-clock time with timing-sensitive failures.
+  DEFAULT_WORKERS = 2
 
   # The last of a failing file's output — the part that diagnoses it. A child writes into a pipe
   # the parent keeps draining into a ring of exactly this size, so neither a file on disk nor the

@@ -1314,8 +1314,8 @@ No gems and no test runner to install — plain minitest on the standard library
 `bin/test` is the one command that runs the complete suite:
 
 ```bash
-bin/test                 # every test/*_test.rb file, one Ruby process each
-bin/test --workers 2     # the same closed set, two files at a time
+bin/test                 # every test/*_test.rb file, two at a time, one process each
+bin/test --workers 1     # the same closed set, serially
 bin/test --workers 4
 ```
 
@@ -1328,7 +1328,10 @@ It keeps the suite's own isolation contract — each file still runs in its own
   competing for the host. Two checkouts are independent.
 - **Bounded workers.** Only `1`, `2`, and `4` are accepted, and anything else is
   rejected (exit `2`) before a single test process starts. The worker count is
-  not derived from the host's processor count.
+  not derived from the host's processor count. Two is the default because it is
+  the smallest mode measured to beat the serial suite by a wide margin — four is
+  faster again, but the suite deliberately leaves the machine room rather than
+  buying wall-clock time with timing-sensitive failures.
 - **Attributable output.** Each file's stdout and stderr are captured and printed
   as one delimited block naming that file, its result, and its duration, so
   concurrent output never interleaves anonymously.
