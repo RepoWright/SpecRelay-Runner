@@ -61,11 +61,15 @@ class ConnectionsCommandTest < Minitest::Test
     assert_equal 0, status
     # RUNNER-0001: the row leads with the PROJECT and carries the workspace key after it, in
     # the dashboard and here — both render through ConnectionView, which is the point.
-    listed = out.lines.grep(/^ [ *] /).map { |line| line.split("·")[1].to_s.strip }
+    listed = out.lines.grep(/^ [ *] \S/).map { |line| line.split("·")[1].to_s.strip }
     assert_equal %w[development-workspace tiny-demo-workspace], listed
     assert_match(/^ \* tiny-demo · tiny-demo-workspace/, out, "the default is marked in the list itself")
     assert_match(/^   tiny-demo · development-workspace/, out, "and non-defaults are not")
-    assert_match(/Default workspace: tiny-demo-workspace \(marked \*\)/, out)
+    assert_match(/Default workspace: #{Regexp.escape(selector('tiny-demo-workspace'))} \(marked \*\)/, out)
+    # Every row carries a complete, copyable selector: a listing an operator cannot paste into
+    # `--workspace` does not let them choose.
+    assert_includes out, selector("tiny-demo-workspace")
+    assert_includes out, selector("development-workspace")
   end
 
   # The top-level listing is the screen most likely to end up in a screenshot or a pasted
@@ -85,7 +89,7 @@ class ConnectionsCommandTest < Minitest::Test
 
     _status, out, = run_cli(%w[connections list])
 
-    assert_match(/SET BUT NOT CONNECTED/, out)
+    assert_match(/NOT RESOLVABLE/, out)
   end
 
   def test_a_damaged_state_file_is_a_usage_error_rather_than_an_empty_list
@@ -174,12 +178,12 @@ class ConnectionsCommandTest < Minitest::Test
     status, out, = run_cli(%w[connections default tiny-demo-workspace])
 
     assert_equal 0, status
-    assert_match(/Default workspace set to tiny-demo-workspace/, out)
+    assert_match(/Default workspace set to #{Regexp.escape(selector('tiny-demo-workspace'))}/, out)
 
     status, out, err = run_cli(%w[claim-once])
 
     assert_equal 0, status, err
-    assert_match(/connected workspace tiny-demo-workspace \(your explicit default workspace\)/, out)
+    assert_match(/connected workspace #{Regexp.escape(selector('tiny-demo-workspace'))} \(your explicit default workspace\)/, out)
     refute_match(/several workspaces are connected/, err)
     assert_equal 1, @platform.requests_to("/api/runner/claim").length, "it must really have claimed for one"
   end
@@ -191,7 +195,7 @@ class ConnectionsCommandTest < Minitest::Test
     status, out, err = run_cli(%w[claim-once])
 
     assert_equal 0, status, err
-    assert_match(/connected workspace tiny-demo-workspace \(the only one connected here\)/, out)
+    assert_match(/connected workspace #{Regexp.escape(selector('tiny-demo-workspace'))} \(the only one connected here\)/, out)
   end
 
   def test_setting_a_default_for_an_unconnected_workspace_is_refused_as_a_usage_error
@@ -200,8 +204,8 @@ class ConnectionsCommandTest < Minitest::Test
     status, _out, err = run_cli(%w[connections default nope])
 
     assert_equal 2, status
-    assert_match(/no local connection for workspace 'nope'/, err)
-    assert_match(/connected workspaces: tiny-demo-workspace/, err)
+    assert_match(/no local connection for 'nope'/, err)
+    assert_match(/connected: #{Regexp.escape(selector('tiny-demo-workspace'))}/, err)
   end
 
   def test_clearing_a_default_restores_the_explicit_choice_requirement
@@ -212,12 +216,12 @@ class ConnectionsCommandTest < Minitest::Test
     status, out, = run_cli(%w[connections clear-default])
 
     assert_equal 0, status
-    assert_match(/Default workspace cleared \(was tiny-demo-workspace\)/, out)
+    assert_match(/Default workspace cleared \(was #{Regexp.escape(selector('tiny-demo-workspace'))}\)/, out)
 
     status, _out, err = run_cli(%w[loop])
 
     assert_equal 2, status
-    assert_match(/several workspaces are connected/, err)
+    assert_match(/several projects are connected/, err)
   end
 
   def test_clearing_a_default_that_was_never_set_is_a_harmless_success
@@ -241,7 +245,9 @@ class ConnectionsCommandTest < Minitest::Test
     status, _out, err = run_cli(%w[claim-once])
 
     assert_equal 2, status
-    assert_match(/default workspace 'development-workspace' is no longer connected/, err)
+    # The stale value is quoted exactly as stored — here a bare key an earlier runner wrote —
+    # so the operator can find it in the file rather than guess what it was.
+    assert_match(/the default 'development-workspace' is no longer connected/, err)
     assert_match(/nothing was claimed/, err)
     assert_empty @platform.requests_to("/api/runner/claim")
   end
@@ -255,7 +261,7 @@ class ConnectionsCommandTest < Minitest::Test
     status, _out, err = run_cli(%w[claim-once])
 
     assert_equal 2, status
-    assert_match(/default workspace 'gone-workspace' is no longer connected/, err)
+    assert_match(/the default 'gone-workspace' is no longer connected/, err)
     assert_empty @platform.requests_to("/api/runner/claim")
   end
 
@@ -266,8 +272,26 @@ class ConnectionsCommandTest < Minitest::Test
     status, _out, err = run_cli(%w[claim-once])
 
     assert_equal 2, status
-    assert_match(/connections default <workspace-key>/, err)
+    assert_match(/connections default <selector>/, err)
     assert_match(/run `specrelay-runner` in a terminal for the dashboard/, err)
+  end
+
+  # The dashboard dispatches every command through ONE CLI instance. A stale default that
+  # refused once must not keep refusing after the operator has cleared it in the same process —
+  # otherwise the menu's own "clear the default" action appears to do nothing.
+  def test_a_cleared_default_lets_the_same_cli_instance_run_again
+    store_connection("tiny-demo-workspace")
+    rewrite_state { |doc| doc["default_workspace_key"] = "gone-workspace" }
+    @platform.offer_no_work!
+    out = StringIO.new
+    err = StringIO.new
+    cli = build_cli(out, err)
+
+    assert_equal 2, cli.run(%w[claim-once]), "the stale default must refuse the first time"
+    assert_equal 0, cli.run(%w[connections clear-default])
+    assert_equal 0, cli.run(%w[claim-once]), err.string
+
+    assert_match(/the only one connected here/, out.string)
   end
 
   # --- disconnect-local -----------------------------------------------------
@@ -279,7 +303,7 @@ class ConnectionsCommandTest < Minitest::Test
     status, out, = run_cli(%w[connections disconnect-local development-workspace])
 
     assert_equal 0, status
-    assert_match(/Removed the local connection for development-workspace/, out)
+    assert_match(/Removed the local connection for #{Regexp.escape(selector('development-workspace'))}/, out)
     assert_match(/Platform-side authorization is unchanged/, out)
     assert_equal [ "tiny-demo-workspace" ], stored_keys
   end
@@ -292,7 +316,7 @@ class ConnectionsCommandTest < Minitest::Test
 
     _status, out, = run_cli(%w[connections disconnect-local development-workspace --remove-credential])
 
-    assert_match(/runner credential was kept: tiny-demo-workspace still uses it/, out)
+    assert_match(/runner credential was kept: #{Regexp.escape(selector('tiny-demo-workspace'))} still uses it/, out)
     assert_empty @secret_store.deletes
     assert @secret_store.stored?(RUNNER_ACCOUNT)
   end
@@ -467,9 +491,14 @@ class ConnectionsCommandTest < Minitest::Test
   def run_cli(argv)
     out = StringIO.new
     err = StringIO.new
-    status = SpecrelayRunner::CLI.new(out: out, err: err, env: env, input: StringIO.new,
-                                     secret_store: @secret_store).run(argv)
+    status = build_cli(out, err).run(argv)
     [ status, out.string, err.string ]
+  end
+
+  # One CLI instance, the way the dashboard holds one and dispatches every command through it.
+  def build_cli(out, err)
+    SpecrelayRunner::CLI.new(out: out, err: err, env: env, input: StringIO.new,
+                             secret_store: @secret_store)
   end
 
   def env
@@ -489,6 +518,12 @@ class ConnectionsCommandTest < Minitest::Test
   end
 
   def stored_keys = SpecrelayRunner::ConnectionStore.new(@state_file).connections.map(&:workspace_key)
+
+  # The full selector for a connection stored by `store_connection`, which is what every command
+  # now names a connection by.
+  def selector(workspace_key, project_slug: "tiny-demo")
+    "#{@platform.base_url}##{project_slug}/#{workspace_key}"
+  end
   def document = JSON.parse(File.read(@state_file))
 
   def rewrite_state

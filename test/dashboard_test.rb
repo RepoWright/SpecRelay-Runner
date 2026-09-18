@@ -188,10 +188,15 @@ class DashboardTest < Minitest::Test
     rewrite_state do |doc|
       doc["connections"].each { |entry| entry["project_slug"] = entry["project_key"] = nil }
     end
-    menu = ScriptedMenu.new([ "tiny-demo-workspace", :show, :back, :quit ])
+    # A record with no project still has ONE identity: the project segment falls back visibly
+    # rather than leaving the row unaddressable.
+    unknown = selector("tiny-demo-workspace",
+                       project_slug: SpecrelayRunner::ConnectionStore::UNKNOWN_PROJECT)
+    menu = ScriptedMenu.new([ unknown, :show, :back, :quit ])
 
     printed = capture_dashboard(menu)
 
+    assert_equal unknown, menu.frames.first[:entries].first[2]
     assert_match(/\Atiny-demo-workspace · specrelay/, menu.frames.first[:entries].first[1])
     assert_equal "#{SpecrelayRunner::Dashboard::TITLE} — tiny-demo-workspace", menu.frames[1][:title]
     assert_match(/Project +—/, printed, "the missing fact is shown as missing, not guessed")
@@ -205,7 +210,8 @@ class DashboardTest < Minitest::Test
 
     run_dashboard(menu)
 
-    assert_match(/Default workspace: tiny-demo-workspace/, menu.frames.first[:header].join("\n"))
+    assert_match(/Default workspace: #{Regexp.escape(selector('tiny-demo-workspace'))}/,
+                 menu.frames.first[:header].join("\n"))
     assert_match(/\(default\)/, menu.frames.first[:entries].first[1])
     assert_includes menu.frames.first[:entries].map(&:first), "C"
   end
@@ -236,7 +242,7 @@ class DashboardTest < Minitest::Test
 
     run_dashboard(menu)
 
-    assert_match(/SET BUT NOT CONNECTED/, menu.frames.first[:header].join("\n"))
+    assert_match(/NOT RESOLVABLE/, menu.frames.first[:header].join("\n"))
   end
 
   def test_quitting_restores_the_terminal
@@ -260,7 +266,7 @@ class DashboardTest < Minitest::Test
 
   def test_opening_a_workspace_shows_every_required_field
     store_connection("tiny-demo-workspace")
-    menu = ScriptedMenu.new([ "tiny-demo-workspace", :back, :quit ])
+    menu = ScriptedMenu.new([ selector("tiny-demo-workspace"), :back, :quit ])
 
     run_dashboard(menu)
 
@@ -275,7 +281,7 @@ class DashboardTest < Minitest::Test
 
   def test_the_detail_view_offers_every_required_action
     store_connection("tiny-demo-workspace")
-    menu = ScriptedMenu.new([ "tiny-demo-workspace", :back, :quit ])
+    menu = ScriptedMenu.new([ selector("tiny-demo-workspace"), :back, :quit ])
 
     run_dashboard(menu)
 
@@ -287,18 +293,18 @@ class DashboardTest < Minitest::Test
 
   def test_the_default_action_label_reflects_the_current_state
     store_connection("tiny-demo-workspace")
-    menu = ScriptedMenu.new([ "tiny-demo-workspace", :default, :back, :quit ])
+    menu = ScriptedMenu.new([ selector("tiny-demo-workspace"), :default, :back, :quit ])
 
     run_dashboard(menu)
 
     assert_match(/Set as the default workspace/, menu.frames[1][:entries][4][1])
     assert_match(/Clear the default workspace/, menu.frames[2][:entries][4][1])
-    assert_equal "tiny-demo-workspace", document["default_workspace_key"]
+    assert_equal selector("tiny-demo-workspace"), document["default_workspace_key"]
   end
 
   def test_going_back_returns_to_the_top_level_rather_than_exiting
     store_connection("tiny-demo-workspace")
-    menu = ScriptedMenu.new([ "tiny-demo-workspace", :back, :quit ])
+    menu = ScriptedMenu.new([ selector("tiny-demo-workspace"), :back, :quit ])
 
     run_dashboard(menu)
 
@@ -312,20 +318,20 @@ class DashboardTest < Minitest::Test
 
   def test_start_loop_dispatches_exactly_the_direct_loop_command
     store_connection("tiny-demo-workspace")
-    menu = ScriptedMenu.new([ "tiny-demo-workspace", :loop, :back, :quit ])
+    menu = ScriptedMenu.new([ selector("tiny-demo-workspace"), :loop, :back, :quit ])
 
     run_dashboard(menu)
 
-    assert_equal [ [ "loop", "--workspace", "tiny-demo-workspace" ] ], @dispatched
+    assert_equal [ [ "loop", "--workspace", selector("tiny-demo-workspace") ] ], @dispatched
   end
 
   def test_claim_once_dispatches_exactly_the_direct_claim_once_command
     store_connection("tiny-demo-workspace")
-    menu = ScriptedMenu.new([ "tiny-demo-workspace", :claim_once, :back, :quit ])
+    menu = ScriptedMenu.new([ selector("tiny-demo-workspace"), :claim_once, :back, :quit ])
 
     run_dashboard(menu)
 
-    assert_equal [ [ "claim-once", "--workspace", "tiny-demo-workspace" ] ], @dispatched
+    assert_equal [ [ "claim-once", "--workspace", selector("tiny-demo-workspace") ] ], @dispatched
   end
 
   # The dispatcher handed to the dashboard must be the CLI's OWN one, or "the menu reuses the
@@ -337,17 +343,18 @@ class DashboardTest < Minitest::Test
     out = FakeTty.new
     cli = SpecrelayRunner::CLI.new(out: out, err: StringIO.new, env: env, input: FakeTty.new,
                                   secret_store: @secret_store)
-    menu = ScriptedMenu.new([ "tiny-demo-workspace", :claim_once, :back, :quit ])
+    menu = ScriptedMenu.new([ selector("tiny-demo-workspace"), :claim_once, :back, :quit ])
     stub_dashboard_menu(menu) { cli.run([]) }
 
     assert_equal 1, @platform.requests_to("/api/runner/claim").length
-    assert_match(/\$ specrelay-runner claim-once --workspace tiny-demo-workspace/, out.string)
-    assert_match(/connected workspace tiny-demo-workspace/, out.string)
+    assert_match(/\$ specrelay-runner claim-once --workspace #{Regexp.escape(selector('tiny-demo-workspace'))}/,
+                 out.string)
+    assert_match(/connected workspace #{Regexp.escape(selector('tiny-demo-workspace'))}/, out.string)
   end
 
   def test_a_dispatched_command_runs_in_cooked_mode
     store_connection("tiny-demo-workspace")
-    menu = ScriptedMenu.new([ "tiny-demo-workspace", :loop, :back, :quit ])
+    menu = ScriptedMenu.new([ selector("tiny-demo-workspace"), :loop, :back, :quit ])
 
     run_dashboard(menu)
 
@@ -358,7 +365,7 @@ class DashboardTest < Minitest::Test
 
   def test_the_test_action_shows_the_ordered_check_trail_and_the_verdict
     store_connection("tiny-demo-workspace")
-    menu = ScriptedMenu.new([ "tiny-demo-workspace", :test, :back, :quit ])
+    menu = ScriptedMenu.new([ selector("tiny-demo-workspace"), :test, :back, :quit ])
 
     printed = capture_dashboard(menu)
 
@@ -372,7 +379,7 @@ class DashboardTest < Minitest::Test
   def test_a_failed_test_shows_one_remedy_and_records_it_in_the_detail_view
     store_connection("tiny-demo-workspace")
     @platform.grants.clear
-    menu = ScriptedMenu.new([ "tiny-demo-workspace", :test, :back, :quit ])
+    menu = ScriptedMenu.new([ selector("tiny-demo-workspace"), :test, :back, :quit ])
 
     printed = capture_dashboard(menu)
 
@@ -385,7 +392,7 @@ class DashboardTest < Minitest::Test
 
   def test_declining_the_local_disconnect_confirmation_changes_nothing
     store_connection("tiny-demo-workspace")
-    menu = ScriptedMenu.new([ "tiny-demo-workspace", :disconnect_local, :back, :quit ],
+    menu = ScriptedMenu.new([ selector("tiny-demo-workspace"), :disconnect_local, :back, :quit ],
                             confirmations: [ false ])
 
     run_dashboard(menu)
@@ -399,7 +406,7 @@ class DashboardTest < Minitest::Test
   # enrollment code.
   def test_the_local_disconnect_confirmation_names_the_workspace_and_the_repository
     store_connection("tiny-demo-workspace")
-    menu = ScriptedMenu.new([ "tiny-demo-workspace", :disconnect_local, :back, :quit ], confirmations: [ false ])
+    menu = ScriptedMenu.new([ selector("tiny-demo-workspace"), :disconnect_local, :back, :quit ], confirmations: [ false ])
 
     printed = capture_dashboard(menu)
 
@@ -412,7 +419,7 @@ class DashboardTest < Minitest::Test
   def test_a_confirmed_local_disconnect_removes_only_that_connection
     store_connection("tiny-demo-workspace")
     store_connection("development-workspace", connected_at: "2026-07-27T10:00:00Z")
-    menu = ScriptedMenu.new([ "development-workspace", :disconnect_local, :quit ], confirmations: [ true ])
+    menu = ScriptedMenu.new([ selector("development-workspace"), :disconnect_local, :quit ], confirmations: [ true ])
 
     run_dashboard(menu)
 
@@ -432,7 +439,7 @@ class DashboardTest < Minitest::Test
   def test_an_already_absent_platform_grant_is_safe_and_still_offers_local_cleanup
     store_connection("tiny-demo-workspace")
     @platform.grants.clear
-    menu = ScriptedMenu.new([ "tiny-demo-workspace", :disconnect_platform, :quit ],
+    menu = ScriptedMenu.new([ selector("tiny-demo-workspace"), :disconnect_platform, :quit ],
                             confirmations: [ true, true, true ])
 
     printed = capture_dashboard(menu)
@@ -447,7 +454,7 @@ class DashboardTest < Minitest::Test
   # else depends on it.
   def test_removing_the_last_connection_asks_about_the_credential_separately
     store_connection("tiny-demo-workspace")
-    menu = ScriptedMenu.new([ "tiny-demo-workspace", :disconnect_local, :quit ],
+    menu = ScriptedMenu.new([ selector("tiny-demo-workspace"), :disconnect_local, :quit ],
                             confirmations: [ true, true ])
 
     run_dashboard(menu)
@@ -460,7 +467,7 @@ class DashboardTest < Minitest::Test
 
   def test_declining_the_credential_question_still_removes_the_local_entry
     store_connection("tiny-demo-workspace")
-    menu = ScriptedMenu.new([ "tiny-demo-workspace", :disconnect_local, :quit ],
+    menu = ScriptedMenu.new([ selector("tiny-demo-workspace"), :disconnect_local, :quit ],
                             confirmations: [ true, false ])
 
     run_dashboard(menu)
@@ -474,7 +481,7 @@ class DashboardTest < Minitest::Test
 
   def test_declining_the_platform_disconnect_confirmation_changes_nothing_anywhere
     store_connection("tiny-demo-workspace")
-    menu = ScriptedMenu.new([ "tiny-demo-workspace", :disconnect_platform, :back, :quit ],
+    menu = ScriptedMenu.new([ selector("tiny-demo-workspace"), :disconnect_platform, :back, :quit ],
                             confirmations: [ false ])
 
     run_dashboard(menu)
@@ -485,7 +492,7 @@ class DashboardTest < Minitest::Test
 
   def test_the_platform_disconnect_warning_scopes_what_it_will_and_will_not_touch
     store_connection("tiny-demo-workspace")
-    menu = ScriptedMenu.new([ "tiny-demo-workspace", :disconnect_platform, :back, :quit ], confirmations: [ false ])
+    menu = ScriptedMenu.new([ selector("tiny-demo-workspace"), :disconnect_platform, :back, :quit ], confirmations: [ false ])
 
     printed = capture_dashboard(menu)
 
@@ -498,7 +505,7 @@ class DashboardTest < Minitest::Test
   # asked only after Platform confirms.
   def test_a_confirmed_platform_disconnect_then_offers_local_removal
     store_connection("tiny-demo-workspace")
-    menu = ScriptedMenu.new([ "tiny-demo-workspace", :disconnect_platform, :quit ],
+    menu = ScriptedMenu.new([ selector("tiny-demo-workspace"), :disconnect_platform, :quit ],
                             confirmations: [ true, true, true ])
 
     run_dashboard(menu)
@@ -510,7 +517,7 @@ class DashboardTest < Minitest::Test
 
   def test_declining_local_removal_after_a_platform_disconnect_keeps_the_local_entry
     store_connection("tiny-demo-workspace")
-    menu = ScriptedMenu.new([ "tiny-demo-workspace", :disconnect_platform, :back, :quit ],
+    menu = ScriptedMenu.new([ selector("tiny-demo-workspace"), :disconnect_platform, :back, :quit ],
                             confirmations: [ true, false ])
 
     printed = capture_dashboard(menu)
@@ -525,7 +532,7 @@ class DashboardTest < Minitest::Test
   def test_a_failed_platform_disconnect_never_deletes_local_state
     store_connection("tiny-demo-workspace")
     @secret_store.write(account: RUNNER_ACCOUNT, credential: "src_no-longer-valid")
-    menu = ScriptedMenu.new([ "tiny-demo-workspace", :disconnect_platform, :back, :quit ],
+    menu = ScriptedMenu.new([ selector("tiny-demo-workspace"), :disconnect_platform, :back, :quit ],
                             confirmations: [ true ])
 
     printed = capture_dashboard(menu)
@@ -540,7 +547,7 @@ class DashboardTest < Minitest::Test
 
   def test_no_dashboard_screen_prints_a_credential
     store_connection("tiny-demo-workspace")
-    menu = ScriptedMenu.new([ "tiny-demo-workspace", :test, :show, :default, :back, :help, :quit ])
+    menu = ScriptedMenu.new([ selector("tiny-demo-workspace"), :test, :show, :default, :back, :help, :quit ])
 
     printed = capture_dashboard(menu)
     rendered = printed + menu.frames.map { |f| f[:header].join("\n") + f[:entries].to_s }.join
@@ -590,6 +597,11 @@ class DashboardTest < Minitest::Test
   end
 
   def env = { "SPECRELAY_RUNNER_STATE_FILE" => @state_file, "PATH" => ENV.fetch("PATH", "") }
+
+  # The full selector the dashboard puts on a row and hands to every action.
+  def selector(workspace_key, project_slug: "tiny-demo")
+    "#{@platform.base_url}##{project_slug}/#{workspace_key}"
+  end
 
   def store_connection(workspace_key, connected_at: "2026-07-20T10:00:00Z")
     SpecrelayRunner::ConnectionStore.new(@state_file).save(

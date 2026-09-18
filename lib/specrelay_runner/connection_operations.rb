@@ -37,14 +37,21 @@ module SpecrelayRunner
     end
 
     # The dashboard's top-level view model. `default_missing` is deliberately separate from
-    # `default_workspace_key`: a default naming a workspace that is no longer connected is a
-    # condition the operator must see and fix, not silently nothing.
-    Listing = Struct.new(:connections, :default_workspace_key, :default_missing, :readable, :path,
-                         keyword_init: true) do
+    # `default_selector`: a default that no longer names exactly one connection is a condition the
+    # operator must see and fix, not silently nothing.
+    #
+    # `default?` asks the store rather than comparing strings, because a stored default may be a
+    # bare workspace key written by an earlier runner and only the store knows every name a
+    # connection answers to.
+    Listing = Struct.new(:connections, :default_selector, :default_missing, :readable, :path,
+                         :default_identity, keyword_init: true) do
       def empty? = connections.empty?
       def readable? = readable ? true : false
       def default_missing? = default_missing ? true : false
-      def default?(connection) = !default_workspace_key.nil? && default_workspace_key == connection.workspace_key
+
+      def default?(connection)
+        !default_identity.nil? && ConnectionStore.selector_for(connection) == default_identity
+      end
     end
 
     def self.call(**kwargs) = new(**kwargs)
@@ -62,36 +69,39 @@ module SpecrelayRunner
     attr_reader :store
 
     def listing
-      Listing.new(connections: store.connections, default_workspace_key: store.default_workspace_key,
+      resolved = store.default_connection
+      Listing.new(connections: store.connections, default_selector: store.default_selector,
                   default_missing: store.default_set_but_missing?, readable: store.readable?,
-                  path: store.path)
+                  path: store.path,
+                  default_identity: (ConnectionStore.selector_for(resolved) if resolved))
     end
 
-    def connection_for(workspace_key) = store.connection_for(workspace_key)
+    def connection_for(selector) = store.resolve(selector).connection
 
     # Would removing this workspace leave the runner-scoped Keychain credential with nothing
     # depending on it? Asked BEFORE the removal so a surface can put both questions to the
     # operator up front and then perform exactly one atomic operation, instead of removing the
     # entry and only then discovering it has a second question to ask.
-    def credential_orphaned_by?(workspace_key)
-      connection = store.connection_for(workspace_key)
+    def credential_orphaned_by?(selector)
+      connection = connection_for(selector)
       return false if connection.nil? || connection.runner_public_id.to_s.strip.empty?
 
+      identity = ConnectionStore.selector_for(connection)
       store.connections.none? do |other|
-        other.workspace_key != connection.workspace_key &&
+        ConnectionStore.selector_for(other) != identity &&
           other.runner_public_id == connection.runner_public_id
       end
     end
 
-    def credential_account_for(workspace_key)
-      connection = store.connection_for(workspace_key)
+    def credential_account_for(selector)
+      connection = connection_for(selector)
       connection && SecretStore.account_for_runner(connection.runner_public_id.to_s)
     end
 
     # --- readiness test ------------------------------------------------------
 
-    def test(workspace_key)
-      connection = require_connection(workspace_key) { |outcome| return outcome }
+    def test(selector)
+      connection = require_connection(selector) { |outcome| return outcome }
       result = @diagnosis.call(connection: connection, env: env, secret_store: @injected_secret_store,
                                platform: platform, client_factory: @client_factory)
       Outcome.new(ok: result.ok?, invalid: result.outcome == ConnectionDiagnosis::LOCAL_STATE_INVALID,
@@ -101,10 +111,10 @@ module SpecrelayRunner
 
     # --- explicit default ----------------------------------------------------
 
-    def set_default(workspace_key)
-      connection = require_connection(workspace_key) { |outcome| return outcome }
-      store.set_default(connection.workspace_key)
-      Outcome.new(ok: true, message: "Default workspace set to #{connection.workspace_key}. " \
+    def set_default(selector)
+      connection = require_connection(selector) { |outcome| return outcome }
+      chosen = store.set_default(ConnectionStore.selector_for(connection))
+      Outcome.new(ok: true, message: "Default workspace set to #{chosen}. " \
                                      "`specrelay-runner loop` and `claim-once` will use it when no " \
                                      "--workspace is given, and will say so.")
     rescue ConnectionStore::Error => e
@@ -112,7 +122,7 @@ module SpecrelayRunner
     end
 
     def clear_default
-      previous = store.default_workspace_key
+      previous = store.default_selector
       store.clear_default
       Outcome.new(ok: true, message: default_cleared_message(previous))
     rescue ConnectionStore::Error => e
@@ -138,9 +148,9 @@ module SpecrelayRunner
     # break a working connection as a side effect of tidying up an unrelated one. When
     # nothing depends on it any more, the operator is told so and decides separately; that
     # decision arrives here as `remove_credential`.
-    def disconnect_local(workspace_key, remove_credential: false)
-      connection = require_connection(workspace_key) { |outcome| return outcome }
-      removed = store.delete(connection.workspace_key)
+    def disconnect_local(selector, remove_credential: false)
+      connection = require_connection(selector) { |outcome| return outcome }
+      removed = store.delete(ConnectionStore.selector_for(connection))
       return already_absent_locally(connection) if removed.nil?
 
       credential = credential_disposition(removed, remove_credential: remove_credential)
@@ -160,7 +170,7 @@ module SpecrelayRunner
     def credential_disposition(removed, remove_credential:)
       account = SecretStore.account_for_runner(removed.runner_public_id.to_s)
       shared_with = store.connections.select { |c| c.runner_public_id == removed.runner_public_id }
-                         .map(&:workspace_key)
+                         .map { |c| ConnectionStore.selector_for(c) }
       return { state: :kept_shared, account: account, shared_with: shared_with } if shared_with.any?
       return { state: :orphaned, account: account, shared_with: [], remedy: orphaned_remedy(removed) } unless remove_credential
 
@@ -170,8 +180,8 @@ module SpecrelayRunner
     def orphaned_remedy(removed)
       "no local connection uses runner #{removed.runner_public_id} any more. Its Keychain " \
         "credential was KEPT. Remove it too with `specrelay-runner connections " \
-        "disconnect-local #{removed.workspace_key} --remove-credential` (already done for the " \
-        "local entry), or leave it — reconnecting reuses it."
+        "disconnect-local #{ConnectionStore.selector_for(removed)} --remove-credential` (already " \
+        "done for the local entry), or leave it — reconnecting reuses it."
     end
 
     def delete_credential(account)
@@ -182,10 +192,11 @@ module SpecrelayRunner
     end
 
     def local_disconnect_message(removed, credential)
-      "Removed the local connection for #{removed.workspace_key} " \
+      selector = ConnectionStore.selector_for(removed)
+      "Removed the local connection for #{selector} " \
         "(#{Redaction.redact(removed.repository_url.to_s)}). #{credential_sentence(credential)} " \
         "This removed only this machine's local memory — Platform-side authorization is " \
-        "unchanged; use `connections disconnect-platform #{removed.workspace_key}` for that."
+        "unchanged; use `connections disconnect-platform #{selector}` for that."
     end
 
     def credential_sentence(credential)
@@ -201,8 +212,8 @@ module SpecrelayRunner
     end
 
     def already_absent_locally(connection)
-      Outcome.new(ok: true, message: "No local connection for #{connection.workspace_key}; " \
-                                     "nothing to remove.")
+      Outcome.new(ok: true, message: "No local connection for " \
+                                     "#{ConnectionStore.selector_for(connection)}; nothing to remove.")
     end
 
     # The pre-round-003 per-workspace Keychain item, removed ONLY through this explicit
@@ -228,8 +239,8 @@ module SpecrelayRunner
     # alone on purpose: deleting it after a FAILED Platform call would leave a machine that
     # still has authorization it can no longer see, which is the worst of both states. The
     # caller offers local removal only after this returns ok.
-    def disconnect_platform(workspace_key)
-      connection = require_connection(workspace_key) { |outcome| return outcome }
+    def disconnect_platform(selector)
+      connection = require_connection(selector) { |outcome| return outcome }
       credential = stored_credential(connection)
       return missing_credential(connection) if credential.nil?
 
@@ -267,9 +278,9 @@ module SpecrelayRunner
 
       Outcome.new(ok: true, payload: disconnected,
                   message: platform_disconnect_message(connection, disconnected, outcome),
-                  remedy: "the local entry for #{connection.workspace_key} is still stored on this " \
-                          "machine. Remove it with `specrelay-runner connections disconnect-local " \
-                          "#{connection.workspace_key}`.")
+                  remedy: "the local entry for #{ConnectionStore.selector_for(connection)} is still " \
+                          "stored on this machine. Remove it with `specrelay-runner connections " \
+                          "disconnect-local #{ConnectionStore.selector_for(connection)}`.")
     end
 
     # Platform's own sentence when it sent one, and the runner's own when it did not. A blank
@@ -296,7 +307,7 @@ module SpecrelayRunner
                   remedy: "nothing local was changed. Check that #{connection.base_url} is really " \
                           "Platform and not a proxy or another service, then try again; or remove " \
                           "only this machine's copy with `specrelay-runner connections " \
-                          "disconnect-local #{connection.workspace_key}`.")
+                          "disconnect-local #{ConnectionStore.selector_for(connection)}`.")
     end
 
     def platform_refused(connection, error)
@@ -305,42 +316,53 @@ module SpecrelayRunner
                           "disconnected and no local state changed. Reconnect with " \
                           "`specrelay-runner connect <enrollment-code>`, or remove only this " \
                           "machine's copy with `specrelay-runner connections disconnect-local " \
-                          "#{connection.workspace_key}`.")
+                          "#{ConnectionStore.selector_for(connection)}`.")
     end
 
     private
 
     attr_reader :env, :platform, :client_factory
 
-    # Resolves a workspace key or yields the Outcome the caller must return. Written as a
-    # yielding guard rather than a nil return so that no caller can forget the check: there
-    # is no way to get a connection out of it without handling the failure.
-    def require_connection(workspace_key)
-      key = workspace_key.to_s.strip
-      yield usage("a workspace key is required (one of: #{known_keys})") if key.empty?
+    # Resolves a selector or yields the Outcome the caller must return. Written as a yielding
+    # guard rather than a nil return so that no caller can forget the check: there is no way to
+    # get a connection out of it without handling the failure.
+    #
+    # An AMBIGUOUS selector fails here too, which is what keeps a destructive action from taking
+    # effect on whichever of two projects happened to be listed first.
+    def require_connection(selector)
+      wanted = selector.to_s.strip
+      yield usage("a connection selector is required (one of: #{known_selectors})") if wanted.empty?
 
-      found = store.connection_for(key)
-      yield unknown_workspace(key) if found.nil?
+      resolution = store.resolve(wanted)
+      yield ambiguous_selection(wanted, resolution) if resolution.ambiguous?
+      yield unknown_workspace(wanted) if resolution.connection.nil?
 
-      found
+      resolution.connection
     end
 
-    def known_keys
-      keys = store.connections.map(&:workspace_key)
-      keys.empty? ? "none connected" : keys.join(", ")
+    def known_selectors
+      selectors = store.connections.map { |connection| ConnectionStore.selector_for(connection) }
+      selectors.empty? ? "none connected" : selectors.join(", ")
     end
 
-    def unknown_workspace(key)
+    def ambiguous_selection(wanted, resolution)
+      alternatives = resolution.matches.map { |connection| ConnectionStore.selector_for(connection) }
+      Outcome.new(ok: false, invalid: true,
+                  message: "'#{wanted}' names #{resolution.matches.length} connections on this machine.",
+                  remedy: "name one of them: #{alternatives.join(', ')}")
+    end
+
+    def unknown_workspace(wanted)
       return unreadable_state unless store.readable?
 
-      Outcome.new(ok: false, invalid: true, message: "no local connection for workspace '#{key}'.",
+      Outcome.new(ok: false, invalid: true, message: "no local connection for '#{wanted}'.",
                   remedy: unknown_workspace_remedy)
     end
 
     def unknown_workspace_remedy
       return "connect this machine first: `specrelay-runner connect <enrollment-code>`" if store.connections.empty?
 
-      "connected workspaces: #{known_keys}"
+      "connected: #{known_selectors}"
     end
 
     def unreadable_state
@@ -355,8 +377,8 @@ module SpecrelayRunner
                   message: "no stored credential for runner #{connection.runner_public_id}, so this " \
                            "machine cannot authenticate to Platform.",
                   remedy: "remove only this machine's copy with `specrelay-runner connections " \
-                          "disconnect-local #{connection.workspace_key}`, or reconnect with " \
-                          "`specrelay-runner connect <enrollment-code>`")
+                          "disconnect-local #{ConnectionStore.selector_for(connection)}`, or reconnect " \
+                          "with `specrelay-runner connect <enrollment-code>`")
     end
 
     def usage(message) = Outcome.new(ok: false, invalid: true, message: message)
@@ -366,15 +388,15 @@ module SpecrelayRunner
                   remedy: "check that #{store.path} is writable by this user")
     end
 
-    # The same runner-scoped-then-legacy resolution order the claim path uses.
+    # The selected registration's own credential, and no other. The same scoped resolution the
+    # claim path uses, because testing a different lookup than the one that runs would prove
+    # nothing — and a workspace-keyed fallback would read a secret that no longer identifies which
+    # project it belongs to.
     def stored_credential(connection)
-      secrets = secret_store
       runner_public_id = connection.runner_public_id.to_s.strip
-      unless runner_public_id.empty?
-        value = secrets.read(account: SecretStore.account_for_runner(runner_public_id))
-        return value if value
-      end
-      secrets.read(account: SecretStore.legacy_account_for(connection.workspace_key))
+      return nil if runner_public_id.empty?
+
+      secret_store.read(account: SecretStore.account_for_runner(runner_public_id))
     end
 
     def secret_store = @injected_secret_store || SecretStore.for(platform: platform)

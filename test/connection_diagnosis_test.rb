@@ -93,13 +93,17 @@ class ConnectionDiagnosisTest < Minitest::Test
     assert_empty @platform.requests
   end
 
-  # A machine that connected before the credential became runner-scoped still authenticates
-  # from its per-workspace item, so the test must find it there too — otherwise it would report
-  # a healthy machine as broken.
-  def test_a_legacy_per_workspace_credential_is_still_found
-    legacy = FakeSecretStore.new(entries: { "workspace:tiny-demo-workspace" => CREDENTIAL })
+  # A workspace-keyed item is NOT this registration's credential, and on a machine connected to
+  # several projects it does not even say which project it belongs to — two projects may use the
+  # same workspace key. Reading it would let the readiness test pass using another project's
+  # secret, so the test reports a missing credential and names the one fix.
+  def test_a_workspace_keyed_credential_is_not_accepted_for_this_registration
+    workspace_keyed = FakeSecretStore.new(entries: { "workspace:tiny-demo-workspace" => CREDENTIAL })
+    result = diagnose(secret_store: workspace_keyed)
 
-    assert_equal SpecrelayRunner::ConnectionDiagnosis::OK, diagnose(secret_store: legacy).outcome
+    assert_equal SpecrelayRunner::ConnectionDiagnosis::CREDENTIAL_MISSING, result.outcome
+    assert_match(/specrelay-runner connect/, result.remedy)
+    assert_empty @platform.requests, "nothing may be sent using a credential that is not this one's"
   end
 
   def test_a_credential_platform_rejects_is_distinguished_from_a_missing_one

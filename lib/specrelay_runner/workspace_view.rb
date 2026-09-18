@@ -29,18 +29,21 @@ module SpecrelayRunner
       @last_readiness = {}
     end
 
-    def open(workspace_key)
+    # `selector` is the connection's full identity, handed over by the row the operator chose.
+    # Every action below re-resolves it, so the view can never act on a different project than
+    # the one on screen — including when two projects use the same workspace key.
+    def open(selector)
       loop do
-        connection = operations.connection_for(workspace_key)
+        connection = operations.connection_for(selector)
         # It can genuinely be gone — disconnected here a moment ago, or removed from another
         # terminal. Returning to the top level is the honest response, not an error.
         return if connection.nil?
 
         action = menu.select(title: "#{Dashboard::TITLE} — #{ConnectionView.selection_label(connection)}",
-                             header: detail_rows(connection), entries: entries(workspace_key),
+                             header: detail_rows(connection), entries: entries(connection),
                              footer: FOOTER)
         return if action == TerminalMenu::CANCEL || action == :back
-        return if perform(workspace_key, action) == :leave
+        return if perform(selector, action) == :leave
       end
     end
 
@@ -49,17 +52,19 @@ module SpecrelayRunner
     attr_reader :operations, :dispatch, :out, :menu
 
     def detail_rows(connection)
+      identity = ConnectionStore.selector_for(connection)
       rows = ConnectionView.detail_rows(connection, default: operations.listing.default?(connection),
-                                        readiness: @last_readiness[connection.workspace_key])
+                                        readiness: @last_readiness[identity])
       label_width = rows.map { |label, _| label.length }.max
-      rows.map { |label, value| "  #{label.ljust(label_width)}  #{value}" }
+      lines = rows.map { |label, value| "  #{label.ljust(label_width)}  #{value}" }
+      lines << "  #{'Selector'.ljust(label_width)}  #{identity}"
     end
 
     # The `D` row's LABEL changes with state rather than the menu offering both a set and a
     # clear action: exactly one of them is ever meaningful, and showing the inapplicable one
     # invites pressing it.
-    def entries(workspace_key)
-      default = operations.listing.default_workspace_key == workspace_key
+    def entries(connection)
+      default = operations.listing.default?(connection)
       [
         entry("L", "Start live loop — poll and execute work for this project", :loop),
         entry("O", "Claim once — one controlled single-shot execution", :claim_once),
@@ -75,15 +80,15 @@ module SpecrelayRunner
     def entry(shortcut, label, value) = TerminalMenu::Entry.new(shortcut: shortcut, label: label, value: value)
 
     # Returns :leave when this view should close, otherwise nil.
-    def perform(workspace_key, action)
+    def perform(selector, action)
       case action
-      when :loop then run_command([ "loop", "--workspace", workspace_key ], acknowledge: false)
-      when :claim_once then run_command([ "claim-once", "--workspace", workspace_key ])
-      when :test then test(workspace_key)
-      when :show then show(workspace_key)
-      when :default then toggle_default(workspace_key)
-      when :disconnect_local then disconnect_local(workspace_key)
-      when :disconnect_platform then disconnect_platform(workspace_key)
+      when :loop then run_command([ "loop", "--workspace", selector ], acknowledge: false)
+      when :claim_once then run_command([ "claim-once", "--workspace", selector ])
+      when :test then test(selector)
+      when :show then show(selector)
+      when :default then toggle_default(selector)
+      when :disconnect_local then disconnect_local(selector)
+      when :disconnect_platform then disconnect_platform(selector)
       end
     end
 
@@ -132,15 +137,15 @@ module SpecrelayRunner
 
     # --- non-destructive actions ---------------------------------------------
 
-    def test(workspace_key)
+    def test(selector)
       menu.restore
       menu.clear
-      out.puts "Testing #{workspace_key} — this claims no work and changes nothing."
+      out.puts "Testing #{selector} — this claims no work and changes nothing."
       out.puts ""
-      outcome = operations.test(workspace_key)
+      outcome = operations.test(selector)
       print_checks(outcome.payload)
       report(outcome)
-      remember_readiness(workspace_key, outcome)
+      remember_readiness(selector, outcome)
       menu.pause
       nil
     end
@@ -157,13 +162,18 @@ module SpecrelayRunner
       out.puts ""
     end
 
-    def remember_readiness(workspace_key, outcome)
-      @last_readiness[workspace_key] =
+    # Keyed by the full identity, so a readiness result shown for one project can never be
+    # attributed to another that happens to share its workspace key.
+    def remember_readiness(selector, outcome)
+      connection = operations.connection_for(selector)
+      return if connection.nil?
+
+      @last_readiness[ConnectionStore.selector_for(connection)] =
         outcome.ok? ? "ready (tested just now)" : "#{outcome.payload&.outcome} (tested just now)"
     end
 
-    def show(workspace_key)
-      connection = operations.connection_for(workspace_key)
+    def show(selector)
+      connection = operations.connection_for(selector)
       return :leave if connection.nil?
 
       menu.restore
@@ -173,11 +183,14 @@ module SpecrelayRunner
       nil
     end
 
-    def toggle_default(workspace_key)
+    def toggle_default(selector)
       menu.restore
       menu.clear
-      currently_default = operations.listing.default_workspace_key == workspace_key
-      report(currently_default ? operations.clear_default : operations.set_default(workspace_key))
+      connection = operations.connection_for(selector)
+      return :leave if connection.nil?
+
+      currently_default = operations.listing.default?(connection)
+      report(currently_default ? operations.clear_default : operations.set_default(selector))
       menu.pause
       nil
     end
@@ -188,24 +201,26 @@ module SpecrelayRunner
     # operation the operator has already agreed to in full. The first names the workspace AND
     # the repository, because a workspace key alone is easy to misread when several are
     # connected.
-    def disconnect_local(workspace_key)
-      connection = operations.connection_for(workspace_key)
+    def disconnect_local(selector)
+      connection = operations.connection_for(selector)
       return :leave if connection.nil?
 
       menu.restore
       menu.clear
       out.puts local_disconnect_warning(connection)
-      return nil unless menu.confirm("Remove the LOCAL connection for #{workspace_key} " \
+      return nil unless menu.confirm("Remove the LOCAL connection for " \
+                                     "#{ConnectionStore.selector_for(connection)} " \
                                      "(#{ConnectionView.repository_label(connection)})?")
 
-      remove_credential = ask_about_credential(workspace_key)
-      report(operations.disconnect_local(workspace_key, remove_credential: remove_credential))
+      remove_credential = ask_about_credential(selector)
+      report(operations.disconnect_local(selector, remove_credential: remove_credential))
       menu.pause
       :leave
     end
 
     def local_disconnect_warning(connection)
-      "This will remove only THIS MACHINE's memory of #{connection.workspace_key}.\n" \
+      "This will remove only THIS MACHINE's memory of " \
+        "#{ConnectionStore.selector_for(connection)}.\n" \
         "It will NOT remove Platform-side authorization: Platform will still list this runner " \
         "as connected to that workspace.\nUse 'Disconnect from Platform' for that."
     end
@@ -214,12 +229,12 @@ module SpecrelayRunner
     # credential is scoped to the RUNNER, not the workspace, so removing it while another local
     # connection still uses it would break a working connection as a side effect of tidying up
     # an unrelated one.
-    def ask_about_credential(workspace_key)
-      return false unless operations.credential_orphaned_by?(workspace_key)
+    def ask_about_credential(selector)
+      return false unless operations.credential_orphaned_by?(selector)
 
       out.puts ""
       out.puts "After this, no local connection will use runner credential " \
-               "#{operations.credential_account_for(workspace_key)}."
+               "#{operations.credential_account_for(selector)}."
       out.puts "Keeping it is safe and lets a later `connect` reuse it."
       menu.confirm("Also remove that credential from the macOS Keychain?")
     end
@@ -229,18 +244,19 @@ module SpecrelayRunner
     # Platform first, local second, and only after Platform CONFIRMS. Deleting local state after
     # a failed Platform call would leave a machine holding authorization it can no longer see or
     # manage from here.
-    def disconnect_platform(workspace_key)
-      connection = operations.connection_for(workspace_key)
+    def disconnect_platform(selector)
+      connection = operations.connection_for(selector)
       return :leave if connection.nil?
 
       menu.restore
       menu.clear
       out.puts platform_disconnect_warning(connection)
-      return nil unless menu.confirm("Ask Platform to remove this runner's grant for #{workspace_key}?")
+      return nil unless menu.confirm("Ask Platform to remove this runner's grant for " \
+                                     "#{connection.workspace_key}?")
 
-      outcome = operations.disconnect_platform(workspace_key)
+      outcome = operations.disconnect_platform(selector)
       report(outcome)
-      outcome.ok? ? offer_local_removal(workspace_key) : keep_local_after_failure
+      outcome.ok? ? offer_local_removal(selector) : keep_local_after_failure
     end
 
     def platform_disconnect_warning(connection)
@@ -251,14 +267,14 @@ module SpecrelayRunner
         "is deleted."
     end
 
-    def offer_local_removal(workspace_key)
+    def offer_local_removal(selector)
       out.puts ""
-      unless menu.confirm("Platform confirmed. Also remove this machine's local entry for #{workspace_key}?")
+      unless menu.confirm("Platform confirmed. Also remove this machine's local entry for #{selector}?")
         return keep_local_entry
       end
 
-      remove_credential = ask_about_credential(workspace_key)
-      report(operations.disconnect_local(workspace_key, remove_credential: remove_credential))
+      remove_credential = ask_about_credential(selector)
+      report(operations.disconnect_local(selector, remove_credential: remove_credential))
       menu.pause
       :leave
     end

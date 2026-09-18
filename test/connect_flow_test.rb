@@ -118,7 +118,7 @@ class ConnectFlowTest < Minitest::Test
     checkout = git_checkout
     connect(code: platform.enrollment_code, checkout: checkout)
 
-    stored = store.connection_for("tiny-demo-workspace")
+    stored = store.resolve("tiny-demo-workspace").connection
 
     assert_equal platform.base_url, stored.base_url
     assert_equal checkout, stored.local_path
@@ -136,7 +136,7 @@ class ConnectFlowTest < Minitest::Test
     connect(code: platform.enrollment_code, checkout: second)
 
     assert_equal 1, store.connections.size
-    assert_equal second, store.connection_for("tiny-demo-workspace").local_path
+    assert_equal second, store.resolve("tiny-demo-workspace").connection.local_path
   end
 
   # --- refusals BEFORE the runner can become ready --------------------------
@@ -441,9 +441,12 @@ class ConnectFlowTest < Minitest::Test
     assert_equal [ "rnr_fake" ], store.connections.map(&:runner_public_id).uniq
   end
 
-  # A machine that connected under the pre-round-003 per-workspace scheme keeps working: the
-  # legacy account is still READ, so it presents its credential and is not rotated.
-  def test_reads_a_legacy_per_workspace_credential_so_an_existing_machine_keeps_working
+  # A workspace-keyed secret is not this registration's credential. A machine now holds one
+  # registration per project, so an item keyed by a workspace key does not say which project it
+  # belongs to — two projects may use the same key. It is not presented; Platform issues this
+  # registration its own credential instead, which is the safe default and the only path a
+  # genuinely new registration can take.
+  def test_a_workspace_keyed_secret_is_not_presented_as_this_registrations_credential
     platform = start_platform
     secret_store = FakeSecretStore.new
     secret_store.write(account: "workspace:tiny-demo-workspace", credential: FakePlatform::ISSUED_CREDENTIAL)
@@ -452,22 +455,20 @@ class ConnectFlowTest < Minitest::Test
     result, = connect(code: platform.enrollment_code, checkout: git_checkout, secret_store: secret_store)
 
     assert result.ready?
-    assert_equal FakePlatform::ISSUED_CREDENTIAL,
-                 platform.last_enrollment.dig(:headers, "x-specrelay-runner-credential")
+    assert_nil platform.last_enrollment.dig(:headers, "x-specrelay-runner-credential")
+    # The connection is usable afterwards because the issued credential was stored under this
+    # registration's own account.
+    assert_equal FakePlatform::ISSUED_CREDENTIAL, secret_store.read(account: "runner:rnr_fake")
   end
 
-  # Consulting the legacy account for the workspace being connected ONLY left a machine
-  # whose credential still sits under ANOTHER workspace's legacy account therefore presented
-  # nothing when connecting a new workspace, Platform issued a fresh credential, and the legacy
-  # copy went stale — reaching the same orphaning by a different route.
-  #
-  # Observed for real: a manual fresh-project connect rotated the credential on a machine whose
-  # only copy was a legacy entry, leaving an already-`ready` workspace unable to authenticate.
-  def test_a_legacy_credential_stored_for_another_workspace_is_still_presented
+  # A SECOND workspace in a project this machine already knows joins that project's existing
+  # registration, so it presents that registration's credential and Platform recognises a
+  # reconnect rather than issuing a second identity.
+  def test_a_second_workspace_in_a_known_project_presents_that_registrations_credential
     platform = start_platform
     secret_store = FakeSecretStore.new
-    # A machine that connected under the superseded scheme: local state knows the runner
-    # identity and the FIRST workspace, and the credential lives under that workspace's account.
+    # A machine already connected to this project: local state knows the registration, and the
+    # credential lives under that registration's own account.
     store.save(SpecrelayRunner::ConnectionStore::Connection.new(
                  base_url: platform.base_url, runner_id: "host-runner", runner_public_id: "rnr_fake",
                  runner_display_name: "host runner", project_slug: "tiny-demo",
@@ -476,19 +477,34 @@ class ConnectFlowTest < Minitest::Test
                  default_branch: "main", local_path: "/tmp/first",
                  connected_at: "2026-07-26T00:00:00Z"
                ))
-    secret_store.write(account: "workspace:first-workspace", credential: FakePlatform::ISSUED_CREDENTIAL)
+    secret_store.write(account: "runner:rnr_fake", credential: FakePlatform::ISSUED_CREDENTIAL)
     platform.held_credential = FakePlatform::ISSUED_CREDENTIAL
 
-    # Connecting a DIFFERENT workspace on the same machine and Platform.
+    # Connecting a DIFFERENT workspace of the same project on the same machine.
     result, = connect(code: platform.enrollment_code, checkout: git_checkout, secret_store: secret_store)
 
     assert result.ready?
     assert_equal FakePlatform::ISSUED_CREDENTIAL,
                  platform.last_enrollment.dig(:headers, "x-specrelay-runner-credential")
-    # Nothing rotated, so the first workspace's stored credential still authenticates and no
-    # runner-scoped credential was written over it.
-    assert_equal 0, secret_store.writes.count("runner:rnr_fake")
-    assert_equal FakePlatform::ISSUED_CREDENTIAL, secret_store.read(account: "workspace:first-workspace")
+    # It was recognised, so nothing rotated and the first workspace keeps working.
+    assert_equal 1, secret_store.writes.count("runner:rnr_fake"), "only the initial write"
+    assert_equal 2, store.connections.length
+  end
+
+  # A secret keyed by a workspace key is never reached for, even when the key matches: it cannot
+  # say which project it belongs to, and presenting it could authenticate one project's
+  # enrollment with another's credential.
+  def test_a_workspace_keyed_secret_from_another_workspace_is_never_presented
+    platform = start_platform
+    secret_store = FakeSecretStore.new
+    secret_store.write(account: "workspace:first-workspace", credential: FakePlatform::ISSUED_CREDENTIAL)
+    platform.held_credential = FakePlatform::ISSUED_CREDENTIAL
+
+    connect(code: platform.enrollment_code, checkout: git_checkout, secret_store: secret_store)
+
+    assert_nil platform.last_enrollment.dig(:headers, "x-specrelay-runner-credential")
+    assert_equal FakePlatform::ISSUED_CREDENTIAL, secret_store.read(account: "workspace:first-workspace"),
+                 "the old item is left alone rather than deleted"
   end
 
   def test_the_preview_carries_no_credential
@@ -622,7 +638,7 @@ class ConnectFlowTest < Minitest::Test
     platform = start_platform
     checkout = git_checkout
     connect(code: platform.enrollment_code, checkout: checkout)
-    stored = store.connection_for("tiny-demo-workspace")
+    stored = store.resolve("tiny-demo-workspace").connection
 
     config = SpecrelayRunner::Config.from_connection(stored, credential: FakePlatform::ISSUED_CREDENTIAL)
 
@@ -644,7 +660,7 @@ class ConnectFlowTest < Minitest::Test
     out = StringIO.new
     platform = start_platform
     connect(code: platform.enrollment_code, checkout: git_checkout)
-    stored = store.connection_for("tiny-demo-workspace")
+    stored = store.resolve("tiny-demo-workspace").connection
     client = SpecrelayRunner::PlatformClient.new(base_url: stored.base_url,
                                                  token: FakePlatform::ISSUED_CREDENTIAL)
     # The fake claims once, then reports not-claimed with its own reason.
@@ -660,7 +676,7 @@ class ConnectFlowTest < Minitest::Test
   def test_a_stored_connection_credential_beats_a_stale_exported_one
     platform = start_platform
     connect(code: platform.enrollment_code, checkout: git_checkout)
-    config = SpecrelayRunner::Config.from_connection(store.connection_for("tiny-demo-workspace"),
+    config = SpecrelayRunner::Config.from_connection(store.resolve("tiny-demo-workspace").connection,
                                                      credential: "src_from-keychain")
 
     auth = config.resolve_auth(env: { "SPECRELAY_RUNNER_CREDENTIAL" => "src_stale-exported" })
@@ -681,7 +697,7 @@ class ConnectFlowTest < Minitest::Test
 
     assert_equal "ready", report.fetch("reviewer_readiness")
     assert_equal "fake", report.dig("reviewer_profile", "provider")
-    stored = store.connection_for("tiny-demo-workspace")
+    stored = store.resolve("tiny-demo-workspace").connection
 
     assert_equal "fake", stored.reviewer_provider
     config = SpecrelayRunner::Config.from_connection(stored, credential: FakePlatform::ISSUED_CREDENTIAL)
@@ -697,7 +713,7 @@ class ConnectFlowTest < Minitest::Test
 
     assert_equal "not_configured",
                  platform.last_readiness_report.fetch(:body).fetch("report").fetch("reviewer_readiness")
-    assert_nil store.connection_for("tiny-demo-workspace").reviewer_provider
+    assert_nil store.resolve("tiny-demo-workspace").connection.reviewer_provider
   end
 
   # The whole point of the ticket: after ONE guided connection, the ordinary claim command

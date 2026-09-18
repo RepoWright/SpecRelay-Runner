@@ -63,8 +63,12 @@ module SpecrelayRunner
 
       out.puts "Connected workspaces (#{listing.connections.length}) — #{listing.path}"
       listing.connections.each do |connection|
-        marker = listing.default_workspace_key == connection.workspace_key ? "*" : " "
+        marker = listing.default?(connection) ? "*" : " "
         out.puts " #{marker} #{ConnectionView.summary_line(connection)}"
+        # The COMPLETE selector, on its own line and never clipped: this is the string an
+        # operator copies into `--workspace`, and a truncated one names nothing. It is the only
+        # place the full identity appears, because the row above it is what they read.
+        out.puts "     #{ConnectionStore.selector_for(connection)}"
       end
       out.puts ""
       out.puts default_line(listing)
@@ -72,27 +76,28 @@ module SpecrelayRunner
     end
 
     def default_line(listing)
-      if listing.default_workspace_key.nil?
+      if listing.default_selector.nil?
         "Default workspace: none set. `loop` and `claim-once` need --workspace when several " \
           "are connected."
       elsif listing.default_missing?
-        "Default workspace: #{listing.default_workspace_key} — SET BUT NOT CONNECTED. `loop` and " \
+        "Default workspace: #{listing.default_selector} — NOT RESOLVABLE. `loop` and " \
           "`claim-once` will fail closed until you set another or clear it."
       else
-        "Default workspace: #{listing.default_workspace_key} (marked *)."
+        "Default workspace: #{listing.default_selector} (marked *)."
       end
     end
 
-    def show(workspace_key)
-      return usage_error("usage: specrelay-runner connections show <workspace-key>") if workspace_key.to_s.strip.empty?
+    def show(selector)
+      return usage_error("usage: specrelay-runner connections show <selector>") if selector.to_s.strip.empty?
 
-      connection = operations.connection_for(workspace_key.to_s)
-      return report(unknown(workspace_key)) if connection.nil?
+      listing = operations.listing
+      connection = operations.connection_for(selector.to_s)
+      return report(unknown(selector)) if connection.nil?
 
-      rows = ConnectionView.detail_rows(connection,
-                                        default: operations.listing.default_workspace_key == connection.workspace_key)
+      rows = ConnectionView.detail_rows(connection, default: listing.default?(connection))
       width = rows.map { |label, _| label.length }.max
       rows.each { |label, value| out.puts "#{label.ljust(width)}  #{value}" }
+      out.puts "#{'Selector'.ljust(width)}  #{ConnectionStore.selector_for(connection)}"
       CLI::SUCCESS
     end
 
@@ -100,11 +105,11 @@ module SpecrelayRunner
     # and a prompt is how a scripted cleanup silently hangs. Without the flag the credential is
     # kept and the outcome says how to remove it — the safe default.
     def disconnect_local(rest)
-      workspace_key = rest.find { |arg| !arg.start_with?("-") }
+      selector = rest.find { |arg| !arg.start_with?("-") }
       unknown_flag = rest.find { |arg| arg.start_with?("-") && arg != "--remove-credential" }
       return usage_error("unknown option for disconnect-local: #{unknown_flag}") if unknown_flag
 
-      report(operations.disconnect_local(workspace_key,
+      report(operations.disconnect_local(selector,
                                         remove_credential: rest.include?("--remove-credential")))
     end
 
@@ -124,10 +129,10 @@ module SpecrelayRunner
       outcome.invalid? ? CLI::USAGE_ERROR : CLI::RUN_FAILED
     end
 
-    def unknown(workspace_key)
+    def unknown(selector)
       ConnectionOperations::Outcome.new(
         ok: false, invalid: true,
-        message: "no local connection for workspace '#{workspace_key}'.",
+        message: "'#{selector}' does not name exactly one local connection.",
         remedy: "run `specrelay-runner connections list` to see what this machine is connected to"
       )
     end
@@ -159,12 +164,12 @@ module SpecrelayRunner
     def usage(subcommand)
       err.puts(subcommand.nil? ? "specrelay-runner connections needs a subcommand" : "unknown connections subcommand: #{subcommand}")
       err.puts "Usage: specrelay-runner connections list"
-      err.puts "       specrelay-runner connections show <workspace-key>"
-      err.puts "       specrelay-runner connections test <workspace-key>"
-      err.puts "       specrelay-runner connections default <workspace-key>"
+      err.puts "       specrelay-runner connections show <selector>"
+      err.puts "       specrelay-runner connections test <selector>"
+      err.puts "       specrelay-runner connections default <selector>"
       err.puts "       specrelay-runner connections clear-default"
-      err.puts "       specrelay-runner connections disconnect-local <workspace-key> [--remove-credential]"
-      err.puts "       specrelay-runner connections disconnect-platform <workspace-key>"
+      err.puts "       specrelay-runner connections disconnect-local <selector> [--remove-credential]"
+      err.puts "       specrelay-runner connections disconnect-platform <selector>"
       err.puts "       specrelay-runner connections forget-legacy-credential <workspace-key>"
       CLI::USAGE_ERROR
     end
