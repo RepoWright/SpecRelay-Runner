@@ -24,6 +24,10 @@ class ProjectSwitchingTest < Minitest::Test
   BETA_PUBLIC_ID = "rnr_beta"
   SHARED_KEY = "shared"
   REPOSITORY = "https://github.com/SpecRelay/tiny-demo-workspace"
+  ALPHA_TASK = "ALPHA-1"
+  BETA_TASK = "BETA-1"
+  # Bounded so a lane that never stops fails this test instead of hanging the suite.
+  LANE_TIMEOUT_SECONDS = 120
 
   def setup
     @dir = Dir.mktmpdir("project-switching")
@@ -45,8 +49,11 @@ class ProjectSwitchingTest < Minitest::Test
   end
 
   def teardown
+    teardown_lanes
     [ @alpha, @beta ].each { |platform| platform&.stop }
-    FileUtils.remove_entry(@dir) if @dir && File.exist?(@dir)
+    [ @dir, @alpha_root, @beta_root ].each do |path|
+      FileUtils.remove_entry(path) if path && File.exist?(path)
+    end
   end
 
   # --- the walk -------------------------------------------------------------
@@ -137,6 +144,89 @@ class ProjectSwitchingTest < Minitest::Test
     assert_empty claims(@beta)
   end
 
+  # --- the real running-session lifecycle -----------------------------------
+
+  # The scenario the earlier no-work `claim-once` walk did not reach: start A's LIVE LOOP, let it
+  # claim and execute a real run, stop it with a real SIGINT through its own trap, land back on the
+  # menu, run B, stop it, and run A again — all in one process, through the real dashboard and the
+  # real CLI.
+  #
+  # Nothing here reconstructs a configuration to assert against. Every fact is observed where the
+  # running session produced it: the credential on the wire at each origin, the raw workspace key in
+  # the presence and claim payloads, and the local root in the `bin/worktree` invocations the
+  # execution really made inside that project's own checkout.
+  #
+  # Synchronization is on observed requests, never on a sleep: each lane is stopped once it has
+  # polled past its own work.
+  def test_a_real_loop_executes_stops_and_the_next_project_runs_in_the_same_process
+    prepare_execution_lanes
+
+    run_walk([ alpha_selector, :loop, :back,
+               beta_selector, :loop, :back,
+               alpha_selector, :loop, :back, :quit ])
+
+    # Each origin ran, and only ever with its own project's credential.
+    assert_operator claims(@alpha).length, :>=, 2, "A's loop did not poll"
+    assert_operator claims(@beta).length, :>=, 2, "B's loop did not poll"
+    assert_equal [ "Bearer #{ALPHA_CREDENTIAL}" ], authorizations(@alpha).uniq
+    assert_equal [ "Bearer #{BETA_CREDENTIAL}" ], authorizations(@beta).uniq
+  end
+
+  def test_each_running_loop_reports_presence_for_its_own_raw_workspace_key
+    prepare_execution_lanes
+
+    run_walk([ alpha_selector, :loop, :back, beta_selector, :loop, :back, :quit ])
+
+    [ @alpha, @beta ].each do |platform|
+      keys = platform.requests_to("/api/runner/presence").map { |r| r.dig(:body, "workspace_key") }
+
+      refute_empty keys, "a running session reported no presence"
+      assert_equal [ SHARED_KEY ], keys.uniq, "the raw workspace key, not the local selector"
+    end
+  end
+
+  # The local root, observed where the session actually used it: the project command each execution
+  # ran, inside that project's own checkout. Both projects share a workspace key, so a lane that
+  # resolved the wrong root would show the other project's task here.
+  def test_each_execution_ran_inside_its_own_projects_checkout
+    prepare_execution_lanes
+
+    run_walk([ alpha_selector, :loop, :back, beta_selector, :loop, :back, :quit ])
+
+    assert_includes worktree_log(@alpha_root), "create #{ALPHA_TASK}"
+    assert_includes worktree_log(@beta_root), "create #{BETA_TASK}"
+    refute_includes worktree_log(@alpha_root), BETA_TASK, "A's checkout ran B's task"
+    refute_includes worktree_log(@beta_root), ALPHA_TASK, "B's checkout ran A's task"
+  end
+
+  def test_switching_between_running_loops_enrolls_nothing
+    prepare_execution_lanes
+
+    run_walk([ alpha_selector, :loop, :back, beta_selector, :loop, :back, :quit ])
+
+    [ @alpha, @beta ].each do |platform|
+      assert_empty platform.requests_to("/api/runner/enrollment")
+      assert_empty platform.requests_to("/api/runner/enrollment_preview")
+    end
+    assert_equal 2, store.connections.length
+  end
+
+  # A running session resolved its connection once. Changing the saved default while it runs is a
+  # change to what the NEXT bare invocation picks, and must not retarget the claims this one is
+  # still making.
+  def test_changing_the_default_while_a_loop_runs_does_not_retarget_its_claims
+    prepare_execution_lanes
+    @change_default_to = beta_selector
+
+    run_walk([ alpha_selector, :loop, :back, :quit ])
+
+    assert_equal beta_selector, store.default_selector, "the default was not changed mid-session"
+    # Everything A's session did, before and after the change, went to A with A's credential.
+    assert_operator claims(@alpha).length, :>=, 2
+    assert_equal [ "Bearer #{ALPHA_CREDENTIAL}" ], authorizations(@alpha).uniq
+    assert_empty @beta.requests, "the running session was retargeted at the new default"
+  end
+
   # --- disconnecting one project leaves the other whole ---------------------
 
   # The confirmed menu flow, on B only. A keeps its registration, its credential, its explicit
@@ -169,8 +259,9 @@ class ProjectSwitchingTest < Minitest::Test
   private
 
   def start_platform(task_id, token)
-    FakePlatform.new(claim_payload: claim_payload_for(task_id: task_id), token: token)
-                .tap(&:start).tap(&:offer_no_work!)
+    platform = FakePlatform.new(claim_payload: claim_payload_for(task_id: task_id), token: token)
+    platform.claim_payload_workspace_key = SHARED_KEY
+    platform.start.tap(&:offer_no_work!)
   end
 
   def store = SpecrelayRunner::ConnectionStore.new(@state_file)
@@ -196,7 +287,7 @@ class ProjectSwitchingTest < Minitest::Test
   # Drive the real Dashboard with scripted selections, dispatching through the real CLI.
   def run_walk(selections, confirmations: [])
     out = StringIO.new
-    menu = ScriptedMenu.new(selections, confirmations: confirmations)
+    menu = ScriptedMenu.new(selections, confirmations: confirmations, on_select: method(:note_choice))
     cli = SpecrelayRunner::CLI.new(out: out, err: StringIO.new, env: env, input: StringIO.new,
                                    secret_store: @secret_store)
     SpecrelayRunner::Dashboard.new(
@@ -212,15 +303,19 @@ class ProjectSwitchingTest < Minitest::Test
   # A minimal stand-in for TerminalMenu: this file is about which project a lane runs, and the
   # real menu's rendering and raw mode are proved under a pty elsewhere.
   class ScriptedMenu
-    def initialize(selections, confirmations: [])
+    def initialize(selections, confirmations: [], on_select: nil)
       @selections = selections
       @answers = confirmations
+      @on_select = on_select || ->(_choice) { }
     end
 
+    # Being asked again is the proof that whatever was chosen last has finished — which is how the
+    # supervisor knows a lane ended without inspecting the loop.
     def select(**)
       raise "the dashboard asked for more input than the script provides" if @selections.empty?
 
-      @selections.shift
+      @on_select.call(:before)
+      @selections.shift.tap { |choice| @on_select.call(choice) }
     end
 
     def confirm(_prompt) = @answers.empty? ? false : @answers.shift
@@ -228,6 +323,144 @@ class ProjectSwitchingTest < Minitest::Test
     def clear = nil
     def restore = nil
     def width = 100
+  end
+
+  # The supervisor's whole view of the walk: a lane is live from the moment `:loop` is chosen
+  # until the menu is asked for the next thing.
+  def note_choice(choice)
+    case choice
+    when :before then @lane_baseline = nil
+    when :loop
+      @lane_baseline = total_claims
+      change_default_mid_session
+    end
+  end
+
+  # Done while A's loop is already running, which is the only time the claim under test can be
+  # made: a default changed before the session starts would simply have been the one it resolved.
+  def change_default_mid_session
+    return if @change_default_to.nil?
+
+    target = @change_default_to
+    @change_default_to = nil
+    Thread.new do
+      wait_until { total_claims >= @lane_baseline.to_i + 1 }
+      store.set_default(target)
+    end
+  end
+
+  def wait_until(timeout: LANE_TIMEOUT_SECONDS)
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
+    until yield
+      break if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
+
+      sleep 0.05
+    end
+  end
+
+  # --- the running-session harness -----------------------------------------
+
+  # Turn both lanes into ones that can really run: a hermetic git workspace per project, one
+  # unit of work waiting at each origin, a connector token and a stand-in connector program, and
+  # a supervisor that stops each loop once it has polled past its own work.
+  def prepare_execution_lanes
+    @alpha_root = build_execution_workspace(@alpha_root)
+    @beta_root = build_execution_workspace(@beta_root)
+    rebind_connection_roots
+    install_connector_stand_in
+    [ [ @alpha, ALPHA_PUBLIC_ID ], [ @beta, BETA_PUBLIC_ID ] ].each do |platform, public_id|
+      @secret_store.write(account: SpecrelayRunner::SecretStore.preview_connector_account_for(public_id),
+                          credential: "connector-token-#{public_id}")
+      platform.offer_again!
+    end
+    supervise_lanes
+  end
+
+  # A real workspace whose project command records every invocation, which is how "this execution
+  # ran in THIS project's checkout" becomes an observed fact rather than an inference.
+  def build_execution_workspace(previous)
+    FileUtils.remove_entry(previous) if previous && File.exist?(previous)
+    root, executor = DemoWorkspace.build
+    use_fixture(fixture_directory, executor)
+    command = File.join(root, "bin", "worktree")
+    File.write(command, File.read(command).sub("set -eu\n",
+                                               "set -eu\nmkdir -p \"$(dirname \"$0\")/../.runs\"\n" \
+                                               "echo \"$*\" >> \"$(dirname \"$0\")/../.runs/worktree.log\"\n"))
+    FileUtils.chmod(0o755, command)
+    root
+  end
+
+  def worktree_log(root)
+    path = File.join(root, ".runs", "worktree.log")
+    File.file?(path) ? File.read(path) : ""
+  end
+
+  def fixture_directory = @fixture_directory ||= fixture_bin
+
+  # The connection records were stored against the setup roots; the execution lanes replace those
+  # checkouts, so the saved connections are rewritten to point at them.
+  def rebind_connection_roots
+    File.write(@state_file, "")
+    store_connection(project: "alpha", platform: @alpha, public_id: ALPHA_PUBLIC_ID,
+                     root: @alpha_root, connected_at: "2026-07-20T10:00:00Z")
+    store_connection(project: "beta", platform: @beta, public_id: BETA_PUBLIC_ID,
+                     root: @beta_root, connected_at: "2026-07-27T10:00:00Z")
+  end
+
+  # A stand-in for the connector program, answering its own readiness endpoint the way the real
+  # client does. It keeps this test off every external service: nothing here reaches a provider,
+  # and the token it is handed is synthetic.
+  def install_connector_stand_in
+    directory = Dir.mktmpdir("connector-bin")
+    path = File.join(directory, "cloudflared")
+    File.write(path, <<~RUBY)
+      #!#{RbConfig.ruby}
+      require "socket"
+      server = TCPServer.new("127.0.0.1", ARGV[ARGV.index("--metrics") + 1].split(":").last.to_i)
+      loop do
+        client = server.accept
+        ok = client.gets.to_s.include?("/ready")
+        client.print("HTTP/1.1 \#{ok ? '200 OK' : '503 Service Unavailable'}\r\n" \
+                     "Content-Length: 0\r\nConnection: close\r\n\r\n")
+        client.close
+      end
+    RUBY
+    FileUtils.chmod(0o755, path)
+    @restore_path = ENV["PATH"]
+    ENV["PATH"] = "#{directory}:#{fixture_directory}:#{@restore_path}"
+  end
+
+  # Stops each lane with a REAL SIGINT, through the trap the loop installs itself — the same path
+  # Ctrl-C takes. The signal is sent only once the lane has polled past its own work, so the loop
+  # is provably running and trapped; it is repeated until the lane ends, so a signal that raced the
+  # trap cannot hang the walk.
+  #
+  # A no-op trap is installed for the whole test, and the loop saves and restores it, so a stray
+  # signal after a lane has ended cannot terminate the suite.
+  def supervise_lanes
+    @previous_int_trap = Signal.trap("INT") { nil }
+    @finished = false
+    @supervisor = Thread.new do
+      until @finished
+        stop_current_lane if @lane_baseline && total_claims >= @lane_baseline + 2
+        sleep 0.1
+      end
+    end
+  end
+
+  def stop_current_lane
+    Process.kill("INT", Process.pid)
+  rescue Errno::ESRCH
+    nil
+  end
+
+  def total_claims = [ @alpha, @beta ].sum { |platform| claims(platform).length }
+
+  def teardown_lanes
+    @finished = true
+    @supervisor&.join(5)
+    Signal.trap("INT", @previous_int_trap) if @previous_int_trap
+    ENV["PATH"] = @restore_path if @restore_path
   end
 
   def store_connection(project:, platform:, public_id:, root:, connected_at:)

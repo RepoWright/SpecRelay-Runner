@@ -820,7 +820,7 @@ bin/specrelay-runner connections forget-legacy-credential <workspace-key>
 
 The default is stored as a full selector and pinned to the connection it names before
 another is added, so connecting a project that reuses a workspace key cannot move it.
-Two deletions fail closed as a result: connecting while the stored default no longer
+Two operations fail closed as a result: connecting while the stored default no longer
 names exactly one connection is refused **before the enrollment code is spent**, and
 removing one of the connections an ambiguous default names is refused because the
 survivor would silently inherit it. Settle it with `connections default <selector>` or
