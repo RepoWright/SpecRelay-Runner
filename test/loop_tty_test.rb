@@ -142,8 +142,8 @@ class LoopTtyTest < Minitest::Test
     output = pty_session([ RbConfig.ruby, runner_bin ], [ "1", "L", polled(2), CTRL_C, "B", "Q" ],
                          env: child_env)
 
-    assert_includes output, "$ specrelay-runner loop --workspace tiny-demo-workspace",
-                    "the menu dispatches the direct command, echoed so it can be copied"
+    assert_match(%r{\$ specrelay-runner loop --workspace \S+#tiny-demo/tiny-demo-workspace}, output,
+                 "the menu dispatches the direct command, echoed so it can be copied")
     assert_includes output, "stopped by signal while IDLE"
     after_loop = output.split("session totals").last
     refute_includes after_loop, "Press any key to return",

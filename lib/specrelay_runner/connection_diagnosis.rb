@@ -104,14 +104,13 @@ module SpecrelayRunner
                 "the stored entry for #{connection.workspace_key} is incomplete " \
                 "(missing #{missing.join(', ')})",
                 "remove this stale local entry with `specrelay-runner connections disconnect-local " \
-                "#{connection.workspace_key}`, then reconnect it with " \
+                "#{ConnectionStore.selector_for(connection)}`, then reconnect it with " \
                 "`specrelay-runner connect <enrollment-code>`")
     end
 
-    # The credential belongs to the RUNNER identity, not the workspace, with the
-    # pre-MVP-0017-round-003 per-workspace account read as a fallback — the same resolution
-    # order the claim path uses, because testing a different lookup than the one that runs
-    # would prove nothing.
+    # The credential belongs to the registration this connection names, not to the workspace —
+    # the same scoped resolution the claim path uses, because testing a different lookup than the
+    # one that runs would prove nothing.
     def stored_credential
       value = read_credential
       return pass_value("Runner credential in the OS secret store", value) if value
@@ -142,7 +141,7 @@ module SpecrelayRunner
                 "Platform holds no grant for this runner on #{connection.workspace_key}",
                 "ask your project owner for a new enrollment code for this workspace and run " \
                 "`specrelay-runner connect <code>`; or drop the local entry with " \
-                "`specrelay-runner connections disconnect-local #{connection.workspace_key}`")
+                "`specrelay-runner connections disconnect-local #{ConnectionStore.selector_for(connection)}`")
     rescue PlatformClient::Error => e
       fail_with(PLATFORM_UNREACHABLE, "Platform reachable", Redaction.redact(e.message),
                 "check that #{connection.base_url} is running and reachable from this machine, " \
@@ -312,14 +311,14 @@ module SpecrelayRunner
 
     # --- collaborators -------------------------------------------------------
 
+    # Only the SELECTED registration's credential. A workspace-keyed fallback would let the
+    # ordinary readiness check read a secret stored under a key another project also uses, and
+    # then report the wrong project's connection as healthy.
     def read_credential
-      store = secret_store
       runner_public_id = connection.runner_public_id.to_s.strip
-      unless runner_public_id.empty?
-        value = store.read(account: SecretStore.account_for_runner(runner_public_id))
-        return value if value
-      end
-      store.read(account: SecretStore.legacy_account_for(connection.workspace_key))
+      return nil if runner_public_id.empty?
+
+      secret_store.read(account: SecretStore.account_for_runner(runner_public_id))
     end
 
     def secret_store = @injected_secret_store || SecretStore.for(platform: platform)

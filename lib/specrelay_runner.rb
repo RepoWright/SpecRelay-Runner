@@ -44,6 +44,9 @@ require_relative "specrelay_runner/secret_store"
 require_relative "specrelay_runner/repository_check"
 require_relative "specrelay_runner/connection_store"
 require_relative "specrelay_runner/connect"
+# The one local exclusion owner for the two commands that run work. Loaded before the CLI, which
+# is its only caller.
+require_relative "specrelay_runner/session_lock"
 # MVP-0021 local control center: the readiness test, the one implementation of every
 # connection-management action, its two presentations (a keyboard-driven dashboard and the
 # scriptable `connections` commands), and the shared non-secret rendering rules.

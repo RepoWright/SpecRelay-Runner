@@ -35,11 +35,37 @@ module SpecrelayRunner
   class ConnectionStore
     Error = Class.new(StandardError)
 
+    # A deletion refused because it would hand an ambiguous default to the connection that
+    # survives it. Named separately from the other store errors because its remedy is the
+    # operator's own set/clear-default action, not "the file could not be written".
+    AmbiguousDefault = Class.new(Error)
+
     VERSION = 2
     DEFAULT_RELATIVE_PATH = ".specrelay/runner/connections.json"
-    # The top-level key holding the operator's explicit default workspace key. Non-secret,
-    # like everything else in this file.
+    # The top-level key holding the operator's explicit default selection. Non-secret, like
+    # everything else in this file. The field name is unchanged, and so is its type: a document
+    # written by an earlier runner holds a bare workspace key there and still resolves, because a
+    # bare key is one of the ways a connection may be named.
     DEFAULT_KEY_FIELD = "default_workspace_key"
+
+    # A connection's durable identity is the tuple (base_url, project_slug, workspace_key).
+    # Platform scopes a workspace key to ONE project, so the key alone is not an identity: two
+    # projects may legitimately use the same one, and treating it as unique is what let a second
+    # project's record overwrite the first's.
+    #
+    # The selector renders that tuple as one string an operator can copy:
+    #
+    #   https://platform.example#beta/tiny-demo-workspace
+    #
+    # It is a DERIVED LOCAL LABEL and never a stored or transmitted value. Platform still receives
+    # the raw workspace key, and nothing here parses a selector back into parts — matching
+    # compares a requested string against the selectors generated from the records on disk, so
+    # there is no format to keep two implementations of.
+    PROJECT_SEPARATOR = "#"
+    WORKSPACE_SEPARATOR = "/"
+    # What stands in for a project on a record written before the project was stored. Visible and
+    # stable, so such a record still has one identity rather than none.
+    UNKNOWN_PROJECT = "-"
 
     # The fields the runner cannot operate without. `build` below already refuses an entry
     # missing a workspace key or base URL; these are what a structurally valid-LOOKING entry
@@ -66,6 +92,36 @@ module SpecrelayRunner
 
       def missing_fields = REQUIRED_CONNECTION_FIELDS.select { |field| self[field].to_s.strip.empty? }
       def complete? = missing_fields.empty?
+    end
+
+    # The one complete name for one connection. Every surface that has to identify a connection in
+    # a single string — a menu row's value, a dashboard action, a stored default, a disconnect
+    # target, a copied command — uses this one.
+    def self.selector_for(connection)
+      "#{connection.base_url}#{PROJECT_SEPARATOR}#{project_segment(connection)}" \
+        "#{WORKSPACE_SEPARATOR}#{connection.workspace_key}"
+    end
+
+    def self.project_segment(connection)
+      slug = connection.project_slug.to_s.strip
+      slug.empty? ? UNKNOWN_PROJECT : slug
+    end
+
+    # Every string that may name this connection, from the complete selector down to the bare
+    # workspace key. The shorter two are conveniences: they identify a connection only while they
+    # match exactly one stored record, which is what `#resolve` decides.
+    def self.selectors_for(connection)
+      [ selector_for(connection),
+        "#{project_segment(connection)}#{WORKSPACE_SEPARATOR}#{connection.workspace_key}",
+        connection.workspace_key.to_s ]
+    end
+
+    # What one requested selector named. `matches` is deliberately the whole list rather than a
+    # count, so a caller can list the real alternatives instead of saying only "ambiguous".
+    Resolution = Struct.new(:connection, :matches, keyword_init: true) do
+      def resolved? = !connection.nil?
+      def ambiguous? = matches.length > 1
+      def none? = matches.empty?
     end
 
     def self.default_path(env: ENV, home: Dir.home)
@@ -98,8 +154,27 @@ module SpecrelayRunner
              .map(&:first)
     end
 
-    def connection_for(workspace_key)
-      connections.find { |connection| connection.workspace_key == workspace_key.to_s }
+    # THE one matching rule. Every adapter asks this rather than comparing keys itself, so an
+    # ambiguous selector cannot be resolved one way by the menu and another by a command.
+    #
+    # A selector that names several connections resolves to NONE of them. Choosing by recency,
+    # by file order, or by which project was seen first would be the silent substitution the
+    # fail-closed rule exists to prevent — and here it would mean claiming another project's work.
+    def resolve(selector)
+      wanted = selector.to_s.strip
+      return Resolution.new(connection: nil, matches: []) if wanted.empty?
+
+      matches = connections.select { |connection| self.class.selectors_for(connection).include?(wanted) }
+      Resolution.new(connection: (matches.first if matches.one?), matches: matches)
+    end
+
+    # Every stored connection registered against one Platform project. This is what decides
+    # whether this machine already holds a registration there, and therefore whether a new
+    # workspace joins an existing registration or needs a new one.
+    def project_connections(base_url, project_slug)
+      connections.select do |connection|
+        connection.base_url == base_url.to_s && connection.project_slug.to_s == project_slug.to_s
+      end
     end
 
     # False only when the file EXISTS and cannot be understood — the `local_state_invalid`
@@ -119,25 +194,26 @@ module SpecrelayRunner
     # dashboard's diagnostics so an operator can see which state format they are on.
     def document_version = File.file?(path) ? read_document["version"] : nil
 
-    # The workspace key the operator explicitly chose as this machine's default, exactly as
-    # stored — WITHOUT checking that it still names a connection. The caller needs that
-    # difference: a default naming a workspace that is no longer connected must fail closed
-    # with a focused remedy, never fall through to another workspace (MVP-0021 scope 4).
-    def default_workspace_key
+    # The selector the operator explicitly chose as this machine's default, exactly as stored —
+    # WITHOUT checking that it still names one connection. The caller needs that difference: a
+    # default that no longer resolves must fail closed with a focused remedy, never fall through
+    # to another workspace. A document written by an earlier runner holds a bare workspace key
+    # here, which resolves while it still names exactly one connection.
+    def default_selector
       value = read_document[DEFAULT_KEY_FIELD].to_s.strip
       value.empty? ? nil : value
     end
 
-    def default?(workspace_key) = !default_workspace_key.nil? && default_workspace_key == workspace_key.to_s
-
-    # The default connection, or nil when no default is set OR the stored default no longer
-    # names a connection. `default_set_but_missing?` separates those two cases.
-    def default_connection
-      key = default_workspace_key
-      key.nil? ? nil : connection_for(key)
+    def default?(connection)
+      selector = default_selector
+      !selector.nil? && self.class.selectors_for(connection).include?(selector)
     end
 
-    def default_set_but_missing? = !default_workspace_key.nil? && default_connection.nil?
+    # The default connection, or nil when no default is set OR the stored default no longer names
+    # exactly one connection. `default_set_but_missing?` separates those two cases.
+    def default_connection = resolve(default_selector).connection
+
+    def default_set_but_missing? = !default_selector.nil? && default_connection.nil?
 
     # The single connection to use when the operator named none. Returns nil when the
     # store holds several, so the runner asks rather than guessing which workspace to
@@ -147,23 +223,48 @@ module SpecrelayRunner
       found.one? ? found.first : nil
     end
 
-    # Upsert one connection by workspace key, so a retried `connect` replaces its own
-    # entry instead of appending a duplicate.
+    # Upsert one connection by its full identity, so a retried `connect` replaces its own entry
+    # while a DIFFERENT project that happens to use the same workspace key is added beside it.
+    #
+    # The existing default is rewritten as the full selector of whatever it names right now,
+    # BEFORE the new record joins the file and in the same atomic write. Leaving a bare key there
+    # is how a default set for one project silently becomes ambiguous — or attaches to the new
+    # record — the moment a second project reuses that key.
     def save(connection)
-      others = connections.reject { |existing| existing.workspace_key == connection.workspace_key }
-      write_connections([ connection, *others ], default_workspace_key)
+      identity = self.class.selector_for(connection)
+      pinned = pinned_default
+      others = connections.reject { |existing| self.class.selector_for(existing) == identity }
+      write_connections([ connection, *others ], pinned)
       connection
     end
 
-    # Record the operator's explicit default. Refused unless the key names a connection this
-    # machine actually holds: a default that cannot resolve is the fail-closed failure mode
-    # scope 4 exists to prevent, and storing one would only move the error later.
-    def set_default(workspace_key)
-      key = workspace_key.to_s.strip
-      raise Error, "no connection for workspace '#{key}'" if connection_for(key).nil?
+    # The stored default as the full selector of the connection it names today, or nil when none
+    # is set. Raises when it is set and no longer names exactly one connection.
+    #
+    # Callers that are about to ADD a record use this as a pre-flight: a stale or ambiguous
+    # default must be fixed by the operator rather than carried into a file where it could attach
+    # to a new record. `connect` asks before it spends the enrollment code, so a refusal here
+    # costs nothing.
+    def pinned_default
+      stored = default_selector
+      return nil if stored.nil?
 
-      write_connections(connections, key)
-      key
+      resolution = resolve(stored)
+      return self.class.selector_for(resolution.connection) if resolution.resolved?
+
+      raise Error, unusable_default_message(stored, resolution)
+    end
+
+    # Record the operator's explicit default, stored as the full selector so it cannot later be
+    # claimed by another project's record. Refused unless the selector names exactly one
+    # connection this machine holds: storing one that cannot resolve would only move the error.
+    def set_default(selector)
+      resolution = resolve(selector)
+      raise Error, unusable_default_message(selector.to_s.strip, resolution) unless resolution.resolved?
+
+      chosen = self.class.selector_for(resolution.connection)
+      write_connections(connections, chosen)
+      chosen
     end
 
     def clear_default
@@ -176,17 +277,69 @@ module SpecrelayRunner
     # error. A default pointing at the removed workspace is cleared in the SAME atomic write,
     # because leaving it behind would turn a clean disconnect into a dangling default that
     # fails every later `loop`.
-    def delete(workspace_key)
-      key = workspace_key.to_s.strip
-      removed = connection_for(key)
+    def delete(selector)
+      removed = resolve(selector).connection
       return nil if removed.nil?
 
-      remaining = connections.reject { |connection| connection.workspace_key == key }
-      write_connections(remaining, default_workspace_key == key ? nil : default_workspace_key)
+      identity = self.class.selector_for(removed)
+      refuse_silent_default_handover!(identity)
+      remaining = connections.reject { |connection| self.class.selector_for(connection) == identity }
+      write_connections(remaining, surviving_default(removed))
       removed
     end
 
     private
+
+    # An ambiguous default fails closed only while it stays ambiguous. Remove one of the
+    # connections it names and the SAME stored string resolves to whichever one survives — so a
+    # project the operator never chose silently acquires the authority of an explicit default, and
+    # the next bare `loop` claims its work while announcing it as the operator's own choice.
+    #
+    # Refused before anything is written, because the operator has two direct ways to say which
+    # project they meant and neither of them is a deletion. Removing a connection the ambiguous
+    # default does NOT name is unaffected: the default stays ambiguous and stays fail-closed.
+    def refuse_silent_default_handover!(identity)
+      stored = default_selector
+      return if stored.nil?
+
+      resolution = resolve(stored)
+      return unless resolution.ambiguous?
+
+      named = resolution.matches.map { |connection| self.class.selector_for(connection) }
+      return unless named.include?(identity)
+
+      raise AmbiguousDefault, silent_handover_message(stored, named, identity)
+    end
+
+    def silent_handover_message(stored, named, identity)
+      survivors = named.reject { |selector| selector == identity }
+      "the default '#{stored}' names #{named.length} connections, so removing #{identity} would " \
+        "leave it silently pointing at #{survivors.join(' or ')}."
+    end
+
+    # The default to keep after one connection is removed: cleared when it named the removed one,
+    # and otherwise left exactly as stored. An ambiguous default that named the removed connection
+    # cannot reach here — `#refuse_silent_default_handover!` has already refused that deletion.
+    def surviving_default(removed)
+      stored = default_selector
+      return nil if stored.nil?
+
+      named = resolve(stored).connection
+      return nil if named && self.class.selector_for(named) == self.class.selector_for(removed)
+
+      stored
+    end
+
+    def unusable_default_message(stored, resolution)
+      unless resolution.ambiguous?
+        return "the default '#{stored}' no longer names a connection on this machine; " \
+               "set another or clear it"
+      end
+
+      alternatives = resolution.matches.map { |connection| self.class.selector_for(connection) }
+      "the default '#{stored}' names several connections (#{alternatives.join(', ')}); " \
+        "set it to one of them or clear it"
+    end
 
     def write_connections(entries, default_key)
       document = { "version" => VERSION, "connections" => entries.map(&:to_h_document) }

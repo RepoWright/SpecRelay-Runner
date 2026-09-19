@@ -45,8 +45,11 @@ module SpecrelayRunner
       command, *rest = argv
       case command
       when "connect" then connect(rest)
-      when "claim-once" then claim_once(rest)
-      when "loop" then loop_mode(rest)
+      # The two commands that RUN WORK, and the only two that take the local session. Both go
+      # through here, so a dashboard dispatch and an explicit `--config` invocation are guarded on
+      # the same line as a typed one.
+      when "claim-once" then in_session { claim_once(rest) }
+      when "loop" then in_session { loop_mode(rest) }
       when "connections" then connections(rest)
       when nil then no_arguments
       when "help", "-h", "--help" then print_help
@@ -101,6 +104,35 @@ module SpecrelayRunner
     end
 
     def connection_operations = ConnectionOperations.new(env: env, secret_store: @injected_secret_store)
+
+    # Hold the machine's one work-running session for the whole invocation, or refuse it before it
+    # does anything another session could observe.
+    #
+    # It wraps the WHOLE command rather than the claim, so the refusal beats the provider probe,
+    # the presence report, the connector start and the claim itself — and beats the connection
+    # resolution too, because "another session is running" is the honest answer even on a machine
+    # that is not connected at all. The block's own ensure boundary releases it, so a startup
+    # failure and a Ctrl-C free the session exactly as a clean finish does.
+    #
+    # `connect`, the dashboard, listings, readiness tests and help are not execution sessions and
+    # take nothing: an operator must still be able to look at, fix, and choose a connection while
+    # a session is running.
+    # Both ways acquiring the session can fail are EXPECTED, and each carries its own exit code:
+    # another session holding it is "the answer is no" (1), and a lock path this user cannot open
+    # is local state that cannot be used (2) — the same distinction the `connections` commands
+    # document, so a wrapper script can tell "try later" from "fix your setup".
+    #
+    # Only these two named classes are caught. The block is the whole command, so a broad rescue
+    # here would swallow work-execution failures and report them as a session problem.
+    def in_session(&block)
+      SessionLock.hold(env: env, &block)
+    rescue SessionLock::Busy => e
+      err.puts e.message
+      RUN_FAILED
+    rescue SessionLock::Error => e
+      err.puts e.message
+      USAGE_ERROR
+    end
 
     def secret_store = @injected_secret_store || SecretStore.for(platform: RUBY_PLATFORM)
 
@@ -593,18 +625,17 @@ module SpecrelayRunner
       nil
     end
 
-    # The credential for this connection's RUNNER identity, falling back to the pre-round-003
-    # per-workspace account so a machine that connected under the old scheme keeps working
-    # (review-002, F3 residual). The credential is per runner, so keying it per workspace is what
-    # let a second workspace's connection orphan the first's stored copy.
+    # The credential for THIS connection's registration, and only that one.
+    #
+    # A machine holds one registration per project, each with its own credential, so a fallback to
+    # a workspace-keyed account would let one project's claim authenticate with a secret stored
+    # for another — and a workspace key repeats across projects, so it does not even identify
+    # which. A missing credential is reported with a reconnect remedy instead.
     def stored_credential(connection)
-      store = secret_store
       runner_public_id = connection.runner_public_id.to_s.strip
-      unless runner_public_id.empty?
-        value = store.read(account: SecretStore.account_for_runner(runner_public_id))
-        return value if value
-      end
-      store.read(account: SecretStore.legacy_account_for(connection.workspace_key))
+      return nil if runner_public_id.empty?
+
+      secret_store.read(account: SecretStore.account_for_runner(runner_public_id))
     end
 
     # Which connection this invocation is for, and — just as importantly — WHY.
@@ -624,11 +655,19 @@ module SpecrelayRunner
     # implicit default by recency, alphabet, project, or last menu row.
     Selection = Struct.new(:connection, :source, keyword_init: true)
 
-    def select_connection(store, workspace_key)
-      requested = workspace_key.to_s.strip
+    def select_connection(store, selector)
+      # Reset per selection, not per process. The dashboard dispatches every command through ONE
+      # CLI instance, so a flag left set by an earlier stale-default refusal would still be
+      # suppressing the sole-connection shortcut after the operator had fixed or cleared that
+      # default — a refusal with nothing left to report.
+      @default_failed = false
+      requested = selector.to_s.strip
       unless requested.empty?
-        found = store.connection_for(requested)
-        return found ? Selection.new(connection: found, source: :requested) : unknown_workspace(store, requested)
+        resolution = store.resolve(requested)
+        return Selection.new(connection: resolution.connection, source: :requested) if resolution.resolved?
+        return ambiguous_selector(store, requested, resolution) if resolution.ambiguous?
+
+        return unknown_workspace(store, requested)
       end
 
       default_selection(store) || sole_selection(store)
@@ -638,14 +677,14 @@ module SpecrelayRunner
     # AND has already reported, which `sole_selection` must not then override — so that case
     # sets a flag rather than relying on nil, which the two states would otherwise share.
     def default_selection(store)
-      key = store.default_workspace_key
-      return nil if key.nil?
+      stored = store.default_selector
+      return nil if stored.nil?
 
-      connection = store.connection_for(key)
-      return Selection.new(connection: connection, source: :default) if connection
+      resolution = store.resolve(stored)
+      return Selection.new(connection: resolution.connection, source: :default) if resolution.resolved?
 
       @default_failed = true
-      broken_default(store, key)
+      broken_default(store, stored, resolution)
     end
 
     def sole_selection(store)
@@ -658,34 +697,51 @@ module SpecrelayRunner
     end
 
     def unknown_workspace(store, requested)
-      err.puts "no connection for workspace '#{requested}'. Connected: " \
-               "#{store.connections.map(&:workspace_key).join(', ')}"
+      err.puts "no connection for '#{requested}'. Connected: #{connected_selectors(store)}"
       nil
     end
 
-    # A default naming a workspace this machine no longer has is a configuration error with a
+    # A selector that names several connections resolves to none of them, and says which. Picking
+    # one would mean claiming for a project the operator did not name — the failure the whole
+    # composite identity exists to prevent — and a workspace key legitimately repeats between
+    # projects, so this is an ordinary state rather than a corrupt one.
+    def ambiguous_selector(store, requested, resolution)
+      err.puts "'#{requested}' names #{resolution.matches.length} connections on this machine, so " \
+               "nothing was claimed."
+      err.puts "Name one of them: #{selectors_of(resolution.matches)}"
+      nil
+    end
+
+    # A default that no longer names exactly one connection is a configuration error with a
     # one-line fix, and it must never resolve to a different workspace: executing another
-    # project's work because a default went stale is exactly the failure mode MVP-0017 fixed.
-    def broken_default(store, key)
-      err.puts "the default workspace '#{key}' is no longer connected on this machine, so nothing " \
-               "was claimed."
-      err.puts "Connected: #{store.connections.map(&:workspace_key).join(', ')}" if store.connections.any?
-      err.puts "Remedy: choose another default (`specrelay-runner connections default <workspace-key>`), " \
+    # project's work because a default went stale is exactly the failure mode this refuses.
+    def broken_default(store, stored, resolution)
+      err.puts "the default '#{stored}' #{resolution.ambiguous? ? 'names several connections' : 'is no longer connected'} " \
+               "on this machine, so nothing was claimed."
+      err.puts "Connected: #{connected_selectors(store)}" if store.connections.any?
+      err.puts "Remedy: choose another default (`specrelay-runner connections default <selector>`), " \
                "clear it (`specrelay-runner connections clear-default`), or pass --workspace explicitly."
       nil
     end
 
     def ambiguous_workspace(store)
-      err.puts "several workspaces are connected " \
-               "(#{store.connections.map(&:workspace_key).join(', ')}); " \
-               "choose one with --workspace <workspace-key>"
+      err.puts "several projects are connected (#{connected_selectors(store)}); choose one with " \
+               "--workspace <selector>"
       err.puts "Or set a default once and stop passing it: `specrelay-runner connections default " \
-               "<workspace-key>` — or just run `specrelay-runner` in a terminal for the dashboard."
+               "<selector>` — or just run `specrelay-runner` in a terminal for the dashboard."
       nil
     end
 
+    # Always the COMPLETE selector, never the bare key: a listing an operator cannot copy into
+    # `--workspace` is not a list of choices.
+    def connected_selectors(store) = selectors_of(store.connections)
+
+    def selectors_of(connections)
+      connections.map { |connection| ConnectionStore.selector_for(connection) }.join(", ")
+    end
+
     def missing_credential(connection)
-      err.puts "no stored credential for workspace #{connection.workspace_key}. " \
+      err.puts "no stored credential for #{ConnectionStore.selector_for(connection)}. " \
                "Reconnect it: specrelay-runner connect <enrollment-code>"
       nil
     end
@@ -718,13 +774,11 @@ module SpecrelayRunner
     def source_line(config)
       return "config file #{config.source_path}" if config.connection.nil?
 
+      selector = ConnectionStore.selector_for(config.connection)
       case config.selection_source
-      when :default
-        "connected workspace #{config.connection.workspace_key} (your explicit default workspace)"
-      when :sole
-        "connected workspace #{config.connection.workspace_key} (the only one connected here)"
-      else
-        "connected workspace #{config.connection.workspace_key}"
+      when :default then "connected workspace #{selector} (your explicit default workspace)"
+      when :sole then "connected workspace #{selector} (the only one connected here)"
+      else "connected workspace #{selector}"
       end
     end
 

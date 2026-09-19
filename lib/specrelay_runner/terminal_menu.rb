@@ -41,6 +41,11 @@ module SpecrelayRunner
     ESCAPE_SEQUENCE_TIMEOUT = 0.05
     DEFAULT_WIDTH = 96
     MINIMUM_WIDTH = 40
+    DEFAULT_HEIGHT = 24
+    # The fewest entry rows a frame will ever show. Below this the menu is unusable anyway, and a
+    # viewport that could shrink to nothing would hide the highlighted row — the one thing it
+    # exists to keep visible.
+    MINIMUM_VISIBLE_ENTRIES = 3
 
     Entry = Struct.new(:shortcut, :label, :value, keyword_init: true)
 
@@ -147,6 +152,15 @@ module SpecrelayRunner
       DEFAULT_WIDTH
     end
 
+    # The usable height, bounded the same way as the width. It decides how many entry rows one
+    # frame can show; an unreported terminal falls back to the conventional 24 lines.
+    def height
+      reported = out.respond_to?(:winsize) ? out.winsize[0].to_i : 0
+      reported.positive? ? reported : DEFAULT_HEIGHT
+    rescue IOError, SystemCallError, NoMethodError
+      DEFAULT_HEIGHT
+    end
+
     private
 
     attr_reader :input, :out
@@ -184,11 +198,56 @@ module SpecrelayRunner
       lines = [ paint(clip(title), :bold), rule ]
       lines.concat(header.map { |line| clip(line) })
       lines << rule unless header.empty?
-      entries.each_with_index { |entry, position| lines << row(entry, position == index) }
+      lines.concat(entry_lines(entries, index, lines.length))
       lines << rule
       lines << dim(clip(footer))
       out.print(CLEAR + lines.join("\r\n") + "\r\n")
       out.flush if out.respond_to?(:flush)
+    end
+
+    # The entry rows for ONE frame, scrolled so the highlighted row is always among them.
+    #
+    # A list longer than the terminal used to render every row, which pushes the top of the frame
+    # — and often the highlighted row and the footer — off the screen. Arrow keys still moved a
+    # highlight nobody could see, so a machine with more projects than the terminal has lines
+    # became unusable at exactly the point several projects is normal.
+    #
+    # The window is minimal on purpose: no search, no paging model, no remembered scroll position.
+    # It follows the highlight and says how many rows are out of sight, which is all an operator
+    # needs to know that ↑/↓ will reach them.
+    def entry_lines(entries, index, chrome_above)
+      whole = height - chrome_above - CHROME_BELOW
+      return entries.each_with_index.map { |entry, position| row(entry, position == index) } if
+        entries.length <= whole
+
+      room = [ whole - NOTICE_LINE, MINIMUM_VISIBLE_ENTRIES ].max
+      first = window_start(entries.length, index, room)
+      window = entries[first, room]
+      rows = window.each_with_index.map { |entry, offset| row(entry, first + offset == index) }
+      rows << dim(clip(hidden_notice(entries.length, first, room)))
+    end
+
+    # What a frame always spends below the entries: the closing rule and the footer. Kept exact,
+    # because reserving a line that is not used would window a list that fits — which costs the
+    # operator a visible row for nothing.
+    CHROME_BELOW = 2
+    # The one extra line a WINDOWED frame spends saying what is out of sight.
+    NOTICE_LINE = 1
+
+    # Centre the highlight where there is room, and pin the window to either end otherwise, so
+    # the first and last entries are reachable without the view jumping.
+    def window_start(total, index, room)
+      [ [ index - (room / 2), 0 ].max, total - room ].min
+    end
+
+    def hidden_notice(total, first, room)
+      above = first
+      below = total - (first + room)
+      shown = "#{first + 1}–#{first + room} of #{total}"
+      return "  #{shown} · #{above} above · #{below} below (↑/↓)" if above.positive? && below.positive?
+      return "  #{shown} · #{above} above (↑/↓)" if above.positive?
+
+      "  #{shown} · #{below} below (↑/↓)"
     end
 
     def row(entry, highlighted)

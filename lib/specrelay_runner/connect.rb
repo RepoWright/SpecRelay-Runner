@@ -1,6 +1,8 @@
 # frozen_string_literal: true
 
 require "base64"
+require "digest"
+require "json"
 require "socket"
 require "time"
 
@@ -90,6 +92,10 @@ module SpecrelayRunner
       # working runner offline. Now a failure here costs nothing at all: the same code still works.
       assignment = preview(origin)
       workspace = assignment.fetch("workspace")
+      # Which machine identity this PROJECT is registered under, resolved from the previewed
+      # assignment and announced before anything is consumed — so what the operator reads is the
+      # identity that will really be enrolled.
+      registration = resolve_registration!(origin, assignment, workspace)
       checkout = validated_checkout!(workspace)
       readiness = executor_readiness(assignment.fetch("executor", {}))
       # Resolved ONCE, before anything is stored or reported. Deriving it separately for the
@@ -97,13 +103,17 @@ module SpecrelayRunner
       # reviewer it could not then launch.
       reviewer = reviewer_settings(readiness)
 
-      # What this machine already holds decides what the exchange presents, so it is resolved
-      # before anything is consumed.
-      held = held_credential(secret_store, workspace, origin)
+      # What this machine already holds for THIS registration decides what the exchange presents,
+      # so it is resolved before anything is consumed.
+      held = held_credential(secret_store, registration)
+      # The local connection file has to be able to accept a new record without disturbing the
+      # existing selection. Asked here, among the other local checks, so a damaged file or a
+      # default the operator must fix costs no enrollment code.
+      verify_connection_store!
       verify_secret_storage!(secret_store)
 
       # Only now is anything consumed or changed.
-      enrolled = exchange(origin, held)
+      enrolled = exchange(origin, registration, held)
       persist(secret_store, enrolled, workspace, checkout, reviewer)
       report(enrolled, workspace, checkout, readiness, reviewer)
     end
@@ -146,10 +156,91 @@ module SpecrelayRunner
 
     # Read the assignment without consuming the code.
     def preview(origin)
-      out.puts "Connecting to #{origin} as #{runner_display_name} (#{runner_id})…"
+      out.puts "Connecting to #{origin}…"
       assignment = client(origin, code).preview_enrollment
       announce_assignment(assignment)
       assignment
+    end
+
+    # WHICH machine identity Platform knows this project by, and which stored credential belongs
+    # to it. One registration per project, because that is what Platform enforces: a registration
+    # belongs to the project of the code that created it and cannot be repointed at another.
+    #
+    # Three cases, in order of how much this machine already knows:
+    #
+    #   1. this exact connection exists — reuse its saved identity, so a reconnect updates the
+    #      registration it already has rather than creating a second one;
+    #   2. a DIFFERENT workspace of a project this machine already knows — reuse that project's
+    #      single registration, because a project's workspaces share one machine there;
+    #   3. a project with nothing saved — derive a new identity for it.
+    #
+    # Two saved registrations for one project is a state this machine cannot choose between, and
+    # guessing would mean presenting one project's credential under another's identity. It is
+    # reported with both identities named instead.
+    Registration = Struct.new(:runner_id, :display_name, :runner_public_id, keyword_init: true)
+
+    def resolve_registration!(origin, assignment, workspace)
+      project_slug = assignment.dig("project", "slug").to_s
+      saved = store.project_connections(origin, project_slug)
+      exact = saved.find { |connection| connection.workspace_key == workspace["workspace_key"] }
+      registration = exact ? from_saved(exact) : registration_for_project(saved, origin, project_slug)
+      announce_registration(registration)
+      @registration = registration
+    end
+
+    def registration_for_project(saved, origin, project_slug)
+      known = saved.uniq { |connection| connection.runner_id.to_s }
+      raise Error, conflicting_registrations(project_slug, known) if known.length > 1
+      return from_saved(known.first) if known.length == 1
+
+      Registration.new(runner_id: project_runner_id(origin, project_slug),
+                       display_name: runner_display_name, runner_public_id: nil)
+    end
+
+    def from_saved(connection)
+      Registration.new(runner_id: connection.runner_id, display_name: runner_display_name,
+                       runner_public_id: presence(connection.runner_public_id))
+    end
+
+    def conflicting_registrations(project_slug, known)
+      identities = known.map { |connection| "#{connection.runner_id} (#{connection.workspace_key})" }
+      "this machine has more than one saved registration for project '#{project_slug}': " \
+        "#{identities.join(', ')}. Disconnect the one you no longer use with " \
+        "`specrelay-runner connections disconnect-local <selector>`, then connect again."
+    end
+
+    # A machine identity for ONE project on ONE Platform. Hostname-derived, so it still names this
+    # machine and a retry updates the same registration, plus a short digest of the Platform
+    # origin and project slug so a second project gets its own registration instead of being
+    # refused as a machine that already belongs somewhere else.
+    #
+    # A standard SHA-256 over a standard JSON serialization of the two values: deterministic
+    # across retries, different between projects, and no new wire format to keep in step with
+    # anything. The digest is an identifier, not a secret, and neither value in it is one.
+    def project_runner_id(origin, project_slug)
+      digest = Digest::SHA256.hexdigest(JSON.generate([ origin, project_slug ]))
+      "#{hostname_slug}-runner-#{digest[0, 12]}"
+    end
+
+    def announce_registration(registration)
+      out.puts "Runner identity:    #{registration.display_name} (#{registration.runner_id})"
+    end
+
+    # The local connection file must be able to take a new record without disturbing the existing
+    # selection. `pinned_default` raises when the stored default no longer names exactly one
+    # connection — the state in which adding a record could let a stale default attach to it.
+    def verify_connection_store!
+      raise ConnectionStore::Error, unreadable_store_message unless store.readable?
+
+      store.pinned_default
+    rescue ConnectionStore::Error => e
+      raise ConnectionStore::Error,
+            "#{e.message} The enrollment code was NOT used, so the same command still works."
+    end
+
+    def unreadable_store_message
+      "the local runner connection file #{store.path} exists but could not be read as SpecRelay " \
+        "connection state. Move it aside and connect again."
     end
 
     # Prove local secret storage works BEFORE the one-time code is spent.
@@ -174,8 +265,8 @@ module SpecrelayRunner
     # Consume the code. The machine's EXISTING credential is presented so Platform can recognise
     # a reconnect and leave that credential alone; when it does, `credential_unchanged` comes
     # back true and nothing in the secret store is touched.
-    def exchange(origin, held)
-      enrolled = client(origin, code).enroll(identity, current_credential: held)
+    def exchange(origin, registration, held)
+      enrolled = client(origin, code).enroll(identity(registration), current_credential: held)
       @credential = presence(enrolled["credential"]) || held
       raise Error, "Platform returned no usable credential for this machine" if @credential.nil?
 
@@ -199,54 +290,27 @@ module SpecrelayRunner
       token
     end
 
-    # The credential this machine already holds for THIS Platform, or nil.
+    # The credential this machine already holds for THIS REGISTRATION, or nil.
     #
-    # The credential is per RUNNER, not per workspace, so it is looked up by the runner identity
-    # this machine already has for this Platform origin — found in the local connection store,
-    # from ANY workspace it has connected to. Looking only at the workspace being connected meant
-    # a first-time connection to a second workspace presented nothing, Platform rotated, and the
-    # first workspace's stored copy went stale.
+    # Read through the selected registration's public id and nothing else. A machine now holds one
+    # registration per project, each with its own credential, so any wider search — another
+    # project's runner account, or a workspace-keyed account from the pre-registration scheme —
+    # could present project A's credential while enrolling project B. Platform would then either
+    # reject it or, worse, accept a reconnect this machine cannot actually authenticate as.
     #
-    # Legacy per-workspace entries are read as a fallback so a machine that connected under the
-    # old scheme keeps working without reconnecting.
+    # A registration this machine has never enrolled holds nothing, which is exactly right: a new
+    # project is issued its own credential.
     #
-    # A store that cannot be read is treated as "none held", so a fresh credential is issued
-    # rather than the connection failing.
-    def held_credential(secret_store, workspace, origin)
-      candidate_accounts(origin, workspace).each do |account|
-        value = secret_store.read(account: account)
-        return value if value
-      end
-      nil
+    # A secret store that cannot be read is treated as "none held", so a fresh credential is
+    # issued rather than the connection failing.
+    def held_credential(secret_store, registration)
+      public_id = presence(registration.runner_public_id)
+      return nil if public_id.nil?
+
+      secret_store.read(account: SecretStore.account_for_runner(public_id))
     rescue SecretStore::Error
       nil
     end
-
-    # Runner-scoped accounts first, because that is where a credential is written today, then
-    # legacy per-workspace accounts for EVERY workspace this machine has connected at this
-    # origin — not only the one being connected.
-    #
-    # Checking the legacy account for the workspace being connected alone left a machine whose
-    # credential is still under `workspace:<some-other-workspace>` presenting nothing when
-    # connecting a NEW workspace: Platform issued a fresh credential and the other workspace's
-    # stored copy went stale — the same orphaning the runner-scoped account was introduced to
-    # end, just reached by a different route.
-    def candidate_accounts(origin, workspace)
-      legacy_keys = origin_connections(origin).map(&:workspace_key) + [ workspace["workspace_key"] ]
-      runner_accounts(origin) +
-        legacy_keys.filter_map { |key| presence(key) }.uniq.map { |key| SecretStore.legacy_account_for(key) }
-    end
-
-    # Every runner-scoped account this machine could hold a credential under for this Platform.
-    # Normally exactly one: a machine has one runner identity per Platform origin.
-    def runner_accounts(origin)
-      origin_connections(origin)
-        .filter_map { |connection| presence(connection.runner_public_id) }
-        .uniq
-        .map { |public_id| SecretStore.account_for_runner(public_id) }
-    end
-
-    def origin_connections(origin) = store.connections.select { |connection| connection.base_url == origin }
 
     # A reconnect that kept its existing credential says so, because "stored in the Keychain"
     # would imply a write that did not happen.
@@ -336,9 +400,9 @@ module SpecrelayRunner
       secret_store.write(account: SecretStore.preview_connector_account_for(public_id),
                          credential: @preview_connector, label: "preview connector token")
       store.save(ConnectionStore::Connection.new(
-                   base_url: @base_url, runner_id: identity.fetch("id"),
+                   base_url: @base_url, runner_id: @registration.runner_id,
                    runner_public_id: assignment.dig("runner", "public_id"),
-                   runner_display_name: identity.fetch("display_name"),
+                   runner_display_name: @registration.display_name,
                    project_slug: assignment.dig("project", "slug"),
                    workspace_key: workspace.fetch("workspace_key"),
                    project_key: workspace["project_key"],
@@ -425,13 +489,9 @@ module SpecrelayRunner
     def client(base_url, token) = client_factory.call(base_url, token)
 
     # Non-secret, machine-derived identity. The user types neither field, and both are
-    # deterministic, so a retried connect updates the same runner.
-    def identity
-      @identity ||= { "id" => runner_id, "display_name" => runner_display_name }
-    end
-
-    def runner_id
-      @runner_id ||= "#{hostname_slug}-runner"
+    # deterministic for a given project, so a retried connect updates the same runner.
+    def identity(registration)
+      { "id" => registration.runner_id, "display_name" => registration.display_name }
     end
 
     def runner_display_name

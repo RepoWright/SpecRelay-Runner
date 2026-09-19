@@ -11,6 +11,17 @@ require "shellwords"
 $LOAD_PATH.unshift(File.expand_path("../lib", __dir__))
 require "specrelay_runner"
 
+# An isolated home for the whole test process, installed before any test runs.
+#
+# The runner keeps one per-user resource outside any state file it is told about: the session
+# lock that allows one work-running session per OS user. Without this, every test that runs
+# `loop` or `claim-once` would take the DEVELOPER's real lock — and, because the suite runs one
+# process per file with several in flight at once, two unrelated files would contend and one
+# would be refused at random.
+#
+# Child processes inherit it, so a runner spawned into a pty is isolated for the same reason.
+ENV["HOME"] = Dir.mktmpdir("runner-test-home")
+
 require_relative "support/fake_platform"
 require_relative "support/fake_secret_store"
 require_relative "support/demo_workspace"

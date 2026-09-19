@@ -24,6 +24,8 @@ module SpecrelayRunner
   class Dashboard
     TITLE = "SpecRelay Runner — local control center"
     FOOTER = "1–9 open · C clear default · H help · Q quit · ↑/↓ then Enter · Esc/Ctrl-C quits"
+    # How many projects get an immediate numeric key. See #entries for why the rest get none.
+    NUMERIC_SHORTCUTS = 9
 
     def self.call(**kwargs) = new(**kwargs).call
 
@@ -77,13 +79,13 @@ module SpecrelayRunner
     end
 
     def default_header(listing)
-      if listing.default_workspace_key.nil?
+      if listing.default_selector.nil?
         no_default_header(listing)
       elsif listing.default_missing?
-        "Default workspace: #{listing.default_workspace_key} — SET BUT NOT CONNECTED; " \
+        "Default workspace: #{listing.default_selector} — NOT RESOLVABLE; " \
           "`loop` fails closed until you set another or clear it"
       else
-        "Default workspace: #{listing.default_workspace_key}"
+        "Default workspace: #{listing.default_selector}"
       end
     end
 
@@ -112,8 +114,15 @@ module SpecrelayRunner
         "Move it aside, then run `specrelay-runner connect <enrollment-code>` again." ]
     end
 
-    # Projects get 1–9. A machine with more than nine connected projects is not a case this
-    # MVP designs for; the tenth onward stay reachable with the arrow keys, so nothing is hidden.
+    # The first nine projects get 1–9, and only those: a shortcut an operator can see but cannot
+    # press — one keypress cannot produce "12" — is worse than none, because it reads as a broken
+    # key rather than as a row reached with the arrows. Every project beyond the ninth stays
+    # reachable with ↑/↓, and the menu keeps the highlighted one on screen, so there is no
+    # product-imposed cap on how many projects a machine may hold.
+    #
+    # The VALUE is the connection's full selector, not its workspace key: two projects may use
+    # the same key, and a menu whose selection did not say which project it meant could open,
+    # test, or disconnect the wrong one.
     #
     # No absolute local path appears on this screen — see ConnectionView for why the detail view
     # is the right place for it.
@@ -121,7 +130,8 @@ module SpecrelayRunner
       listing = operations.listing
       rows = listing.connections.each_with_index.map do |connection, index|
         TerminalMenu::Entry.new(
-          shortcut: (index + 1).to_s, value: connection.workspace_key,
+          shortcut: numeric_shortcut(index),
+          value: ConnectionStore.selector_for(connection),
           label: ConnectionView.summary_line(connection, default: listing.default?(connection),
                                              width: menu.width - 8)
         )
@@ -129,9 +139,11 @@ module SpecrelayRunner
       rows.concat(global_entries(listing))
     end
 
+    def numeric_shortcut(index) = index < NUMERIC_SHORTCUTS ? (index + 1).to_s : nil
+
     def global_entries(listing)
       rows = []
-      if listing.default_workspace_key
+      if listing.default_selector
         rows << TerminalMenu::Entry.new(shortcut: "C", label: "Clear the default workspace",
                                        value: :clear_default)
       end
@@ -162,12 +174,12 @@ module SpecrelayRunner
       layer over commands you can also run directly, so everything here is scriptable:
 
         specrelay-runner connections list
-        specrelay-runner connections show <workspace-key>
-        specrelay-runner connections test <workspace-key>
-        specrelay-runner connections default <workspace-key>
+        specrelay-runner connections show <selector>
+        specrelay-runner connections test <selector>
+        specrelay-runner connections default <selector>
         specrelay-runner connections clear-default
-        specrelay-runner connections disconnect-local <workspace-key> [--remove-credential]
-        specrelay-runner connections disconnect-platform <workspace-key>
+        specrelay-runner connections disconnect-local <selector> [--remove-credential]
+        specrelay-runner connections disconnect-platform <selector>
 
       Two disconnects, two different meanings:
 

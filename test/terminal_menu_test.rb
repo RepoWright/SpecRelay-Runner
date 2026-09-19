@@ -99,11 +99,79 @@ class TerminalMenuTest < Minitest::Test
     assert_equal 120, menu.width
   end
 
-  def narrow_terminal(columns)
+  def narrow_terminal(columns, rows = 24)
     StringIO.new.tap do |io|
-      io.define_singleton_method(:winsize) { [ 24, columns ] }
+      io.define_singleton_method(:winsize) { [ rows, columns ] }
       io.define_singleton_method(:tty?) { true }
     end
+  end
+
+  # --- long lists -----------------------------------------------------------
+  #
+  # A machine may hold more projects than the terminal has lines. Rendering every row pushed the
+  # top of the frame — and with it the highlighted row and the footer — off the screen, so the
+  # arrow keys moved a highlight nobody could see. The frame is windowed instead.
+
+  def many_entries(count)
+    (1..count).map { |n| Entry.new(shortcut: (n.to_s if n < 10), label: "project #{n}", value: :"p#{n}") }
+  end
+
+  def frame_for(entries, index, rows: 24, columns: 100)
+    terminal = narrow_terminal(columns, rows)
+    SpecrelayRunner::TerminalMenu.new(input: StringIO.new, out: terminal)
+                                .send(:render, title: "T", entries: entries, index: index,
+                                      footer: "F", header: [ "H" ])
+    terminal.string.sub(SpecrelayRunner::TerminalMenu::CLEAR, "").split("\r\n")
+  end
+
+  def test_a_frame_never_renders_more_lines_than_the_terminal_has
+    lines = frame_for(many_entries(40), 0, rows: 24)
+
+    assert_operator lines.reject(&:empty?).length, :<=, 24
+  end
+
+  def test_the_highlighted_row_stays_on_screen_at_the_start_middle_and_end
+    entries = many_entries(40)
+
+    [ 0, 19, 39 ].each do |index|
+      frame = frame_for(entries, index, rows: 24).join("\n")
+
+      assert_includes frame, entries[index].label,
+                      "row #{index} was scrolled out of the frame that highlights it"
+      assert_match(/› .*#{Regexp.escape(entries[index].label)}/, frame,
+                   "row #{index} is not the highlighted one on its own frame")
+    end
+  end
+
+  def test_the_footer_survives_a_list_longer_than_the_terminal
+    lines = frame_for(many_entries(40), 39, rows: 24)
+
+    assert_includes lines.last.gsub(/\e\[[\d;]*m/, ""), "F"
+  end
+
+  # The operator has to be able to tell that ↑/↓ will reach more than they can see.
+  def test_a_windowed_frame_says_how_many_rows_are_out_of_sight
+    frame = frame_for(many_entries(40), 20, rows: 24).join("\n")
+
+    assert_match(/of 40/, frame)
+    assert_match(/above/, frame)
+    assert_match(/below/, frame)
+  end
+
+  def test_a_list_that_fits_is_rendered_whole_with_no_notice
+    frame = frame_for(many_entries(4), 0, rows: 40).join("\n")
+
+    (1..4).each { |n| assert_includes frame, "project #{n}" }
+    refute_match(/of 4/, frame, "a list that fits needs no scrolling notice")
+  end
+
+  # A very short terminal must still show the highlight rather than collapsing to nothing.
+  def test_a_tiny_terminal_still_shows_at_least_the_minimum_rows
+    frame = frame_for(many_entries(40), 0, rows: 6).join("\n")
+
+    shown = (1..40).count { |n| frame.include?("project #{n}") }
+
+    assert_operator shown, :>=, SpecrelayRunner::TerminalMenu::MINIMUM_VISIBLE_ENTRIES
   end
 
   # --- rendering posture ----------------------------------------------------

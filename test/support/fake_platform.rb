@@ -486,12 +486,44 @@ class FakePlatform
   #
   # Read from the workspace contract rather than restated, so the only way to widen what a runner
   # test may assert is to widen the published contract — which is reviewed.
-  GENERATION_RESULT_CONTRACT =
-    File.expand_path("../../../contracts/runner/v1/specification-generation-result.schema.json", __dir__)
+  # The contract lives in the WORKSPACE, and this repository is checked out in one of two
+  # supported places relative to it:
+  #
+  #   standalone  <parent>/specrelay-runner        and <parent>/contracts
+  #   task        <workspace>/repositories/specrelay-runner and <workspace>/contracts
+  #
+  # Both are stated, in that order, rather than searched upwards: a resolver that walked parents
+  # would silently bind to whatever `contracts` directory it met first, which is exactly the kind
+  # of accident this fixture exists to prevent. Neither copies the schema, and neither weakens the
+  # check — the authoritative published document is read in both layouts.
+  CONTRACT_RELATIVE_PATH = "contracts/runner/v1/specification-generation-result.schema.json"
+  SUPPORTED_CONTRACT_ROOTS = [
+    File.expand_path("../../..", __dir__),
+    File.expand_path("../../../..", __dir__)
+  ].freeze
+
+  def self.generation_result_contract
+    @generation_result_contract ||= contract_in(SUPPORTED_CONTRACT_ROOTS)
+  end
+
+  # The first of the STATED roots that actually holds the contract. Public so both supported
+  # layouts can be exercised against synthetic roots rather than by moving this checkout.
+  #
+  # It fails loudly and says where it looked. A fixture that quietly skipped the check would let a
+  # runner test assert a field Platform drops on arrival and still pass, which is the defect this
+  # contract read exists to catch.
+  def self.contract_in(roots)
+    found = roots.map { |root| File.join(root, CONTRACT_RELATIVE_PATH) }.find { |path| File.file?(path) }
+    return found if found
+
+    raise "could not find #{CONTRACT_RELATIVE_PATH} in any supported layout. Looked in: " \
+          "#{roots.join(', ')}. The workspace contract is authoritative; do not copy it into " \
+          "this repository."
+  end
 
   def self.generation_result_keys
     @generation_result_keys ||=
-      JSON.parse(File.read(GENERATION_RESULT_CONTRACT)).fetch("properties").keys.freeze
+      JSON.parse(File.read(generation_result_contract)).fetch("properties").keys.freeze
   end
 
   def specification_generation(request)

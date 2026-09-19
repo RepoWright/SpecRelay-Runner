@@ -149,7 +149,121 @@ class DashboardTtyTest < Minitest::Test
     assert_includes attributes, "isig"
   end
 
+  # --- switching projects in a real terminal --------------------------------
+
+  # A, back, B, back, A again, through real raw mode and real keystrokes, at both required sizes.
+  #
+  # This is the half only a terminal can settle: that each selection really opens the project the
+  # operator chose, that returning goes back to the list rather than out, and that the shell is
+  # handed back afterwards. WHICH credential, workspace key and checkout each lane then uses is
+  # proved in `project_switching_test.rb` — this harness drives the legacy `--config` path
+  # precisely so it never touches a Keychain, which also means it cannot answer that question.
+  [ [ 120, 30 ], [ 80, 24 ] ].each do |columns, rows|
+    define_method(:"test_switching_between_two_projects_at_#{columns}x#{rows}") do
+      write_two_projects
+      # 1 opens the newest (beta), B goes back, 2 opens alpha, B back, 1 opens beta again.
+      output = drive([ "1", "B", "2", "B", "1", "B", "Q" ], columns: columns, rows: rows)
+
+      opened = output.scan(/local control center — (\w+)  ·  /).flatten
+
+      assert_equal %w[beta alpha beta], opened,
+                   "the menu did not open the projects that were selected, in order"
+      # Every frame stayed inside the terminal, so nothing the operator chose from scrolled away.
+      output.split(SpecrelayRunner::TerminalMenu::CLEAR).reject { |f| f.strip.empty? }.each do |frame|
+        assert_operator frame.split("\r\n").reject { |l| l.strip.empty? }.length, :<=, rows,
+                        "a frame overflowed a #{columns}x#{rows} terminal"
+      end
+    end
+  end
+
+  def test_switching_between_projects_leaves_the_terminal_cooked
+    write_two_projects
+
+    assert_cooked_after([ "1", "B", "2", "B", "Q" ])
+  end
+
+  # Returning from a project goes back to the LIST, not out of the dashboard, which is what makes
+  # switching possible without restarting the runner.
+  def test_going_back_from_a_project_returns_to_the_list
+    write_two_projects
+    output = drive([ "1", "B", "2", "B", "Q" ], columns: 120, rows: 30)
+
+    assert_operator output.scan("2 projects connected to this runner").length, :>=, 3,
+                    "the top-level list was not redrawn between selections"
+  end
+
+  # --- more projects than the terminal has lines ----------------------------
+
+  # Twelve projects in an ordinary 80x24 terminal. The list is longer than the screen, so the
+  # frame has to scroll: without a viewport every row is printed, the top of the frame leaves the
+  # screen, and the highlighted row and the footer go with it.
+  def test_a_long_project_list_keeps_the_frame_inside_an_ordinary_terminal
+    write_many_projects(12)
+    output = drive([ "Q" ], columns: 80, rows: 24)
+
+    assert_includes output, "12 projects connected to this runner"
+    frame = last_frame(output)
+
+    assert_operator frame.length, :<=, 24,
+                    "the frame is taller than the terminal, so its top scrolled away:\n#{frame.join("\n")}"
+    assert_includes frame.last, "Q quit", "the footer must survive a list longer than the screen"
+  end
+
+  # Thirty projects genuinely overflow an 80x24 terminal, so this is the case the viewport exists
+  # for. Up from the first row wraps past Quit and How-this-works to the LAST project — the row
+  # furthest outside the initial window, and the one a frame with no viewport could never show.
+  def test_the_last_project_stays_visible_when_the_list_scrolls
+    write_many_projects(30)
+    output = drive([ "\e[A", "\e[A", "\e[A", "Q" ], columns: 80, rows: 24)
+    frame = last_frame(output)
+
+    assert_operator frame.length, :<=, 24, "the scrolled frame is still taller than the terminal"
+    assert_match(/› .*project-01/, frame.join("\n"),
+                 "the last project is not visible while it is highlighted")
+    assert_includes frame.last, "Q quit", "the footer must stay visible while scrolled"
+    # The first project is off-screen now, which is what makes this a scrolled frame at all.
+    refute_includes frame.join("\n"), "project-30"
+  end
+
+  def test_a_scrolled_frame_says_how_many_projects_are_out_of_sight
+    write_many_projects(30)
+    frame = last_frame(drive([ "Q" ], columns: 80, rows: 24)).join("\n")
+
+    assert_match(/of 32/, frame, "the operator cannot tell that more rows exist")
+  end
+
+  def test_a_long_list_still_restores_the_terminal
+    write_many_projects(12)
+
+    assert_cooked_after([ "\e[B", "\e[B", "Q" ])
+  end
+
   private
+
+  # The frame the program drew last: everything after the final screen clear.
+  def last_frame(output)
+    output.split(SpecrelayRunner::TerminalMenu::CLEAR).last.to_s
+          .split("\r\n").reject { |line| line.strip.empty? }
+  end
+
+  # Two projects on one machine, each with its own slug — the shape an operator switches between.
+  # They deliberately share a workspace key, because that is the case where a menu that tracked
+  # the key rather than the project would open the wrong one.
+  def write_two_projects
+    entries = [ entry("shared", "2026-07-27T10:00:00Z", project_slug: "beta"),
+                entry("shared", "2026-07-20T10:00:00Z", project_slug: "alpha") ]
+    File.write(@state_file, JSON.pretty_generate("version" => 2, "connections" => entries))
+    File.chmod(0o600, @state_file)
+  end
+
+  # `count` projects, oldest last, so the numbered order in the list is stable.
+  def write_many_projects(count)
+    entries = (1..count).map do |n|
+      entry(format("project-%02d", n), format("2026-07-%02dT10:00:00Z", n))
+    end
+    File.write(@state_file, JSON.pretty_generate("version" => 2, "connections" => entries))
+    File.chmod(0o600, @state_file)
+  end
 
   # Two connections on one machine — the shape that used to refuse with "several workspaces are
   # connected". Local paths point at the temporary directory, so nothing outside it is read.
@@ -162,17 +276,19 @@ class DashboardTtyTest < Minitest::Test
     File.chmod(0o600, @state_file)
   end
 
-  def entry(workspace_key, connected_at)
+  def entry(workspace_key, connected_at, project_slug: "tiny-demo")
     { "base_url" => "http://127.0.0.1:65535", "runner_id" => "host-runner",
       "runner_public_id" => "rnr_fake", "runner_display_name" => "host runner",
-      "project_slug" => "tiny-demo", "workspace_key" => workspace_key, "project_key" => "tiny-demo",
+      "project_slug" => project_slug, "workspace_key" => workspace_key, "project_key" => project_slug,
       "workspace_display_name" => "Tiny Demo Workspace",
       "repository_url" => "https://github.com/SpecRelay/tiny-demo-workspace", "default_branch" => "main",
       "local_path" => @dir, "connected_at" => connected_at }
   end
 
   # Run the real `specrelay-runner` inside a pty and send `keys`.
-  def drive(keys) = pty_session([ RbConfig.ruby, runner_bin ], keys, env: child_env)
+  def drive(keys, columns: nil, rows: 40)
+    pty_session([ RbConfig.ruby, runner_bin ], keys, env: child_env, columns: columns, rows: rows)
+  end
 
   # Drive the dashboard, then ask the PTY ITSELF what state it is in — from a separate process, so
   # the answer does not depend on the program under test being honest about it.

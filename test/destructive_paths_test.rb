@@ -140,7 +140,8 @@ class DestructivePathsTest < Minitest::Test
 
     assert_equal 1, status, "a refused credential removal is an operation failure, not a success"
     assert_empty stored_keys, "the local entry really was removed, and the message must say so"
-    assert_match(/Removed the local connection for tiny-demo-workspace/, "#{out}#{err}")
+    assert_match(%r{Removed the local connection for \S+\#tiny-demo/tiny-demo-workspace},
+                 "#{out}#{err}")
     assert_match(/could NOT be removed and is still stored/, "#{out}#{err}")
     refute_match(/credential \(runner:rnr_fake\) was removed/, "#{out}#{err}")
     assert_equal [ RUNNER_ACCOUNT ], @secret_store.refused_deletes

@@ -135,14 +135,18 @@ leaves any previously-ready connection unable to authenticate.
 already holds; when Platform recognises it, nothing is rotated and step 7 is skipped. That is
 what stops a reconnect that fails later from taking a working machine offline.
 
-The credential is stored under ONE **runner-scoped** Keychain account
+The credential is stored under ONE **registration-scoped** Keychain account
 (`runner:<runner-public-id>`), because that is its actual scope —
-`registered_runners.credential_digest` is per runner, not per workspace. Connecting a second
-workspace on the same machine therefore presents the credential it already has and leaves the
-first workspace authenticating. Pre-round-003 per-workspace accounts are still READ as a
-fallback — for **every** workspace this machine has connected at that Platform, not only the one
-being connected, so a machine whose credential still sits under another workspace's account is
-not rotated out from under itself.
+`registered_runners.credential_digest` is per registered runner, not per workspace. A machine
+holds one registration per project, so connecting another workspace of a project it already
+knows presents that registration's credential and leaves it authenticating, while a NEW project
+is issued its own.
+
+The credential for a lane is resolved through that lane's registration and nothing else. A
+superseded per-workspace account is never read: it cannot say which project it belongs to — two
+projects may use the same workspace key — so reading one could authenticate a lane with another
+project's secret. A machine still holding one reconnects once, and its missing credential is
+reported with that remedy rather than silently substituted.
 
 It travels in a **header**, never the request body, so it cannot reach Rails' parameter log.
 
@@ -152,14 +156,30 @@ Two commands. `loop` is the normal mode for a connected machine; `claim-once` is
 the controlled single shot.
 
 ```bash
-bin/specrelay-runner loop                          # poll, claim one at a time, repeat
-bin/specrelay-runner loop --workspace <key>        # when several are connected here
-bin/specrelay-runner loop --poll-interval 300      # 5-3600s (default 10s)
-bin/specrelay-runner loop --on-failure stop        # end the session after a failed run
+bin/specrelay-runner loop                            # poll, claim one at a time, repeat
+bin/specrelay-runner loop --workspace <selector>     # when several are connected here
+bin/specrelay-runner loop --poll-interval 300        # 5-3600s (default 10s)
+bin/specrelay-runner loop --on-failure stop          # end the session after a failed run
 
-bin/specrelay-runner claim-once                    # exactly one claim, then exit
-bin/specrelay-runner claim-once --workspace <key>
+bin/specrelay-runner claim-once                      # exactly one claim, then exit
+bin/specrelay-runner claim-once --workspace <selector>
 ```
+
+**One of these runs at a time per OS user.** Both take one local lock
+(`~/.specrelay/runner/session.lock`) for the whole invocation, so a second is refused
+at once — before it probes a provider, reports presence, starts a connector or claims
+anything — whatever project, working directory, config or state file it names:
+
+```text
+another SpecRelay runner session is already running on this machine. Stop it first
+(Ctrl-C in its terminal), then start this one.
+```
+
+Stopping the first releases it: a clean finish, a startup failure and `Ctrl-C` all do,
+with nothing to clean up by hand. It is a same-user, same-machine guard, and every
+installation in concurrent use must be updated — an older binary does not take it.
+`connect`, the dashboard, listings and the readiness test are not sessions and stay
+usable while one runs.
 
 Neither needs a config file, an exported credential, a workspace-root environment
 variable, or a reviewer-provider environment variable: the credential is read from
@@ -183,8 +203,17 @@ sole stored connection. Anything else asks. The chosen source is printed, so the
 decision is visible rather than inferred:
 
 ```text
-Source:   connected workspace tiny-demo-workspace (your explicit default workspace)
+Source:   connected workspace https://platform.example.com#tiny-demo/tiny-demo-workspace (your explicit default workspace)
 ```
+
+**Selectors.** Platform scopes a workspace key to a project, so the same key can
+appear in two of them. A connection is named by the whole tuple — origin, project,
+workspace key — printed by `connections list` and `connections show`, and accepted by
+`--workspace` and every `connections` subcommand. `project/key` and the bare key work
+too, but only while they name exactly one connection; when one names several, nothing
+is claimed and nothing is read, and the runner lists the full selectors instead of
+choosing. The selector is a local label — Platform is still sent the raw workspace
+key.
 
 `claim-once` claims at most one eligible run (**Platform** decides which), executes
 it, and uploads the report. Exit `0` on completion, no eligible work, or a generated
@@ -741,10 +770,16 @@ Each row leads with the project and keeps its workspace key beside it:
  1  tiny-demo · tiny-demo-workspace · specrelay/tiny-demo-workspace@main · 2d ago
 ```
 
-The project is the operator's concept; the workspace key is the routing fact
-`--workspace` takes, and the only thing that distinguishes two connections to the
-same project. A record stored before project metadata existed falls back to the
-workspace key rather than to a guessed name.
+The project is the operator's concept; the workspace key is the routing fact Platform
+uses, and the only thing that distinguishes two connections to the same project. A
+record stored before project metadata existed falls back to the workspace key rather
+than to a guessed name.
+
+A machine may hold as many projects as it has connected — each with its own
+registration and credential — and adding one never disturbs another. The list scrolls
+to keep the highlighted row and the footer on screen, says how many rows are out of
+sight, and gives the first nine an immediate `1`–`9` shortcut; the rest are reached
+with the arrows.
 
 Keys match `./bin/worktree`: single-key shortcuts act immediately, arrows move a
 highlight that Enter runs, `Esc`/`Ctrl-C` backs out. The terminal is restored on
@@ -759,7 +794,7 @@ pass as a successful run that executed nothing.
 
 **The dashboard is a presentation layer and nothing else.** Every action calls one
 `ConnectionOperations` method — the same one the equivalent direct command calls —
-and `Start live loop` / `Claim once` hand `["loop", "--workspace", <key>]` to the
+and `Start live loop` / `Claim once` hand `["loop", "--workspace", <selector>]` to the
 CLI's own dispatcher. They cannot drift from the direct commands, because they
 *are* them; the command line is echoed before it runs so it can be copied.
 
@@ -774,14 +809,22 @@ Every action is also scriptable, needs no terminal, and never prompts:
 
 ```bash
 bin/specrelay-runner connections list
-bin/specrelay-runner connections show <workspace-key>
-bin/specrelay-runner connections test <workspace-key>
-bin/specrelay-runner connections default <workspace-key>
+bin/specrelay-runner connections show <selector>
+bin/specrelay-runner connections test <selector>
+bin/specrelay-runner connections default <selector>
 bin/specrelay-runner connections clear-default
-bin/specrelay-runner connections disconnect-local <workspace-key> [--remove-credential]
-bin/specrelay-runner connections disconnect-platform <workspace-key>
+bin/specrelay-runner connections disconnect-local <selector> [--remove-credential]
+bin/specrelay-runner connections disconnect-platform <selector>
 bin/specrelay-runner connections forget-legacy-credential <workspace-key>
 ```
+
+The default is stored as a full selector and pinned to the connection it names before
+another is added, so connecting a project that reuses a workspace key cannot move it.
+Two operations fail closed as a result: connecting while the stored default no longer
+names exactly one connection is refused **before the enrollment code is spent**, and
+removing one of the connections an ambiguous default names is refused because the
+survivor would silently inherit it. Settle it with `connections default <selector>` or
+`clear-default` first.
 
 Exit codes: `0` success, `1` an expected operation failure (Platform rejected it, a
 readiness check failed), `2` usage or unusable local state. `1` means "the answer
@@ -823,13 +866,13 @@ changes.
 | `disconnect-local` | Removes THIS machine's stored connection. Platform **still** authorizes this runner for that workspace — local deletion revokes nothing. |
 | `disconnect-platform` | Asks Platform to remove THIS runner's grant for THIS workspace. Never revokes the runner identity, never touches another workspace, and deletes no project, workspace, run, report, or branch. |
 
-The runner credential is scoped to the **runner identity**, so a local disconnect
-keeps it while any other local connection still uses it. When nothing depends on it
-any more you are asked separately (dashboard) or must pass `--remove-credential`
-(script). The pre-round-003 per-workspace Keychain item is removed only by
-`forget-legacy-credential`, which names the exact account it removes — nothing else
-in the runner ever deletes a legacy item, because a machine that connected under the
-old scheme still authenticates from it.
+The runner credential is scoped to the **registration**, one per project, so a local
+disconnect keeps it while any other local connection still uses it. When nothing
+depends on it any more you are asked separately (dashboard) or must pass
+`--remove-credential` (script). A superseded per-workspace Keychain item is removed
+only by `forget-legacy-credential`, which names the exact account it removes —
+nothing else in the runner ever deletes one. That command is cleanup only: such an
+item is no longer read to authenticate anything.
 
 Platform disconnect goes first; local removal is offered only after Platform
 confirms, and a **failed** Platform disconnect changes no local state.

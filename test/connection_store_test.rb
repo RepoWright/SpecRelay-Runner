@@ -25,11 +25,17 @@ class ConnectionStoreTest < Minitest::Test
 
   def store = SpecrelayRunner::ConnectionStore.new(@path)
 
+  # The full selector a connection made by `connection` answers to.
+  def selector(workspace_key, base_url: "http://127.0.0.1:3100", project_slug: "tiny-demo")
+    "#{base_url}#{SpecrelayRunner::ConnectionStore::PROJECT_SEPARATOR}#{project_slug}" \
+      "#{SpecrelayRunner::ConnectionStore::WORKSPACE_SEPARATOR}#{workspace_key}"
+  end
+
   def connection(workspace_key:, runner_public_id: "rnr_one", connected_at: "2026-07-20T10:00:00Z",
-                 reviewer_provider: nil)
+                 reviewer_provider: nil, project_slug: "tiny-demo", base_url: "http://127.0.0.1:3100")
     SpecrelayRunner::ConnectionStore::Connection.new(
-      base_url: "http://127.0.0.1:3100", runner_id: "host-runner", runner_public_id: runner_public_id,
-      runner_display_name: "host runner", project_slug: "tiny-demo", workspace_key: workspace_key,
+      base_url: base_url, runner_id: "host-runner", runner_public_id: runner_public_id,
+      runner_display_name: "host runner", project_slug: project_slug, workspace_key: workspace_key,
       project_key: "tiny-demo", workspace_display_name: "Tiny Demo Workspace",
       repository_url: "https://github.com/SpecRelay/tiny-demo-workspace", default_branch: "main",
       local_path: "/Users/someone/dev/tiny-demo-workspace", reviewer_provider: reviewer_provider,
@@ -42,7 +48,7 @@ class ConnectionStoreTest < Minitest::Test
   def test_a_missing_file_is_an_empty_but_readable_store
     assert_empty store.connections
     assert store.readable?, "a machine that has never connected is not a damaged machine"
-    assert_nil store.default_workspace_key
+    assert_nil store.default_selector
     assert_nil store.document_version
   end
 
@@ -75,7 +81,7 @@ class ConnectionStoreTest < Minitest::Test
 
     assert_equal [ "tiny-demo-workspace" ], store.connections.map(&:workspace_key)
     assert_equal 1, store.document_version
-    assert_nil store.default_workspace_key, "a version-1 file records no default"
+    assert_nil store.default_selector, "a version-1 file records no default"
     assert store.readable?
   end
 
@@ -102,14 +108,16 @@ class ConnectionStoreTest < Minitest::Test
     store.save(connection(workspace_key: "tiny-demo-workspace"))
     store.set_default("tiny-demo-workspace")
 
-    assert_equal "tiny-demo-workspace", store.default_workspace_key
-    assert store.default?("tiny-demo-workspace")
+    # A bare key that names exactly one connection is accepted, and STORED as the full selector
+    # so a project added later cannot make it ambiguous.
+    assert_equal selector("tiny-demo-workspace"), store.default_selector
+    assert store.default?(store.connections.first)
     assert_equal "tiny-demo-workspace", store.default_connection.workspace_key
     refute store.default_set_but_missing?
 
     store.clear_default
 
-    assert_nil store.default_workspace_key
+    assert_nil store.default_selector
     assert_nil store.default_connection
   end
 
@@ -117,7 +125,7 @@ class ConnectionStoreTest < Minitest::Test
     store.save(connection(workspace_key: "tiny-demo-workspace"))
     store.set_default("tiny-demo-workspace")
 
-    assert_equal "tiny-demo-workspace", document["default_workspace_key"]
+    assert_equal selector("tiny-demo-workspace"), document["default_workspace_key"]
   end
 
   # Storing an unresolvable default would only move the failure later, to a `loop` that then
@@ -127,15 +135,15 @@ class ConnectionStoreTest < Minitest::Test
 
     error = assert_raises(SpecrelayRunner::ConnectionStore::Error) { store.set_default("not-connected") }
 
-    assert_match(/no connection for workspace 'not-connected'/, error.message)
-    assert_nil store.default_workspace_key, "a refused default must not be written"
+    assert_match(/no longer names a connection/, error.message)
+    assert_nil store.default_selector, "a refused default must not be written"
   end
 
   def test_a_default_that_was_hand_edited_to_a_missing_workspace_is_reported_not_resolved
     write_raw("version" => 2, "default_workspace_key" => "gone",
               "connections" => [ connection(workspace_key: "tiny-demo-workspace").to_h_document ])
 
-    assert_equal "gone", store.default_workspace_key
+    assert_equal "gone", store.default_selector
     assert_nil store.default_connection, "it must never resolve to another workspace"
     assert store.default_set_but_missing?
   end
@@ -145,7 +153,105 @@ class ConnectionStoreTest < Minitest::Test
     store.set_default("first")
     store.save(connection(workspace_key: "second", connected_at: "2026-07-28T00:00:00Z"))
 
-    assert_equal "first", store.default_workspace_key
+    assert_equal selector("first"), store.default_selector
+  end
+
+  # --- composite identity ---------------------------------------------------
+
+  # The same workspace key in two projects is a state Platform allows, so the store has to keep
+  # both. Treating the key as the identity silently replaced the first record with the second.
+  def test_the_same_workspace_key_in_two_projects_is_two_connections
+    store.save(connection(workspace_key: "shared", project_slug: "alpha"))
+    store.save(connection(workspace_key: "shared", project_slug: "beta",
+                          connected_at: "2026-07-28T00:00:00Z"))
+
+    assert_equal 2, store.connections.length
+    assert_equal %w[alpha beta], store.connections.map(&:project_slug).sort
+  end
+
+  def test_re_saving_the_same_identity_replaces_that_one_entry
+    store.save(connection(workspace_key: "shared", project_slug: "alpha"))
+    store.save(connection(workspace_key: "shared", project_slug: "alpha",
+                          connected_at: "2026-07-28T00:00:00Z"))
+
+    assert_equal 1, store.connections.length
+    assert_equal "2026-07-28T00:00:00Z", store.connections.first.connected_at
+  end
+
+  def test_a_bare_key_resolves_only_while_it_names_one_connection
+    store.save(connection(workspace_key: "shared", project_slug: "alpha"))
+
+    assert store.resolve("shared").resolved?
+
+    store.save(connection(workspace_key: "shared", project_slug: "beta",
+                          connected_at: "2026-07-28T00:00:00Z"))
+    ambiguous = store.resolve("shared")
+
+    refute ambiguous.resolved?, "a key naming two projects must resolve to neither"
+    assert ambiguous.ambiguous?
+    assert_equal 2, ambiguous.matches.length
+  end
+
+  def test_a_project_qualified_selector_tells_two_duplicate_keys_apart
+    store.save(connection(workspace_key: "shared", project_slug: "alpha"))
+    store.save(connection(workspace_key: "shared", project_slug: "beta",
+                          connected_at: "2026-07-28T00:00:00Z"))
+
+    assert_equal "alpha", store.resolve("alpha/shared").connection.project_slug
+    assert_equal "beta", store.resolve("beta/shared").connection.project_slug
+  end
+
+  # Two origins may host the same project slug and workspace key, which is why the origin is
+  # part of the identity rather than a display field.
+  def test_the_platform_origin_is_part_of_the_identity
+    store.save(connection(workspace_key: "shared", project_slug: "alpha"))
+    store.save(connection(workspace_key: "shared", project_slug: "alpha",
+                          base_url: "http://127.0.0.1:3999", connected_at: "2026-07-28T00:00:00Z"))
+
+    assert_equal 2, store.connections.length
+    assert_equal "http://127.0.0.1:3999",
+                 store.resolve(selector("shared", base_url: "http://127.0.0.1:3999",
+                                        project_slug: "alpha")).connection.base_url
+  end
+
+  def test_a_record_without_a_project_still_has_one_identity
+    write_raw("version" => 2,
+              "connections" => [ connection(workspace_key: "legacy")
+                                   .to_h_document.merge("project_slug" => nil) ])
+
+    identity = SpecrelayRunner::ConnectionStore.selector_for(store.connections.first)
+
+    assert_equal selector("legacy", project_slug: SpecrelayRunner::ConnectionStore::UNKNOWN_PROJECT),
+                 identity
+    assert store.resolve(identity).resolved?
+  end
+
+  # --- the default across a duplicate key -----------------------------------
+
+  # The case a bare default cannot survive: it was set when the key was unique, and a second
+  # project then reused it. Pinning it to the full selector BEFORE the new record lands is what
+  # keeps it attached to the connection the operator actually chose.
+  def test_an_existing_bare_default_is_pinned_before_a_colliding_record_is_added
+    store.save(connection(workspace_key: "shared", project_slug: "alpha"))
+    write_raw(JSON.parse(File.read(@path)).merge("default_workspace_key" => "shared"))
+    store.save(connection(workspace_key: "shared", project_slug: "beta",
+                          connected_at: "2026-07-28T00:00:00Z"))
+
+    assert_equal selector("shared", project_slug: "alpha"), store.default_selector
+    assert_equal "alpha", store.default_connection.project_slug
+  end
+
+  # Adding a record while the stored default resolves to nothing would let it attach to the new
+  # one. It is refused where the operator can still fix it, and nothing is written.
+  def test_saving_is_refused_while_the_stored_default_cannot_resolve
+    store.save(connection(workspace_key: "first"))
+    write_raw(JSON.parse(File.read(@path)).merge("default_workspace_key" => "gone"))
+
+    assert_raises(SpecrelayRunner::ConnectionStore::Error) do
+      store.save(connection(workspace_key: "second", connected_at: "2026-07-28T00:00:00Z"))
+    end
+
+    assert_equal [ "first" ], store.connections.map(&:workspace_key)
   end
 
   # --- delete ---------------------------------------------------------------
@@ -154,7 +260,7 @@ class ConnectionStoreTest < Minitest::Test
     store.save(connection(workspace_key: "keep"))
     store.save(connection(workspace_key: "drop", connected_at: "2026-07-28T00:00:00Z"))
 
-    removed = store.delete("drop")
+    removed = store.delete(selector("drop"))
 
     assert_equal "drop", removed.workspace_key
     assert_equal [ "keep" ], store.connections.map(&:workspace_key)
@@ -176,7 +282,7 @@ class ConnectionStoreTest < Minitest::Test
 
     store.delete("going")
 
-    assert_nil store.default_workspace_key
+    assert_nil store.default_selector
     refute store.default_set_but_missing?
     assert_equal [ "other" ], store.connections.map(&:workspace_key)
   end
@@ -188,7 +294,56 @@ class ConnectionStoreTest < Minitest::Test
 
     store.delete("drop")
 
-    assert_equal "keep", store.default_workspace_key
+    assert_equal selector("keep"), store.default_selector
+  end
+
+  # An ambiguous default is safe only while it stays ambiguous: it refuses every bare claim.
+  # Removing one of the two connections it names would leave the SAME stored string resolving to
+  # the survivor, so a project the operator never chose would silently become their explicit
+  # default. The deletion is refused, and nothing is written.
+  def test_removing_a_connection_an_ambiguous_default_names_is_refused
+    store.save(connection(workspace_key: "shared", project_slug: "alpha"))
+    store.save(connection(workspace_key: "shared", project_slug: "beta",
+                          connected_at: "2026-07-28T00:00:00Z"))
+    write_raw(JSON.parse(File.read(@path)).merge("default_workspace_key" => "shared"))
+
+    error = assert_raises(SpecrelayRunner::ConnectionStore::AmbiguousDefault) do
+      store.delete(selector("shared", project_slug: "beta"))
+    end
+
+    assert_match(/names 2 connections/, error.message)
+    assert_equal 2, store.connections.length, "the refusal must not have written anything"
+    assert_equal "shared", store.default_selector
+  end
+
+  # The operator settles it with the action that exists for it, and the removal is then ordinary.
+  def test_settling_the_default_first_allows_the_same_removal
+    store.save(connection(workspace_key: "shared", project_slug: "alpha"))
+    store.save(connection(workspace_key: "shared", project_slug: "beta",
+                          connected_at: "2026-07-28T00:00:00Z"))
+    store.set_default(selector("shared", project_slug: "alpha"))
+
+    store.delete(selector("shared", project_slug: "beta"))
+
+    assert_equal [ "alpha" ], store.connections.map(&:project_slug)
+    assert_equal "alpha", store.default_connection.project_slug
+  end
+
+  # The rule is about the connections the ambiguous default NAMES. Removing an unrelated one is
+  # ordinary cleanup: the default stays ambiguous, so it stays fail-closed.
+  def test_removing_a_connection_an_ambiguous_default_does_not_name_is_allowed
+    store.save(connection(workspace_key: "shared", project_slug: "alpha"))
+    store.save(connection(workspace_key: "shared", project_slug: "beta",
+                          connected_at: "2026-07-28T00:00:00Z"))
+    store.save(connection(workspace_key: "other", project_slug: "gamma",
+                          connected_at: "2026-07-29T00:00:00Z"))
+    write_raw(JSON.parse(File.read(@path)).merge("default_workspace_key" => "shared"))
+
+    store.delete(selector("other", project_slug: "gamma"))
+
+    assert_equal 2, store.connections.length
+    assert_nil store.default_connection, "the default must still resolve to nothing"
+    assert store.resolve(store.default_selector).ambiguous?
   end
 
   # --- damaged state --------------------------------------------------------
@@ -229,7 +384,7 @@ class ConnectionStoreTest < Minitest::Test
     write_raw("connections" => [ connection(workspace_key: "partial").to_h_document
                                   .merge("local_path" => "", "runner_public_id" => nil) ])
 
-    found = store.connection_for("partial")
+    found = store.resolve("partial").connection
 
     refute found.complete?
     assert_equal %i[runner_public_id local_path], found.missing_fields
@@ -238,8 +393,8 @@ class ConnectionStoreTest < Minitest::Test
   def test_a_complete_entry_reports_itself_complete
     store.save(connection(workspace_key: "whole"))
 
-    assert store.connection_for("whole").complete?
-    assert_empty store.connection_for("whole").missing_fields
+    assert store.resolve("whole").connection.complete?
+    assert_empty store.resolve("whole").connection.missing_fields
   end
 
   # --- the stored reviewer selection (MAPIAI-91) -----------------------------
@@ -250,7 +405,7 @@ class ConnectionStoreTest < Minitest::Test
   def test_a_selected_reviewer_provider_round_trips_and_carries_no_launch_configuration
     store.save(connection(workspace_key: "reviewing", reviewer_provider: "claude"))
 
-    assert_equal "claude", store.connection_for("reviewing").reviewer_provider
+    assert_equal "claude", store.resolve("reviewing").connection.reviewer_provider
     entry = document["connections"].first
 
     assert_equal "claude", entry["reviewer_provider"]
@@ -263,7 +418,7 @@ class ConnectionStoreTest < Minitest::Test
   def test_a_connection_with_no_selected_reviewer_provider_reports_none_and_stays_complete
     store.save(connection(workspace_key: "executing"))
 
-    found = store.connection_for("executing")
+    found = store.resolve("executing").connection
 
     assert_nil found.reviewer_provider
     assert found.complete?
@@ -273,7 +428,7 @@ class ConnectionStoreTest < Minitest::Test
     write_raw("version" => 2,
               "connections" => [ connection(workspace_key: "older").to_h_document.tap { |e| e.delete("reviewer_provider") } ])
 
-    found = store.connection_for("older")
+    found = store.resolve("older").connection
 
     assert_equal "older", found.workspace_key
     assert_nil found.reviewer_provider
