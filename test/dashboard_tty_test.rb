@@ -149,6 +149,49 @@ class DashboardTtyTest < Minitest::Test
     assert_includes attributes, "isig"
   end
 
+  # --- switching projects in a real terminal --------------------------------
+
+  # A, back, B, back, A again, through real raw mode and real keystrokes, at both required sizes.
+  #
+  # This is the half only a terminal can settle: that each selection really opens the project the
+  # operator chose, that returning goes back to the list rather than out, and that the shell is
+  # handed back afterwards. WHICH credential, workspace key and checkout each lane then uses is
+  # proved in `project_switching_test.rb` — this harness drives the legacy `--config` path
+  # precisely so it never touches a Keychain, which also means it cannot answer that question.
+  [ [ 120, 30 ], [ 80, 24 ] ].each do |columns, rows|
+    define_method(:"test_switching_between_two_projects_at_#{columns}x#{rows}") do
+      write_two_projects
+      # 1 opens the newest (beta), B goes back, 2 opens alpha, B back, 1 opens beta again.
+      output = drive([ "1", "B", "2", "B", "1", "B", "Q" ], columns: columns, rows: rows)
+
+      opened = output.scan(/local control center — (\w+)  ·  /).flatten
+
+      assert_equal %w[beta alpha beta], opened,
+                   "the menu did not open the projects that were selected, in order"
+      # Every frame stayed inside the terminal, so nothing the operator chose from scrolled away.
+      output.split(SpecrelayRunner::TerminalMenu::CLEAR).reject { |f| f.strip.empty? }.each do |frame|
+        assert_operator frame.split("\r\n").reject { |l| l.strip.empty? }.length, :<=, rows,
+                        "a frame overflowed a #{columns}x#{rows} terminal"
+      end
+    end
+  end
+
+  def test_switching_between_projects_leaves_the_terminal_cooked
+    write_two_projects
+
+    assert_cooked_after([ "1", "B", "2", "B", "Q" ])
+  end
+
+  # Returning from a project goes back to the LIST, not out of the dashboard, which is what makes
+  # switching possible without restarting the runner.
+  def test_going_back_from_a_project_returns_to_the_list
+    write_two_projects
+    output = drive([ "1", "B", "2", "B", "Q" ], columns: 120, rows: 30)
+
+    assert_operator output.scan("2 projects connected to this runner").length, :>=, 3,
+                    "the top-level list was not redrawn between selections"
+  end
+
   # --- more projects than the terminal has lines ----------------------------
 
   # Twelve projects in an ordinary 80x24 terminal. The list is longer than the screen, so the
@@ -203,6 +246,16 @@ class DashboardTtyTest < Minitest::Test
           .split("\r\n").reject { |line| line.strip.empty? }
   end
 
+  # Two projects on one machine, each with its own slug — the shape an operator switches between.
+  # They deliberately share a workspace key, because that is the case where a menu that tracked
+  # the key rather than the project would open the wrong one.
+  def write_two_projects
+    entries = [ entry("shared", "2026-07-27T10:00:00Z", project_slug: "beta"),
+                entry("shared", "2026-07-20T10:00:00Z", project_slug: "alpha") ]
+    File.write(@state_file, JSON.pretty_generate("version" => 2, "connections" => entries))
+    File.chmod(0o600, @state_file)
+  end
+
   # `count` projects, oldest last, so the numbered order in the list is stable.
   def write_many_projects(count)
     entries = (1..count).map do |n|
@@ -223,10 +276,10 @@ class DashboardTtyTest < Minitest::Test
     File.chmod(0o600, @state_file)
   end
 
-  def entry(workspace_key, connected_at)
+  def entry(workspace_key, connected_at, project_slug: "tiny-demo")
     { "base_url" => "http://127.0.0.1:65535", "runner_id" => "host-runner",
       "runner_public_id" => "rnr_fake", "runner_display_name" => "host runner",
-      "project_slug" => "tiny-demo", "workspace_key" => workspace_key, "project_key" => "tiny-demo",
+      "project_slug" => project_slug, "workspace_key" => workspace_key, "project_key" => project_slug,
       "workspace_display_name" => "Tiny Demo Workspace",
       "repository_url" => "https://github.com/SpecRelay/tiny-demo-workspace", "default_branch" => "main",
       "local_path" => @dir, "connected_at" => connected_at }
