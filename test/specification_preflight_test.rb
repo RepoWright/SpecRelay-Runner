@@ -328,6 +328,14 @@ class SpecificationPreflightTest < Minitest::Test
   # at the file level and at the git level.
   def assert_disjoint_state_root_refusal(state_root)
     start_platform(spec_creation_payload_for(issue_key: ISSUE))
+    # The session lock is a pre-existing local RESOURCE, not generated content. Every
+    # work-running command opens `$HOME/.specrelay/runner/session.lock` before it decides
+    # anything, and this fixture deliberately points HOME at the very checkout it snapshots — so
+    # the empty lock file appears on one side of a comparison that is asking a different
+    # question. Creating it here, through the real owner and the same HOME the run will use,
+    # puts it on BOTH sides. Nothing is excluded and no assertion is relaxed: an unexpected file
+    # still fails the snapshot, and the disjointness check below is untouched.
+    SpecrelayRunner::SessionLock.hold(env: SpecificationWorkspace.lane_env(state_root)) {}
     files = { specs: snapshot(@specs), source: snapshot(@source) }
     # Only the seed is a git checkout in this fixture; the source is a plain directory, so it is
     # compared at the file level alone.
