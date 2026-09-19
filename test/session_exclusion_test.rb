@@ -158,6 +158,58 @@ class SessionExclusionTest < Minitest::Test
     end
   end
 
+  # --- the lock path itself cannot be opened --------------------------------
+
+  # A regular file where the lock's directory belongs. `flock` never gets a chance, so the session
+  # cannot be acquired for a reason that is neither "free" nor "held" — an expected environment
+  # failure the command must report, not an exception that escapes the CLI with no message.
+  def block_lock_path = File.write(File.join(@home, ".specrelay"), "not a directory")
+
+  def test_an_unopenable_lock_path_is_an_expected_failure_for_both_execution_commands
+    block_lock_path
+
+    %w[loop claim-once].each do |command|
+      out, err, status = run_cli([ command ])
+
+      assert_equal SpecrelayRunner::CLI::USAGE_ERROR, status,
+                   "#{command} did not report the lock path as unusable local state"
+      assert_match(/session lock/, err, "#{command} printed no operator message")
+      assert_match(/directory exists and this user can write to it/, err,
+                   "#{command} named no remedy")
+      assert_equal "", out
+    end
+  end
+
+  # The refusal happens at the session boundary, so nothing downstream starts: no connection is
+  # resolved, no credential is read, and Platform is never contacted.
+  def test_an_unopenable_lock_path_has_no_startup_side_effects
+    platform = FakePlatform.new(claim_payload: claim_payload_for(task_id: "DEMO-171")).start
+    connected = connected_state_file(platform.base_url)
+    block_lock_path
+
+    _out, err, status = run_cli([ "claim-once" ], overrides: { "SPECRELAY_RUNNER_STATE_FILE" => connected })
+
+    refute_equal 0, status
+    assert_empty platform.requests, "the refused command reached Platform"
+    refute_match(/not connected to a workspace/, err, "it resolved a connection before refusing")
+  ensure
+    platform&.stop
+  end
+
+  def test_the_session_works_again_once_the_lock_path_is_repaired
+    block_lock_path
+
+    assert_equal SpecrelayRunner::CLI::USAGE_ERROR, run_cli([ "claim-once" ]).last
+
+    File.delete(File.join(@home, ".specrelay"))
+    _out, err, status = run_cli([ "loop" ])
+
+    # Past the session boundary now: it fails on the connection instead, which is the next gate.
+    assert_equal SpecrelayRunner::CLI::USAGE_ERROR, status
+    assert_match(/not connected to a workspace/, err)
+    assert File.file?(SpecrelayRunner::SessionLock.path(env: env)), "the lock file was created"
+  end
+
   # --- real processes -------------------------------------------------------
 
   # Two real invocations, in different working directories, with different state files and a
@@ -264,10 +316,11 @@ class SessionExclusionTest < Minitest::Test
 
   # Run the CLI in this process, which is where the guard's ordering relative to connection
   # resolution and the provider gate is observable.
-  def run_cli(argv)
+  def run_cli(argv, overrides: {})
     out = StringIO.new
     err = StringIO.new
-    status = SpecrelayRunner::CLI.new(out: out, err: err, env: env, input: StringIO.new).run(argv)
+    status = SpecrelayRunner::CLI.new(out: out, err: err, env: env(overrides),
+                                      input: StringIO.new).run(argv)
     [ out.string, err.string, status ]
   end
 

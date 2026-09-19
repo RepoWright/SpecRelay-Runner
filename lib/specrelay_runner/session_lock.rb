@@ -90,7 +90,8 @@ module SpecrelayRunner
       file.close_on_exec = true
       file
     rescue SystemCallError, IOError => e
-      raise Error, "could not open the runner session lock #{path} (#{e.class})"
+      raise Error, "could not open the runner session lock #{path} (#{e.class}). Make sure that " \
+                   "path's directory exists and this user can write to it, then try again."
     end
   end
 end

@@ -35,6 +35,11 @@ module SpecrelayRunner
   class ConnectionStore
     Error = Class.new(StandardError)
 
+    # A deletion refused because it would hand an ambiguous default to the connection that
+    # survives it. Named separately from the other store errors because its remedy is the
+    # operator's own set/clear-default action, not "the file could not be written".
+    AmbiguousDefault = Class.new(Error)
+
     VERSION = 2
     DEFAULT_RELATIVE_PATH = ".specrelay/runner/connections.json"
     # The top-level key holding the operator's explicit default selection. Non-secret, like
@@ -277,6 +282,7 @@ module SpecrelayRunner
       return nil if removed.nil?
 
       identity = self.class.selector_for(removed)
+      refuse_silent_default_handover!(identity)
       remaining = connections.reject { |connection| self.class.selector_for(connection) == identity }
       write_connections(remaining, surviving_default(removed))
       removed
@@ -284,10 +290,36 @@ module SpecrelayRunner
 
     private
 
+    # An ambiguous default fails closed only while it stays ambiguous. Remove one of the
+    # connections it names and the SAME stored string resolves to whichever one survives — so a
+    # project the operator never chose silently acquires the authority of an explicit default, and
+    # the next bare `loop` claims its work while announcing it as the operator's own choice.
+    #
+    # Refused before anything is written, because the operator has two direct ways to say which
+    # project they meant and neither of them is a deletion. Removing a connection the ambiguous
+    # default does NOT name is unaffected: the default stays ambiguous and stays fail-closed.
+    def refuse_silent_default_handover!(identity)
+      stored = default_selector
+      return if stored.nil?
+
+      resolution = resolve(stored)
+      return unless resolution.ambiguous?
+
+      named = resolution.matches.map { |connection| self.class.selector_for(connection) }
+      return unless named.include?(identity)
+
+      raise AmbiguousDefault, silent_handover_message(stored, named, identity)
+    end
+
+    def silent_handover_message(stored, named, identity)
+      survivors = named.reject { |selector| selector == identity }
+      "the default '#{stored}' names #{named.length} connections, so removing #{identity} would " \
+        "leave it silently pointing at #{survivors.join(' or ')}."
+    end
+
     # The default to keep after one connection is removed: cleared when it named the removed one,
-    # and otherwise left exactly as stored. Resolved leniently on purpose — an operator removing
-    # one of two records that made a bare default ambiguous is fixing that state, and refusing the
-    # removal would leave them with no way to.
+    # and otherwise left exactly as stored. An ambiguous default that named the removed connection
+    # cannot reach here — `#refuse_silent_default_handover!` has already refused that deletion.
     def surviving_default(removed)
       stored = default_selector
       return nil if stored.nil?

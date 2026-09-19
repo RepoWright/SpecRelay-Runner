@@ -117,11 +117,21 @@ module SpecrelayRunner
     # `connect`, the dashboard, listings, readiness tests and help are not execution sessions and
     # take nothing: an operator must still be able to look at, fix, and choose a connection while
     # a session is running.
+    # Both ways acquiring the session can fail are EXPECTED, and each carries its own exit code:
+    # another session holding it is "the answer is no" (1), and a lock path this user cannot open
+    # is local state that cannot be used (2) — the same distinction the `connections` commands
+    # document, so a wrapper script can tell "try later" from "fix your setup".
+    #
+    # Only these two named classes are caught. The block is the whole command, so a broad rescue
+    # here would swallow work-execution failures and report them as a session problem.
     def in_session(&block)
       SessionLock.hold(env: env, &block)
     rescue SessionLock::Busy => e
       err.puts e.message
       RUN_FAILED
+    rescue SessionLock::Error => e
+      err.puts e.message
+      USAGE_ERROR
     end
 
     def secret_store = @injected_secret_store || SecretStore.for(platform: RUBY_PLATFORM)

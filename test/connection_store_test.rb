@@ -297,18 +297,53 @@ class ConnectionStoreTest < Minitest::Test
     assert_equal selector("keep"), store.default_selector
   end
 
-  # Removing one of two records that share a key is how an operator FIXES an ambiguous default,
-  # so it must not be refused — and the surviving record's default must not be cleared with it.
-  def test_removing_one_of_two_duplicate_keys_is_allowed_while_a_bare_default_is_ambiguous
+  # An ambiguous default is safe only while it stays ambiguous: it refuses every bare claim.
+  # Removing one of the two connections it names would leave the SAME stored string resolving to
+  # the survivor, so a project the operator never chose would silently become their explicit
+  # default. The deletion is refused, and nothing is written.
+  def test_removing_a_connection_an_ambiguous_default_names_is_refused
     store.save(connection(workspace_key: "shared", project_slug: "alpha"))
     store.save(connection(workspace_key: "shared", project_slug: "beta",
                           connected_at: "2026-07-28T00:00:00Z"))
     write_raw(JSON.parse(File.read(@path)).merge("default_workspace_key" => "shared"))
 
+    error = assert_raises(SpecrelayRunner::ConnectionStore::AmbiguousDefault) do
+      store.delete(selector("shared", project_slug: "beta"))
+    end
+
+    assert_match(/names 2 connections/, error.message)
+    assert_equal 2, store.connections.length, "the refusal must not have written anything"
+    assert_equal "shared", store.default_selector
+  end
+
+  # The operator settles it with the action that exists for it, and the removal is then ordinary.
+  def test_settling_the_default_first_allows_the_same_removal
+    store.save(connection(workspace_key: "shared", project_slug: "alpha"))
+    store.save(connection(workspace_key: "shared", project_slug: "beta",
+                          connected_at: "2026-07-28T00:00:00Z"))
+    store.set_default(selector("shared", project_slug: "alpha"))
+
     store.delete(selector("shared", project_slug: "beta"))
 
     assert_equal [ "alpha" ], store.connections.map(&:project_slug)
     assert_equal "alpha", store.default_connection.project_slug
+  end
+
+  # The rule is about the connections the ambiguous default NAMES. Removing an unrelated one is
+  # ordinary cleanup: the default stays ambiguous, so it stays fail-closed.
+  def test_removing_a_connection_an_ambiguous_default_does_not_name_is_allowed
+    store.save(connection(workspace_key: "shared", project_slug: "alpha"))
+    store.save(connection(workspace_key: "shared", project_slug: "beta",
+                          connected_at: "2026-07-28T00:00:00Z"))
+    store.save(connection(workspace_key: "other", project_slug: "gamma",
+                          connected_at: "2026-07-29T00:00:00Z"))
+    write_raw(JSON.parse(File.read(@path)).merge("default_workspace_key" => "shared"))
+
+    store.delete(selector("other", project_slug: "gamma"))
+
+    assert_equal 2, store.connections.length
+    assert_nil store.default_connection, "the default must still resolve to nothing"
+    assert store.resolve(store.default_selector).ambiguous?
   end
 
   # --- damaged state --------------------------------------------------------

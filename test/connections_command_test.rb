@@ -394,6 +394,73 @@ class ConnectionsCommandTest < Minitest::Test
     refute_includes @secret_store.deletes, "workspace:tiny-demo-workspace"
   end
 
+  # --- an ambiguous default is settled by the operator, never by a deletion -----
+
+  # An ambiguous default fails closed only while it stays ambiguous. Remove one of the two
+  # connections it names and the SAME stored string resolves to the survivor — so a project the
+  # operator never chose silently acquires the authority of an explicit default, and the next bare
+  # claim runs its work while announcing it as their own choice.
+  def test_removing_a_connection_an_ambiguous_default_names_is_refused
+    store_ambiguous_default_pair
+    @platform.offer_no_work!
+
+    assert_equal 2, run_cli(%w[claim-once]).first, "an ambiguous default must fail closed first"
+
+    status, _out, err = run_cli([ "connections", "disconnect-local", alpha_selector ])
+
+    assert_equal 2, status
+    assert_match(/names 2 connections/, err)
+    assert_match(/connections default <selector>/, err)
+    assert_match(/clear-default/, err)
+  end
+
+  # Refused BEFORE any local-state or credential change, so the machine is exactly as it was.
+  def test_the_refused_removal_changes_no_local_state_and_no_credential
+    store_ambiguous_default_pair
+    @platform.offer_no_work!
+
+    run_cli([ "connections", "disconnect-local", alpha_selector ])
+
+    assert_equal 2, stored_keys.length, "the entry was removed despite the refusal"
+    assert_empty @secret_store.deletes, "a credential was touched despite the refusal"
+    assert_equal "shared", document["default_workspace_key"], "the stored default was rewritten"
+    # And it still fails closed, rather than having quietly settled on one project.
+    assert_equal 2, run_cli(%w[claim-once]).first
+    assert_empty @platform.requests_to("/api/runner/claim")
+  end
+
+  # The operator settles it with the action that exists for exactly this, and the removal then
+  # behaves normally — including clearing a default that named the connection being removed.
+  def test_settling_the_default_first_lets_the_removal_proceed
+    store_ambiguous_default_pair
+
+    assert_equal 0, run_cli([ "connections", "default", alpha_selector ]).first
+    assert_equal 0, run_cli([ "connections", "disconnect-local", beta_selector ]).first
+    assert_equal 1, stored_keys.length
+    assert_equal alpha_selector, document["default_workspace_key"]
+
+    assert_equal 0, run_cli([ "connections", "disconnect-local", alpha_selector ]).first
+    assert_nil document["default_workspace_key"], "removing the default connection clears it"
+  end
+
+  # The refusal is about the connections the ambiguous default NAMES. An unrelated one is ordinary
+  # cleanup: the default stays ambiguous, so it stays fail-closed and nothing is handed over.
+  def test_removing_an_unrelated_connection_is_unaffected_by_an_ambiguous_default
+    # Every record first, THEN the bare default: adding one while the default is already
+    # ambiguous is separately refused, which is the write-side half of the same rule.
+    store_connection("shared", project_slug: "alpha")
+    store_connection("shared", project_slug: "beta", connected_at: "2026-07-27T10:00:00Z")
+    store_connection("other", project_slug: "gamma", connected_at: "2026-07-28T10:00:00Z")
+    rewrite_state { |doc| doc["default_workspace_key"] = "shared" }
+    @platform.offer_no_work!
+
+    status, = run_cli([ "connections", "disconnect-local", selector("other", project_slug: "gamma") ])
+
+    assert_equal 0, status
+    assert_equal %w[shared shared], stored_keys.sort
+    assert_equal 2, run_cli(%w[claim-once]).first, "the default is still ambiguous and still refuses"
+  end
+
   # --- disconnect-platform --------------------------------------------------
 
   def test_platform_disconnect_removes_the_grant_and_leaves_local_state_alone
@@ -505,17 +572,29 @@ class ConnectionsCommandTest < Minitest::Test
     { "SPECRELAY_RUNNER_STATE_FILE" => @state_file, "PATH" => ENV.fetch("PATH", "") }
   end
 
-  def store_connection(workspace_key, runner_public_id: "rnr_fake", connected_at: "2026-07-20T10:00:00Z")
+  def store_connection(workspace_key, runner_public_id: "rnr_fake", connected_at: "2026-07-20T10:00:00Z",
+                       project_slug: "tiny-demo")
     SpecrelayRunner::ConnectionStore.new(@state_file).save(
       SpecrelayRunner::ConnectionStore::Connection.new(
         base_url: @platform.base_url, runner_id: "host-runner", runner_public_id: runner_public_id,
-        runner_display_name: "host runner", project_slug: "tiny-demo", workspace_key: workspace_key,
-        project_key: "tiny-demo", workspace_display_name: "Tiny Demo Workspace",
+        runner_display_name: "host runner", project_slug: project_slug, workspace_key: workspace_key,
+        project_key: project_slug, workspace_display_name: "Tiny Demo Workspace",
         repository_url: REPOSITORY, default_branch: "main", local_path: @checkout,
         connected_at: connected_at
       )
     )
   end
+
+  # Two projects using the same workspace key, with a bare default that therefore names both —
+  # the state a machine reaches by setting a default and later connecting a second project.
+  def store_ambiguous_default_pair
+    store_connection("shared", project_slug: "alpha")
+    store_connection("shared", project_slug: "beta", connected_at: "2026-07-27T10:00:00Z")
+    rewrite_state { |doc| doc["default_workspace_key"] = "shared" }
+  end
+
+  def alpha_selector = selector("shared", project_slug: "alpha")
+  def beta_selector = selector("shared", project_slug: "beta")
 
   def stored_keys = SpecrelayRunner::ConnectionStore.new(@state_file).connections.map(&:workspace_key)
 

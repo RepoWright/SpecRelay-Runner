@@ -161,8 +161,20 @@ module SpecrelayRunner
       Outcome.new(ok: credential[:state] != :remove_failed,
                   message: local_disconnect_message(removed, credential),
                   remedy: credential[:remedy], payload: credential)
+    rescue ConnectionStore::AmbiguousDefault => e
+      unsettled_default(e)
     rescue ConnectionStore::Error => e
       write_failed(e)
+    end
+
+    # Refused before the entry was removed and before any credential was touched, so the machine
+    # is exactly as it was. The remedy is the operator's own decision about which project the
+    # default means — a question only they can answer.
+    def unsettled_default(error)
+      Outcome.new(ok: false, invalid: true, message: error.message,
+                  remedy: "say which one you meant with `specrelay-runner connections default " \
+                          "<selector>`, or drop it with `specrelay-runner connections " \
+                          "clear-default`, then remove this connection")
     end
 
     # Whether the runner-scoped Keychain credential is still needed, and what was done about
