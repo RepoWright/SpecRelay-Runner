@@ -43,41 +43,36 @@ module SpecrelayRunner
       def released? = released ? true : false
     end
 
-    # `owned` is a PROOF, never an absence of evidence. Every path that could not establish the
-    # owner answers false with the reason, so a caller cannot mistake an unanswered question for
-    # permission.
-    Ownership = Struct.new(:owned, :reason, keyword_init: true) do
-      def owned? = owned ? true : false
-    end
-
     module_function
 
-    # Does `run_id` own the environment `task_id`, provably, right now?
+    # Why `run_id` may NOT use the environment `task_id`, or nil when the project proves it owns
+    # it right now.
     #
-    # Cleanliness is not ownership and neither is the canonical branch being checked out
-    # somewhere: both are true of an environment a person made by hand, and adopting one would
-    # delete their work at the end of this run. So the recorded owner is read from the project,
-    # compared exactly, and anything else is a refusal.
+    # Nil is the narrow answer and every other path produces a reason, which is what stops an
+    # unanswered question being read as permission. Cleanliness is not ownership, and neither is
+    # the canonical branch being checked out somewhere: both are true of an environment a person
+    # made by hand, and adopting one would delete their work at the end of this run. So the
+    # recorded owner is read from the project, compared exactly, and anything else is a refusal.
     #
     # `canonical_branch` is compared when the caller knows it, because the answer must be about
     # the environment this run is actually going to use.
-    def ownership(root:, task_id:, run_id:, canonical_branch: nil)
+    def unowned_reason(root:, task_id:, run_id:, canonical_branch: nil)
       unavailable = unavailable_reason(root, task_id, run_id)
-      return unproved(task_id, "cannot be claimed: #{unavailable}") if unavailable
+      return sentence(task_id, "cannot be claimed: #{unavailable}") if unavailable
 
       result = invoke(root, [ "status", task_id.to_s, "--json" ], STATUS_TIMEOUT)
       document = document_of(result)
-      return unproved(task_id, "could not be inspected: #{detail(result, 'status', task_id)}") if
+      return sentence(task_id, "could not be inspected: #{detail(result, 'status', task_id)}") if
         document.nil?
 
       mismatch = identity_mismatch(document, task_id, canonical_branch)
-      return unproved(task_id, mismatch) if mismatch
+      return sentence(task_id, mismatch) if mismatch
 
       owner = document["owner_run_id"].to_s
-      return unproved(task_id, "records no run owner, so it is a manual environment") if owner.empty?
-      return unproved(task_id, "is owned by a different run") unless owner == run_id.to_s
+      return sentence(task_id, "records no run owner, so it is a manual environment") if owner.empty?
+      return sentence(task_id, "is owned by a different run") unless owner == run_id.to_s
 
-      Ownership.new(owned: true)
+      nil
     end
 
     # Hand back the environment this run owns, or say why it is still allocated.
@@ -187,8 +182,6 @@ module SpecrelayRunner
     rescue SystemCallError
       nil
     end
-
-    def unproved(task_id, reason) = Ownership.new(owned: false, reason: sentence(task_id, reason))
 
     def still_allocated(task_id, reason) = Result.new(released: false,
                                                       reason: sentence(task_id, reason))

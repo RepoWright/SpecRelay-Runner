@@ -234,9 +234,9 @@ module SpecrelayRunner
     def refuse_unowned!
       return unless automatic?
 
-      proof = TaskEnvironment.ownership(root: root, task_id: task_id, run_id: run_id,
-                                        canonical_branch: canonical_branch)
-      raise Error, proof.reason unless proof.owned?
+      reason = TaskEnvironment.unowned_reason(root: root, task_id: task_id, run_id: run_id,
+                                              canonical_branch: canonical_branch)
+      raise Error, reason if reason
     end
 
     # An automatic run may be allocated ONLY through the project's own run-aware command.
