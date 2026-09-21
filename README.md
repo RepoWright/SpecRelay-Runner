@@ -302,8 +302,12 @@ that run's own by then and goes with it, including edits you made there by hand;
 removes none of it itself. Only an explicit `released` naming that run, or your project's own
 proof that there is nothing left, is completion. A timeout, a non-zero exit, an unreadable
 answer or a partial teardown is reported as still allocated — without guessing which files
-survived, because your project is what knows — and this machine stops claiming until you
-resolve it.
+survived, because your project is what knows. What follows differs by lane, deliberately.
+After an implementation run this machine stops: it is holding an environment the next run
+would otherwise be put on top of, so a single run exits non-zero and a `loop` session ends
+until you release it by hand. After a specification publication it reports the same thing as
+a warning and carries on, because the pull request already exists and a reviewer may already
+be reading it — the environment stays allocated and is yours to release.
 
 Waiting on a question, a failed or cancelled attempt, an unacknowledged publication and an
 uncertain transport all keep the environment and ask for no release.
