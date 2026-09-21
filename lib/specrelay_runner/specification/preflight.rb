@@ -403,9 +403,14 @@ module SpecrelayRunner
         refuse(SOURCE_WORKSPACE_UNRESOLVED, task_unavailable_message(e.message))
       end
 
+      # Built with this generation's Run identity, so the SAME owner gate the implementation lane
+      # applies applies here: an environment this run cannot prove it owns is refused before the
+      # package is read, before the accepted implementation is reconciled and before the provider
+      # is launched. A manual worktree on the canonical branch stays a manual worktree.
       def task_workspace_owner(source_root)
         Workspace.new(root: source_root, canonical_branch: assignment.canonical_branch,
-                      task_id: assignment.task_id, create_command: assignment.worktree_create_command,
+                      task_id: assignment.task_id, run_id: assignment.run_id,
+                      create_command: assignment.worktree_create_command,
                       env: { "PATH" => env["PATH"].to_s })
       end
 

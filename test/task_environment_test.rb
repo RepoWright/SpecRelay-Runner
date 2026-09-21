@@ -2,17 +2,24 @@
 
 require_relative "test_helper"
 
-# MAPIAI-97 — releasing the task environment a finished implementation run leaves behind.
+# Releasing the task environment a finished implementation run leaves behind.
 #
-# It matters now for a reason it did not before: the preview lane addresses the SAME task id, so
-# an environment nobody released is the difference between a preview that starts and one that
-# fails on a worktree it did not create. The rule proved here is that a release the project
-# refused stops this machine from claiming again, rather than being logged and forgotten.
+# It matters for a reason it did not before: the preview lane addresses the SAME task id, so an
+# environment nobody released is the difference between a preview that starts and one that fails
+# on a worktree it did not create. The rules proved here are that the release is asked for as the
+# run that OWNS the environment, and that one the project would not prove released stops this
+# machine from claiming again rather than being logged and forgotten.
+#
+# The ownership contract itself — who may reuse, allocate and take down an environment — is
+# proved in {TaskEnvironmentOwnershipTest}. What is proved here is how this adapter is invoked
+# and what it reports back to the session.
 class TaskEnvironmentTest < Minitest::Test
-  TASK = "MAPIAI-97-cleanup"
+  TASK = "EXAMPLE-1-cleanup"
+  RUN = "run_alpha"
 
   def setup
     @workspace = PreviewWorkspace.build(components: %w[component-a])
+    @workspace.own!(TASK, RUN)
     @io = StringIO.new
   end
 
@@ -22,16 +29,21 @@ class TaskEnvironmentTest < Minitest::Test
     nil
   end
 
-  def release = SpecrelayRunner::TaskEnvironment.release(root: @workspace.root, task_id: TASK)
+  def release = SpecrelayRunner::TaskEnvironment.release(root: @workspace.root, task_id: TASK,
+                                                         run_id: RUN)
 
+  # Once, from the connected root, naming the owning run. The working directory is asserted
+  # because a project command run from anywhere else would address a different checkout.
   def test_it_invokes_the_project_owned_release_once_from_the_connected_root
     assert_predicate release, :released?
-    assert_equal [ [ File.realpath(@workspace.root), "release #{TASK}" ] ], @workspace.invocations
+    assert_equal [ [ File.realpath(@workspace.root), "release #{TASK} --run-id #{RUN} --json" ] ],
+                 @workspace.invocations
   end
 
-  # An environment the project says does not exist needs no cleanup. Reporting otherwise would
-  # stop a healthy runner for ever.
-  def test_an_unknown_environment_needs_no_cleanup
+  # The project's own proof that there is nothing to take down. It is the project that
+  # inventories the workspace and every registered component repository to establish it, and
+  # this runner must neither recreate that inventory nor shortcut it.
+  def test_the_projects_own_absent_proof_needs_no_cleanup
     @workspace.absent!
 
     assert_predicate release, :released?
@@ -47,12 +59,16 @@ class TaskEnvironmentTest < Minitest::Test
     assert_includes result.reason, "still allocated"
   end
 
-  # A project that owns no lifecycle command built no environment through one, and this runner
-  # must not guess how to take down a directory it did not create.
-  def test_a_project_without_the_command_releases_nothing_and_reports_nothing_to_clean
+  # A project that owns no run-aware lifecycle command could never have recorded this run as an
+  # owner, so it cannot prove a release either. Reporting nothing to clean up would be a guess
+  # about an environment this runner can no longer see.
+  def test_a_project_without_the_run_aware_command_cannot_prove_a_release
     FileUtils.rm_f(File.join(@workspace.root, "bin", "worktree"))
 
-    assert_predicate release, :released?
+    result = release
+
+    refute_predicate result, :released?
+    assert_includes result.reason, "no run-aware"
     assert_equal [], @workspace.invocations
   end
 
@@ -60,14 +76,16 @@ class TaskEnvironmentTest < Minitest::Test
     @workspace.fail!("release")
 
     error = assert_raises(SpecrelayRunner::CleanupRequired) do
-      SpecrelayRunner::TaskEnvironment.release!(root: @workspace.root, task_id: TASK, io: @io)
+      SpecrelayRunner::TaskEnvironment.release!(root: @workspace.root, task_id: TASK, run_id: RUN,
+                                                io: @io)
     end
 
     assert_includes error.message, "still allocated"
   end
 
   def test_a_successful_release_says_so_and_lets_the_loop_continue
-    assert SpecrelayRunner::TaskEnvironment.release!(root: @workspace.root, task_id: TASK, io: @io)
+    assert SpecrelayRunner::TaskEnvironment.release!(root: @workspace.root, task_id: TASK,
+                                                     run_id: RUN, io: @io)
     assert_includes @io.string, "Released the task environment #{TASK}"
   end
 

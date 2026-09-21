@@ -266,6 +266,9 @@ class ReworkFlowTest < Minitest::Test
   # was told to release themselves.
   def test_a_replacement_never_discards_the_abandoned_uncommitted_work
     git(@root, "worktree", "add", "-q", "-b", TASK, worktree_path, "HEAD")
+    # Recorded as THIS run's environment, so what the attempt refuses below is its own dirty
+    # worktree rather than somebody else's ownership.
+    ProjectCommand.own!(@root, TASK, IMPL_RUN)
     File.write(File.join(worktree_path, "demo-app", "index.html"), "<h1>abandoned checkpoint</h1>\n")
     start(restart: { "repositories" => [ reviewed_repository ] })
     code, output = run_cli
@@ -284,6 +287,9 @@ class ReworkFlowTest < Minitest::Test
   # `reset --hard`, which is the only destructive git operation in the runner.
   def test_a_dirty_worktree_refuses_before_the_change_request_round_and_keeps_the_local_edit
     git(@root, "worktree", "add", "-q", "-b", TASK, worktree_path, "HEAD")
+    # Recorded as THIS run's environment, so what the attempt refuses below is its own dirty
+    # worktree rather than somebody else's ownership.
+    ProjectCommand.own!(@root, TASK, IMPL_RUN)
     File.write(File.join(worktree_path, "demo-app", "index.html"), "<h1>local edit in progress</h1>\n")
     start(rework: { "repositories" => [ reviewed_repository ] })
     code, output = run_cli

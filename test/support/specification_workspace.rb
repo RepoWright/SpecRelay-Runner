@@ -199,25 +199,34 @@ module SpecificationWorkspace
   def write_worktree_command(source)
     write_executable(File.join(source, "bin", "worktree"), <<~SH)
       #!/usr/bin/env sh
-      set -eu
+      set -u
       ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
       WT_ROOT="$ROOT_DIR/.runs/worktrees"
-      case "${1:-}" in
+      #{ProjectCommand.arguments}
+      case "$VERB" in
         create)
           mkdir -p "$WT_ROOT"
-          if git -C "$ROOT_DIR" show-ref --verify --quiet "refs/heads/$2"; then
-            git -C "$ROOT_DIR" worktree add -q "$WT_ROOT/$2" "$2"
+          if git -C "$ROOT_DIR" show-ref --verify --quiet "refs/heads/$TASK"; then
+            git -C "$ROOT_DIR" worktree add -q "$WT_ROOT/$TASK" "$TASK" || exit 1
           else
-            git -C "$ROOT_DIR" worktree add -q -b "$2" "$WT_ROOT/$2" HEAD
+            git -C "$ROOT_DIR" worktree add -q -b "$TASK" "$WT_ROOT/$TASK" HEAD || exit 1
           fi
-          if [ -d "$ROOT_DIR/#{COMPONENT_DIR}" ] && [ ! -d "$WT_ROOT/$2/#{COMPONENT_DIR}" ]; then
-            git clone -q "$ROOT_DIR/#{COMPONENT_DIR}" "$WT_ROOT/$2/#{COMPONENT_DIR}"
-            git -C "$WT_ROOT/$2/#{COMPONENT_DIR}" remote set-url origin "#{COMPONENT_REMOTE}"
-            git -C "$WT_ROOT/$2/#{COMPONENT_DIR}" checkout -q -B "$2"
+          if [ -d "$ROOT_DIR/#{COMPONENT_DIR}" ] && [ ! -d "$WT_ROOT/$TASK/#{COMPONENT_DIR}" ]; then
+            git clone -q "$ROOT_DIR/#{COMPONENT_DIR}" "$WT_ROOT/$TASK/#{COMPONENT_DIR}" || exit 1
+            git -C "$WT_ROOT/$TASK/#{COMPONENT_DIR}" remote set-url origin "#{COMPONENT_REMOTE}"
+            git -C "$WT_ROOT/$TASK/#{COMPONENT_DIR}" checkout -q -B "$TASK"
           fi
+          #{ProjectCommand.record_owner}
           ;;
-        release) git -C "$ROOT_DIR" worktree remove --force "$WT_ROOT/$2" ;;
-        *) echo "usage: worktree create|release <task>" >&2; exit 1 ;;
+        status)
+          #{ProjectCommand.status_case}
+          ;;
+        release)
+          #{ProjectCommand.release_guard}
+          git -C "$ROOT_DIR" worktree remove --force "$WT_ROOT/$TASK"
+          #{ProjectCommand.release_report}
+          ;;
+        *) echo "usage: worktree create|status|release <task>" >&2; exit 1 ;;
       esac
     SH
   end

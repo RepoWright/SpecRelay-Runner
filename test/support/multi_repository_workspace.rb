@@ -51,29 +51,49 @@ module MultiRepositoryWorkspace
   # the workspace repository on the canonical branch, and every component repository as its own
   # linked worktree on that same branch. It records every invocation, so "invoked exactly once
   # with `create <TASK-ID>`" is an observable fact rather than an inference.
+  #
+  # It implements the accepted project's OWNERSHIP contract, because that is the contract the
+  # runner is being tested against: `create --run-id` records the owner durably, `status --json`
+  # reports it (null for an environment created without one), and `release --run-id` refuses any
+  # identity but the recorded one, proves `absent` when there is no environment, and names the
+  # owner it released for. A fixture that accepted `--run-id` and ignored it would let every
+  # ownership assertion here pass against a runner that never sent it.
   def write_project_command(root, components)
     path = File.join(root, "bin", "worktree")
-    File.write(path, <<~SH)
+    File.write(path, project_command_body(components))
+    FileUtils.chmod(0o755, path)
+  end
+
+  def project_command_body(components)
+    <<~SH
       #!/usr/bin/env sh
-      set -eu
+      set -u
       ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
       mkdir -p "$ROOT_DIR/.runs"
       echo "$*" >> "$ROOT_DIR/.runs/worktree.log"
-      WT="$ROOT_DIR/.runs/worktrees/${2:-}"
-      case "${1:-}" in
+      #{ProjectCommand.arguments}
+      WT="$ROOT_DIR/.runs/worktrees/$TASK"
+      case "$VERB" in
         create)
           mkdir -p "$ROOT_DIR/.runs/worktrees"
-          git -C "$ROOT_DIR" worktree add -b "$2" "$WT" HEAD
+          git -C "$ROOT_DIR" worktree add -b "$TASK" "$WT" HEAD >/dev/null 2>&1 || exit 1
           for repo in #{components.join(' ')}; do
-            git -C "$ROOT_DIR/$repo" worktree add -b "$2" "$WT/$repo" HEAD
+            git -C "$ROOT_DIR/$repo" worktree add -b "$TASK" "$WT/$repo" HEAD >/dev/null 2>&1 || exit 1
           done
+          #{ProjectCommand.record_owner}
           echo "created $WT"
           ;;
-        release) git -C "$ROOT_DIR" worktree remove --force "$WT" ;;
-        *) echo "usage: worktree create|release <task>" >&2; exit 1 ;;
+        status)
+          #{ProjectCommand.status_case}
+          ;;
+        release)
+          #{ProjectCommand.release_guard}
+          git -C "$ROOT_DIR" worktree remove --force "$WT" >/dev/null 2>&1 || true
+          #{ProjectCommand.release_report}
+          ;;
+        *) echo "usage: worktree create|status|release <task>" >&2; exit 1 ;;
       esac
     SH
-    FileUtils.chmod(0o755, path)
   end
 
   # The executor. `FAKE_EXECUTOR_EDITED` names the repositories it actually changes (comma-separated
@@ -257,4 +277,9 @@ module MultiRepositoryWorkspace
   def task_workspace(root, task_id) = File.join(root, ".runs", "worktrees", task_id)
 
   def worktree_invocations(log) = File.exist?(log) ? File.read(log).lines.map(&:strip).reject(&:empty?) : []
+
+  # The owner the project RECORDED, read from its own durable file by this process rather than
+  # from the runner's narration — the second OS process AC1 asks for. Nil when the project holds
+  # no environment for that task; an empty string when it holds a manual one.
+  def recorded_owner(root, task_id) = ProjectCommand.recorded_owner(root, task_id)
 end

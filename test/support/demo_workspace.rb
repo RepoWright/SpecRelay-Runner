@@ -28,21 +28,30 @@ module DemoWorkspace
     path = File.join(root, "bin", "worktree")
     File.write(path, <<~SH)
       #!/usr/bin/env sh
-      set -eu
+      set -u
       ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
       WT_ROOT="$ROOT_DIR/.runs/worktrees"
-      case "${1:-}" in
+      #{ProjectCommand.arguments}
+      case "$VERB" in
         create)
           mkdir -p "$WT_ROOT"
-          if git -C "$ROOT_DIR" show-ref --verify --quiet "refs/heads/$2"; then
-            git -C "$ROOT_DIR" worktree add "$WT_ROOT/$2" "$2"
+          if git -C "$ROOT_DIR" show-ref --verify --quiet "refs/heads/$TASK"; then
+            git -C "$ROOT_DIR" worktree add "$WT_ROOT/$TASK" "$TASK" || exit 1
           else
-            git -C "$ROOT_DIR" worktree add -b "$2" "$WT_ROOT/$2" HEAD
+            git -C "$ROOT_DIR" worktree add -b "$TASK" "$WT_ROOT/$TASK" HEAD || exit 1
           fi
+          #{ProjectCommand.record_owner}
           ;;
-        release) git -C "$ROOT_DIR" worktree remove --force "$WT_ROOT/$2" ;;
+        status)
+          #{ProjectCommand.status_case}
+          ;;
+        release)
+          #{ProjectCommand.release_guard}
+          git -C "$ROOT_DIR" worktree remove --force "$WT_ROOT/$TASK"
+          #{ProjectCommand.release_report}
+          ;;
         list) git -C "$ROOT_DIR" worktree list ;;
-        *) echo "usage: worktree create|release|list <task>" >&2; exit 1 ;;
+        *) echo "usage: worktree create|status|release|list <task>" >&2; exit 1 ;;
       esac
     SH
     FileUtils.chmod(0o755, path)

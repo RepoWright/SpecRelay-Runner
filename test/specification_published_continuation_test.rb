@@ -64,7 +64,16 @@ class SpecificationPublishedContinuationTest < Minitest::Test
     published = publish_the_accepted_package
     plant_unrelated_branch
 
-    refute local_branch?(TASK), "the accepted round must leave only the remote branch"
+    # The owned release RETAINS the local ref. That is the project's contract, not an oversight:
+    # an automatic release discards the environment, never a branch that may hold work of its own.
+    #
+    # The retained ref is STALE. The package was committed and pushed from the runner's own
+    # publication snapshot, so the environment's branch never moved, and the local ref is left at
+    # the base the environment was created from. That is a known condition of this slice — the
+    # next round below therefore has to reach the published head over the remote rather than
+    # trusting what the checkout already has, which is exactly what it proves.
+    assert local_branch?(TASK), "the owned release retains the local ref"
+    refute_equal published, local_head(TASK), "the retained base is stale until it is aligned"
     assert_equal published, remote_head(TASK)
 
     assert_equal SpecrelayRunner::CLI::SUCCESS, continue_from_the_pull_request, @io.string
@@ -83,8 +92,8 @@ class SpecificationPublishedContinuationTest < Minitest::Test
     refute_equal published, revised
     assert_equal revised, remote_head(TASK)
     refute_path_exists task_workspace, "the continued round must release the environment too"
-    refute local_branch?(TASK), "a released ticket must leave no local branch behind"
-    assert_equal 2, worktree_invocations.count("release #{TASK}")
+    assert local_branch?(TASK), "the second owned release retains the local ref too"
+    assert_equal 2, worktree_invocations.count("release #{TASK} --run-id #{SPEC_RUN} --json")
 
     # The SAME pull request, and only it. Each phase runs its own `gh` over the shared
     # pull-request state, so "opened nothing new" is counted from the invocations the continuation
@@ -283,6 +292,12 @@ class SpecificationPublishedContinuationTest < Minitest::Test
     status.success?
   end
 
+  # The commit the RETAINED local ref points at. An owned release takes the environment down and
+  # leaves the branch, so this is what a later round finds already in the checkout.
+  def local_head(branch)
+    SpecificationWorkspace.git!(@root, "rev-parse", "refs/heads/#{branch}").strip
+  end
+
   def remote_head(branch)
     SpecificationWorkspace.git!(@built.bares["."], "rev-parse", "refs/heads/#{branch}").strip
   end
@@ -322,7 +337,8 @@ class SpecificationPublishedContinuationTest < Minitest::Test
       ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
       mkdir -p "$ROOT_DIR/.runs"
       echo "$*" >> "$ROOT_DIR/.runs/worktree.log"
-      WT="$ROOT_DIR/.runs/worktrees/${2:-}"
+      #{ProjectCommand.arguments}
+      WT="$ROOT_DIR/.runs/worktrees/$TASK"
       attach() {
         if git -C "$1" show-ref --verify --quiet "refs/heads/$3"; then
           git -C "$1" worktree add -q "$2" "$3"
@@ -333,21 +349,31 @@ class SpecificationPublishedContinuationTest < Minitest::Test
           git -C "$1" branch -q --set-upstream-to "origin/$3" "$3"
         fi
       }
-      case "${1:-}" in
+      case "$VERB" in
         create)
           mkdir -p "$ROOT_DIR/.runs/worktrees"
-          attach "$ROOT_DIR" "$WT" "$2"
-          for repo in #{components}; do attach "$ROOT_DIR/$repo" "$WT/$repo" "$2"; done
+          attach "$ROOT_DIR" "$WT" "$TASK"
+          for repo in #{components}; do attach "$ROOT_DIR/$repo" "$WT/$repo" "$TASK"; done
+          #{ProjectCommand.record_owner}
+          ;;
+        status)
+          #{ProjectCommand.status_case}
           ;;
         release)
+          #{ProjectCommand.release_guard}
           for repo in #{components}; do
             git -C "$ROOT_DIR/$repo" worktree remove --force "$WT/$repo" || true
-            git -C "$ROOT_DIR/$repo" branch -D "$2" || true
           done
-          git -C "$ROOT_DIR" worktree remove "$WT"
-          git -C "$ROOT_DIR" branch -d "$2"
+          if [ -n "$RUN_ID" ]; then
+            git -C "$ROOT_DIR" worktree remove --force "$WT"
+          else
+            for repo in #{components}; do git -C "$ROOT_DIR/$repo" branch -D "$TASK" || true; done
+            git -C "$ROOT_DIR" worktree remove "$WT"
+            git -C "$ROOT_DIR" branch -d "$TASK"
+          fi
+          #{ProjectCommand.release_report}
           ;;
-        *) echo "usage: worktree create|release <task>" >&2; exit 1 ;;
+        *) echo "usage: worktree create|status|release <task>" >&2; exit 1 ;;
       esac
     SH
   end
@@ -394,24 +420,40 @@ class SpecificationPublishedContinuationTest < Minitest::Test
       #!/usr/bin/env sh
       set -eu
       ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-      WT="$ROOT_DIR/.runs/worktrees/${2:-}"
-      case "${1:-}" in
+      mkdir -p "$ROOT_DIR/.runs"
+      #{ProjectCommand.arguments}
+      WT="$ROOT_DIR/.runs/worktrees/$TASK"
+      case "$VERB" in
         create)
           mkdir -p "$ROOT_DIR/.runs/worktrees"
-          if git -C "$ROOT_DIR" show-ref --verify --quiet "refs/heads/$2"; then
-            git -C "$ROOT_DIR" worktree add -q "$WT" "$2"
+          if git -C "$ROOT_DIR" show-ref --verify --quiet "refs/heads/$TASK"; then
+            git -C "$ROOT_DIR" worktree add -q "$WT" "$TASK"
           else
-            git -C "$ROOT_DIR" worktree add -q -b "$2" "$WT" HEAD
+            git -C "$ROOT_DIR" worktree add -q -b "$TASK" "$WT" HEAD
           fi
+          #{ProjectCommand.record_owner}
           ;;
-        release) git -C "$ROOT_DIR" worktree remove "$WT"; git -C "$ROOT_DIR" branch -d "$2" ;;
-        *) echo "usage: worktree create|release <task>" >&2; exit 1 ;;
+        status)
+          #{ProjectCommand.status_case}
+          ;;
+        release)
+          #{ProjectCommand.release_guard}
+          if [ -n "$RUN_ID" ]; then
+            git -C "$ROOT_DIR" worktree remove --force "$WT"
+          else
+            git -C "$ROOT_DIR" worktree remove "$WT"
+            git -C "$ROOT_DIR" branch -d "$TASK"
+          fi
+          #{ProjectCommand.release_report}
+          ;;
+        *) echo "usage: worktree create|status|release <task>" >&2; exit 1 ;;
       esac
     SH
   end
 
   def create_task_environment
-    out, status = Open3.capture2e(File.join(@root, "bin", "worktree"), "create", TASK, chdir: @root)
+    out, status = Open3.capture2e(File.join(@root, "bin", "worktree"), "create", TASK,
+                                  "--run-id", SPEC_RUN, chdir: @root)
     raise "bin/worktree create failed: #{out}" unless status.success?
   end
 

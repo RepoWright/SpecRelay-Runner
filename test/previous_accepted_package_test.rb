@@ -102,7 +102,8 @@ class PreviousAcceptedPackageTest < Minitest::Test
   # one. Returns its path.
   def create_task_workspace
     DemoWorkspace.git(@root, "worktree", "list") # ensure the fixture repository is usable
-    out, status = Open3.capture2e(File.join(@root, "bin", "worktree"), "create", TASK, chdir: @root)
+    out, status = Open3.capture2e(File.join(@root, "bin", "worktree"), "create", TASK,
+                                  "--run-id", IMPL_RUN, chdir: @root)
     raise out unless status.success?
 
     File.join(@root, ".runs", "worktrees", TASK)
@@ -291,7 +292,8 @@ class PreviousAcceptedPackageTest < Minitest::Test
     assert_equal 0, code
     # MAPIAI-97 — a successful implementation hands its task environment back before this
     # machine claims anything else, so `release` is part of the expected sequence.
-    assert_equal [ "create #{TASK}", "release #{TASK}" ], worktree_invocations
+    assert_equal [ "create #{TASK} --run-id #{IMPL_RUN}", "status #{TASK} --json",
+                   "release #{TASK} --run-id #{IMPL_RUN} --json" ], worktree_invocations
     # Read from each component repository's canonical branch rather than from the task workspace:
     # the successful run handed that environment back, and the branch it placed the accepted head
     # on is the durable half of the same reconstruction.
@@ -313,16 +315,22 @@ class PreviousAcceptedPackageTest < Minitest::Test
     code, = run_cli(gh_dir)
 
     assert_equal 0, code
-    assert_empty worktree_invocations
+    # No second allocation and no reset — only the ownership proof this run must pass before it
+    # may continue in an environment that was already there.
+    assert_equal [ "status #{TASK} --json" ], worktree_invocations
     assert_equal 0, FakeGithub.pr_views(gh_log)
     refute_path_exists File.join(task_root, "component-b", ACCEPTED_FILE)
     assert_equal before["component-b"], head_of(task_root, "component-b")
   end
 
-  # S06 — the native single-repository fallback. A checkout with no project-owned command builds
-  # its task workspace from the command the assignment names, and the SAME materializer places
-  # that one repository on the canonical branch at its accepted head.
-  def test_a_checkout_without_the_project_command_is_reconstructed_the_same_way
+  # S06 — a checkout with no run-aware project command refuses the automatic run, so there is
+  # no environment to reconstruct an accepted implementation into.
+  #
+  # This replaces the native single-repository fallback for this lane. That command records no
+  # owner, so a run reconstructing accepted work into it could neither prove the environment was
+  # its own on a later attempt nor release it at the end. The refusal happens before the
+  # continuation is materialized and before any external write.
+  def test_a_checkout_without_the_run_aware_project_command_refuses_before_reconstructing
     FileUtils.remove_entry(@root)
     @root, executor = DemoWorkspace.build
     use_fixture(fixture_dir, executor)
@@ -346,11 +354,12 @@ class PreviousAcceptedPackageTest < Minitest::Test
     @platform = FakePlatform.new(claim_payload: payload).start
     @config_path = write_config
 
-    code, output = run_cli(gh_dir)
+    _code, output = run_cli(gh_dir)
 
-    assert_equal 0, code, output
-    assert_path_exists File.join(@root, ".runs", "worktrees", TASK, ACCEPTED_FILE)
-    assert_equal 1, FakeGithub.pr_views(gh_log)
+    assert_match(/preflight_failed/, output)
+    assert_includes output, "no run-aware"
+    refute_path_exists File.join(@root, ".runs", "worktrees", TASK)
+    assert_equal 0, FakeGithub.pr_creates(gh_log), "nothing may be published"
   end
 
   # S08 at the execution boundary — a stale continuation stops the whole attempt BEFORE the

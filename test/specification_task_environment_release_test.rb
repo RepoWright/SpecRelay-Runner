@@ -7,8 +7,14 @@ require "open3"
 # Returning the ticket's task environment once a specification publication has been ACCEPTED.
 #
 # Generation deliberately leaves its package in that environment, beside the code it describes,
-# and until now nothing took the environment back: a ticket whose specification was published
-# still held a worktree, and the preview lane addresses the same task id.
+# and nothing took the environment back: a ticket whose specification was published still held a
+# worktree, and the preview lane addresses the same task id.
+#
+# What is proved here is the ORDER and the OWNERSHIP. The release is asked for only after the
+# publication succeeded and Platform accepted the result, it is asked for as the run that owns
+# the environment, and the runner clears nothing itself first — an owned environment's
+# unpublished edits are that run's own and are disposable, and an environment it does not own is
+# refused by the project with nothing removed.
 #
 # Driven through the real `claim-once` CLI against the real fake Platform, over a REAL task
 # environment built by the project's OWN `bin/worktree` — because every claim here is about what
@@ -43,135 +49,98 @@ class SpecificationTaskEnvironmentReleaseTest < Minitest::Test
 
   # ---------------------------------------------------------------- accepted cleanup
 
-  # The outcome. Platform accepted the publication, so the local package is a duplicate of
-  # committed history: it is removed from the task environment and the project's own release
-  # command takes the environment down.
-  def test_an_accepted_publication_removes_the_package_and_releases_the_environment
+  # The outcome. Platform accepted the publication, so the environment this run owns is handed
+  # back through the project's own release command, named for that run.
+  def test_an_accepted_publication_releases_the_environment_as_its_owning_run
     start_platform
 
     assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
     assert_equal "published", @platform.last_specification_publication["outcome"], @io.string
 
-    assert_includes worktree_invocations, "release #{TASK}"
+    assert_includes worktree_invocations, "release #{TASK} --run-id #{SPEC_RUN} --json"
     refute File.exist?(task_workspace), "the released environment must be gone"
+    assert_includes @io.string, "Released this ticket's task environment."
   end
 
-  # Only the package. The environment's own repositories and their working trees are the project's
-  # to take down, so the removal is scoped to the recorded package folder and the release command
-  # does the rest — proved by removing the package and then declining to release.
-  def test_only_the_recorded_package_folder_is_removed_before_the_release_is_invoked
+  # The runner removes NOTHING itself. It used to clear the recorded package folder before
+  # asking, which meant a refused release left the environment stripped of the accepted files
+  # while still allocated. The project is the only thing that removes anything now, so a refusal
+  # leaves the environment exactly as the run left it.
+  def test_a_refused_release_leaves_the_package_and_the_environment_untouched
     start_platform(release_mode: "refuse")
 
     assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
 
-    refute File.exist?(task_package_root), "the accepted package must be removed"
+    assert_equal PACKAGE_CONTENTS["spec.md"], File.read(File.join(task_package_root, "spec.md"))
     assert_path_exists File.join(task_workspace, "README.md")
     assert_path_exists File.join(task_workspace, "component-a", "app", "services", "export_report.rb")
-    assert_includes @io.string, "still allocated"
+    assert_includes @io.string, "was NOT released"
   end
 
-  # ---------------------------------------------------------------- a TRACKED accepted package
-
-  # The package reached the environment as the branch's own history rather than as output lying
-  # beside it — the shape a round that continued a published specification leaves behind.
-  #
-  # The cleanup still has to end with a tree the project's release authority will take down, and
-  # that authority refuses an environment with uncommitted changes in it. Deleting tracked files
-  # would produce exactly that, so the recorded folder is returned to the branch head instead: the
-  # accepted evidence stays where the branch says it is, and nothing is left uncommitted.
-  def test_a_tracked_accepted_package_is_returned_to_the_branch_head_and_leaves_a_clean_tree
-    commit_the_package_on_the_task_branch
+  # No claim about which files were cleared or retained. Only the project knows what is left.
+  def test_an_incomplete_release_claims_nothing_about_the_files
     start_platform(release_mode: "refuse")
+    run_cli
 
-    assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
-
-    assert_equal "", git(task_workspace, "status", "--porcelain", "--untracked-files=all").strip
-    assert_equal PACKAGE_CONTENTS["spec.md"], File.read(File.join(task_package_root, "spec.md"))
+    refute_includes @io.string, "was cleared from this ticket's task environment"
+    refute_includes @io.string, "was left in this ticket's task environment"
   end
 
-  # The revised round in one environment: the previous package is tracked, this round's bytes are
-  # a modification of it plus one file the branch has never carried. Both are cleared, because
-  # either one left behind is an uncommitted change release refuses.
-  def test_a_revised_tracked_package_leaves_no_modification_and_no_new_file
-    published = PACKAGE_CONTENTS.except("generation-manifest.json")
-                                .merge("spec.md" => "# EXAMPLE-1\n\nRound one, as published.\n")
-    FileUtils.rm_rf(task_package_root)
-    write_package_contents(task_package_root, published)
-    commit_the_package_on_the_task_branch
-    write_package(task_package_root)
-    build_isolated_workspace
-    start_platform(release_mode: "refuse")
+  # ---------------------------------------------------------------- owned unpublished edits
 
-    assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
-
-    assert_equal "", git(task_workspace, "status", "--porcelain", "--untracked-files=all").strip
-    assert_equal published["spec.md"], File.read(File.join(task_package_root, "spec.md"))
-    refute_path_exists File.join(task_package_root, "generation-manifest.json")
-  end
-
-  # ---------------------------------------------------------------- user-dirty protection
-
-  # Somebody else's uncommitted work. The environment is not this run's to take down, and the
-  # package is not removed either: deleting inside an environment a person is using, and then
-  # releasing it, is the one failure this guard exists to prevent.
-  def test_unrelated_uncommitted_work_blocks_both_the_removal_and_the_release
+  # Uncommitted work inside an environment this run owns — including a file a person wrote by
+  # hand — is that run's own once the publication has been accepted. It needs no second
+  # confirmation and cannot hold the environment open.
+  def test_owned_unpublished_edits_do_not_prevent_the_release
     dirty_a_component_repository
-    start_platform
-
-    assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
-    assert_equal "published", @platform.last_specification_publication["outcome"], @io.string
-
-    assert_path_exists File.join(task_package_root, "spec.md")
-    refute_includes worktree_invocations, "release #{TASK}"
-    assert_path_exists task_workspace
-    assert_includes @io.string, "was left in this ticket's task environment"
-    assert_includes @io.string, "uncommitted"
-  end
-
-  # ---------------------------------------------------------------- modified generated bytes
-
-  # The package on disk is no longer the one Platform accepted, so it is EVIDENCE of an edit
-  # rather than a duplicate of committed history. The publication itself still succeeds — it
-  # publishes the verified snapshot — and nothing is deleted or released.
-  def test_a_generated_file_edited_in_the_task_environment_blocks_the_cleanup
+    File.write(File.join(task_workspace, "notes-of-my-own.md"), "my working notes\n")
     File.write(File.join(task_package_root, "spec.md"), "# edited by hand after generation\n")
     start_platform
 
     assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
     assert_equal "published", @platform.last_specification_publication["outcome"], @io.string
 
-    assert_equal "# edited by hand after generation\n", File.read(File.join(task_package_root, "spec.md"))
-    refute_includes worktree_invocations, "release #{TASK}"
-    assert_includes @io.string, SpecrelayRunner::Specification::PackageVerification::MISMATCH
+    assert_includes worktree_invocations, "release #{TASK} --run-id #{SPEC_RUN} --json"
+    refute File.exist?(task_workspace)
   end
 
-  # A file the accepted package does not describe, beside the ones it does. Digests alone never
-  # see this: every recorded file matches and one more would be deleted with them.
-  def test_an_unrecorded_file_beside_the_package_blocks_the_cleanup
-    File.write(File.join(task_package_root, "notes-of-my-own.md"), "my working notes\n")
+  # A tracked accepted package — the shape a round continuing a published specification
+  # inherits. Nothing has to be restored or deleted first, because the runner no longer touches
+  # the folder at all.
+  def test_a_tracked_accepted_package_needs_no_preparation_before_the_release
+    commit_the_package_on_the_task_branch
     start_platform
 
     assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
 
-    assert_path_exists File.join(task_package_root, "notes-of-my-own.md")
-    assert_path_exists File.join(task_package_root, "spec.md")
-    refute_includes worktree_invocations, "release #{TASK}"
-    assert_includes @io.string, SpecrelayRunner::Specification::PackageVerification::ALTERED
+    assert_includes worktree_invocations, "release #{TASK} --run-id #{SPEC_RUN} --json"
+    refute File.exist?(task_workspace)
   end
 
-  # A package folder replaced by a symbolic link. Nothing outside the task environment may be
-  # deleted, so the link is refused rather than followed.
-  def test_a_symlinked_package_folder_is_refused_and_nothing_outside_is_deleted
-    outside = File.join(@built.temp, "somebody-elses-package")
-    FileUtils.mv(task_package_root, outside)
-    File.symlink(outside, task_package_root)
+  # ---------------------------------------------------------------- foreign ownership
+
+  # Ownership replaced between generation and cleanup. The project refuses, and the task package
+  # — the thing the runner used to clear FIRST — is untouched.
+  def test_an_environment_owned_by_another_run_is_refused_with_the_package_untouched
+    ProjectCommand.own!(@root, TASK, "run_somebody_else")
     start_platform
 
     assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
 
-    assert_path_exists File.join(outside, "spec.md")
-    refute_includes worktree_invocations, "release #{TASK}"
-    assert_includes @io.string, SpecrelayRunner::Specification::PackageVerification::ALTERED
+    assert_equal PACKAGE_CONTENTS["spec.md"], File.read(File.join(task_package_root, "spec.md"))
+    assert_path_exists task_workspace
+    assert_includes @io.string, "was NOT released"
+  end
+
+  # A missing task directory is not a Runner-side "nothing to do". The project still decides,
+  # because metadata, a registration or an isolated runtime resource may remain.
+  def test_a_missing_task_directory_still_delegates_to_the_projects_release_proof
+    FileUtils.rm_rf(task_workspace)
+    start_platform
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
+
+    assert_includes worktree_invocations, "release #{TASK} --run-id #{SPEC_RUN} --json"
   end
 
   # ---------------------------------------------------------------- non-accepted retention
@@ -185,7 +154,7 @@ class SpecificationTaskEnvironmentReleaseTest < Minitest::Test
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
 
     assert_path_exists File.join(task_package_root, "spec.md")
-    refute_includes worktree_invocations, "release #{TASK}"
+    assert_empty worktree_invocations.grep(/\Arelease /), "no release may be asked for"
     assert_path_exists task_workspace
   end
 
@@ -198,7 +167,7 @@ class SpecificationTaskEnvironmentReleaseTest < Minitest::Test
     assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
 
     assert_path_exists File.join(task_package_root, "spec.md")
-    refute_includes worktree_invocations, "release #{TASK}"
+    assert_empty worktree_invocations.grep(/\Arelease /), "no release may be asked for"
   end
 
   # A failure BEFORE the publication reaches GitHub. Nothing was accepted, so nothing is cleaned.
@@ -208,7 +177,7 @@ class SpecificationTaskEnvironmentReleaseTest < Minitest::Test
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
 
     assert_path_exists File.join(task_package_root, "spec.md")
-    refute_includes worktree_invocations, "release #{TASK}"
+    assert_empty worktree_invocations.grep(/\Arelease /), "no release may be asked for"
   end
 
   private
@@ -220,9 +189,11 @@ class SpecificationTaskEnvironmentReleaseTest < Minitest::Test
     File.exist?(@built.worktree_log) ? File.read(@built.worktree_log).split("\n") : []
   end
 
-  # The environment the project's own command builds, exactly as generation would have left it.
+  # The environment the project's own command builds, exactly as generation would have left it:
+  # allocated for THIS run, because that is what makes it this run's to hand back.
   def create_task_environment
-    out, status = Open3.capture2e(File.join(@root, "bin", "worktree"), "create", TASK, chdir: @root)
+    out, status = Open3.capture2e(File.join(@root, "bin", "worktree"), "create", TASK,
+                                  "--run-id", SPEC_RUN, chdir: @root)
     raise "bin/worktree create failed: #{out}" unless status.success?
   end
 
@@ -290,13 +261,21 @@ class SpecificationTaskEnvironmentReleaseTest < Minitest::Test
     @config = build_config
   end
 
-  # A project whose `release` fails, so "the package was removed and the environment was not" is
-  # an observable state rather than an argument about ordering.
+  # A project whose `release` fails outright, so "the environment was not returned" is an
+  # observable state rather than an argument about ordering.
   def refuse_release!
     path = File.join(@root, "bin", "worktree")
-    body = File.read(path).sub('release) git -C "$ROOT_DIR" worktree remove --force "$WT" ;;',
-                               'release) echo "release is not available" >&2; exit 9 ;;')
-    File.write(path, body)
+    real = "#{path}-real"
+    FileUtils.mv(path, real)
+    File.write(path, <<~SH)
+      #!/usr/bin/env sh
+      set -u
+      if [ "${1:-}" = "release" ]; then
+        echo "release is not available" >&2
+        exit 9
+      fi
+      exec "$(dirname "$0")/worktree-real" "$@"
+    SH
     FileUtils.chmod(0o755, path)
   end
 
