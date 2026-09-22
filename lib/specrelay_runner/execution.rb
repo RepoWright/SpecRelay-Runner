@@ -64,6 +64,19 @@ module SpecrelayRunner
       # still stop such a loop.
       def handled? = success? || outcome == :awaiting_input
 
+      # The report could not be BUILT, so Platform was told nothing at all about this attempt.
+      #
+      # Every other unsuccessful outcome travelled the terminal-result contract and was answered,
+      # which is what makes the run terminal there and the next claim about different work. This
+      # one did not: the work is over and decided, and its result exists only on this machine.
+      #
+      # `reported_status` carries the distinction without a new field, because it is set from a
+      # submission that RETURNED. An unset one on the outcome the reporting paths fall back to
+      # therefore means nothing was submitted — which is why the acknowledged unmeasurable report
+      # sets its own status once its upload comes back. A nil `reported_status` alone proves
+      # nothing; only this pairing does.
+      def report_unsubmitted? = outcome == :publication_failed && reported_status.nil?
+
       # MAPIAI-97 — the attempt SUCCEEDED, both halves of it: the implementation reported success
       # and Platform accepted that report.
       #
@@ -77,6 +90,10 @@ module SpecrelayRunner
 
     STOP_HEARTBEAT_ENV = "SPECRELAY_RUNNER_STOP_HEARTBEAT_AFTER_SECONDS"
     DEFAULT_RENEWAL_SECONDS = 30
+
+    # How much of one cause a terminal diagnostic carries. Long enough for a real exception
+    # message or failure reason, short enough that neither can turn the ending into a transcript.
+    MAX_DIAGNOSTIC_CHARS = 200
 
     # The lane discriminator Platform states on every assignment (MVP-0025).
     RUN_TYPE = "implementation"
@@ -537,14 +554,19 @@ module SpecrelayRunner
       reason = "could not determine what the executor changed: #{changes.measurement_error}"
       log("Publication aborted for #{run['task_id']}: #{Redaction.redact(reason)}")
       emit("attempt.completed", "Uploading failed execution report for #{run['task_id']}", phase: "completed")
-      bundle = ReportBundle.build(payload: payload, status: ReportBundle::STATUS_FAILED, executor: executor_result,
-                                  verifications: [], changes: changes, base_commit: worktree.base_commit,
-                                  worktree_path: worktree.path, failure_details: reason)
+      bundle = build_report(payload: payload, status: ReportBundle::STATUS_FAILED, executor: executor_result,
+                            verifications: [], changes: changes, base_commit: worktree.base_commit,
+                            worktree_path: worktree.path, failure_details: reason)
+      return report_construction_failed(reason) if bundle.nil?
+
       terminal = terminal_result(status: ReportBundle::STATUS_FAILED, final_sequence: emitter.sequence,
                                  exit_code: executor_result.exit_code, base_commit: worktree.base_commit,
                                  changes: changes, error_classification: "worktree_unmeasurable")
       client.submit_report(claim: claim, bundle: bundle, terminal_result: terminal)
-      Result.new(outcome: :publication_failed, message: "Runner outcome: publication_failed (#{reason}).")
+      # The status is set from a submission that RETURNED, which is what separates this
+      # acknowledged failure from one whose report never reached Platform at all.
+      Result.new(outcome: :publication_failed, reported_status: ReportBundle::STATUS_FAILED,
+                 message: "Runner outcome: publication_failed (#{reason}).")
     end
 
     # MVP-0014 — publish the changed repository output to GitHub, between verification
@@ -769,10 +791,16 @@ module SpecrelayRunner
     def submit(worktree, executor_result, verifications, changes, status, publication, publication_failure = nil)
       emit("attempt.completed", "Uploading execution report for #{run['task_id']} (#{status})",
            phase: "completed", exit_code: executor_result.exit_code)
-      bundle = ReportBundle.build(payload: payload, status: status, executor: executor_result,
-                                  verifications: verifications,
-                                  changes: changes, base_commit: worktree.base_commit, worktree_path: worktree.path,
-                                  failure_details: failure_details(status, verifications, publication_failure))
+      details = failure_details(status, verifications, publication_failure)
+      bundle = build_report(payload: payload, status: status, executor: executor_result,
+                            verifications: verifications,
+                            changes: changes, base_commit: worktree.base_commit, worktree_path: worktree.path,
+                            failure_details: details)
+      # A successful attempt has no failure narrative, so the verification summary is what it
+      # knows: the commands really ran, and saying so is not the same as inventing a result for a
+      # verification that never happened.
+      return report_construction_failed(details || verification_summary(verifications)) if bundle.nil?
+
       terminal = terminal_result(status: status, final_sequence: emitter.sequence, exit_code: executor_result.exit_code,
                                  base_commit: worktree.base_commit, changes: changes, publication: publication,
                                  error_classification: publication_failure ? "publication_failed" : nil)
@@ -802,14 +830,70 @@ module SpecrelayRunner
       log(message)
       changes = measuring_workspace(root).capture_changes(worktree.path)
       emit("attempt.completed", "Uploading failed execution report for #{run['task_id']}", phase: "completed")
-      bundle = ReportBundle.build(payload: payload, status: ReportBundle::STATUS_FAILED, executor: executor_result,
-                                  verifications: verifications, changes: changes, base_commit: worktree.base_commit,
-                                  worktree_path: worktree.path, failure_details: message)
+      bundle = build_report(payload: payload, status: ReportBundle::STATUS_FAILED, executor: executor_result,
+                            verifications: verifications, changes: changes, base_commit: worktree.base_commit,
+                            worktree_path: worktree.path, failure_details: message)
+      return report_construction_failed(message) if bundle.nil?
+
       terminal = terminal_result(status: ReportBundle::STATUS_FAILED, final_sequence: emitter.sequence,
                                  exit_code: executor_result.exit_code, base_commit: worktree.base_commit,
                                  changes: changes, error_classification: classification)
       client.submit_report(claim: claim, bundle: bundle, terminal_result: terminal)
       Result.new(outcome: :executor_failed, message: message)
+    end
+
+    # The ONE place report construction is allowed to fail, shared by the three paths that build
+    # a bundle.
+    #
+    # Building it serializes the manifest through YAML, so it runs code this process loads
+    # lazily: a report-generation dependency that is broken or missing on this host raises
+    # LoadError from there, after the work is over and already decided. Unhandled, that replaced
+    # a known verification or executor failure with a traceback about the reporting machinery and
+    # left the command exiting through the interpreter rather than through its controlled path.
+    #
+    # Exactly StandardError and LoadError, around exactly this call. An Interrupt or a SystemExit
+    # is not a report problem and still escapes; the submission that follows is deliberately
+    # outside it, because a refused upload is an upload failure and already means something else.
+    def build_report(**attributes)
+      ReportBundle.build(**attributes)
+    rescue StandardError, LoadError => e
+      @report_error = e
+      nil
+    end
+
+    # The report could not be built, so this attempt submitted nothing — and says so here,
+    # because there is nowhere else left to say it.
+    #
+    # The work's own outcome stays the headline. It is known, it is what the operator has to act
+    # on, and failing to describe it is a second fact rather than a correction of the first.
+    # Nothing is rebuilt, re-serialized or re-run to produce this: a fallback that needed the
+    # machinery which just failed would fail with it.
+    #
+    # It claims nothing about the run's state on Platform. This process could not deliver a
+    # result; what Platform currently holds, and whether the claim is still live, are things it
+    # has not observed and must not guess at.
+    def report_construction_failed(primary)
+      error = @report_error
+      log("Report construction failed for #{run['task_id']}; no final result was submitted.")
+      log("  Work outcome: #{sanitized(primary)}")
+      log("  Report error: #{error.class}: #{sanitized(error.message)}")
+      log("  Final result was not submitted to Platform because report construction failed.")
+      log("  To recover: repair this machine's report-generation dependency, inspect this run in")
+      log("  Platform, and release the claim there only if it is still needed before restarting:")
+      log("       bin/platform runner release #{run['task_id']}")
+      Result.new(outcome: :publication_failed,
+                 message: "Runner outcome: publication_failed (the report could not be built, " \
+                          "so no final result was submitted).")
+    end
+
+    # Dynamic text on its way to an operator's terminal. Secret SHAPES and absolute local paths
+    # are two different rules with two different owners, and a diagnostic assembled from an
+    # exception message and a prior failure reason can carry either. Collapsed and bounded
+    # afterwards, because the useful part of such a message is its beginning and an unbounded one
+    # is a transcript — which this deliberately is not.
+    def sanitized(text)
+      safe = PrivatePaths.sanitize(Redaction.redact(text.to_s)).gsub(/\s+/, " ").strip
+      safe.length > MAX_DIAGNOSTIC_CHARS ? "#{safe[0, MAX_DIAGNOSTIC_CHARS]}…" : safe
     end
 
     # The provider ended without one provable result: a non-zero exit, a timeout, or a stream this
