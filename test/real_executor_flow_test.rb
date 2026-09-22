@@ -34,7 +34,7 @@ class RealExecutorFlowTest < Minitest::Test
   # The CANONICAL Claude profile, byte-for-byte what Platform serves. An override here produces a
   # payload the runner must refuse, which is what the refusal examples assert.
   def claude_payload(overrides = {})
-    base_claim_payload(task_id: TASK)
+    base_claim_payload(task_id: TASK, root: @root)
       .merge("executor" => SpecrelayRunner::ClaudeProfile::CANONICAL.merge(overrides))
   end
 
@@ -164,7 +164,7 @@ class RealExecutorFlowTest < Minitest::Test
   def test_the_fake_executor_path_never_probes_claude
     root, executor = DemoWorkspace.build
     @root = root
-    start_platform(base_claim_payload(task_id: TASK))
+    start_platform(base_claim_payload(task_id: TASK, root: @root))
     bin_dir, argv_log = FakeClaudeCli.build
 
     exit_code = run_cli(fake_config, bin_dir: "#{fixture_bin(executor)}:#{bin_dir}")
@@ -194,7 +194,7 @@ class RealExecutorFlowTest < Minitest::Test
     # Platform hands back the seeded FAKE fixture even though this runner selected
     # the real Claude profile. Executing it would produce evidence that lies about
     # what ran, so the runner refuses.
-    start_platform(base_claim_payload(task_id: TASK))
+    start_platform(base_claim_payload(task_id: TASK, root: @root))
     bin_dir, argv_log = FakeClaudeCli.build
 
     exit_code = run_cli(claude_config, bin_dir: bin_dir)

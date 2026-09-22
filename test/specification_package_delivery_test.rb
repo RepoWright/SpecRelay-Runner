@@ -5,21 +5,30 @@ require_relative "test_helper"
 # MVP-0034 contract 4 and S22/S23: the pinned package reaches the Executor as files it can read,
 # and one altered document stops the attempt before a provider starts.
 class SpecificationPackageDeliveryTest < Minitest::Test
+  TASK = "DEMO-0001"
+
   def setup
     @staging = Dir.mktmpdir("package-delivery-")
+    # A real contained repository holding the approved package, because delivery is not allowed to
+    # be the only place the package exists. The document checks below still run first and still
+    # refuse first; this is what they refuse INSTEAD of.
+    @root, = DemoWorkspace.build
   end
 
   def teardown
-    FileUtils.remove_entry(@staging) if File.directory?(@staging)
+    [ @staging, @root ].each { |dir| FileUtils.remove_entry(dir) if dir && File.directory?(dir) }
   end
+
+  # The approved block, pinned to what this fixture actually committed.
+  def approved(**overrides) = specification_package_block(TASK, root: @root, **overrides)
 
   def deliver(block)
     SpecrelayRunner::SpecificationPackage.call(payload: { "specification_package" => block },
-                                               staging_dir: @staging)
+                                               staging_dir: @staging, task_root: @root)
   end
 
   def test_writes_every_document_read_only_under_the_staging_root
-    result = deliver(specification_package_block("DEMO-0001"))
+    result = deliver(approved)
 
     assert result.ok?, result.failure
     assert_equal %w[spec.md analysis/input-evidence.md analysis/business.md analysis/technical.md
@@ -39,7 +48,7 @@ class SpecificationPackageDeliveryTest < Minitest::Test
   # S23 — ONE changed byte, with the length left intact so the digest is the only check that can
   # catch it. A tamper that also changed the size would prove the cheaper comparison instead.
   def test_refuses_a_document_whose_bytes_do_not_reproduce_the_pinned_digest
-    block = specification_package_block("DEMO-0001")
+    block = approved
     block["documents"][2]["content"] = "# Business analysix\n"
 
     result = deliver(block)
@@ -52,7 +61,7 @@ class SpecificationPackageDeliveryTest < Minitest::Test
   end
 
   def test_refuses_a_document_whose_byte_size_does_not_match
-    block = specification_package_block("DEMO-0001")
+    block = approved
     block["documents"][0]["byte_size"] = 99_999
 
     result = deliver(block)
@@ -62,7 +71,7 @@ class SpecificationPackageDeliveryTest < Minitest::Test
   end
 
   def test_refuses_a_duplicated_document
-    block = specification_package_block("DEMO-0001")
+    block = approved
     block["documents"] << block["documents"].first.dup
 
     result = deliver(block)
@@ -74,7 +83,7 @@ class SpecificationPackageDeliveryTest < Minitest::Test
   # S11 — a path that escapes the package folder never becomes a filesystem write.
   def test_refuses_a_traversing_or_absolute_path
     [ "../escape.md", "/etc/passwd", "analysis/../../escape.md" ].each do |path|
-      block = specification_package_block("DEMO-0001")
+      block = approved
       block["documents"][0]["path"] = path
 
       result = deliver(block)
@@ -87,7 +96,7 @@ class SpecificationPackageDeliveryTest < Minitest::Test
 
   def test_refuses_a_document_larger_than_the_bound
     oversized = "x" * (SpecrelayRunner::SpecificationPackage::MAX_FILE_BYTES + 1)
-    block = specification_package_block("DEMO-0001",
+    block = approved(
                                          documents: [ [ "specification", "spec.md", oversized ] ])
 
     result = deliver(block)
@@ -99,7 +108,7 @@ class SpecificationPackageDeliveryTest < Minitest::Test
   # An assignment with no documents is a contract violation, not an empty package: Platform
   # authorizes execution only after pinning one.
   def test_refuses_an_assignment_that_carries_no_documents
-    result = deliver(specification_package_block("DEMO-0001").merge("documents" => []))
+    result = deliver(approved.merge("documents" => []))
 
     refute result.ok?
     assert_includes result.failure, "no specification documents"
@@ -117,7 +126,7 @@ class SpecificationPackageDeliveryFlowTest < Minitest::Test
   def setup
     @root, @executor = DemoWorkspace.build
     use_fixture(fixture_dir, @executor)
-    @payload = claim_payload_for(task_id: TASK)
+    @payload = claim_payload_for(task_id: TASK, root: @root)
     @platform = nil
   end
 

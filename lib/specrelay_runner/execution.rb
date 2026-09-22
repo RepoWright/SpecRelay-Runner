@@ -294,6 +294,28 @@ module SpecrelayRunner
                  message: "Runner outcome: preflight_failed (claimed executor is not the selected profile; nothing executed).")
     end
 
+    # The pre-provider tree, named the way an operator can check it: one line per contained
+    # repository with its own path inside the environment and the exact commit it is on, then the
+    # approved package's location and the commit it was pinned to and verified against.
+    def report_effective_inputs(worktree)
+      state = Specification::Preflight.repository_state(task_root: worktree.path, env: env)
+      anchor = @package.anchor
+      if state.nil?
+        emit("workspace.prepared", "Prepared #{run['task_id']}; its repositories could not be " \
+             "inspected to report their heads", phase: "workspace")
+        return
+      end
+
+      heads = state.map do |prefix, facts|
+        # The task root's own prefix is empty; naming it "." keeps every entry readable as a path.
+        "#{prefix.to_s.empty? ? '.' : prefix}@#{facts[:head].to_s[0, 12]}"
+      end.sort.join(" ")
+      pinned = anchor ? ", approved specification #{anchor[:package_path]} pinned at " \
+                        "#{anchor[:head].to_s[0, 12]} in #{anchor[:repository]}" : ""
+      emit("workspace.prepared", "Prepared #{run['task_id']} at #{heads}#{pinned}",
+           phase: "workspace")
+    end
+
     def run_flow(root, staging)
       # MAPIAI-87 CR-001 F1 — the continuation field is authority, so an absent or malformed one
       # is refused HERE: before a worktree is created or reused, before any git or GitHub read,
@@ -326,23 +348,41 @@ module SpecrelayRunner
 
         worktree = Workspace::Info.new(path: worktree.path, created: worktree.created?,
                                        base_commit: continuation.head_commit || worktree.base_commit)
-      elsif @continuation.package && worktree.created?
+      end
+
+      # The pinned package is verified and ANCHORED
+      # to the contained repository and commit it belongs to. It sits here, after any recorded
+      # target has been placed and before any fresh input is, for two reasons: a rework or restart
+      # target is this run's own recorded authority and keeps its precedence, including its own
+      # refusals; and the owner that chooses a head for the fresh inputs below has to know what the
+      # specification requires in order to pick a commit that satisfies both. The check reads the
+      # pinned COMMIT rather than the working tree, so it is answerable at this point.
+      @package = SpecificationPackage.call(payload: payload, staging_dir: staging,
+                                           task_root: worktree.path)
+      return package_refused(root, worktree, @package.failure) unless @package.ok?
+
+      if !continued && (@continuation.package || @package.anchor) && worktree.created?
         # MAPIAI-87 — the ticket's PREVIOUS accepted implementation, and only into a workspace
         # this attempt just built. Same-run authority wins: a rework or restart target is handled
         # above and never reaches here, and a resume reuses the worktree its question was asked
-        # from, so `created?` is false for it. A refusal stops before the provider, before the
-        # package, and before any external write.
-        reconstructed = @continuation.package.materialize(task_root: worktree.path)
+        # from, so `created?` is false for it.
+        #
+        # The verified specification anchor travels with the accepted code, so one authority
+        # chooses a commit that satisfies BOTH inputs — or refuses before placing any of them. A
+        # first run has no accepted code and still needs its approved specification placed, so the
+        # same owner is used with no accepted targets rather than a second placement path here.
+        placer = @continuation.package ||
+                 PreviousAcceptedPackage.for_specification(run["canonical_branch"], env: env)
+        reconstructed = placer.materialize(task_root: worktree.path,
+                                           specification: @package.anchor)
         return continuation_refused(reconstructed.reason) unless reconstructed.ok?
       end
 
-      # MVP-0034 contract 4 — the pinned package is verified and written read-only BEFORE the
-      # provider starts. A document whose bytes do not reproduce the digest Platform pinned ends
-      # the attempt here, with a failed report and no executor (S23).
-      @package = SpecificationPackage.call(payload: payload, staging_dir: staging)
-      unless @package.ok?
-        return package_refused(root, worktree, @package.failure)
-      end
+      # What the provider is ABOUT to see, measured after every input has been placed. The seeds an
+      # environment was allocated from are not this: inputs are placed in stages, and reporting the
+      # starting point as the effective one would describe a tree that no longer exists. Identities
+      # are repository-relative and the values are commit ids, so nothing here carries a host path.
+      report_effective_inputs(worktree)
 
       emit("core.started", "Running #{provider} executor for #{run['task_id']}", phase: "core")
       executor_result = run_executor(root, worktree, staging)

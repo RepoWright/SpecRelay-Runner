@@ -353,6 +353,21 @@ module SpecrelayRunner
         accepted = materialize_previous_accepted(task)
         return accepted if accepted
 
+        # The previous published specification is placed BEFORE anything
+        # reads the environment. It used to be resolved after the evidence was gathered, the
+        # analysis tools were checked and the provider was resolved against the task tree, which
+        # meant every one of those described a tree that did not yet hold the revision the writer
+        # was about to work from.
+        revision = resolve_revision(seed, package, task)
+        return revision if revision.is_a?(Refusal)
+
+        # All input placement is done, so the task-local analysis wrappers are prepared against
+        # the FINAL tree. A graph built while the environment was still being assembled describes
+        # inputs that have since been replaced, and reusing it would answer questions about the
+        # wrong code.
+        prepared = source_gatherer.prepare(root: task.path, settings: settings, env: env)
+        return refuse(GRAPHIFY_UNAVAILABLE, prepared.reason) unless prepared.ok?
+
         source = source_gatherer.gather(root: task.path, settings: settings, env: env)
         tools = check_tools(source)
         return tools if tools
@@ -362,9 +377,6 @@ module SpecrelayRunner
 
         redaction = check_redaction
         return redaction if redaction
-
-        revision = resolve_revision(seed, package, task)
-        return revision if revision.is_a?(Refusal)
 
         # The BASELINE, taken after everything this class legitimately places in the environment
         # and before anything else can touch it. Later is not an option: from here on the only

@@ -68,15 +68,20 @@ class QuestionResumeTest < Minitest::Test
                 env: { "FAKE_EXECUTOR_QUESTION_JSON" => BATCH.to_json,
                        "FAKE_EXECUTOR_QUESTION_TIMEOUT_SECONDS" => "5",
                        "FAKE_EXECUTOR_QUESTION_EDIT_FIRST" => "1" })
-    claim_payload_for(task_id: TASK)
+    claim_payload_for(task_id: TASK).merge("specification_package" => approved_package)
   end
+
+  # Committed ONCE, into the first machine, before anything clones it. Both phases and both
+  # machines then name the same commit: the second machine is a clone, so re-committing the
+  # package there would move its history past the base the checkpoint recorded.
+  def approved_package = @approved_package ||= specification_package_block(TASK, root: @root)
 
   # Phase two: the same run, claimed again, carrying the answers and the recorded checkpoint —
   # metadata and the one claim-bound download path, never the bytes.
   def resume_payload(checkpoint, executor: nil, env: {}, root: @root)
     executor ||= DemoWorkspace.write_resume_executor(root)
     use_fixture(fixture_dir, executor, env: env)
-    claim_payload_for(task_id: TASK).merge(
+    claim_payload_for(task_id: TASK).merge("specification_package" => approved_package).merge(
       "resume" => { "question_id" => "exq_fake", "checkpoint" => assigned(checkpoint),
                     "continuation_context" => BATCH["continuation_context"],
                     "questions" => BATCH["questions"], "answers" => ANSWERS }

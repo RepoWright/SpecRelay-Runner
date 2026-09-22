@@ -14,7 +14,7 @@ class RunnerFlowTest < Minitest::Test
     # The approved fixture name resolves to this test's own script on the CHILD PATH. The payload
     # stays canonical; only the host decides which file the approved name is.
     @executor_path = fixture_path(@executor)
-    @platform = FakePlatform.new(claim_payload: claim_payload_for(task_id: TASK)).start
+    @platform = FakePlatform.new(claim_payload: claim_payload_for(task_id: TASK, root: @root)).start
     @config = build_config
     @io = StringIO.new
   end

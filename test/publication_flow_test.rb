@@ -41,7 +41,7 @@ class PublicationFlowTest < Minitest::Test
   # --- harness -------------------------------------------------------------
 
   def start(publication: {})
-    payload = claim_payload_for(task_id: TASK,
+    payload = claim_payload_for(task_id: TASK, root: @root,
                                 publication: publication)
     @platform = FakePlatform.new(claim_payload: payload).start
     @config_path = write_config
@@ -175,7 +175,7 @@ class PublicationFlowTest < Minitest::Test
       changed_files: [ "demo-app/index.html" ], diff: ""
     )
     SpecrelayRunner::Publication.new(
-      payload: claim_payload_for(task_id: TASK, publication: {}),
+      payload: claim_payload_for(task_id: TASK, publication: {}, root: @root),
       repository: repository,
       env: { "PATH" => "#{fixture_dir}:#{gh_dir}:#{ENV['PATH']}", "HOME" => ENV["HOME"].to_s }, io: StringIO.new
     ).call
@@ -622,7 +622,7 @@ class PublicationFlowTest < Minitest::Test
       changed_files: [ "demo-app/index.html" ], diff: ""
     )
     publication = SpecrelayRunner::Publication.new(
-      payload: claim_payload_for(task_id: TASK, publication: {}),
+      payload: claim_payload_for(task_id: TASK, publication: {}, root: @root),
       repository: repository,
       env: { "PATH" => "#{fixture_dir}:#{@gh_dir}:#{ENV['PATH']}", "HOME" => ENV["HOME"].to_s }, io: StringIO.new
     )
@@ -804,7 +804,13 @@ class PublicationFlowTest < Minitest::Test
   # run. Patching the spawn boundary keeps the rest of the flow real.
   def inject_emfile_on_first_spawn
     fired = false
-    guard = ->(argv) { argv.first == "git" && argv.include?("status") && !fired }
+    # The CHANGE-DETECTION status, not the read that reports the prepared heads: both ask git for
+    # status, and only the first is the measurement this test exhausts. They are told apart by
+    # `--untracked-files=all`, which only the evidence read passes.
+    guard = ->(argv) {
+      argv.first == "git" && argv.include?("status") &&
+        !argv.include?("--untracked-files=all") && !fired
+    }
     SpecrelayRunner::CommandRunner.class_eval do
       alias_method :spawn_process_without_injection, :spawn_process
       define_method(:spawn_process) do |argv|

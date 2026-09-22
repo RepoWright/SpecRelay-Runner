@@ -30,6 +30,7 @@ module SpecrelayRunner
       # can print the exact path the operator is missing.
       GRAPH_CHECK = "bin/graph-check"
       GRAPH_QUERY = "bin/graph-query"
+      GRAPH_BUILD = "bin/graph-build"
 
       # `graph-check` exit codes, from the workspace contract: 0 fresh, 1 unavailable or
       # missing, 3 stale. A STALE graph is explicitly not evidence, so it is recorded as
@@ -96,11 +97,58 @@ module SpecrelayRunner
 
       def self.gather(**kwargs) = new(**kwargs).gather
 
+      # Bring this checkout's own analysis up to date with the tree as it FINALLY stands, before
+      # anything reads it.
+      #
+      # Every input of a run is placed into the environment in stages, and a graph built part-way
+      # through describes inputs that have since been replaced. Gathering evidence from it, or
+      # letting a provider query it, answers questions about code that is no longer there — which
+      # is worse than having no graph, because it looks like an answer.
+      #
+      # It is deliberately the same seam for both lanes. A project with no wrappers is not a
+      # failure: direct source inspection is the approved fallback and `gather` already says so.
+      # A project that HAS them and cannot produce a fresh graph is a failure, and it stops here
+      # rather than being carried forward as stale evidence.
+      def self.prepare(**kwargs) = new(**kwargs).prepare
+
+      Preparation = Struct.new(:ok, :reason, :rebuilt, keyword_init: true) do
+        def ok? = ok
+      end
+
       def initialize(root:, settings:, env: ENV, command_runner: CommandRunner)
         @root = File.expand_path(root.to_s)
         @settings = settings
         @env = env
         @command_runner = command_runner
+      end
+
+      def prepare
+        return Preparation.new(ok: true, rebuilt: false) if graphify_absent?
+
+        check = wrapper_path(GRAPH_CHECK)
+        build = wrapper_path(GRAPH_BUILD)
+        return Preparation.new(ok: false, reason: "this checkout has #{GRAPH_CHECK} but it is " \
+                               "not executable, so its analysis cannot be verified") if check.nil?
+
+        first = run([ check ])
+        return Preparation.new(ok: true, rebuilt: false) if first.exit_code == FRESH
+        return Preparation.new(ok: false, reason: "`#{GRAPH_CHECK}` reports no usable graph for " \
+                               "this checkout (exit #{first.exit_code}) and #{GRAPH_BUILD} is not " \
+                               "available to build one") if build.nil?
+
+        built = run([ build ])
+        return Preparation.new(ok: false, reason: "`#{GRAPH_BUILD}` failed for this checkout " \
+                               "(exit #{built.exit_code}), so its analysis describes inputs this " \
+                               "run has already replaced") unless built.exit_code.to_i.zero?
+
+        # Verified rather than assumed: a build that exits 0 and still leaves the graph stale is
+        # exactly the case this is here to stop.
+        again = run([ check ])
+        return Preparation.new(ok: false, reason: "`#{GRAPH_CHECK}` still does not report a fresh " \
+                               "graph after #{GRAPH_BUILD} (exit #{again.exit_code})") unless
+          again.exit_code == FRESH
+
+        Preparation.new(ok: true, rebuilt: true)
       end
 
       def gather

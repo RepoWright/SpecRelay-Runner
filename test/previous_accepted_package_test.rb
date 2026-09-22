@@ -246,7 +246,8 @@ class PreviousAcceptedPackageTest < Minitest::Test
     # Which repository the double edits is a host-side control, installed behind the approved bare
     # name; the assignment carries the canonical fixture profile and nothing else.
     use_fixture(fixture_dir, @built.executor, env: { "FAKE_EXECUTOR_EDITED" => "component-a" })
-    payload = claim_payload_for(task_id: TASK,
+    payload = claim_payload_for(task_id: TASK, root: @root,
+                                specification_repository: "component-c",
                                 publication: {}, restart: restart)
     absent ? payload.delete("previous_accepted_package") :
       payload["previous_accepted_package"] = continuation_block
@@ -346,7 +347,7 @@ class PreviousAcceptedPackageTest < Minitest::Test
                 "headRefOid" => @heads.fetch(".") } ]
     )
 
-    payload = claim_payload_for(task_id: TASK, publication: {},
+    payload = claim_payload_for(task_id: TASK, publication: {}, root: @root,
                                 worktree_create_command: "git worktree add .runs/worktrees/#{TASK} -b #{TASK}")
     payload["previous_accepted_package"] = continuation(components: [ "." ]).merge(
       "implementation_pull_requests" => [ accepted_row(".", "pull_request_url" => url) ]

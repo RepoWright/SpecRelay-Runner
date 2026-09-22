@@ -44,6 +44,16 @@ module SpecrelayRunner
     # The one authoritative reading of the required, nullable continuation field. Both lanes call
     # it — the implementation lane here, the specification lane through {Input} — so neither can
     # invent its own idea of what the field may contain.
+    # A first run's accepted-code block is an explicit null: there is no accepted implementation,
+    # but there IS an approved specification that must still be made visible. This builds the same
+    # owner with no accepted targets so that placement stays in one place rather than being
+    # reimplemented at the call site for the one case that has only half the inputs.
+    def self.for_specification(canonical_branch, env: ENV, github: GitHub,
+                               git: Review::Checkout::Git)
+      new({ "implementation_pull_requests" => [] }, canonical_branch,
+          env: env, github: github, git: git)
+    end
+
     def self.read(payload, env: ENV, github: GitHub, git: Review::Checkout::Git)
       reason = Input.refusal(payload)
       return Claim.new(ok: false, reason: reason) if reason
@@ -68,28 +78,122 @@ module SpecrelayRunner
 
     # Put every accepted repository of the task workspace on the canonical branch at its verified
     # head, or refuse. A package that changed nothing succeeds without touching git.
-    def materialize(task_root:) = act(task_root) { |plans| place(plans) }
+    def materialize(task_root:, specification: nil)
+      act(task_root, specification: specification) { |plans| place(plans) }
+    end
 
     # PROVE a workspace this run did not build already contains the accepted implementation,
     # without resetting it. Same targets, same verification, different placement — see {advance}.
-    def reconcile(task_root:) = act(task_root) { |plans| advance(plans) }
+    #
+    # A reused environment is never re-seeded to satisfy the specification: this run's own work is
+    # in it, so an incompatibility is REPORTED rather than repaired.
+    def reconcile(task_root:, specification: nil)
+      act(task_root, specification: specification, place_specification: false) do |plans|
+        advance(plans)
+      end
+    end
 
     private
 
     # Everything the two entry points share: read the targets, find them in the workspace, and
     # prove every one of them before any of them is touched.
-    def act(task_root)
+    #
+    # The specification anchor participates here rather than in either caller, so one authority
+    # decides what a repository's head must be when it carries both the approved specification and
+    # accepted code. An explicit null accepted-code block is still a decision: there is no code to
+    # honour, so the specification alone determines that repository's head.
+    def act(task_root, specification: nil, place_specification: true)
       targets = read_targets
       return refuse(targets) if targets.is_a?(String)
-      return Result.new(ok: true, repositories: []) if targets.empty?
+      return Result.new(ok: true, repositories: []) if targets.empty? && specification.nil?
 
       contained = ContainedRepositories.discover(task_root, git: git)
       return refuse(contained.error) unless contained.ok?
 
-      plans = plan(targets, contained)
+      plans = targets.empty? ? [] : plan(targets, contained)
       return refuse(plans) if plans.is_a?(String)
 
+      plans = with_specification(plans, specification, place_specification)
+      return refuse(plans) if plans.is_a?(String)
+      return Result.new(ok: true, repositories: []) if plans.empty?
+
       yield(plans)
+    end
+
+    # The compatibility decision, for the one repository that holds both inputs.
+    #
+    # Nothing is invented here. Only a commit that ALREADY exists can be chosen, because a merge
+    # or a cherry-pick would hand the provider a history nobody accepted and nobody reviewed. That
+    # leaves exactly three ways the two pins can agree, and everything else is a refusal the
+    # operator has to resolve:
+    #
+    #   * no accepted code in that repository — the specification head is the whole answer;
+    #   * the accepted head already carries this package unchanged — keep the accepted code;
+    #   * the specification head only adds the package on top of the accepted code — take it.
+    def with_specification(plans, specification, place_specification)
+      return plans if specification.nil?
+
+      # Matched by IDENTITY, not by path: both sides already agree on what repository this is,
+      # while the two paths can be different spellings of one directory.
+      existing = plans.find { |plan| plan[:repository].to_s.casecmp?(specification[:repository].to_s) }
+      unless existing
+        return plans unless place_specification
+
+        return plans + [ { repository: specification[:repository], path: specification[:path],
+                           head: specification[:head] } ]
+      end
+
+      chosen, refusal = compatible_head(specification, existing[:head])
+      return refusal if refusal
+
+      plans.map { |plan| plan.equal?(existing) ? plan.merge(head: chosen) : plan }
+    end
+
+    # Which existing commit satisfies both pins, as `[head, nil]`, or `[nil, reason]` when none
+    # does. Two values rather than one, because a commit id and a refusal are both strings and a
+    # caller that had to tell them apart by type would eventually get it wrong.
+    def compatible_head(specification, accepted)
+      path = specification[:path]
+      spec_head = specification[:head]
+      return [ spec_head, nil ] if accepted.to_s.empty?
+      return [ accepted, nil ] if accepted.casecmp?(spec_head.to_s)
+
+      if ancestor?(path, spec_head, accepted) && package_tree(path, accepted, specification) ==
+         package_tree(path, spec_head, specification)
+        return [ accepted, nil ]
+      end
+
+      if ancestor?(path, accepted, spec_head) && outside_package(path, accepted, spec_head,
+                                                                 specification).empty?
+        return [ spec_head, nil ]
+      end
+
+      [ nil, "#{quoted(specification[:repository])} cannot show the approved specification " \
+             "#{spec_head[0, 12]} and the accepted code #{accepted[0, 12]} at the same commit; " \
+             "no existing history carries both" ]
+    end
+
+    # The package's own tree object at one commit. Comparing tree ids compares the whole package
+    # in one cheap question, and an absent package answers nil rather than raising.
+    def package_tree(path, head, specification)
+      location = specification[:package_path].to_s
+      spec = location.empty? ? "#{head}^{tree}" : "#{head}:#{location}"
+      result = run(path, [ "rev-parse", "--verify", "--quiet", spec ])
+      return nil unless result&.exit_code.to_i&.zero?
+
+      result.stdout.to_s.strip
+    end
+
+    # Which paths differ between two commits OUTSIDE the package directory. Anything here is code
+    # the specification head would drag along, which is why it disqualifies that head.
+    def outside_package(path, from, to, specification)
+      location = specification[:package_path].to_s
+      result = run(path, [ "diff", "--name-only", from, to ])
+      return [ "<unreadable>" ] unless result&.exit_code.to_i&.zero?
+
+      result.stdout.to_s.split("\n").reject do |name|
+        location.empty? || name == location || name.start_with?("#{location}/")
+      end
     end
 
     attr_reader :block, :canonical_branch, :env, :github, :git
