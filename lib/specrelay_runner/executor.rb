@@ -171,7 +171,10 @@ module SpecrelayRunner
     # keeps the operator's own HOME/XDG/keychain context and authenticates as
     # itself. The runner therefore never has to read, copy, or forward a provider
     # credential to give the executor a working login (MVP-0016).
-    def process_env = { "PATH" => env["PATH"].to_s }.merge(extra_env)
+    #
+    # The executor and every project command it starts are project work, so they lose only the
+    # Runner's own Ruby activation ({CommandRunner.project_env}); authentication context stays.
+    def process_env = CommandRunner.project_env({ "PATH" => env["PATH"].to_s }.merge(extra_env))
 
     def write_prompt(text)
       path = File.join(staging_dir, "executor-prompt.md")

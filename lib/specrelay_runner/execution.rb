@@ -1052,6 +1052,12 @@ module SpecrelayRunner
         - For each repository, select the SMALLEST verification relevant to what you changed there:
           read that repository's own instructions, scripts, manifests and CI configuration. Each
           command is an argv array, run from that repository's root — never a shell string.
+        - Run installation, build and tests through the repository's own complete entrypoint: the
+          script or version-manager invocation that selects and checks its declared runtime and
+          dependency location. SpecRelay starts each reported command in a fresh process, so an
+          earlier `cd`, `source`, `rvm use` or `export` does not carry over; keep activation and
+          the command it enables in ONE argv. If the required runtime or entrypoint is missing,
+          report the command that fails; never fall back to another interpreter or omit it.
         - Run what you select, diagnose any failure, fix it, and rerun it before you exit. If you
           cannot fix it, still report the final commands so SpecRelay records the real failure.
         - Write `"commands": []` when a repository has no applicable verification. That is a valid

@@ -131,6 +131,19 @@ class ProportionalVerificationTest < Minitest::Test
     assert_match(/ran bin\/verify in component-b: passed/, stdout)
   end
 
+  # The replay starts each reported argv in a fresh process, so the executor has to be told that
+  # session-only activation does not carry over and that the project's own entrypoint selects its
+  # runtime — otherwise it passes in its shell and fails, or silently falls back, on replay.
+  def test_the_executor_is_instructed_to_report_complete_project_owned_commands
+    start
+    code, output = run_cli
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, code, output
+    stdout = report_file("evidence/stdout.log")
+    assert_match(/entrypoint - Run installation, build and tests through the repository's own complete entrypoint/,
+                 stdout)
+  end
+
   # --- S03 / S08: focused verification, replayed where it belongs ----------
 
   def test_a_selected_command_is_replayed_from_the_repository_against_the_final_files

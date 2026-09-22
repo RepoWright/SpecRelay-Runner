@@ -103,7 +103,9 @@ module SpecrelayRunner
       end
 
       require_owned_create!
-      result = run(create_argv, on_output: on_output)
+      # The create command is the project's own preparation, so it runs without the Runner's Ruby
+      # activation; the git bookkeeping around it keeps the ordinary environment.
+      result = run(create_argv, on_output: on_output, env: CommandRunner.project_env(env))
       unless result.success?
         raise Error, "worktree create failed (exit #{result.exit_code}): #{first_line(result.stderr, result.stdout)}"
       end
@@ -454,7 +456,7 @@ module SpecrelayRunner
     # worktree never depends on the workspace root being usable.
     def git(dir, args) = run([ "git", "-C", dir.to_s, *args ], chdir: dir)
 
-    def run(argv, chdir: root, on_output: nil) =
+    def run(argv, chdir: root, on_output: nil, env: self.env) =
       CommandRunner.run(argv, chdir: chdir, env: env, timeout_seconds: 300, on_output: on_output)
 
     def first_line(*candidates)

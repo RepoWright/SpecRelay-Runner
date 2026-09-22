@@ -128,6 +128,7 @@ module MultiRepositoryWorkspace
       # Echoed back so the test can prove the prompt really told the executor to run, diagnose,
       # repair and rerun its own selection — not merely that a document path was named.
       puts "[multi-executor] instructions #{prompt[/^- Run what you select.*$/].to_s.strip}"
+      puts "[multi-executor] entrypoint #{prompt[/^- Run installation, build and tests.*$/].to_s.strip}"
 
       broken = ENV.fetch("FAKE_EXECUTOR_BREAK", "").split(",").reject(&:empty?)
       edited = ENV.fetch("FAKE_EXECUTOR_EDITED", "component-a,component-b").split(",").reject(&:empty?)
