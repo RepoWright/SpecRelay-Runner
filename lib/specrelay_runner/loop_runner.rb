@@ -111,6 +111,7 @@ module SpecrelayRunner
       @sleeper = sleeper || ->(seconds) { sleep seconds }
       @stop_requested = false
       @stopped_during_execution = false
+      @unreported_failure = false
       @execution_active = false
       @failures = 0
       @consecutive_errors = 0
@@ -243,9 +244,11 @@ module SpecrelayRunner
       @stopped_during_execution ||= @stop_requested
       resume_presence
       @executed += 1
-      # Read before the Boolean, because this is not a degree of failure: it is the one outcome
-      # whose correct answer is to stop, whatever `--on-failure` says.
+      # Read before the Boolean, because neither is a degree of failure: each is an outcome whose
+      # correct answer is to stop, whatever `--on-failure` says. Both symbols are truthy, so
+      # reading them afterwards would report them as successful runs.
       return run_release_attempted_refusal if disposition == RELEASE_ATTEMPTED_REFUSAL
+      return run_unreported_failure if disposition == FAILED
 
       disposition ? run_succeeded : run_failed
     end
@@ -312,6 +315,27 @@ module SpecrelayRunner
       line "run REFUSED before the provider — nothing was executed and nothing was published"
       line "stopping after a pre-provider refusal; polling again would only reach the same " \
            "refusal. Fix what the refusal names, then start this runner again."
+      :stop
+    end
+
+    # A failed run whose result never reached Platform.
+    #
+    # {#run_failed} says the failure travelled the terminal-result contract. That is true of every
+    # ordinary failure and is exactly what this one could not do: the report could not be built,
+    # so nothing was submitted. The session stops for the reason a pre-provider refusal does —
+    # the next claim meets the same broken reporting dependency on this same machine — and the
+    # failure policy is not consulted, because `continue` means "a REPORTED failure does not end
+    # the session".
+    #
+    # It says nothing about the run's state on Platform. The execution has already printed what
+    # this machine knows and what it did not send; a session-level line about a server this
+    # process never successfully delivered to would be a guess.
+    def run_unreported_failure
+      @failures += 1
+      @unreported_failure = true
+      line "run FAILED — its report could not be built, so no final result was submitted to Platform"
+      line "stopping — this machine cannot report a result until what the execution above names " \
+           "is repaired. Fix it, then start this runner again."
       :stop
     end
 
@@ -465,6 +489,13 @@ module SpecrelayRunner
     def stop_description
       return "stopped — no further iterations requested" unless @stop_requested
       if @stopped_during_execution
+        # "reported its result first" is the ordinary case and not a universal one. A run whose
+        # report could not be built finished without submitting anything, and answering an
+        # operator's Ctrl-C with the reassurance that it reported would describe a delivery that
+        # did not happen.
+        return "stopped by signal DURING an execution — the run finished; its result was NOT " \
+               "submitted to Platform" if @unreported_failure
+
         return "stopped by signal DURING an execution — the run finished and reported its result first"
       end
 

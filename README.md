@@ -1074,6 +1074,25 @@ exit status, duration, a bounded redacted transcript, diff, test output, termina
 result, and publication facts. They never carry provider credentials, raw auth
 output, account identity, hidden reasoning, tool-call streams, or session ids.
 
+### When the report itself cannot be built
+
+Report construction happens before the final result is submitted to Platform.
+If it fails, the runner prints the known work outcome — including available exit,
+timeout or launch facts for failed verification — separately from the sanitized
+construction error. Execution and verification may have succeeded even though
+the report could not be built.
+
+The runner explicitly states that **the final result was not submitted to Platform**
+and exits non-zero. A `loop` session stops even under `--on-failure continue`.
+There is no automatic report-delivery retry, and this failure does not trigger
+task-environment release.
+
+Repair the reported report-generation dependency or file problem, inspect the run
+in Platform, and use the existing
+[`bin/platform runner release`](#recovering-a-stuck-claim) step only if the claim
+still needs releasing before restarting. This diagnostic makes no claim about
+the run's current state on Platform.
+
 ## The deterministic demo executor
 
 [`bin/specrelay-fake-executor`](bin/specrelay-fake-executor) applies scripted
