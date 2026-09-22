@@ -41,6 +41,14 @@ module SpecrelayRunner
 
     OPEN = "OPEN"
 
+    # What a planned head IS, so a refusal about it can say so. Two inputs can decide a head and
+    # they are not interchangeable to the operator who has to act on the message: being told the
+    # "accepted head" is unreachable when the unreachable commit is the approved specification's
+    # sends them to the wrong pull request.
+    ACCEPTED_HEAD = "the accepted head"
+    SPECIFICATION_HEAD = "the approved specification head"
+    BOTH_HEADS = "the head carrying both approved inputs"
+
     # The one authoritative reading of the required, nullable continuation field. Both lanes call
     # it — the implementation lane here, the specification lane through {Input} — so neither can
     # invent its own idea of what the field may contain.
@@ -88,9 +96,7 @@ module SpecrelayRunner
     # A reused environment is never re-seeded to satisfy the specification: this run's own work is
     # in it, so an incompatibility is REPORTED rather than repaired.
     def reconcile(task_root:, specification: nil)
-      act(task_root, specification: specification, place_specification: false) do |plans|
-        advance(plans)
-      end
+      act(task_root, specification: specification) { |plans| advance(plans) }
     end
 
     private
@@ -102,7 +108,7 @@ module SpecrelayRunner
     # decides what a repository's head must be when it carries both the approved specification and
     # accepted code. An explicit null accepted-code block is still a decision: there is no code to
     # honour, so the specification alone determines that repository's head.
-    def act(task_root, specification: nil, place_specification: true)
+    def act(task_root, specification: nil)
       targets = read_targets
       return refuse(targets) if targets.is_a?(String)
       return Result.new(ok: true, repositories: []) if targets.empty? && specification.nil?
@@ -113,7 +119,7 @@ module SpecrelayRunner
       plans = targets.empty? ? [] : plan(targets, contained)
       return refuse(plans) if plans.is_a?(String)
 
-      plans = with_specification(plans, specification, place_specification)
+      plans = with_specification(plans, specification, contained)
       return refuse(plans) if plans.is_a?(String)
       return Result.new(ok: true, repositories: []) if plans.empty?
 
@@ -130,23 +136,47 @@ module SpecrelayRunner
     #   * no accepted code in that repository — the specification head is the whole answer;
     #   * the accepted head already carries this package unchanged — keep the accepted code;
     #   * the specification head only adds the package on top of the accepted code — take it.
-    def with_specification(plans, specification, place_specification)
+    def with_specification(plans, specification, contained)
       return plans if specification.nil?
+
+      # WHERE that repository is, resolved from the environment rather than taken on trust, and
+      # by the same reader that resolved the accepted ones. A specification repository that is
+      # not checked out here refuses: there is nowhere to make the approved documents visible,
+      # and neither cloning one nor writing its files into a different repository is a substitute
+      # for the checkout the run was supposed to have. It resolves a component exactly as it
+      # resolves the workspace root, because a contained repository is a contained repository.
+      located = contained.resolve(specification[:repository])
+      return "no repository in the prepared task workspace is " \
+             "#{quoted(specification[:repository])}; the approved specification cannot be made " \
+             "visible where it belongs" if located == :missing
+      return "the prepared task workspace holds two checkouts of " \
+             "#{quoted(specification[:repository])}" if located == :duplicate
+
+      anchored = specification.merge(path: located)
+      # The pinned commit has to BE here before any rule reasons about ancestry: a commit this
+      # checkout has never seen is not a divergence, and reading it as one would tell an operator
+      # the wrong thing. One read-only fetch is the ordinary path for a fresh environment.
+      return "#{quoted(anchored[:repository])} does not contain #{SPECIFICATION_HEAD} " \
+             "#{anchored[:head][0, 12]} after a fetch" if
+        fetch_head({ repository: anchored[:repository], head: anchored[:head] }, located)
 
       # Matched by IDENTITY, not by path: both sides already agree on what repository this is,
       # while the two paths can be different spellings of one directory.
-      existing = plans.find { |plan| plan[:repository].to_s.casecmp?(specification[:repository].to_s) }
-      unless existing
-        return plans unless place_specification
+      existing = plans.find { |plan| plan[:repository].to_s.casecmp?(anchored[:repository].to_s) }
+      # The specification's own repository joins the plan whichever entry point called: WHAT its
+      # head must be is one decision, and HOW the environment reaches it is the difference between
+      # the two. {#place} seats a created environment on it; {#advance} proves a reused one
+      # already carries it, fast-forwards one that is merely behind, and refuses divergence — so
+      # the reused environment is never rewound to satisfy an older input.
+      return plans + [ { repository: anchored[:repository], path: located,
+                         head: anchored[:head], head_is: SPECIFICATION_HEAD } ] unless existing
 
-        return plans + [ { repository: specification[:repository], path: specification[:path],
-                           head: specification[:head] } ]
-      end
-
-      chosen, refusal = compatible_head(specification, existing[:head])
+      chosen, refusal = compatible_head(anchored, existing[:head])
       return refusal if refusal
 
-      plans.map { |plan| plan.equal?(existing) ? plan.merge(head: chosen) : plan }
+      plans.map do |plan|
+        plan.equal?(existing) ? plan.merge(head: chosen, head_is: BOTH_HEADS) : plan
+      end
     end
 
     # Which existing commit satisfies both pins, as `[head, nil]`, or `[nil, reason]` when none
@@ -158,8 +188,14 @@ module SpecrelayRunner
       return [ spec_head, nil ] if accepted.to_s.empty?
       return [ accepted, nil ] if accepted.casecmp?(spec_head.to_s)
 
-      if ancestor?(path, spec_head, accepted) && package_tree(path, accepted, specification) ==
-         package_tree(path, spec_head, specification)
+      # Both trees MEASURED, then compared. `package_tree` answers nil for a package that is not
+      # there and for a question Git could not answer, and neither is a statement that the two
+      # packages are the same — comparing the two nils would grant the accepted head on the
+      # strength of two failures.
+      accepted_tree = package_tree(path, accepted, specification)
+      spec_tree = package_tree(path, spec_head, specification)
+      if ancestor?(path, spec_head, accepted) && accepted_tree && spec_tree &&
+         accepted_tree == spec_tree
         return [ accepted, nil ]
       end
 
@@ -173,15 +209,18 @@ module SpecrelayRunner
              "no existing history carries both" ]
     end
 
-    # The package's own tree object at one commit. Comparing tree ids compares the whole package
-    # in one cheap question, and an absent package answers nil rather than raising.
+    # The package's own tree object at one commit, or nil when there is no answer — because the
+    # package is absent at that commit, or because the question could not be asked. Comparing
+    # tree ids compares the whole package in one cheap question; the caller is what must never
+    # read an absent answer as a matching one.
     def package_tree(path, head, specification)
       location = specification[:package_path].to_s
       spec = location.empty? ? "#{head}^{tree}" : "#{head}:#{location}"
       result = run(path, [ "rev-parse", "--verify", "--quiet", spec ])
       return nil unless result&.exit_code.to_i&.zero?
 
-      result.stdout.to_s.strip
+      measured = result.stdout.to_s.strip
+      measured.empty? ? nil : measured
     end
 
     # Which paths differ between two commits OUTSIDE the package directory. Anything here is code
@@ -251,7 +290,7 @@ module SpecrelayRunner
         refusal = verify(target, path)
         return refusal if refusal
 
-        plans << target.merge(path: path)
+        plans << target.merge(path: path, head_is: ACCEPTED_HEAD)
       end
       plans
     end
@@ -305,7 +344,8 @@ module SpecrelayRunner
       plans.each do |plan|
         result = run(plan[:path], [ "checkout", "-B", canonical_branch, plan[:head] ])
         return refuse("could not place #{quoted(plan[:repository])} on #{quoted(canonical_branch)} " \
-                      "at its accepted head") unless result&.exit_code.to_i.zero?
+                      "at #{plan[:head_is]} #{plan[:head][0, 12]}") unless
+          result&.exit_code.to_i.zero?
       end
       Result.new(ok: true, repositories: plans.map { |plan| plan[:repository] })
     end
@@ -337,7 +377,7 @@ module SpecrelayRunner
       return nil if local == plan[:head] || ancestor?(plan[:path], plan[:head], local)
       return fast_forward(plan) if ancestor?(plan[:path], local, plan[:head])
 
-      "the checkout of #{quoted(plan[:repository])} has diverged from the accepted head " \
+      "the checkout of #{quoted(plan[:repository])} has diverged from #{plan[:head_is]} " \
         "#{plan[:head][0, 12]}; preserve or release the task workspace before retrying"
     end
 
@@ -345,7 +385,7 @@ module SpecrelayRunner
       result = run(plan[:path], [ "merge", "--ff-only", plan[:head] ])
       return nil if result && result.exit_code.to_i.zero?
 
-      "#{quoted(plan[:repository])} could not be advanced to its accepted head #{plan[:head][0, 12]}"
+      "#{quoted(plan[:repository])} could not be advanced to #{plan[:head_is]} #{plan[:head][0, 12]}"
     end
 
     def ancestor?(path, ancestor, descendant)

@@ -53,6 +53,40 @@ module SpecrelayRunner
 
     def self.call(**kwargs) = new(**kwargs).call
 
+    # The package as the provider will actually READ it: the bytes in the checkout, after every
+    # input has been placed and immediately before anything is launched against them.
+    #
+    # {#anchor} proves the pinned COMMIT carries the approved documents, which is the strongest
+    # statement available before placement — and it is a statement about an object in the
+    # database, not about the tree. An environment this run reused, or continued from its own
+    # recorded target, can stand on a later commit whose package says something else entirely
+    # while the pinned object sits in its history, intact and beside the point. So the last word
+    # is taken from the files themselves.
+    #
+    # A disagreement is REPORTED, never repaired: the environment holds this run's own work, and
+    # resetting it to make the check pass would destroy exactly what the check exists to protect.
+    # The delivered copy is the comparison because it is the immutable one — written read-only
+    # from the assignment and already proved against the pin.
+    def self.visible_failure(result)
+      anchor = result.anchor
+      return nil if anchor.nil?
+
+      location = anchor[:package_path].to_s
+      result.paths.each do |relative|
+        full = location.empty? ? relative : File.join(location, relative)
+        visible = File.join(anchor[:path], full)
+        # Mode before content, for the same reason the pinned commit is read that way: a link
+        # would be followed somewhere the package does not control, and "the bytes matched"
+        # would then be true of the wrong file.
+        return "#{full} is not a regular file in the prepared task workspace" if
+          File.symlink?(visible) || !File.file?(visible)
+        return "#{full} in the prepared task workspace is not the approved specification this " \
+               "run was assigned" unless
+          File.binread(visible) == File.binread(File.join(result.root, relative))
+      end
+      nil
+    end
+
     # `task_root` is the prepared environment this package must also be VISIBLE in, and it is
     # required: the delivered copy may not be the only correct copy, so there is no mode in which
     # this writes a package it could not attribute to a commit.

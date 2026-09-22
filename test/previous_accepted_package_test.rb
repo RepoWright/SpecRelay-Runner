@@ -307,11 +307,14 @@ class PreviousAcceptedPackageTest < Minitest::Test
   end
 
   def test_reuses_an_exact_clean_task_workspace_without_creating_or_resetting_it
+    gh_dir, gh_log, = gh_bin
+    # The assignment's package is committed by `start`, so the environment is built AFTER it: one
+    # created earlier predates the approved specification and could not show it, which is a
+    # different refusal from the reuse this test is about.
+    start(continuation_block: continuation)
     task_root = create_task_workspace
     File.truncate(@built.worktree_log, 0)
     before = ACCEPTED.to_h { |name| [ name, head_of(task_root, name) ] }
-    gh_dir, gh_log, = gh_bin
-    start(continuation_block: continuation)
 
     code, = run_cli(gh_dir)
 

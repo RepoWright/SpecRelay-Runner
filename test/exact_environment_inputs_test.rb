@@ -206,6 +206,96 @@ class ExactEnvironmentInputsTest < Minitest::Test
     assert_equal before, placed_head
     refute_equal BRANCH, git("symbolic-ref", "--quiet", "--short", "HEAD", dir: @repo).strip rescue nil
   end
+
+  # --- measurements that did not happen ---------------------------------------
+
+  # The rule that keeps the accepted head asks whether the package tree is the SAME at both
+  # commits. An unanswered question is not a yes: when both measurements fail, they are equally
+  # absent, and reading that as equality grants the accepted head — with the wrong specification
+  # visible — on the strength of two failures.
+  def test_two_failed_package_measurements_are_not_a_match
+    spec_head = commit_package
+    write(File.join(PACKAGE, "spec.md"), "# A DIFFERENT specification\n")
+    accepted_head = commit("the accepted head changed the package")
+    placer = accepted(accepted_head)
+    break_package_measurement(placer)
+
+    result = placer.materialize(task_root: @task_root, specification: specification(spec_head))
+
+    refute result.ok?, "two unanswered measurements must not read as equal package trees"
+    assert_equal "# A DIFFERENT specification\n",
+                 File.read(File.join(@repo, PACKAGE, "spec.md")),
+                 "and nothing may be placed on the strength of them"
+  end
+
+  # The control: with the SAME injection, a repository whose package genuinely is unchanged at the
+  # accepted head must still be refused rather than accepted — because the proof was not obtained.
+  # Without this the test above would pass for a version that simply never keeps an accepted head.
+  def test_an_unmeasurable_but_genuinely_equal_package_is_still_refused
+    spec_head = commit_package
+    write("app/main.rb", "puts :two\n")
+    accepted_head = commit("accepted code on top of the package")
+    placer = accepted(accepted_head)
+
+    assert placer.materialize(task_root: @task_root,
+                              specification: specification(spec_head)).ok?,
+           "control: this case is compatible when the measurement succeeds"
+
+    git("checkout", "--quiet", "--detach", spec_head)
+    broken = accepted(accepted_head)
+    break_package_measurement(broken)
+
+    refute broken.materialize(task_root: @task_root, specification: specification(spec_head)).ok?
+  end
+
+  # Fails exactly the two package-tree reads, and nothing else, so every other question the
+  # decision asks is still answered by real git.
+  def break_package_measurement(placer)
+    original = placer.method(:run)
+    failure = Struct.new(:exit_code, :stdout, :stderr).new(1, "", "injected query error")
+    placer.define_singleton_method(:run) do |path, args|
+      args[0] == "rev-parse" && args.last.to_s.include?(":#{PACKAGE}") ? failure
+                                                                      : original.call(path, args)
+    end
+  end
+
+  # --- the specification's own repository -------------------------------------
+
+  # The plan owner resolves WHERE the specification repository is, rather than being told. A run
+  # whose environment does not contain it has nowhere to make the approved documents visible, and
+  # neither a clone nor writing the files into some other repository is that place.
+  def test_a_specification_repository_the_environment_does_not_hold_refuses
+    spec_head = commit_package
+    elsewhere = specification(spec_head).merge(repository: "SpecRelay/not-here")
+
+    result = specification_only.materialize(task_root: @task_root, specification: elsewhere)
+
+    refute result.ok?
+    assert_match(/no repository in the prepared task workspace is/, result.reason)
+  end
+
+  def test_two_checkouts_of_the_specification_repository_refuse_rather_than_choosing
+    spec_head = commit_package
+    FileUtils.cp_r(@repo, File.join(@task_root, "product-again"))
+
+    result = specification_only.materialize(task_root: @task_root,
+                                            specification: specification(spec_head))
+
+    refute result.ok?
+    assert_match(/two checkouts/, result.reason)
+  end
+
+  # A pinned commit the contained checkout cannot produce, even after a fetch, is refused as such
+  # — not as a divergence, which would send an operator to the wrong place.
+  def test_a_specification_commit_the_checkout_cannot_obtain_refuses
+    commit_package
+    absent = specification("0" * 40)
+
+    result = specification_only.materialize(task_root: @task_root, specification: absent)
+
+    refute result.ok?
+    assert_match(/does not contain the approved specification head/, result.reason)
+  end
 end
 
 # The approved package must be attributable to a commit in a repository the environment actually
@@ -333,6 +423,52 @@ class VisibleSpecificationPackageTest < Minitest::Test
 
   # A link is not the file the package pinned; following it would make "the bytes matched" a
   # statement about whatever it points at.
+  # --- the package as the provider will READ it --------------------------------
+  #
+  # Anchoring proves the pinned COMMIT carries the approved bytes, which is a statement about an
+  # object in the database. An environment this run reused, or continued from its own recorded
+  # target, can stand on a later commit whose package says something else entirely while the
+  # pinned object sits in its history, intact and beside the point.
+
+  def test_the_visible_package_is_accepted_when_the_checkout_matches_the_delivery
+    assert_nil SpecrelayRunner::SpecificationPackage.visible_failure(deliver)
+  end
+
+  def test_a_checkout_committed_past_the_pinned_package_refuses_without_being_reset
+    result = deliver
+    visible = File.join(@repo, PACKAGE, "spec.md")
+    File.write(visible, "# A LATER round's specification\n")
+    git(@repo, "add", "-A")
+    git(@repo, "commit", "--quiet", "-m", "a later round replaced the package")
+
+    failure = SpecrelayRunner::SpecificationPackage.visible_failure(result)
+
+    assert_match(/is not the approved specification this run was assigned/, failure.to_s)
+    assert_equal "# A LATER round's specification\n", File.read(visible),
+                 "the environment's own work may not be reset to make the check pass"
+  end
+
+  def test_a_package_file_missing_from_the_checkout_refuses
+    result = deliver
+    FileUtils.rm(File.join(@repo, PACKAGE, "spec.md"))
+
+    assert_match(/is not a regular file in the prepared task workspace/,
+                 SpecrelayRunner::SpecificationPackage.visible_failure(result).to_s)
+  end
+
+  def test_a_package_file_replaced_by_a_link_refuses_rather_than_being_followed
+    result = deliver
+    visible = File.join(@repo, PACKAGE, "spec.md")
+    decoy = File.join(@task_root, "decoy.md")
+    File.write(decoy, File.read(visible))
+    FileUtils.rm(visible)
+    File.symlink(decoy, visible)
+
+    # Matching bytes read through a link are a fact about the wrong file.
+    assert_match(/is not a regular file in the prepared task workspace/,
+                 SpecrelayRunner::SpecificationPackage.visible_failure(result).to_s)
+  end
+
   def test_a_symlinked_document_refuses_rather_than_being_followed
     target = File.join(@repo, "elsewhere.md")
     File.write(target, "# Approved\nBuild it.\n")
@@ -389,56 +525,43 @@ class AnalysisPreparationTest < Minitest::Test
     FileUtils.chmod(0o755, File.join(@root, "bin", "graph-query"))
   end
 
+  # nil, or the reason preparation could not be completed.
   def prepare
     SpecrelayRunner::Specification::SourceEvidence.prepare(
-      root: @root, settings: nil, env: { "PATH" => ENV["PATH"].to_s }
+      root: @root, env: { "PATH" => ENV["PATH"].to_s }
     )
   end
 
   def calls = File.exist?(@log) ? File.read(@log).split("\n") : []
 
   def test_a_checkout_without_the_wrappers_is_not_a_failure
-    result = prepare
-
-    assert result.ok?, result.reason
-    refute result.rebuilt
+    assert_nil prepare
+    assert_empty calls, "there is nothing to ask"
   end
 
   def test_a_fresh_graph_is_left_alone
     install(check_codes: [ 0 ])
 
-    result = prepare
-
-    assert result.ok?, result.reason
-    refute result.rebuilt, "a fresh graph needs no rebuild"
-    refute_includes calls, "build"
+    assert_nil prepare
+    assert_equal %w[check], calls, "a fresh graph needs no rebuild"
   end
 
   def test_a_stale_graph_is_rebuilt_and_then_verified
     install(check_codes: [ 3, 0 ])
 
-    result = prepare
-
-    assert result.ok?, result.reason
-    assert result.rebuilt
+    assert_nil prepare
     assert_equal %w[check build check], calls, "the rebuild must be verified, not assumed"
   end
 
   def test_a_rebuild_that_leaves_the_graph_stale_refuses
     install(check_codes: [ 3, 3 ])
 
-    result = prepare
-
-    refute result.ok?, "a graph that is still stale is not evidence"
-    assert_match(/still does not report a fresh graph/, result.reason)
+    assert_match(/still does not report a fresh graph/, prepare.to_s)
   end
 
   def test_a_failed_rebuild_stops_rather_than_reusing_earlier_evidence
     install(check_codes: [ 3 ], build_code: 1)
 
-    result = prepare
-
-    refute result.ok?
-    assert_match(/failed for this checkout/, result.reason)
+    assert_match(/failed for this checkout/, prepare.to_s)
   end
 end
