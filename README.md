@@ -332,9 +332,11 @@ Every repository is checked before the first one is placed. A missing, ambiguous
 repository or package, an unavailable commit, a byte mismatch or a failed placement refuses
 before the provider and before anything is published.
 
-After placement the project's own `bin/graph-check` runs again. A graph built during
-allocation is now stale, so it is rebuilt with `bin/graph-build` and verified; if that fails
-the run stops rather than reusing the old graph. A project without the wrappers continues on
+Final preparation, after placement and before any evidence is gathered or the provider starts,
+runs the project's own `bin/graph-check`. Allocation may already have built a graph for the
+seed; once inputs have been placed that graph is usually stale, so it is rebuilt with
+`bin/graph-build` and verified. A graph that is already fresh is not rebuilt. If the rebuild
+fails the run stops rather than reusing the old graph. A project without the wrappers continues on
 direct source inspection, and a specification lane's recorded Graphify substitute keeps its
 existing meaning. The runner then prints the final heads, relative paths only, for example:
 
