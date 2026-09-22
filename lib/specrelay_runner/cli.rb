@@ -282,9 +282,9 @@ module SpecrelayRunner
     # exit status is read from, so the two can never disagree, and `claim-once` is untouched — it
     # passes no block and keeps its unchanged nonzero single attempt.
     def loop_disposition(config, client, payload)
-      refused = false
-      code = execute(config, client, payload) { refused = true }
-      refused ? LoopRunner::RELEASE_ATTEMPTED_REFUSAL : code == SUCCESS
+      disposition = nil
+      code = execute(config, client, payload) { |signal| disposition = signal }
+      disposition || code == SUCCESS
     end
 
     # MVP-0031 — the idle presence session for this loop.
@@ -537,14 +537,29 @@ module SpecrelayRunner
       result = Execution.new(config: config, client: client, payload: payload, env: env,
                              io: presenter).call
       presenter.line result.message
-      # MAPIAI-107 — the one fact a `loop` session needs beyond this exit status, reported at the
-      # single place both entry points map an execution to one. `claim-once` passes no block, so
-      # its behaviour is unchanged.
-      yield if block_given? && result.refused_after_release_attempt?
+      # The facts a `loop` session needs beyond this exit status, reported at the single place
+      # both entry points map an execution to one. `claim-once` passes no block, so its
+      # behaviour is unchanged.
+      signal = loop_signal(result)
+      yield signal if block_given? && signal
       return RUN_FAILED unless result.handled?
 
       release_task_environment(config, payload) if result.completed_successfully?
       SUCCESS
+    end
+
+    # The two outcomes a session must not simply poll past, in the order they are decided.
+    #
+    # Neither is a degree of failure. A pre-provider refusal left the run exactly as this machine
+    # found it, so the next claim reaches the identical refusal; a result whose report could not
+    # be built never reached Platform at all, and the next claim meets the same broken reporting
+    # dependency on this same host. An exit status cannot express either, and a Boolean that only
+    # said "failed" let the session keep going and describe both as reported failures.
+    def loop_signal(result)
+      return LoopRunner::RELEASE_ATTEMPTED_REFUSAL if result.refused_after_release_attempt?
+      return LoopRunner::FAILED if result.report_unsubmitted?
+
+      nil
     end
 
     # MAPIAI-97 — the environment a COMPLETED implementation leaves behind is released here, on
