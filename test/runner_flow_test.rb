@@ -371,7 +371,14 @@ class RunnerFlowTest < Minitest::Test
     observe_provider
     repin
 
-    code = SpecrelayRunner::Specification::Preflight.stub(:repository_state, nil) { run_cli }
+    preflight = SpecrelayRunner::Specification::Preflight
+    original = preflight.method(:repository_state)
+    preflight.define_singleton_method(:repository_state) { |**| nil }
+    code = begin
+      run_cli
+    ensure
+      preflight.define_singleton_method(:repository_state, original)
+    end
 
     refute_equal SpecrelayRunner::CLI::SUCCESS, code, @io.string
     assert_nil provider_ran, "unmeasurable inputs must refuse before the provider"

@@ -312,6 +312,43 @@ be reading it — the environment stays allocated and is yours to release.
 Waiting on a question, a failed or cancelled attempt, an unacknowledged publication and an
 uncertain transport all keep the environment and ask for no release.
 
+#### What a fresh environment contains
+
+A new environment starts from the project's current heads, never from a leftover task branch.
+Before the provider or any analysis runs, the runner places the run's approved inputs into it:
+
+- **The approved specification, at its pinned commit.** The assignment's repository, commit
+  and package path must resolve to one contained repository; that exact commit is fetched if
+  needed (a newer branch tip never stands in) and its package files must reproduce the
+  approved bytes. The provider sees the package at its normal path, identical to its read-only
+  delivered copy.
+- **Accepted code from earlier rounds**, each head verified as before. Where one repository
+  holds both, the runner keeps whichever existing commit carries both inputs unchanged, and
+  otherwise refuses with an incompatible-inputs reason. It never merges or overlays files.
+- **A specification revision's previously published package**, placed before source is
+  gathered, together with any accepted code.
+
+Every repository is checked before the first one is placed. A missing, ambiguous or unsafe
+repository or package, an unavailable commit, a byte mismatch or a failed placement refuses
+before the provider and before anything is published.
+
+After placement the project's own `bin/graph-check` runs again. A graph built during
+allocation is now stale, so it is rebuilt with `bin/graph-build` and verified; if that fails
+the run stops rather than reusing the old graph. A project without the wrappers continues on
+direct source inspection, and a specification lane's recorded Graphify substitute keeps its
+existing meaning. The runner then prints the final heads, relative paths only, for example:
+
+```text
+Prepared <TASK-ID> at .@<full-sha> repositories/component-a@<full-sha>, approved specification specs/<TASK-ID> pinned at <full-sha> in <owner>/<repository>
+```
+
+The specification lane records the same heads in its source evidence and manifest.
+
+A continued run — the same Run's retry, an answered question or a restored checkpoint — keeps
+its environment as it is. Its rework or restart target still wins over older accepted code, and
+it is never reset to a fresh seed to make validation pass. An incompatible visible package
+refuses instead.
+
 Within the specification lane the runner branches a second time, on
 `assignment_boundary.expected_runner_action` rather than on the run's state:
 
