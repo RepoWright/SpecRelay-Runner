@@ -1206,6 +1206,15 @@ the one publication would push. Ignored command output is harmless.
 An empty selection stays a valid no-change success and reports an empty verification
 collection, which is a different thing from one changed repository reporting `not_found`.
 
+Project commands (the project's create command, the executor and every replayed command) run
+without the Runner's own Ruby, gem and Bundler activation; `PATH`, home and authentication
+settings are kept. Each reported command must therefore be complete on its own: it goes through
+the project's entrypoint that selects its runtime and dependency location, so the project's
+installation stays separate from the Runner's. A shell `cd`, `source`, `rvm use` or `export` from
+the executor's session does not carry over. If the required runtime or entrypoint is missing, that
+command fails with its own reason and blocks publication; it is never replaced by another
+interpreter or reported as `not_found`.
+
 ## GitHub publication
 
 After every changed repository passes verification and before the report upload,
