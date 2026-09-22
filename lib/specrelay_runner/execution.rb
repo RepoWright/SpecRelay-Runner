@@ -799,7 +799,9 @@ module SpecrelayRunner
       # A successful attempt has no failure narrative, so the verification summary is what it
       # knows: the commands really ran, and saying so is not the same as inventing a result for a
       # verification that never happened.
-      return report_construction_failed(details || verification_summary(verifications)) if bundle.nil?
+      if bundle.nil?
+        return report_construction_failed(details || verification_summary(verifications), verifications)
+      end
 
       terminal = terminal_result(status: status, final_sequence: emitter.sequence, exit_code: executor_result.exit_code,
                                  base_commit: worktree.base_commit, changes: changes, publication: publication,
@@ -833,7 +835,7 @@ module SpecrelayRunner
       bundle = build_report(payload: payload, status: ReportBundle::STATUS_FAILED, executor: executor_result,
                             verifications: verifications, changes: changes, base_commit: worktree.base_commit,
                             worktree_path: worktree.path, failure_details: message)
-      return report_construction_failed(message) if bundle.nil?
+      return report_construction_failed(message, verifications) if bundle.nil?
 
       terminal = terminal_result(status: ReportBundle::STATUS_FAILED, final_sequence: emitter.sequence,
                                  exit_code: executor_result.exit_code, base_commit: worktree.base_commit,
@@ -872,10 +874,12 @@ module SpecrelayRunner
     # It claims nothing about the run's state on Platform. This process could not deliver a
     # result; what Platform currently holds, and whether the claim is still live, are things it
     # has not observed and must not guess at.
-    def report_construction_failed(primary)
+    def report_construction_failed(primary, verifications = [])
       error = @report_error
+      failed = failed_command_facts(verifications)
       log("Report construction failed for #{run['task_id']}; no final result was submitted.")
       log("  Work outcome: #{sanitized(primary)}")
+      log("  Failed commands: #{sanitized(failed)}") if failed
       log("  Report error: #{error.class}: #{sanitized(error.message)}")
       log("  Final result was not submitted to Platform because report construction failed.")
       log("  To recover: repair this machine's report-generation dependency, inspect this run in")
@@ -884,6 +888,36 @@ module SpecrelayRunner
       Result.new(outcome: :publication_failed,
                  message: "Runner outcome: publication_failed (the report could not be built, " \
                           "so no final result was submitted).")
+    end
+
+    # What the failed verification commands actually did, or nil when none failed.
+    #
+    # The failure narrative names repositories and stops there, which is right for the report —
+    # the report carries every attempt beside it. This fallback has no report, so the narrative
+    # alone would reduce a nonzero exit, a command killed at the deadline and a command that
+    # never launched to one indistinguishable line, and those are three different repairs.
+    #
+    # It READS the attempts the verifier already produced. Nothing is rerun, re-measured or
+    # re-derived, and it states the fact rather than the evidence: no argv, no captured output,
+    # no inference about why the command failed.
+    def failed_command_facts(verifications)
+      failed = Array(verifications).select(&:failed?)
+      return nil if failed.empty?
+
+      failed.map do |result|
+        facts = Array(result.attempts).reject(&:passed?).map { |attempt| command_fact(attempt) }.uniq
+        "#{result.repository_path} (#{facts.join(', ')})"
+      end.join("; ")
+    end
+
+    # The three distinct endings {RepositoryVerification::Attempt} already separates, in the order
+    # that decides them: a command that never started has no exit status to report, and one killed
+    # at the deadline has none either.
+    def command_fact(attempt)
+      return "could not launch: #{attempt.launch_error}" if attempt.launch_error
+      return "timed out" if attempt.timed_out
+
+      "exit #{attempt.exit_code}"
     end
 
     # Dynamic text on its way to an operator's terminal. Secret SHAPES and absolute local paths

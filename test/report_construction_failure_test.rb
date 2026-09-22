@@ -64,11 +64,66 @@ class ReportConstructionFailureTest < Minitest::Test
   def test_the_builder_is_invoked_once_and_the_fallback_serializes_nothing
     start(expected_heading: "Never Present")
 
-    dumps = 0
-    code, = YAML.stub(:dump, ->(*) { dumps += 1; raise LoadError, "cannot load such file -- psych" }) { run_cli }
+    code, = with_unloadable_yaml { run_cli }
 
     assert_equal CLI::RUN_FAILED, code
-    assert_equal 1, dumps, "the builder ran once and the fallback did not reach for YAML again"
+    assert_equal 1, @yaml_dump_calls, "the builder ran once and the fallback did not reach for YAML again"
+  end
+
+  # ---- S1: the failed command's own fact, not just the repository ----------
+  #
+  # "verification failed in service-a" names WHERE and nothing else. A nonzero exit, a command
+  # killed at the deadline and a command that never launched are three different problems with
+  # three different repairs, and this fallback is the last place any of them is reported — no
+  # report is uploaded, so an operator who only has this terminal has only what it prints.
+  #
+  # These drive the real `submit` with the verification results the verifier really produces,
+  # rather than a whole CLI run, because a genuine 900-second timeout cannot be waited for and a
+  # fabricated one proves less than the real result object does.
+
+  def test_a_nonzero_verification_exit_is_named_in_the_fallback
+    output = submit_with_verification(attempt(exit_code: 42))
+
+    assert_includes output, "verification failed in service-a", "the repository is still named"
+    assert_includes output, "exit 42", "the failing command's own exit status must survive"
+    assert_includes output, "LoadError", "and stays separate from the report error"
+  end
+
+  def test_a_verification_timeout_is_named_in_the_fallback
+    output = submit_with_verification(attempt(timed_out: true))
+
+    assert_includes output, "verification failed in service-a"
+    assert_includes output, "timed out", "a command killed at the deadline is not a failed one"
+    refute_includes output, "exit 42"
+  end
+
+  def test_a_verification_launch_failure_is_named_in_the_fallback
+    output = submit_with_verification(attempt(launch_error: "verifier unavailable"))
+
+    assert_includes output, "verification failed in service-a"
+    assert_includes output, "verifier unavailable", "a command that never ran says so"
+    refute_includes output, "timed out"
+  end
+
+  # The evidence is READ, never re-derived: the verifier's own result objects come back untouched,
+  # the builder is entered once, and nothing is submitted or released.
+  def test_the_fallback_reads_the_existing_attempts_without_disturbing_them
+    verification = failed_verification(attempt(exit_code: 42))
+    frozen = [ verification.repository_path, verification.status,
+               verification.attempts.map { |a| [ a.argv, a.exit_code, a.timed_out, a.launch_error, a.output ] } ]
+    builds = 0
+
+    output = submit_with_verification(nil, verification: verification) { builds += 1 }
+
+    assert_equal 1, builds, "one attempt, one build"
+    assert_equal frozen[0], verification.repository_path
+    assert_equal frozen[1], verification.status
+    assert_equal frozen[2],
+                 verification.attempts.map { |a| [ a.argv, a.exit_code, a.timed_out, a.launch_error, a.output ] },
+                 "the verifier's results are evidence and must come back unchanged"
+    refute_includes output, "bin/verify --strict", "the argv is never printed back"
+    refute_includes output, "secret-ridden output", "the command's own output is never printed back"
+    assert_empty @platform.requests_to("/api/runner/reports")
   end
 
   # ---- S2: a healthy run, and a builder that cannot load -------------------
@@ -374,18 +429,107 @@ class ReportConstructionFailureTest < Minitest::Test
     )
   end
 
+  # ---- the real submit path, driven with real verification results ----------
+
+  # One verification attempt exactly as {RepositoryVerification} produces it. The argv and the
+  # output are deliberately present and deliberately identifiable, so "the fallback never prints
+  # them back" is an assertion rather than an assumption.
+  def attempt(exit_code: nil, timed_out: false, launch_error: nil)
+    SpecrelayRunner::RepositoryVerification::Attempt.new(
+      argv: [ "bin/verify", "--strict" ], exit_code: exit_code, timed_out: timed_out,
+      launch_error: launch_error, output: "secret-ridden output"
+    )
+  end
+
+  def failed_verification(one_attempt)
+    SpecrelayRunner::RepositoryVerification::Result.new(
+      repository_path: "service-a", repository_id: "service-a",
+      status: SpecrelayRunner::RepositoryVerification::FAILED, attempts: [ one_attempt ]
+    )
+  end
+
+  # Call the REAL `Execution#submit` with a failed verification and a builder that cannot load,
+  # and return what the operator sees. Everything but the builder is genuine: the payload, the
+  # client, the emitter and the failure narrative are the production ones.
+  def submit_with_verification(one_attempt, verification: nil, &on_build)
+    start
+    verification ||= failed_verification(one_attempt)
+    io = StringIO.new
+    execution = SpecrelayRunner::Execution.new(
+      config: SpecrelayRunner::Config.load(@config_path),
+      client: SpecrelayRunner::PlatformClient.new(base_url: @platform.base_url,
+                                                  token: FakePlatform::EXPECTED_TOKEN),
+      payload: claim_payload_for(task_id: TASK, publication: {}), env: child_env, io: io
+    )
+    result = with_failing_builder(LoadError.new("cannot load such file -- psych"), on_build) do
+      execution.send(:submit, worktree_info, executor_result, [ verification ], changes,
+                     SpecrelayRunner::ReportBundle::STATUS_FAILED, [], nil)
+    end
+    refute_predicate result, :success?, "a construction failure is never a successful attempt"
+    assert_predicate result, :report_unsubmitted?
+    io.string
+  end
+
+  def worktree_info
+    SpecrelayRunner::Workspace::Info.new(path: File.join(@root, ".runs", "worktrees", TASK),
+                                         base_commit: "a" * 40, created: true)
+  end
+
+  def executor_result
+    SpecrelayRunner::Executor::Result.new(exit_code: 0, stdout: "", stderr: "", duration_seconds: 1.0,
+                                          timed_out: false, argv: [ "fake" ], launch_error: nil)
+  end
+
+  def changes
+    SpecrelayRunner::Workspace::Changes.new(changed_files: [ "service-a/app.rb" ], diff: "",
+                                            head_commit: "b" * 40, measurement_error: nil)
+  end
+
   # ---- fault injection ------------------------------------------------------
 
   # The REAL builder, failing where the incident did. Nothing is installed, moved or corrupted:
   # `YAML.dump` has exactly one caller in this codebase — the report bundle's manifest — so the
   # fault is scoped to report construction by construction rather than by convention.
-  def with_unloadable_yaml(&block)
-    YAML.stub(:dump, ->(*) { raise LoadError, "cannot load such file -- psych" }, &block)
+  #
+  # The method is replaced and restored by hand, like every other fault in this file. A mocking
+  # API would be an invisible dependency on WHICH Minitest a given shell resolves: the copy
+  # bundled with the interpreter still ships `Object#stub`, and the newer one this repository
+  # also resolves does not, so the same file would pass or error depending on the gem home
+  # rather than on the code under test. This repository installs no test dependency.
+  def with_unloadable_yaml
+    calls = 0
+    YAML.singleton_class.class_eval do
+      alias_method :dump_without_injection, :dump
+      define_method(:dump) do |*_args, **_options|
+        calls += 1
+        raise LoadError, "cannot load such file -- psych"
+      end
+    end
+    yield
+  ensure
+    @yaml_dump_calls = calls
+    YAML.singleton_class.class_eval do
+      alias_method :dump, :dump_without_injection
+      remove_method :dump_without_injection
+    end
   end
 
-  # An ordinary failure of the one call the three reporting paths share.
-  def with_failing_builder(error, &block)
-    SpecrelayRunner::ReportBundle.stub(:build, ->(**) { raise error }, &block)
+  # An ordinary failure of the one call the three reporting paths share. `on_build` counts the
+  # entries, so "the builder ran once" is measured at the builder rather than inferred.
+  def with_failing_builder(error, on_build = nil)
+    SpecrelayRunner::ReportBundle.singleton_class.class_eval do
+      alias_method :build_without_injection, :build
+      define_method(:build) do |*_args, **_options|
+        on_build&.call
+        raise error
+      end
+    end
+    yield
+  ensure
+    SpecrelayRunner::ReportBundle.singleton_class.class_eval do
+      alias_method :build, :build_without_injection
+      remove_method :build_without_injection
+    end
   end
 
   # The bundle builds; Platform reads it and refuses it. The upload is deliberately OUTSIDE the
