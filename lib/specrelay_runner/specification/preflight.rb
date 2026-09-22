@@ -176,6 +176,15 @@ module SpecrelayRunner
         end
       end
 
+      # A measured state as an operator can check it: each contained repository by its path in the
+      # environment, the task root as ".", at its exact commit. Repository-relative, so nothing here
+      # carries a host path. One rendering, because both lanes state the same measurement and two
+      # spellings of it would be two claims about one tree.
+      def self.effective_heads(state)
+        state.map { |prefix, facts| "#{prefix.to_s.empty? ? '.' : prefix}@#{facts[:head]}" }
+             .sort.join(" ")
+      end
+
       # The offending task-relative paths of a captured state, or `[]` when only the allowed
       # directory changed. Kept separate from {repository_state} because the state is a fact about
       # the environment while "allowed" is a fact about this run.
@@ -398,6 +407,13 @@ module SpecrelayRunner
         # writer is the provider, and a baseline taken after it would describe its own work.
         state = capture_repository_state(task)
         return state if state.is_a?(Refusal)
+
+        # The same measurement, STATED. It is the baseline the change boundary later compares
+        # against, and a specification whose evidence cannot say which commits it was written from
+        # cannot be checked against them — for a first generation least of all, whose heads are
+        # simply the seeds the environment holds. It goes into the evidence the provider is handed
+        # and the package keeps, rather than into a second channel of its own.
+        source = source_gatherer.attributed(source, self.class.effective_heads(state))
 
         # LAST, and only once every read-only check has passed. The isolated workspace holds the
         # publication snapshot and nothing else, so it is created after everything that could

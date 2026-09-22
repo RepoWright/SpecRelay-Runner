@@ -311,10 +311,7 @@ module SpecrelayRunner
       return "the prepared repositories of #{run['task_id']} could not be inspected, so the " \
              "inputs this run would execute against cannot be stated" if state.nil?
 
-      heads = state.map do |prefix, facts|
-        # The task root's own prefix is empty; naming it "." keeps every entry readable as a path.
-        "#{prefix.to_s.empty? ? '.' : prefix}@#{facts[:head]}"
-      end.sort.join(" ")
+      heads = Specification::Preflight.effective_heads(state)
       anchor = @package.anchor
       pinned = anchor ? ", approved specification #{anchor[:package_path]} pinned at " \
                         "#{anchor[:head]} in #{anchor[:repository]}" : ""

@@ -128,6 +128,20 @@ module SpecrelayRunner
           .prepare(substitute: substitute)
       end
 
+      # The gathered evidence, attributed to the exact commits it describes.
+      #
+      # The structural-analysis entry is where that belongs: whether the graph was fresh, or direct
+      # inspection stood in for it, is a statement about a tree, and a tree is named by its heads.
+      # The entry already reaches both places this has to — the evidence the provider is handed and
+      # the package's own manifest — so saying it here adds no channel, field or document.
+      def self.attributed(result, heads)
+        return result if heads.to_s.empty?
+
+        graph = result.graphify.dup
+        graph.summary = "#{graph.summary}; source inspected at #{heads}"
+        result.dup.tap { |copy| copy.graphify = graph }
+      end
+
       def initialize(root:, settings:, env: ENV, command_runner: CommandRunner)
         @root = File.expand_path(root.to_s)
         @settings = settings
