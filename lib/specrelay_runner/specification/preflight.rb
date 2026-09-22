@@ -699,11 +699,30 @@ module SpecrelayRunner
       # {#resolve_package_path} judges the path the assignment asks for; this judges the same path
       # RESOLVED in the environment that was just prepared, which is a different question and can
       # only be asked once that environment exists.
+      #
+      # It is judged inside the SPECIFICATION REPOSITORY's own checkout, which is the only root
+      # the package is ever written to or replaced in. When the environment itself is that
+      # repository the two roots are the same directory and nothing changes; when it is a
+      # contained component they are different, and judging the task root inspects a path the
+      # package never touches — so an escaping link inside the component passed unseen, and the
+      # checkout that places the revision then replaced whatever stood there.
+      #
+      # A repository this environment does not contain is not answered here: the planner refuses
+      # that with the reason an operator can act on, and until then the task root is the only
+      # destination there is to judge.
       def unsafe_package_destination(task, package)
-        package.absolute_in(task.path)
+        package.absolute_in(specification_root_in(task))
         nil
       rescue PackagePath::Unsafe => e
         refuse(SPECIFICATION_FOLDER_UNSAFE, e.message)
+      end
+
+      def specification_root_in(task)
+        contained = ContainedRepositories.discover(task.path)
+        return task.path unless contained.ok?
+
+        located = contained.resolve(assignment.target_slug)
+        located.is_a?(String) ? located : task.path
       end
 
       # The Runner's own state root, proven DISJOINT from both operator checkouts and then proven

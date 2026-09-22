@@ -93,6 +93,29 @@ class SpecificationGenerationRevisionTest < Minitest::Test
 
   # ------------------------------------------------------------------ the happy path
 
+  # The specification repository is a contained COMPONENT here, so the package destination that
+  # matters is inside that component — not the task root. Judging the root inspected a path the
+  # package never touches, and the checkout that places the revision then replaced the link.
+  def test_a_component_specification_root_that_escapes_refuses_before_placement
+    build_previous_package_on_branch
+    outside = File.join(@temp, "outside-component-package")
+    FileUtils.mkdir_p(outside)
+    FileUtils.rm_rf(File.join(@specs, "specs"))
+    File.symlink(outside, File.join(@specs, "specs"))
+    git(@specs, "add", "specs")
+    commit(@specs, "linked specification root in the component seed")
+    capture = File.join(@temp, "component-provider.json")
+    start_with_revision(provider: SpecificationWorkspace.claude_stub(@temp, files: valid_generated_files,
+                                                                            capture_prompt_to: capture))
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
+
+    refute_path_exists capture, "no provider may run against an escaping package destination"
+    component = File.join(@source, ".runs", "worktrees", BRANCH, SpecificationWorkspace::SPECS_CHECKOUT)
+    assert File.symlink?(File.join(component, "specs")),
+           "the committed link must survive: placement may not replace what the refusal protects"
+  end
+
   def test_the_previous_packages_own_files_reach_the_provider_as_revision_context
     build_previous_package_on_branch
     capture = File.join(@temp, "captured-packet.json")

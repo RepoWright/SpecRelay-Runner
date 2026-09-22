@@ -72,17 +72,33 @@ module SpecrelayRunner
       return nil if anchor.nil?
 
       location = anchor[:package_path].to_s
+      begin
+        base = File.realpath(anchor[:path])
+      rescue SystemCallError
+        return "the repository holding the approved specification cannot be resolved in the " \
+               "prepared task workspace"
+      end
+
       result.paths.each do |relative|
         full = location.empty? ? relative : File.join(location, relative)
-        visible = File.join(anchor[:path], full)
-        # Mode before content, for the same reason the pinned commit is read that way: a link
-        # would be followed somewhere the package does not control, and "the bytes matched"
-        # would then be true of the wrong file.
-        return "#{full} is not a regular file in the prepared task workspace" if
-          File.symlink?(visible) || !File.file?(visible)
+        visible = File.join(base, full)
+        # Containment before content, judged on the REAL path. Testing the file alone for a link
+        # is not enough: a linked ANCESTOR — an escaping `specs` directory, say — puts documents
+        # the run never pinned where the package belongs, and every byte then matches, because
+        # they were copied there. `realpath` resolves each segment, so one question covers the
+        # whole path, and a file that is not a regular file fails it too.
+        begin
+          contained = File.realpath(visible)
+        rescue SystemCallError
+          return "#{full} is not a regular file in the prepared task workspace"
+        end
+        return "#{full} is not a regular file in the prepared task workspace" unless
+          File.file?(contained) && !File.symlink?(visible)
+        return "#{full} resolves outside the repository holding the approved specification" unless
+          contained.start_with?("#{base}/")
         return "#{full} in the prepared task workspace is not the approved specification this " \
                "run was assigned" unless
-          File.binread(visible) == File.binread(File.join(result.root, relative))
+          File.binread(contained) == File.binread(File.join(result.root, relative))
       end
       nil
     end

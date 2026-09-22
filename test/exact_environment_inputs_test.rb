@@ -456,6 +456,27 @@ class VisibleSpecificationPackageTest < Minitest::Test
                  SpecrelayRunner::SpecificationPackage.visible_failure(result).to_s)
   end
 
+  # The ancestor case. Testing the file alone is not containment: the documents behind an
+  # escaping `specs` link match byte for byte, because they were copied there — matching bytes
+  # are a fact about whichever file the path reached, not about which repository it is in.
+  def test_a_package_directory_that_links_out_of_the_repository_refuses
+    result = deliver
+    outside = File.join(@task_root, "outside-specs")
+    FileUtils.mkdir_p(File.dirname(File.join(outside, "spec.md")))
+    DOCUMENTS.each do |relative, content|
+      absolute = File.join(outside, relative)
+      FileUtils.mkdir_p(File.dirname(absolute))
+      File.write(absolute, content)
+    end
+    FileUtils.rm_rf(File.join(@repo, PACKAGE))
+    File.symlink(outside, File.join(@repo, PACKAGE))
+
+    failure = SpecrelayRunner::SpecificationPackage.visible_failure(result)
+
+    refute_nil failure, "identical bytes outside the repository are not the visible package"
+    assert_match(/resolves outside the repository|is not a regular file/, failure)
+  end
+
   def test_a_package_file_replaced_by_a_link_refuses_rather_than_being_followed
     result = deliver
     visible = File.join(@repo, PACKAGE, "spec.md")

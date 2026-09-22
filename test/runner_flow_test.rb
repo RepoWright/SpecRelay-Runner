@@ -296,6 +296,26 @@ class RunnerFlowTest < Minitest::Test
     assert provider_ran, "an environment showing the right package must not be blocked"
   end
 
+  # The ancestor case, through the whole flow: a clean, same-owner, reused allocation whose
+  # committed `specs` is a link to matching documents outside it. Every byte agrees, and none of
+  # them is the package this run was given.
+  def test_a_reused_environment_whose_package_links_outside_it_refuses_before_the_provider
+    observe_provider
+    repin
+    allocate_environment
+    outside = File.join(@root, ".runs", "outside-specs")
+    FileUtils.mv(File.join(worktree, "specs"), outside)
+    File.symlink(outside, File.join(worktree, "specs"))
+    DemoWorkspace.git(worktree, "add", "specs")
+    DemoWorkspace.git(worktree, "commit", "-qm", "linked specification directory")
+
+    code = run_cli
+
+    refute_equal SpecrelayRunner::CLI::SUCCESS, code, @io.string
+    assert_nil provider_ran, "a package reached through an escaping link must not be launched against"
+    assert File.symlink?(File.join(worktree, "specs")), "and the environment is left as it was"
+  end
+
   # ---------------------------------------------------------------- final analysis
 
   # The checkout's own analysis has to describe the tree as it FINALLY stands. Inputs are placed
