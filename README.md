@@ -1076,26 +1076,22 @@ output, account identity, hidden reasoning, tool-call streams, or session ids.
 
 ### When the report itself cannot be built
 
-Every classification above is *reported* — the attempt reaches Platform and is
-recorded there. Building the report is the one step that can still fail afterwards:
-it serializes the manifest through YAML, so a missing or broken report-generation
-dependency on this host raises once the work is already over and decided.
+Report construction happens before the final result is submitted to Platform.
+If it fails, the runner prints the known work outcome — including available exit,
+timeout or launch facts for failed verification — separately from the sanitized
+construction error. Execution and verification may have succeeded even though
+the report could not be built.
 
-The two failures are then kept apart. The runner prints what the attempt itself
-found — including the failed repository and whether its verification command exited
-non-zero, timed out, or never launched — and, separately, the construction error's
-class and message. It then states that **the final result was not submitted to
-Platform**, and exits non-zero. A `loop` session stops there even under
-`--on-failure continue`, because another claim would meet the same broken
-dependency on this same machine.
+The runner explicitly states that **the final result was not submitted to Platform**
+and exits non-zero. A `loop` session stops even under `--on-failure continue`.
+There is no automatic report-delivery retry, and this failure does not trigger
+task-environment release.
 
-Nothing is delivered later: there is no queue, no background resend and no retry of
-the upload, and the attempt's task environment is left in place. Repair the
-report-generation dependency, inspect the run in Platform to see what it actually
-holds, and use the existing
+Repair the reported report-generation dependency or file problem, inspect the run
+in Platform, and use the existing
 [`bin/platform runner release`](#recovering-a-stuck-claim) step only if the claim
-still needs releasing before you restart. This ending reports only what this runner
-did not send; it asserts nothing about the run's current state on Platform.
+still needs releasing before restarting. This diagnostic makes no claim about
+the run's current state on Platform.
 
 ## The deterministic demo executor
 
