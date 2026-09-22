@@ -83,15 +83,21 @@ class RunnerFlowTest < Minitest::Test
   # A release the project refused does NOT retract the accepted report — it is already uploaded —
   # but it does stop this machine, because it is now holding something nobody has accounted for.
   def test_a_refused_release_blocks_the_machine_without_rewriting_the_accepted_report
-    File.write(File.join(@root, "bin", "worktree"), <<~SH)
+    # Only the release verb is replaced. Allocation and the ownership proof still run through
+    # the project's real command, so the environment this run is refused the release of is one
+    # it genuinely owns — which is the situation the rule is about.
+    path = File.join(@root, "bin", "worktree")
+    FileUtils.mv(path, "#{path}-real")
+    File.write(path, <<~SH)
       #!/usr/bin/env sh
-      case "${1:-}" in
-        release) echo "refusing to release $2" >&2; exit 1 ;;
-        create) git -C "$(cd "$(dirname "$0")/.." && pwd)" worktree add -b "$2" \
-                  "$(cd "$(dirname "$0")/.." && pwd)/.runs/worktrees/$2" HEAD ;;
-        *) exit 0 ;;
-      esac
+      set -u
+      if [ "${1:-}" = "release" ]; then
+        echo "refusing to release ${2:-}" >&2
+        exit 1
+      fi
+      exec "$(dirname "$0")/worktree-real" "$@"
     SH
+    FileUtils.chmod(0o755, path)
 
     exit_code = run_cli
 

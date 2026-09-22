@@ -604,8 +604,14 @@ module SpecrelayRunner
     # ordinary first execution does.
     def creating_workspace(root)
       Workspace.new(root: root, canonical_branch: run["canonical_branch"], task_id: run["task_id"],
+                    run_id: run_identity,
                     create_command: workspace.fetch("worktree_create_command"))
     end
+
+    # The Platform Run this attempt acts for, and the only identity that may own its environment.
+    # Not the claim, the attempt or the execution: those change between attempts of the SAME run,
+    # and an environment whose owner changed under a retry could not be continued or released.
+    def run_identity = run["id"].to_s
 
     # The recorded package, from the one claim-bound path Platform put in the assignment.
     def download_checkpoint
@@ -616,8 +622,13 @@ module SpecrelayRunner
     # The same workspace, for READING only: the change capture, the checkpoint and the resume's
     # worktree lookup all ask about a worktree rather than create one, so none of them carries a
     # create command.
+    #
+    # It carries the run identity all the same, because one of those reads is a CONTINUATION: an
+    # answered resume picks up the dirty worktree its question was asked from, and that worktree
+    # has to be this run's. The measurement calls are unaffected — they are handed a path.
     def measuring_workspace(root)
-      Workspace.new(root: root, canonical_branch: run["canonical_branch"], create_command: "")
+      Workspace.new(root: root, canonical_branch: run["canonical_branch"], task_id: run["task_id"],
+                    run_id: run_identity, create_command: "")
     end
 
     # MVP-0018 — the executor runs with a live output sink attached, so safe,

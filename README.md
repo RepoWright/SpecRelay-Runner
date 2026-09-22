@@ -271,8 +271,46 @@ assignment's own `run.type` — never on which fields are missing:
 
 | `run.type` | What this runner does |
 |---|---|
-| `implementation` | The full flow: worktree, executor, tests, report, publication. |
+| `implementation` | The full flow: owned task environment, executor, tests, report, publication. |
 | `spec_creation` | Two phases, each its own claim: **generate** a specification package locally, then — when Platform offers the same run again — **publish** it as a draft pull request. |
+
+#### The task environment belongs to a Run
+
+Both automatic lanes work in an environment your project allocated **for the Platform Run
+they were claimed for**, and in no other.
+
+```bash
+bin/worktree create  <TASK-ID> --run-id <RUN-ID>          # allocate, recording the owner
+bin/worktree status  <TASK-ID> --json                     # who owns it, if anyone
+bin/worktree release <TASK-ID> --run-id <RUN-ID> --json   # hand it back
+```
+
+Allocation names the run and is then PROVED: the runner reads the owner back before it hands
+the environment to a provider, so a command that accepted `--run-id` and recorded nothing
+refuses the run instead of leaving it an environment it could never release. Continuing an
+environment that is already there asks the same question first, before the working tree is
+read and before any reset, materialization or publication. Manual, other-run and unprovable
+environments are refused untouched — clean or dirty, because clean is not the same as yours.
+
+A project whose `bin/worktree` cannot record an owner refuses the run. The assignment's plain
+git creation command is not used as a fallback: it builds a worktree with no owner, which the
+run could neither prove on a retry nor hand back at the end.
+
+A successful run hands its environment back once its report — or, in the specification lane,
+its publication result — has been ACCEPTED, and not before. Everything unpublished in it is
+that run's own by then and goes with it, including edits you made there by hand; the runner
+removes none of it itself. Only an explicit `released` naming that run, or your project's own
+proof that there is nothing left, is completion. A timeout, a non-zero exit, an unreadable
+answer or a partial teardown is reported as still allocated — without guessing which files
+survived, because your project is what knows. What follows differs by lane, deliberately.
+After an implementation run this machine stops: it is holding an environment the next run
+would otherwise be put on top of, so a single run exits non-zero and a `loop` session ends
+until you release it by hand. After a specification publication it reports the same thing as
+a warning and carries on, because the pull request already exists and a reviewer may already
+be reading it — the environment stays allocated and is yours to release.
+
+Waiting on a question, a failed or cancelled attempt, an unacknowledged publication and an
+uncertain transport all keep the environment and ask for no release.
 
 Within the specification lane the runner branches a second time, on
 `assignment_boundary.expected_runner_action` rather than on the run's state:

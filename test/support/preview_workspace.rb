@@ -47,6 +47,10 @@ module PreviewWorkspace
       File.write(File.join(runs, "splittail.#{verb}"), tail)
     end
     def status!(document) = File.write(File.join(runs, "status.json"), JSON.generate(document))
+
+    # An environment the project already holds for somebody: another run, or — with an empty
+    # `run_id` — a person.
+    def own!(task_id, run_id) = ProjectCommand.own!(File.dirname(runs), task_id, run_id)
   end
 
   module_function
@@ -111,7 +115,7 @@ module PreviewWorkspace
       RUNS="$ROOT_DIR/.runs"
       mkdir -p "$RUNS"
       printf '%s\\t%s\\n' "$PWD" "$*" >> "$RUNS/worktree.log"
-      VERB="${1:-}"
+      #{ProjectCommand.arguments}
       if [ -f "$RUNS/leak.$VERB" ]; then cat "$RUNS/leak.$VERB"; fi
       if [ -f "$RUNS/leakerr.$VERB" ]; then cat "$RUNS/leakerr.$VERB" >&2; fi
       if [ -f "$RUNS/splithead.$VERB" ]; then
@@ -119,7 +123,6 @@ module PreviewWorkspace
         sleep 1
         printf '%s\\n' "$(cat "$RUNS/splittail.$VERB")"
       fi
-      TASK="${2:-}"
       WT="$RUNS/worktrees/$TASK"
       FAIL="$(cat "$RUNS/fail" 2>/dev/null || true)"
       HANG="$(cat "$RUNS/hang" 2>/dev/null || true)"
@@ -140,6 +143,7 @@ module PreviewWorkspace
           for repo in $COMPONENTS; do
             git -C "$ROOT_DIR/$repo" worktree add -b "$TASK" "$WT/$repo" HEAD >/dev/null 2>&1 || exit 1
           done
+          #{ProjectCommand.record_owner}
           echo "created $WT"
           ;;
         up)
@@ -147,21 +151,26 @@ module PreviewWorkspace
           ;;
         status)
           if [ -f "$RUNS/absent" ]; then
-            echo "unknown task environment '$TASK'" >&2
+            echo '{"error":"unknown task environment"}'
             exit 4
           fi
           cat "$RUNS/status.json"
           ;;
         release)
           if [ -f "$RUNS/absent" ]; then
+            if [ -n "$RUN_ID" ]; then
+              printf '{"task_id":"%s","outcome":"absent"}\\n' "$TASK"
+              exit 0
+            fi
             echo "unknown task environment '$TASK'" >&2
             exit 4
           fi
+          #{ProjectCommand.release_guard}
           for repo in $COMPONENTS; do
             git -C "$ROOT_DIR/$repo" worktree remove --force "$WT/$repo" >/dev/null 2>&1 || true
           done
           git -C "$ROOT_DIR" worktree remove --force "$WT" >/dev/null 2>&1 || true
-          echo "released $TASK"
+          #{ProjectCommand.release_report(%(echo "released $TASK"))}
           ;;
         *)
           echo "usage: worktree create|up|status|release <task>" >&2

@@ -266,7 +266,8 @@ class SpecificationTaskStateTest < Minitest::Test
   # Build the task environment with the project's own command, so a test starts from one this
   # run did NOT create.
   def prepare_task_environment
-    output, status = Open3.capture2e(File.join(@root, "bin", "worktree"), "create", TASK, chdir: @root)
+    output, status = Open3.capture2e(File.join(@root, "bin", "worktree"), "create", TASK,
+                                     "--run-id", SPEC_RUN, chdir: @root)
     raise "fixture worktree create failed: #{output}" unless status.success?
 
     File.delete(@built.worktree_log) if File.exist?(@built.worktree_log)

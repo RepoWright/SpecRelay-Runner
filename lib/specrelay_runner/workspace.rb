@@ -67,17 +67,31 @@ module SpecrelayRunner
     # `on_output` is the live consumer of the CREATE command's own stdout/stderr, and
     # only that command's: it is the one invocation here that belongs to an operator watching a
     # page. The git reads below are this class's own bookkeeping and stay silent.
-    def initialize(root:, canonical_branch:, create_command:, task_id: nil, env: {}, on_output: nil)
+    #
+    # `run_id` is what separates the two kinds of caller, and it is nil-or-present rather than
+    # blank-or-present on purpose. An AUTOMATIC lane always passes the Platform Run identity it
+    # was assigned, so a blank one is a malformed assignment and is refused — where treating it
+    # as "no identity supplied" would quietly allocate an environment nobody owns. The preview
+    # and measurement callers pass nothing at all, and keep their existing behavior exactly.
+    def initialize(root:, canonical_branch:, create_command:, task_id: nil, run_id: nil, env: {},
+                   on_output: nil)
       @root = root.to_s
       @canonical_branch = canonical_branch.to_s
       @create_command = create_command.to_s
       @task_id = task_id.to_s
+      @run_id = run_id
       @env = { "PATH" => ENV["PATH"].to_s }.merge(env)
       @on_output = on_output
     end
 
     def create
       if (existing = locate(required: false))
+        # Ownership FIRST, and before the working tree is even read. An environment that is not
+        # this run's is refused whether it is clean or dirty, and asking the cheaper question
+        # second is what would make a foreign environment's refusal name its uncommitted changes
+        # — sending an operator to tidy a worktree that was never going to be reused.
+        refuse_unowned!
+
         status = git(existing, %w[status --porcelain])
         raise Error, "existing worktree for #{canonical_branch} could not be inspected" unless status.success?
         unless status.stdout.to_s.strip.empty?
@@ -88,12 +102,18 @@ module SpecrelayRunner
         return Info.new(path: existing, base_commit: rev_parse(existing, "HEAD"), created: false)
       end
 
+      require_owned_create!
       result = run(create_argv, on_output: on_output)
       unless result.success?
         raise Error, "worktree create failed (exit #{result.exit_code}): #{first_line(result.stderr, result.stdout)}"
       end
 
       path = locate
+      # The allocation is proved AFTER it is built, not inferred from a successful exit. A project
+      # command that accepted the run identity and recorded nothing would otherwise hand this run
+      # an unowned environment it would later refuse to release — and the run would discover that
+      # only at the end, with the work already done.
+      refuse_unowned!
       Info.new(path: path, base_commit: rev_parse(path, "HEAD"), created: true)
     end
 
@@ -112,7 +132,11 @@ module SpecrelayRunner
     # command's own output is not parsed: git already knows the answer.
     def create_argv
       project = File.join(root, PROJECT_COMMAND)
-      return [ project, "create", task_id ] if !task_id.empty? && File.executable?(project)
+      if !task_id.empty? && File.executable?(project)
+        return [ project, "create", task_id ] unless automatic?
+
+        return [ project, "create", task_id, "--run-id", run_id.to_s ]
+      end
 
       Shellwords.split(create_command)
     end
@@ -127,6 +151,11 @@ module SpecrelayRunner
       path = locate(required: false)
       return nil if path.to_s.empty?
 
+      # The same gate `create` applies, for the same reason and in the same place in the order:
+      # every automatic caller that may CONTINUE in an existing environment reaches it through
+      # here, so stating the rule once is what keeps reuse and release from disagreeing about
+      # whose environment this is.
+      refuse_unowned!
       Info.new(path: path, base_commit: rev_parse(path, "HEAD"), created: false)
     end
 
@@ -193,7 +222,42 @@ module SpecrelayRunner
 
     private
 
-    attr_reader :root, :canonical_branch, :create_command, :task_id, :env, :on_output
+    attr_reader :root, :canonical_branch, :create_command, :task_id, :run_id, :env, :on_output
+
+    # An automatic lane is one that was given a Run to act for. Only those lanes gate on
+    # ownership; the preview and measurement callers are unchanged by everything below.
+    def automatic? = !run_id.nil?
+
+    # Refuse unless the project can PROVE this run owns the environment. A refusal here has
+    # touched nothing: it is asked before the working tree is read, before any reset or
+    # materialization, and before the provider is launched.
+    def refuse_unowned!
+      return unless automatic?
+
+      reason = TaskEnvironment.unowned_reason(root: root, task_id: task_id, run_id: run_id,
+                                              canonical_branch: canonical_branch)
+      raise Error, reason if reason
+    end
+
+    # An automatic run may be allocated ONLY through the project's own run-aware command.
+    #
+    # The assignment's native git creation command is not a fallback for a project that lacks it.
+    # It builds a worktree with no owner, which this lane could then neither prove nor release —
+    # so supporting it would mean automatic runs that quietly accumulate environments nobody can
+    # take down. A project that cannot record ownership refuses the run instead.
+    #
+    # What makes an allocation ownable is the same set of conditions that makes ownership
+    # provable afterwards, so the rule is asked of {TaskEnvironment} rather than restated here:
+    # a second copy is how "we may allocate this" and "we may release this" would come to
+    # disagree, which is exactly the state that strands an environment.
+    def require_owned_create!
+      return unless automatic?
+
+      missing = TaskEnvironment.unavailable_reason(root, task_id, run_id)
+      return if missing.nil?
+
+      raise Error, "#{missing}, so this run cannot allocate a task environment it could own"
+    end
 
     # One entry, or the first fact about it that failed. The order is deliberate: containment
     # before git, git before the remote, and the change set last, so a refusal names the cheapest

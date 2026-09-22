@@ -199,10 +199,12 @@ class MultiRepositoryPublicationTest < Minitest::Test
     start(fixture_env: { "FAKE_EXECUTOR_EDITED" => "component-a" })
     run_cli
 
-    assert_equal [ "create #{TASK}", "release #{TASK}" ],
+    assert_equal [ "create #{TASK} --run-id #{IMPL_RUN}", "status #{TASK} --json",
+                   "release #{TASK} --run-id #{IMPL_RUN} --json" ],
                  MultiRepositoryWorkspace.worktree_invocations(@built.worktree_log),
-                 "the project-owned command constructs the task environment exactly once, and " \
-                 "MAPIAI-97 hands it back once the successful report is accepted"
+                 "the project-owned command constructs the task environment exactly once for " \
+                 "this run, proves it recorded that owner, and hands it back once the " \
+                 "successful report is accepted"
     # Which workspace the runner actually USED, read from the report it uploaded rather than from
     # the disk: MAPIAI-97 releases that environment once the successful report is accepted, and
     # the recorded identity is the durable evidence of the same fact.
@@ -213,9 +215,15 @@ class MultiRepositoryPublicationTest < Minitest::Test
 
   # --- S06: the native single-repository fallback -------------------------
 
-  # A checkout with no project-owned command still works: the runner runs the native worktree
-  # command the assignment names, publishes normally, and never touches `bin/dev`.
-  def test_a_checkout_without_the_project_command_uses_the_native_worktree_path
+  # A checkout with no run-aware project command REFUSES the automatic run, and the assignment's
+  # native worktree command is not used as a fallback.
+  #
+  # This replaces the native-fallback path for this lane rather than sitting beside it. That
+  # command builds a worktree with no recorded owner: the run could neither prove the
+  # environment was its own on a retry nor release it at the end, so an operator of such a
+  # project would accumulate environments nobody can take down. Refusing before anything is
+  # created is the honest answer; supporting ownerless automatic projects is separate work.
+  def test_a_checkout_without_the_run_aware_project_command_refuses_the_automatic_run
     FileUtils.remove_entry(@root)
     @root, executor = DemoWorkspace.build
     use_fixture(fixture_dir, executor)
@@ -227,12 +235,12 @@ class MultiRepositoryPublicationTest < Minitest::Test
                                 worktree_create_command: "git worktree add .runs/worktrees/#{TASK} -b #{TASK}")
     @platform = FakePlatform.new(claim_payload: payload).start
     @config_path = write_config
-    code, output = run_cli(gh_dir: gh_dir)
+    _code, output = run_cli(gh_dir: gh_dir)
 
-    assert_equal SpecrelayRunner::CLI::SUCCESS, code, output
-    assert_equal [ "SpecRelay/tiny-demo-workspace" ], result_ids
-    assert_equal 1, FakeGithub.pr_creates(gh_log)
-    assert_equal results.first["head_commit"], FakeGithub.remote_branches(bare)[BRANCH]
+    assert_match(/preflight_failed/, output)
+    assert_includes output, "no run-aware"
+    refute_path_exists File.join(@root, ".runs", "worktrees", TASK)
+    assert_equal 0, FakeGithub.pr_creates(gh_log), "nothing may be published"
     refute File.exist?(dev_log), "bin/dev must never be used for workspace discovery or creation"
   end
 
@@ -319,7 +327,8 @@ class MultiRepositoryPublicationTest < Minitest::Test
   # reports. The runner's own preparation finds the clean workspace already on the canonical
   # branch and continues it, which is the existing retry/resume behaviour rather than a test hook.
   def prepare_task_workspace
-    out, status = Open3.capture2e(File.join(@root, "bin", "worktree"), "create", TASK)
+    out, status = Open3.capture2e(File.join(@root, "bin", "worktree"), "create", TASK,
+                                  "--run-id", IMPL_RUN)
     raise out unless status.success?
 
     File.write(@built.worktree_log, "")

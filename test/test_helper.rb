@@ -22,6 +22,8 @@ require "specrelay_runner"
 # Child processes inherit it, so a runner spawned into a pty is isolated for the same reason.
 ENV["HOME"] = Dir.mktmpdir("runner-test-home")
 
+# The ownership contract every fixture project command implements, in one place.
+require_relative "support/project_command"
 require_relative "support/fake_platform"
 require_relative "support/fake_secret_store"
 require_relative "support/demo_workspace"
@@ -46,6 +48,14 @@ require_relative "support/recording_terminal"
 # payload. It adds no production bypass, no environment override and no test-only branch: the
 # payload is always the canonical profile, and what a bare name resolves to on a host, under which
 # environment, is the host's business.
+# The Platform Run the specification fixtures act for. Named because it is now load-bearing:
+# it is the identity the project records as the owner of the ticket's task environment, so a
+# test that prepares or inspects one has to use the SAME id the assignment carries.
+SPEC_RUN = "run_spec123"
+
+# The same, for the implementation fixtures.
+IMPL_RUN = "run_test123"
+
 def fixture_bin(script = nil, env: {})
   dir = Dir.mktmpdir("fixture-bin-")
   script ? use_fixture(dir, script, env: env) : dir
@@ -91,7 +101,7 @@ def spec_creation_payload_for(issue_key:, title: "Add an export button", inputs:
     # `canonical_branch` defaults to the issue key only because most cases here are not ABOUT
     # branch identity. Platform sends the ticket's own branch, so any case that reasons about
     # which branch this ticket owns must state it — see the revision and publication fixtures.
-    "run" => { "id" => "run_spec123", "type" => "spec_creation",
+    "run" => { "id" => SPEC_RUN, "type" => "spec_creation",
                "state" => "AWAITING_SPECIFICATION_CREATION",
                "task_id" => canonical_branch || issue_key,
                "canonical_branch" => canonical_branch || issue_key },
@@ -163,7 +173,7 @@ def spec_publication_payload_for(issue_key:, files:, package_path:, branch:, wor
   # would describe a document Platform cannot produce — and would let a test claim a long
   # canonical branch while the wire carried a bare key.
   spec_creation_payload_for(issue_key: issue_key, title: title, canonical_branch: branch).merge(
-    "run" => { "id" => "run_spec123", "type" => "spec_creation",
+    "run" => { "id" => SPEC_RUN, "type" => "spec_creation",
                "state" => "AWAITING_SPECIFICATION_PUBLICATION",
                "task_id" => branch, "canonical_branch" => branch },
     "assignment_boundary" => { "generation" => "generate_package_only",
@@ -308,7 +318,7 @@ def base_claim_payload(task_id:, worktree_create_command: nil)
     "contract_version" => "mvp-0010",
     "claim" => { "runner_execution_id" => "rex_test123", "claim_policy_mode" => "all_eligible" },
     # MVP-0025 names the LANE on every assignment, and Platform's RunPayload always sends it.
-    "run" => { "id" => "run_test123", "type" => "implementation", "task_id" => task_id,
+    "run" => { "id" => IMPL_RUN, "type" => "implementation", "task_id" => task_id,
                "canonical_branch" => task_id },
     "workspace" => {
       "project_key" => "tiny-demo", "workspace_key" => "tiny-demo-workspace",

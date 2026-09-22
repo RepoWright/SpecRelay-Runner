@@ -566,7 +566,11 @@ module SpecrelayRunner
       return if task_id.empty?
 
       root = config.workspace_root(payload.to_h["workspace"].to_h["workspace_key"], env: env)
-      TaskEnvironment.release!(root: root, task_id: task_id, io: presenter)
+      # Released AS the run that owns it. The project refuses any other identity, so a release
+      # this runner cannot prove ownership for stops the session here rather than taking down an
+      # environment that belongs to somebody else.
+      TaskEnvironment.release!(root: root, task_id: task_id,
+                               run_id: payload.to_h["run"].to_h["id"].to_s, io: presenter)
     end
 
     def generate_specification(config, client, payload)

@@ -246,8 +246,8 @@ module SpecrelayRunner
       #
       # TWO things are cleaned up, because generation left the package in two places: this
       # runner's own publication snapshot, and the ticket's task environment the analysis ran in.
-      # Both are duplicates of committed history once Platform has accepted, and the second one
-      # is a whole worktree the preview lane addresses by the same task id.
+      # The snapshot is this runner's own directory and it removes it; the environment is the
+      # project's, so the project is ASKED to release it, and only for the run that owns it.
       def clean_up(workspace)
         remove_snapshot(workspace)
         return_task_environment
@@ -262,21 +262,18 @@ module SpecrelayRunner
 
       # The ticket's task environment, handed back through the project's own release command.
       #
-      # {TaskEnvironmentCleanup} fails closed — an environment holding somebody's own uncommitted
-      # work, or a package that is no longer the accepted one, is left exactly as it is and never
-      # released. That is reported as a WARNING for the same reason a snapshot-removal failure is:
-      # the pull request exists and the run has advanced, and an operator told the publication
-      # failed would go looking for a specification a reviewer is already reading.
+      # An incomplete release is reported as a WARNING for the same reason a snapshot-removal
+      # failure is: the pull request exists and the run has advanced, and an operator told the
+      # publication failed would go looking for a specification a reviewer is already reading.
+      #
+      # The message says only what was proved. It does not claim which files were cleared or
+      # retained, because this runner removed none of them and the project — which did — has
+      # recorded what is still there.
       def return_task_environment
         result = TaskEnvironmentCleanup.call(assignment: assignment, config: config, env: env)
-        return log("Removed the accepted package from this ticket's task environment and released it.") if
-          result.released?
-        return if result.reason.nil?
+        return log("Released this ticket's task environment.") if result.released?
 
-        log(result.removed? ? "The accepted package was cleared from this ticket's task " \
-                              "environment, which was NOT released:"
-                            : "The accepted package was left in this ticket's task environment " \
-                              "and the environment was NOT released:")
+        log("This ticket's task environment was NOT released:")
         log("  #{result.reason}")
       end
 

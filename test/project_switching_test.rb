@@ -383,9 +383,12 @@ class ProjectSwitchingTest < Minitest::Test
     root, executor = DemoWorkspace.build
     use_fixture(fixture_directory, executor)
     command = File.join(root, "bin", "worktree")
-    File.write(command, File.read(command).sub("set -eu\n",
-                                               "set -eu\nmkdir -p \"$(dirname \"$0\")/../.runs\"\n" \
-                                               "echo \"$*\" >> \"$(dirname \"$0\")/../.runs/worktree.log\"\n"))
+    logging = "mkdir -p \"$(dirname \"$0\")/../.runs\"\n" \
+              "echo \"$*\" >> \"$(dirname \"$0\")/../.runs/worktree.log\"\n"
+    source = File.read(command)
+    raise "the fixture project command changed shape" unless source.include?("set -u\n")
+
+    File.write(command, source.sub("set -u\n", "set -u\n#{logging}"))
     FileUtils.chmod(0o755, command)
     root
   end

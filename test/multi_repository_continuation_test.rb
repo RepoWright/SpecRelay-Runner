@@ -514,7 +514,8 @@ class MultiRepositoryContinuationTest < Minitest::Test
   # to refuse. The runner's own preparation finds it already on the canonical branch and
   # continues it, which is the existing retry behaviour rather than a test hook.
   def prepare_task_workspace
-    out, status = Open3.capture2e(File.join(@root, "bin", "worktree"), "create", TASK)
+    out, status = Open3.capture2e(File.join(@root, "bin", "worktree"), "create", TASK,
+                                  "--run-id", IMPL_RUN)
     raise out unless status.success?
   end
 

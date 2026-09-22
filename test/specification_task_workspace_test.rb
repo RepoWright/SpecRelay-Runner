@@ -39,7 +39,8 @@ class SpecificationTaskWorkspaceTest < Minitest::Test
     start
     assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
 
-    assert_equal [ "create #{TASK}" ], worktree_invocations
+    assert_equal [ "create #{TASK} --run-id #{SPEC_RUN}", "status #{TASK} --json" ],
+                 worktree_invocations
     assert_equal task_workspace, probe["cwd"], "the provider must run in the task environment"
     assert_includes probe["entries"], "component-a"
     assert_includes probe["entries"], "component-b"
@@ -67,7 +68,8 @@ class SpecificationTaskWorkspaceTest < Minitest::Test
     start
     assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
 
-    assert_equal [], worktree_invocations
+    # Only the ownership proof. No second allocation, and no rewrite of the recorded owner.
+    assert_equal [ "status #{TASK} --json" ], worktree_invocations
     assert_equal before, Dir.children(File.join(@root, ".runs", "worktrees")).sort
     assert_equal task_workspace, probe["cwd"]
   end
@@ -473,9 +475,14 @@ class SpecificationTaskWorkspaceTest < Minitest::Test
 
   # Run the project-owned command exactly as the runner would, so a REUSE test starts from an
   # environment the runner did not build.
-  def prepare_task_environment
+  # An environment this generation's own Run already owns — the state a same-run retry finds.
+  # Allocated through the project's own command with that Run id, because ownership is what
+  # makes it reusable and a fixture that recorded none would be preparing a manual environment.
+  def prepare_task_environment(run_id: SPEC_RUN)
     SpecificationWorkspace.git!(@root, "status", "--porcelain")
-    output, status = Open3.capture2e(File.join(@root, "bin", "worktree"), "create", TASK, chdir: @root)
+    argv = [ File.join(@root, "bin", "worktree"), "create", TASK ]
+    argv += [ "--run-id", run_id ] unless run_id.nil?
+    output, status = Open3.capture2e(*argv, chdir: @root)
     raise "fixture worktree create failed: #{output}" unless status.success?
 
     File.delete(@built.worktree_log) if File.exist?(@built.worktree_log)

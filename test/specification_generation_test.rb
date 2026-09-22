@@ -442,11 +442,20 @@ class SpecificationGenerationTest < Minitest::Test
   # A checkout that RESOLVES, can still build the ticket's task environment, and contains nothing
   # readable to write a specification from. That is a different condition from a missing workspace
   # root, and — since generation is grounded in the task environment — a different condition from
-  # a wiped directory: removing `.git` and the project's own `bin/worktree` would refuse for a
-  # missing environment rather than exercise the zero-source path this asserts about.
+  # a wiped directory: removing `.git` would refuse for a missing environment rather than
+  # exercise the zero-source path this asserts about.
+  #
+  # `bin/worktree` is RESTORED into the checkout afterwards, untracked. An automatic run may only
+  # allocate through the project's own run-aware command, so a checkout without one refuses
+  # before generation and never reaches the condition under test — but a tracked one would be
+  # carried into the task environment and counted as a readable source file, which is the very
+  # thing this is emptying. The connected checkout keeps the command; the environment built from
+  # its history does not.
   #
   # The removal is COMMITTED, because the task environment is built from this checkout's history.
   def empty_the_source_checkout
+    command = File.join(@source, "bin", "worktree")
+    allocator = File.read(command)
     Dir.glob(File.join(@source, "*"), File::FNM_DOTMATCH).each do |path|
       next if path.end_with?("/.", "/..", "/.git")
 
@@ -456,21 +465,9 @@ class SpecificationGenerationTest < Minitest::Test
     SpecificationWorkspace.git!(@source, "-c", "user.email=fixture@specrelay.local",
                                 "-c", "user.name=SpecRelay Fixture", "commit", "-q",
                                 "-m", "empty the readable source")
-    restart_platform_without_project_tooling
-  end
-
-  # The workspace's OWN create command, because a checkout with nothing in it has no
-  # `bin/worktree` either — and that is the path the assignment's `worktree_create_command`
-  # exists for. Restated as a fresh claim so the runner reads it.
-  def restart_platform_without_project_tooling
-    @platform.stop
-    @platform = FakePlatform.new(
-      claim_payload: spec_creation_payload_for(
-        issue_key: ISSUE,
-        worktree_create_command: "git worktree add -b #{ISSUE} .runs/worktrees/#{ISSUE} HEAD"
-      )
-    ).start
-    @config = build_config
+    FileUtils.mkdir_p(File.dirname(command))
+    SpecificationWorkspace.write_executable(command, allocator)
+    restart_platform
     @io = StringIO.new
   end
 
