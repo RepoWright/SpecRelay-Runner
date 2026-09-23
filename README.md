@@ -298,9 +298,10 @@ run could neither prove on a retry nor hand back at the end.
 
 A run hands its environment back once Platform has RECORDED how it ended, and not before: an
 implementation report (success or failure), a specification publication or publication
-failure, or a generation failure or refusal. An explicit cancellation from Platform is an
-ending too: the runner ends the run's process group, sends no late result and hands the
-environment back. Everything unpublished in it is that run's own by then and goes with it,
+failure, or a generation failure or refusal. An explicit cancellation this runner observes
+while the run is active is an ending too: it ends the run's process group, sends no late
+result and hands the environment back. A cancellation discovered later, or while the runner
+was offline, releases nothing yet. Everything unpublished in it is that run's own by then and goes with it,
 including edits you made there by hand; the runner removes none of it itself. Only an explicit
 `released` naming that run, or your project's own proof that there is nothing left, is
 completion. A timeout, a non-zero exit, an unreadable answer or a partial teardown is reported
