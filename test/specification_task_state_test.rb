@@ -52,6 +52,27 @@ class SpecificationTaskStateTest < Minitest::Test
   # A revision starts from the package the ticket's own specification pull request carries, and
   # that package is present IN THE TASK ENVIRONMENT before the provider runs — so a provider that
   # reads its own package directory reads the previous round rather than an empty folder.
+
+  # ------------------------------------------------ the heads the specification describes
+
+  # The environment is measured once, after every input is placed and before the provider starts,
+  # and that measurement is the baseline the change boundary later compares against. It also has
+  # to be STATED: a package whose evidence cannot say which commits it was written from cannot be
+  # checked against them. First generation has no previous package, so its heads are simply the
+  # seeds the environment holds — which is exactly why they need saying.
+  def test_a_first_generation_records_the_full_source_heads_it_was_written_from
+    start
+    head = git(@root, "rev-parse", "HEAD").strip
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
+    assert_path_exists @probe, "the provider must actually have run"
+
+    manifest = JSON.parse(File.read(File.join(task_workspace, PACKAGE, "generation-manifest.json")))
+    evidence = manifest.dig("source_evidence", "tools").map { |tool| tool["summary"] }.join("\n")
+    assert_includes evidence, ".@#{head}", "the task root's own head, in full, repository-relative"
+    refute_includes evidence, @root, "and no host path"
+  end
+
   def test_a_revision_makes_the_existing_pull_request_package_visible_before_generation
     build_previous_package_on_spec_branch
     start(revision: SPEC_PR)

@@ -19,7 +19,7 @@ class RegisteredCredentialFlowTest < Minitest::Test
   def setup
     @root, @executor = DemoWorkspace.build
     use_fixture(fixture_dir, @executor)
-    @platform = FakePlatform.new(claim_payload: claim_payload_for(task_id: TASK)).start
+    @platform = FakePlatform.new(claim_payload: claim_payload_for(task_id: TASK, root: @root)).start
     @config = build_config
   end
 

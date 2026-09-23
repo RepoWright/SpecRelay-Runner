@@ -30,6 +30,7 @@ module SpecrelayRunner
       # can print the exact path the operator is missing.
       GRAPH_CHECK = "bin/graph-check"
       GRAPH_QUERY = "bin/graph-query"
+      GRAPH_BUILD = "bin/graph-build"
 
       # `graph-check` exit codes, from the workspace contract: 0 fresh, 1 unavailable or
       # missing, 3 stale. A STALE graph is explicitly not evidence, so it is recorded as
@@ -96,11 +97,100 @@ module SpecrelayRunner
 
       def self.gather(**kwargs) = new(**kwargs).gather
 
+      # Bring this checkout's own analysis up to date with the tree as it FINALLY stands, before
+      # anything reads it.
+      #
+      # Every input of a run is placed into the environment in stages, and a graph built part-way
+      # through describes inputs that have since been replaced. Gathering evidence from it, or
+      # letting a provider query it, answers questions about code that is no longer there — which
+      # is worse than having no graph, because it looks like an answer.
+      #
+      # It is deliberately the same seam for both lanes. A project with no wrappers is not a
+      # failure: direct source inspection is the approved fallback and `gather` already says so.
+      # A project that HAS them and cannot produce a fresh graph is a failure, and it stops here
+      # rather than being carried forward as stale evidence.
+      #
+      # It answers nil or the reason it could not, which is how this file's other checks already
+      # report a single yes-or-why-not. A result object would carry a second value nothing reads.
+      #
+      # It takes the recorded `substitute` rather than the whole settings object, because that is
+      # the only setting the question involves: preparation asks the checkout's own wrappers about
+      # the checkout, which the implementation lane can ask too — and that lane has no
+      # specification settings to hand it.
+      #
+      # A recorded substitute is an operator saying, in advance, that this checkout's graph is not
+      # how they intend the work to be grounded. It is the existing approved policy and it is not
+      # overridden here: the gap is then carried into the evidence by {#gather}, truthfully, as a
+      # tool that contributed nothing — which is more honest than a refusal that ignores a
+      # decision the operator already recorded.
+      def self.prepare(root:, substitute: nil, env: ENV, command_runner: CommandRunner)
+        new(root: root, settings: nil, env: env, command_runner: command_runner)
+          .prepare(substitute: substitute)
+      end
+
+      # The gathered evidence, attributed to the exact commits it describes.
+      #
+      # The structural-analysis entry is where that belongs: whether the graph was fresh, or direct
+      # inspection stood in for it, is a statement about a tree, and a tree is named by its heads.
+      # The entry already reaches both places this has to — the evidence the provider is handed and
+      # the package's own manifest — so saying it here adds no channel, field or document.
+      def self.attributed(result, heads)
+        return result if heads.to_s.empty?
+
+        graph = result.graphify.dup
+        graph.summary = "#{graph.summary}; source inspected at #{heads}"
+        result.dup.tap { |copy| copy.graphify = graph }
+      end
+
       def initialize(root:, settings:, env: ENV, command_runner: CommandRunner)
         @root = File.expand_path(root.to_s)
         @settings = settings
         @env = env
         @command_runner = command_runner
+      end
+
+      def prepare(substitute: nil)
+        reason = unprepared_reason
+        return nil if reason.nil? || !substitute.to_s.strip.empty?
+
+        reason
+      end
+
+      # What is wrong with this checkout's analysis, or nil. Whether that is allowed to stop the
+      # run is decided once, above; keeping the two apart is what stops a recorded substitute
+      # from having to be threaded through every branch.
+      def unprepared_reason
+        return nil if graphify_absent?
+
+        check = wrapper_path(GRAPH_CHECK)
+        build = wrapper_path(GRAPH_BUILD)
+        return "this checkout has #{GRAPH_CHECK} but it is not executable, so its analysis " \
+               "cannot be verified" if check.nil?
+
+        first = run([ check ])
+        return nil if first.exit_code == FRESH
+        return "#{unusable(first)} and #{GRAPH_BUILD} is not available to build one" if build.nil?
+
+        built = run([ build ])
+        return "`#{GRAPH_BUILD}` failed for this checkout (exit #{built.exit_code}), so its " \
+               "analysis describes inputs this run has already replaced" unless
+          built.exit_code.to_i.zero?
+
+        # Verified rather than assumed: a build that exits 0 and still leaves the graph stale is
+        # exactly the case this is here to stop.
+        again = run([ check ])
+        return nil if again.exit_code == FRESH
+
+        "`#{GRAPH_CHECK}` still does not report a fresh graph after #{GRAPH_BUILD} " \
+          "(exit #{again.exit_code})"
+      end
+
+      # The wrapper's own vocabulary, so the refusal names the state an operator can go and look
+      # at rather than only the exit code it was reported through.
+      def unusable(result)
+        return "`#{GRAPH_CHECK}` reports the graph is STALE" if result.exit_code == STALE
+
+        "`#{GRAPH_CHECK}` reports no usable graph for this checkout (exit #{result.exit_code})"
       end
 
       def gather

@@ -49,7 +49,7 @@ class QuestionBridgeTest < Minitest::Test
     use_fixture(fixture_dir, executor || @executor,
                 env: { "FAKE_EXECUTOR_QUESTION_JSON" => request,
                        "FAKE_EXECUTOR_QUESTION_TIMEOUT_SECONDS" => timeout }.merge(env))
-    claim_payload_for(task_id: TASK)
+    claim_payload_for(task_id: TASK, root: @root)
   end
 
   def build_config
@@ -446,7 +446,7 @@ end
   def test_an_ordinary_provider_that_never_asks_follows_the_existing_path_unchanged
     root, executor = DemoWorkspace.build
     use_fixture(fixture_dir, executor)
-    platform = FakePlatform.new(claim_payload: claim_payload_for(task_id: TASK)).start
+    platform = FakePlatform.new(claim_payload: claim_payload_for(task_id: TASK, root: root)).start
     config_path = File.join(Dir.mktmpdir("cfg"), "runner.yml")
     File.write(config_path, <<~YAML)
       platform:

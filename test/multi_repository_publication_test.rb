@@ -56,7 +56,8 @@ class MultiRepositoryPublicationTest < Minitest::Test
   def start(publication: {}, fixture_env: {}, executor: nil)
     use_fixture(fixture_dir, executor || @built.executor,
                 env: { "FAKE_EXECUTOR_EDITED" => "component-a,component-b" }.merge(fixture_env))
-    payload = claim_payload_for(task_id: TASK, publication: publication)
+    payload = claim_payload_for(task_id: TASK, publication: publication,
+                                root: @root, specification_repository: "component-c")
     @platform = FakePlatform.new(claim_payload: payload).start
     @config_path = write_config
     payload
@@ -232,6 +233,7 @@ class MultiRepositoryPublicationTest < Minitest::Test
     gh_dir, gh_log, = FakeGithub.gh_bin(bare: bare)
 
     payload = claim_payload_for(task_id: TASK, publication: {},
+                                root: @root, specification_repository: "component-c",
                                 worktree_create_command: "git worktree add .runs/worktrees/#{TASK} -b #{TASK}")
     @platform = FakePlatform.new(claim_payload: payload).start
     @config_path = write_config

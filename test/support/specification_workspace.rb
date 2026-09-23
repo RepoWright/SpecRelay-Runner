@@ -30,6 +30,11 @@ module SpecificationWorkspace
   # repository could never exercise that.
   COMPONENT_DIR = "component-app"
 
+  # The specification repository's own directory beside the workspace checkout, and the name it
+  # takes inside a task environment that contains it.
+  SPECS_DIR = "SpecRelay-Specs"
+  SPECS_CHECKOUT = "specrelay-specs"
+
   # Returns [source_root, specification_root, temp_root]. Both checkouts are real directories
   # under one temp root so a single `remove_entry` cleans up.
   #
@@ -39,7 +44,7 @@ module SpecificationWorkspace
   def build(graph: :fresh, specs_remote: SPECS_REMOTE)
     root = Dir.mktmpdir("specrelay-spec-lane-")
     source = File.join(root, "tiny-demo-workspace")
-    specs = File.join(root, "SpecRelay-Specs")
+    specs = File.join(root, SPECS_DIR)
     build_source(source, graph: graph)
     build_specs(specs, remote: specs_remote)
     [ source, specs, root ]
@@ -177,7 +182,8 @@ module SpecificationWorkspace
                "class ExportReport\n  def call = :exported\nend\n")
     File.write(File.join(source, "app", "services", "report_row.rb"),
                "class ReportRow\n  def to_csv = \"row\"\nend\n")
-    File.write(File.join(source, ".gitignore"), ".runs/\n#{COMPONENT_DIR}/\n")
+    File.write(File.join(source, ".gitignore"),
+               ".runs/\n#{COMPONENT_DIR}/\n#{SPECS_CHECKOUT}/\n")
     write_graph_wrappers(source, graph) unless graph == :missing
     write_worktree_command(source)
     git_init(source, remote: WORKSPACE_REMOTE)
@@ -215,6 +221,19 @@ module SpecificationWorkspace
             git clone -q "$ROOT_DIR/#{COMPONENT_DIR}" "$WT_ROOT/$TASK/#{COMPONENT_DIR}" || exit 1
             git -C "$WT_ROOT/$TASK/#{COMPONENT_DIR}" remote set-url origin "#{COMPONENT_REMOTE}"
             git -C "$WT_ROOT/$TASK/#{COMPONENT_DIR}" checkout -q -B "$TASK"
+          fi
+          # The specification repository as a CONTAINED component of the environment, which is
+          # where a run must be able to see the approved package. Only when the fixture's own
+          # repository is served by a local bare remote: that shim is what makes an `origin` that
+          # reads as a GitHub identity fetch locally, so no environment this builds can reach the
+          # network to satisfy a pinned commit.
+          SPECS_SRC="$ROOT_DIR/../#{SPECS_DIR}"
+          SPECS_SSH="$(git -C "$SPECS_SRC" config core.sshCommand 2>/dev/null || true)"
+          if [ -n "$SPECS_SSH" ] && [ ! -d "$WT_ROOT/$TASK/#{SPECS_CHECKOUT}" ]; then
+            git clone -q "$SPECS_SRC" "$WT_ROOT/$TASK/#{SPECS_CHECKOUT}" || exit 1
+            git -C "$WT_ROOT/$TASK/#{SPECS_CHECKOUT}" remote set-url origin \
+              "$(git -C "$SPECS_SRC" remote get-url origin)"
+            git -C "$WT_ROOT/$TASK/#{SPECS_CHECKOUT}" config core.sshCommand "$SPECS_SSH"
           fi
           #{ProjectCommand.record_owner}
           ;;

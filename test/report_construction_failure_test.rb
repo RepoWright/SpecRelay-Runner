@@ -360,7 +360,7 @@ class ReportConstructionFailureTest < Minitest::Test
   def start(expected_heading: nil)
     rebuild_workspace(expected_heading) if expected_heading
     @platform&.stop
-    @platform = FakePlatform.new(claim_payload: claim_payload_for(task_id: TASK, publication: {})).start
+    @platform = FakePlatform.new(claim_payload: claim_payload_for(task_id: TASK, publication: {}, root: @root)).start
     @config_path = write_config(@platform, @root)
   end
 
@@ -410,7 +410,8 @@ class ReportConstructionFailureTest < Minitest::Test
     use_fixture(fixture_dir, loop_executor)
     bare = FakeGithub.add_remote(@loop_root)
     gh_dir, = FakeGithub.gh_bin(bare: bare)
-    @loop_platform = FakePlatform.new(claim_payload: claim_payload_for(task_id: TASK, publication: {}),
+    @loop_platform = FakePlatform.new(claim_payload: claim_payload_for(task_id: TASK, publication: {},
+                                                                       root: @loop_root),
                                       claim_limit: 4).start
     path = write_config(@loop_platform, @loop_root)
 
@@ -553,7 +554,11 @@ class ReportConstructionFailureTest < Minitest::Test
   # primary cause this test controls the text of.
   def inject_measurement_failure(message)
     fired = false
-    guard = ->(argv) { argv.first == "git" && argv.include?("status") && !fired }
+    # The executor's CHANGE measurement, not the pre-provider inventory of the prepared inputs,
+    # which asks for every untracked file and is not the path under test here.
+    guard = lambda do |argv|
+      argv.first == "git" && argv.include?("status") && !argv.include?("--untracked-files=all") && !fired
+    end
     SpecrelayRunner::CommandRunner.class_eval do
       alias_method :spawn_process_without_injection, :spawn_process
       define_method(:spawn_process) do |argv|

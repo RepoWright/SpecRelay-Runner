@@ -14,7 +14,7 @@ class ProtocolFlowTest < Minitest::Test
   def setup
     @root, @executor = DemoWorkspace.build
     @executor_path = fixture_path(@executor)
-    @platform = FakePlatform.new(claim_payload: claim_payload_for(task_id: TASK)).start
+    @platform = FakePlatform.new(claim_payload: claim_payload_for(task_id: TASK, root: @root)).start
     @config_path = write_config
   end
 

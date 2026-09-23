@@ -246,7 +246,8 @@ class PreviousAcceptedPackageTest < Minitest::Test
     # Which repository the double edits is a host-side control, installed behind the approved bare
     # name; the assignment carries the canonical fixture profile and nothing else.
     use_fixture(fixture_dir, @built.executor, env: { "FAKE_EXECUTOR_EDITED" => "component-a" })
-    payload = claim_payload_for(task_id: TASK,
+    payload = claim_payload_for(task_id: TASK, root: @root,
+                                specification_repository: "component-c",
                                 publication: {}, restart: restart)
     absent ? payload.delete("previous_accepted_package") :
       payload["previous_accepted_package"] = continuation_block
@@ -306,11 +307,14 @@ class PreviousAcceptedPackageTest < Minitest::Test
   end
 
   def test_reuses_an_exact_clean_task_workspace_without_creating_or_resetting_it
+    gh_dir, gh_log, = gh_bin
+    # The assignment's package is committed by `start`, so the environment is built AFTER it: one
+    # created earlier predates the approved specification and could not show it, which is a
+    # different refusal from the reuse this test is about.
+    start(continuation_block: continuation)
     task_root = create_task_workspace
     File.truncate(@built.worktree_log, 0)
     before = ACCEPTED.to_h { |name| [ name, head_of(task_root, name) ] }
-    gh_dir, gh_log, = gh_bin
-    start(continuation_block: continuation)
 
     code, = run_cli(gh_dir)
 
@@ -346,7 +350,7 @@ class PreviousAcceptedPackageTest < Minitest::Test
                 "headRefOid" => @heads.fetch(".") } ]
     )
 
-    payload = claim_payload_for(task_id: TASK, publication: {},
+    payload = claim_payload_for(task_id: TASK, publication: {}, root: @root,
                                 worktree_create_command: "git worktree add .runs/worktrees/#{TASK} -b #{TASK}")
     payload["previous_accepted_package"] = continuation(components: [ "." ]).merge(
       "implementation_pull_requests" => [ accepted_row(".", "pull_request_url" => url) ]

@@ -281,7 +281,7 @@ class LoopModeTest < Minitest::Test
   def test_claim_once_is_unchanged_and_prints_no_loop_status
     root, executor = DemoWorkspace.build
     use_fixture(fixture_dir, executor)
-    platform = FakePlatform.new(claim_payload: claim_payload_for(task_id: "DEMO-ONCE")).start
+    platform = FakePlatform.new(claim_payload: claim_payload_for(task_id: "DEMO-ONCE", root: root)).start
     path = File.join(Dir.mktmpdir("cfg"), "runner.yml")
     File.write(path, <<~YAML)
       platform:
@@ -375,7 +375,7 @@ class LoopModeTest < Minitest::Test
                  "clone_url" => "git@github.com:SpecRelay/tiny-demo-workspace.git",
                  "branch" => "DEMO-LOOP", "head_commit" => "a" * 40,
                  "pull_request_url" => "https://github.com/SpecRelay/tiny-demo-workspace/pull/9" }
-    payload = claim_payload_for(task_id: "DEMO-LOOP",
+    payload = claim_payload_for(task_id: "DEMO-LOOP", root: @loop_root,
                                 publication: {}, rework: { "repositories" => [ reviewed ] })
     @loop_platform = FakePlatform.new(claim_payload: payload, claim_limit: 4,
                                       release_status: release_status).start
