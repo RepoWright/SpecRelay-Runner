@@ -286,10 +286,10 @@ module SpecrelayRunner
     # is no longer claimable and the paused attempt's claim token ended with its session.
     #
     # Only a connected loop asks; a `--config` loop has no runner identity for Platform to prove
-    # the paused attempt against. Nothing unproved lets the claim through: an unreadable project
-    # list, a target this machine did not list and an incomplete release raise {CleanupRequired},
-    # which stops the session, and an unanswered or unreadable Platform read raises before the
-    # claim is sent.
+    # the paused attempt against. Nothing unproved lets a claim through: an unreadable project
+    # list, an unanswered, refused or unreadable Platform read, a target this machine did not list
+    # and an incomplete release all raise {CleanupRequired}, which stops the session. Only the
+    # claim itself keeps the loop's ordinary transport backoff.
     def claim_after_cancellation_cleanup(config, client)
       release_cancelled_environment(config, client) if config.connection
       client.claim(config.claim_runner_params)
@@ -302,7 +302,7 @@ module SpecrelayRunner
       raise CleanupRequired, unreadable if unreadable
       return if listed.empty?
 
-      target = client.cancellation_cleanup_target(workspace_key: workspace_key, candidates: listed)
+      target = confirmed_cleanup_target(client, workspace_key, listed)
       return if target.nil?
       raise CleanupRequired, "Platform named a cancelled run this machine did not list" unless listed.include?(target)
 
@@ -312,6 +312,16 @@ module SpecrelayRunner
       presenter.line("[loop] released the task environment #{task_id}")
     rescue Config::Error => e
       raise CleanupRequired, "the task environments could not be checked: #{PrivatePaths.sanitize(e.message)}"
+    end
+
+    # A rejected credential stays the loop's own stop, with its reconnect remedy.
+    def confirmed_cleanup_target(client, workspace_key, listed)
+      client.cancellation_cleanup_target(workspace_key: workspace_key, candidates: listed)
+    rescue PlatformClient::Unauthorized
+      raise
+    rescue PlatformClient::Error => e
+      raise CleanupRequired, "the task environments of cancelled runs could not be confirmed with Platform " \
+                             "(#{e.message}); they were kept"
     end
 
     # MAPIAI-107 — what one claimed assignment tells the SESSION, which is one fact more than its

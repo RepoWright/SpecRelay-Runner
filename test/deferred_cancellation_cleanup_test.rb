@@ -21,9 +21,16 @@ class DeferredCancellationCleanupTest < Minitest::Test
   # Platform with nothing to hand out: every claim is answered "nothing ready", so a session ends
   # after the polls a test asks for and never executes anything.
   class IdlePlatform < FakePlatform
+    def script_claim_failure_once = @claim_failure = true
+
     private
 
-    def claim = [ 200, { claimed: false, reason: "no eligible work" } ]
+    def claim
+      return [ 200, { claimed: false, reason: "no eligible work" } ] unless @claim_failure
+
+      @claim_failure = false
+      [ 500, { error: "internal" } ]
+    end
   end
 
   def setup
@@ -100,9 +107,10 @@ class DeferredCancellationCleanupTest < Minitest::Test
 
   # ------------------------------------------------------------------- retention
 
-  # Scenario 4 and 7. No target, and every answer that proves nothing, keeps the environment; an
-  # answer that proves nothing also takes no claim on that poll.
-  def test_an_answer_that_proves_nothing_keeps_the_environment_and_takes_no_claim
+  # Scenario 4 and 7. Every answer that proves nothing keeps the environment and stops the
+  # session, so no later poll claims either. Each session is given a second poll whose lookup
+  # would answer "no target", which a session that only backed off would go on to claim after.
+  def test_an_answer_that_proves_nothing_keeps_the_environment_and_stops_before_any_claim
     { "malformed target" => [ 200, { target: "run_paused" } ],
       "missing task" => [ 200, { target: { run_id: RUN } } ],
       "extra field" => [ 200, { target: { run_id: RUN, task_id: TASK, state: "CANCELLED" } } ],
@@ -112,25 +120,41 @@ class DeferredCancellationCleanupTest < Minitest::Test
       "failed" => [ 500, { error: "internal" } ] }.each do |name, answer|
       restart_platform
       allocate(TASK, RUN)
-      @platform.script_cleanup_targets(answer)
+      @platform.script_cleanup_targets(answer, [ 200, { target: nil } ])
 
-      run_loop(iterations: 1)
+      refute_equal SpecrelayRunner::LoopRunner::OK, run_loop(iterations: 2), "#{name}: #{@io.string}"
 
       assert_equal %w[target], exchanges, "#{name}: a claim followed an unproved answer"
       assert File.directory?(worktree(TASK)), "#{name}: the environment was released"
       assert_equal RUN, ProjectCommand.recorded_owner(@root, TASK), name
+      assert_includes @io.string, "cancelled runs could not be confirmed", name
     end
   end
 
-  def test_an_unreachable_platform_keeps_the_environment_and_takes_no_claim
+  def test_an_unreachable_platform_keeps_the_environment_and_stops_before_any_claim
     allocate(TASK, RUN)
     base_url = @platform.base_url
     @platform.stop
 
-    run_loop(iterations: 1, base_url: base_url)
+    refute_equal SpecrelayRunner::LoopRunner::OK, run_loop(iterations: 2, base_url: base_url), @io.string
 
     assert File.directory?(worktree(TASK))
     assert_equal RUN, ProjectCommand.recorded_owner(@root, TASK)
+    assert_includes @io.string, "cancelled runs could not be confirmed"
+    refute_includes @io.string, "polling failed"
+  end
+
+  # The ordinary claim keeps its transport backoff: a failed claim after a completed lookup is
+  # retried on the next poll, not a reason to stop.
+  def test_a_failed_claim_after_a_completed_lookup_still_backs_off_and_retries
+    allocate(TASK, RUN)
+    @platform.script_claim_failure_once
+
+    assert_equal SpecrelayRunner::LoopRunner::OK, run_loop(iterations: 2), @io.string
+
+    assert_equal %w[target claim target claim], exchanges
+    assert_includes @io.string, "polling failed"
+    assert File.directory?(worktree(TASK))
   end
 
   # A target this machine did not list is not one it may act on: the session stops.
@@ -156,6 +180,28 @@ class DeferredCancellationCleanupTest < Minitest::Test
     assert_empty exchanges
     assert_equal RUN, ProjectCommand.recorded_owner(@root, TASK)
     assert_includes @io.string, "could not be listed"
+  end
+
+  # Scenario 8. A listed row that cannot be classified is not a manual environment: the list is
+  # unreadable, and nothing is asked or claimed while the owned environment stays.
+  def test_a_listed_environment_that_cannot_be_classified_stops_the_loop_before_a_claim
+    { "owner without a task" => %([{"owner_run_id":"#{RUN}"}]),
+      "owner that is not text" => %([{"task_id":"#{TASK}","owner_run_id":7}]),
+      "blank task beside an owner" => %([{"task_id":"","owner_run_id":"#{RUN}"}]),
+      "row that is not an object" => %(["#{TASK}"]) }.each do |name, rows|
+      restart_platform
+      allocate(TASK, RUN)
+      listing = File.join(@root, "listing.json")
+      File.write(listing, %({"environments":#{rows}}\n))
+      override_verb("list", "cat '#{listing}'; exit 0")
+
+      refute_equal SpecrelayRunner::LoopRunner::OK, run_loop(iterations: 2), "#{name}: #{@io.string}"
+
+      assert_empty exchanges, name
+      assert File.directory?(worktree(TASK)), name
+      assert_equal RUN, ProjectCommand.recorded_owner(@root, TASK), name
+      assert_includes @io.string, "could not be listed", name
+    end
   end
 
   # Scenario 8. A release the project refuses stops the loop, and the owner record stays for

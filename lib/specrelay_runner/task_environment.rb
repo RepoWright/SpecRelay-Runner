@@ -94,7 +94,8 @@ module SpecrelayRunner
     #
     # A project without the run-aware command lists nothing: an automatic run can allocate only
     # through it, so such a project cannot hold a Run-owned environment. An environment with no
-    # recorded owner is a manual one and is never listed here.
+    # recorded owner is a manual one and is never listed here. A row that is neither is unproved,
+    # not manual, so it makes the whole list unreadable.
     def run_owned(root:)
       return [ [], nil ] unless File.executable?(File.join(root.to_s, Workspace::PROJECT_COMMAND))
 
@@ -104,16 +105,26 @@ module SpecrelayRunner
         return [ nil, "the project's task environments could not be listed: #{detail(result, 'list', '--json')}" ]
       end
 
-      [ rows.filter_map { |row| listed_owner(row) }, nil ]
+      owners = rows.map { |row| listed_owner(row) }
+      if owners.include?(:unreadable)
+        return [ nil, "the project's task environments could not be listed: " \
+                      "`#{Workspace::PROJECT_COMMAND} list --json` named an environment this runner could not read" ]
+      end
+
+      [ owners.compact, nil ]
     end
 
+    # `[run_id, task_id]` for a Run-owned row, nil for a manual one, :unreadable otherwise.
     def listed_owner(row)
-      return nil unless row.is_a?(Hash)
+      return :unreadable unless row.is_a?(Hash) && listed_identity?(row["task_id"])
 
-      run_id = row["owner_run_id"]
-      task_id = row["task_id"]
-      [ run_id, task_id ] if run_id.is_a?(String) && !run_id.empty? && task_id.is_a?(String) && !task_id.empty?
+      owner = row["owner_run_id"]
+      return nil if owner.nil? || owner == ""
+
+      listed_identity?(owner) ? [ owner, row["task_id"] ] : :unreadable
     end
+
+    def listed_identity?(value) = value.is_a?(String) && !value.empty?
 
     # Hand back the environment this run owns, or say why it is still allocated.
     #
