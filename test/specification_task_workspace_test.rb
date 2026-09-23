@@ -304,7 +304,47 @@ class SpecificationTaskWorkspaceTest < Minitest::Test
     refute_path_exists File.join(@root, ".runs", "worktrees")
   end
 
+  # ------------------------------------------------------------------ owned process group
+
+  # The provider's own process group cannot be shown to have ended. The claim ends at the
+  # command-line boundary: no generation result, no release of the task environment, no next claim.
+  # Inspection of that one group is refused at the OS boundary, and the grace is shortened so the
+  # bounded shutdown runs out quickly; everything else is the real lane.
+  def test_a_provider_group_that_cannot_be_shown_to_have_ended_stops_the_claim
+    leader = File.join(@built.temp, "provider.pgid")
+    start(sabotage: "echo $PPID > #{leader}")
+
+    code = with_unprovable_provider_group(leader) { run_cli }
+
+    assert_path_exists leader, "the provider must really have run"
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, code, @io.string
+    assert_includes @io.string, "process group #{File.read(leader).strip}"
+    assert_nil @platform.last_specification_generation, "no generation result may be reported"
+    assert_equal 1, @platform.requests_to("/api/runner/claim").size
+    refute(worktree_invocations.any? { |call| call.start_with?("release") }, worktree_invocations.inspect)
+  end
+
   # --- harness -------------------------------------------------------------
+
+  def with_unprovable_provider_group(leader)
+    runner = SpecrelayRunner::CommandRunner
+    grace = runner::TERM_GRACE_SECONDS
+    runner.send(:remove_const, :TERM_GRACE_SECONDS)
+    runner.const_set(:TERM_GRACE_SECONDS, 0.3)
+    kill = Process.method(:kill)
+    Process.define_singleton_method(:kill) do |signal, *targets|
+      pid = File.exist?(leader) ? Integer(File.read(leader).strip, exception: false) : nil
+      group = pid && -pid
+      raise Errno::EPERM if signal.to_s == "0" && group && targets == [ group ]
+
+      kill.call(signal, *targets)
+    end
+    yield
+  ensure
+    Process.define_singleton_method(:kill, kill)
+    runner.send(:remove_const, :TERM_GRACE_SECONDS)
+    runner.const_set(:TERM_GRACE_SECONDS, grace)
+  end
 
   # Re-offer this run's claim with fields removed from one block, so the refusal is measured
   # against the document Platform would have to be broken to send.
