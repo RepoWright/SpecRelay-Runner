@@ -50,7 +50,9 @@ module DemoWorkspace
           git -C "$ROOT_DIR" worktree remove --force "$WT_ROOT/$TASK"
           #{ProjectCommand.release_report}
           ;;
-        list) git -C "$ROOT_DIR" worktree list ;;
+        list)
+          #{ProjectCommand.list_case}
+          ;;
         *) echo "usage: worktree create|status|release|list <task>" >&2; exit 1 ;;
       esac
     SH

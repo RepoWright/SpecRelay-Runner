@@ -275,10 +275,43 @@ module SpecrelayRunner
         presence: loop_presence(config, client, interval),
         connector: loop_connector(config),
         status_reporter: loop_status_reporter(config, client),
-        claim: -> { client.claim(config.claim_runner_params) },
+        claim: -> { claim_after_cancellation_cleanup(config, client) },
         execute: ->(payload) { loop_disposition(config, client, payload) }
       )
       result == LoopRunner::OK ? SUCCESS : RUN_FAILED
+    end
+
+    # Release the task environment of a Run Platform cancelled after its question pause, then
+    # claim. Asked before every loop claim, because that cancellation reaches no process: the Run
+    # is no longer claimable and the paused attempt's claim token ended with its session.
+    #
+    # Only a connected loop asks; a `--config` loop has no runner identity for Platform to prove
+    # the paused attempt against. Nothing unproved lets the claim through: an unreadable project
+    # list, a target this machine did not list and an incomplete release raise {CleanupRequired},
+    # which stops the session, and an unanswered or unreadable Platform read raises before the
+    # claim is sent.
+    def claim_after_cancellation_cleanup(config, client)
+      release_cancelled_environment(config, client) if config.connection
+      client.claim(config.claim_runner_params)
+    end
+
+    def release_cancelled_environment(config, client)
+      workspace_key = config.connection.workspace_key
+      root = config.workspace_root(workspace_key, env: env)
+      listed, unreadable = TaskEnvironment.run_owned(root: root)
+      raise CleanupRequired, unreadable if unreadable
+      return if listed.empty?
+
+      target = client.cancellation_cleanup_target(workspace_key: workspace_key, candidates: listed)
+      return if target.nil?
+      raise CleanupRequired, "Platform named a cancelled run this machine did not list" unless listed.include?(target)
+
+      run_id, task_id = target
+      presenter.line("[loop] run #{run_id} was cancelled on Platform; releasing its task environment")
+      TaskEnvironment.release!(root: root, task_id: task_id, run_id: run_id)
+      presenter.line("[loop] released the task environment #{task_id}")
+    rescue Config::Error => e
+      raise CleanupRequired, "the task environments could not be checked: #{PrivatePaths.sanitize(e.message)}"
     end
 
     # MAPIAI-107 — what one claimed assignment tells the SESSION, which is one fact more than its

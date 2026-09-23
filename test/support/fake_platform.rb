@@ -137,6 +137,7 @@ class FakePlatform
     @question_polls = 0
     @question_delivered = false
     @question_refusals = []
+    @cleanup_targets = []
     @mutex = Mutex.new
   end
 
@@ -222,6 +223,10 @@ class FakePlatform
 
   # Play the Product Owner. The settlement lands on the Nth POLL rather than immediately, so the
   # runner's waiting loop is exercised rather than short-circuited by the submission response.
+  # Scripted answers to the pre-claim cancellation read, consumed one per request; with none left
+  # Platform names no target, which is its answer for every Run it cannot prove.
+  def script_cleanup_targets(*answers) = @mutex.synchronize { @cleanup_targets.concat(answers) }
+
   def answer_question!(answers, after_polls: 1) = settle_question("ANSWER_READY", answers, after_polls)
   def release_question!(after_polls: 1) = settle_question("OFFLINE_WAIT", [], after_polls)
 
@@ -395,6 +400,7 @@ class FakePlatform
     when "/api/runner/workspace_connections" then workspace_connection(request)
     when %r{\A/api/runner/workspace_connections/(?<key>.+)\z} then member(request, Regexp.last_match[:key])
     when "/api/runner/claim" then claim
+    when "/api/runner/cancellation_cleanup_target" then cancellation_cleanup_target
     when "/api/runner/events" then events(request)
     when "/api/runner/heartbeat" then [ 200, { acknowledged: true, state: "EXECUTING", lease: lease_signal } ]
     when "/api/runner/reports" then report(request)
@@ -700,6 +706,10 @@ class FakePlatform
     [ 201, { recorded: true, classification: classification, duplicate: duplicate,
              event: { sequence: sequence, event_type: event["event_type"], classification: classification },
              lease: lease_signal } ]
+  end
+
+  def cancellation_cleanup_target
+    @mutex.synchronize { @cleanup_targets.shift } || [ 200, { target: nil } ]
   end
 
   def claim

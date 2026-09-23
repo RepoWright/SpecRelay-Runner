@@ -89,6 +89,32 @@ module SpecrelayRunner
       [ OWNED, nil ]
     end
 
+    # The Run-owned environments this project lists, as `[[run_id, task_id], ...]` with a nil
+    # reason, or nil and the reason the list could not be read.
+    #
+    # A project without the run-aware command lists nothing: an automatic run can allocate only
+    # through it, so such a project cannot hold a Run-owned environment. An environment with no
+    # recorded owner is a manual one and is never listed here.
+    def run_owned(root:)
+      return [ [], nil ] unless File.executable?(File.join(root.to_s, Workspace::PROJECT_COMMAND))
+
+      result = invoke(root, [ "list", "--json" ], STATUS_TIMEOUT)
+      rows = document_of(result)&.fetch("environments", nil)
+      unless rows.is_a?(Array)
+        return [ nil, "the project's task environments could not be listed: #{detail(result, 'list', '--json')}" ]
+      end
+
+      [ rows.filter_map { |row| listed_owner(row) }, nil ]
+    end
+
+    def listed_owner(row)
+      return nil unless row.is_a?(Hash)
+
+      run_id = row["owner_run_id"]
+      task_id = row["task_id"]
+      [ run_id, task_id ] if run_id.is_a?(String) && !run_id.empty? && task_id.is_a?(String) && !task_id.empty?
+    end
+
     # Hand back the environment this run owns, or say why it is still allocated.
     #
     # The owner is passed to the project rather than checked here first: it is the project that
