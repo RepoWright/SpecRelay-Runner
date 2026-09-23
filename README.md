@@ -1108,6 +1108,17 @@ Jira does not advance, and nothing reviewable is published. A real model that
 produces no usable change is a **valid failed run**, not a reason to fall back to
 the fake executor.
 
+**A supervised command ends with its whole process group.** The provider, verification and your
+project's `bin/worktree` commands each run in their own process group, and the runner goes on
+only once that whole group has ended, including after the command itself exits normally. A
+background process the command left in that group is terminated: TERM, then KILL, each with a
+5-second bound. If the runner cannot show that the group has ended, it stops the invocation with
+exit 1 and `Runner stopped: a supervised command could not be shown to have ended: process group
+<N> …`. A report or a release may already have happened by then, so the environment may or may
+not still be there; make sure that process group has ended before starting the runner again.
+This is process supervision only: a process that moved into its own session is not covered, and
+it does not release an environment after a failed, cancelled or waiting attempt.
+
 Reports keep redacted command metadata (the prompt appears only as `<PROMPT>`),
 exit status, duration, a bounded redacted transcript, diff, test output, terminal
 result, and publication facts. They never carry provider credentials, raw auth
