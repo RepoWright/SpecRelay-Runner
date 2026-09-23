@@ -281,7 +281,10 @@ class RunnerFlowTest < Minitest::Test
 
     refute_equal SpecrelayRunner::CLI::SUCCESS, code, @io.string
     assert_nil provider_ran, "a mismatched visible package must not reach a provider"
-    assert_equal "# A LATER round's specification\n", File.read(visible),
+    # The recorded refusal ends the Run, so its checkout is released afterwards; the work it held
+    # is committed on the task branch, which the release keeps. That is where "not reset" is read.
+    assert_equal "# A LATER round's specification\n",
+                 DemoWorkspace.git(@root, "show", "#{TASK}:specs/#{TASK}/spec.md"),
                  "the environment's own work may not be reset to make the check pass"
   end
 
@@ -313,7 +316,9 @@ class RunnerFlowTest < Minitest::Test
 
     refute_equal SpecrelayRunner::CLI::SUCCESS, code, @io.string
     assert_nil provider_ran, "a package reached through an escaping link must not be launched against"
-    assert File.symlink?(File.join(worktree, "specs")), "and the environment is left as it was"
+    # Read from the task branch the released checkout was on: the link is still what it holds.
+    assert_equal "120000", DemoWorkspace.git(@root, "ls-tree", TASK, "specs").split.first,
+                 "and the environment is left as it was"
   end
 
   # ---------------------------------------------------------------- final analysis

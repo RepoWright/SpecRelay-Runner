@@ -296,21 +296,29 @@ A project whose `bin/worktree` cannot record an owner refuses the run. The assig
 git creation command is not used as a fallback: it builds a worktree with no owner, which the
 run could neither prove on a retry nor hand back at the end.
 
-A successful run hands its environment back once its report — or, in the specification lane,
-its publication result — has been ACCEPTED, and not before. Everything unpublished in it is
-that run's own by then and goes with it, including edits you made there by hand; the runner
-removes none of it itself. Only an explicit `released` naming that run, or your project's own
-proof that there is nothing left, is completion. A timeout, a non-zero exit, an unreadable
-answer or a partial teardown is reported as still allocated — without guessing which files
-survived, because your project is what knows. What follows differs by lane, deliberately.
-After an implementation run this machine stops: it is holding an environment the next run
-would otherwise be put on top of, so a single run exits non-zero and a `loop` session ends
-until you release it by hand. After a specification publication it reports the same thing as
-a warning and carries on, because the pull request already exists and a reviewer may already
-be reading it — the environment stays allocated and is yours to release.
+A run hands its environment back once Platform has RECORDED how it ended, and not before: an
+implementation report (success or failure), a specification publication or publication
+failure, or a generation failure or refusal. An explicit cancellation this runner observes
+while the run is active is an ending too: it ends the run's process group, sends no late
+result and hands the environment back. A cancellation discovered later, or while the runner
+was offline, releases nothing yet. Everything unpublished in it is that run's own by then and goes with it,
+including edits you made there by hand; the runner removes none of it itself. Only an explicit
+`released` naming that run, or your project's own proof that there is nothing left, is
+completion. A timeout, a non-zero exit, an unreadable answer or a partial teardown is reported
+as still allocated — without guessing which files survived, because your project is what
+knows — and this machine stops: a single run exits non-zero and a `loop` session ends before
+another claim, until you release it by hand.
 
-Waiting on a question, a failed or cancelled attempt, an unacknowledged publication and an
-uncertain transport all keep the environment and ask for no release.
+Two endings keep something back. After a recorded publication failure the runner keeps its
+package snapshot, so a publication retry republishes the same files. After a recorded
+generation refusal, an environment your project records as manual or another run's is kept
+without a cleanup error; any other answer goes to the release above, including an unmapped
+workspace root.
+
+Waiting on a question, an expired lease, a result Platform refused, did not record or could
+not be reached for, and a report that could not be built all keep the environment and ask for
+no release. The terminal result an implementation run submits therefore always says cleanup
+has not yet succeeded.
 
 #### What a fresh environment contains
 
@@ -1117,7 +1125,7 @@ exit 1 and `Runner stopped: a supervised command could not be shown to have ende
 <N> …`. A report or a release may already have happened by then, so the environment may or may
 not still be there; make sure that process group has ended before starting the runner again.
 This is process supervision only: a process that moved into its own session is not covered, and
-it does not release an environment after a failed, cancelled or waiting attempt.
+supervision itself releases no environment.
 
 Reports keep redacted command metadata (the prompt appears only as `<PROMPT>`),
 exit status, duration, a bounded redacted transcript, diff, test output, terminal

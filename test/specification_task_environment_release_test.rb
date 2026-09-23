@@ -62,19 +62,22 @@ class SpecificationTaskEnvironmentReleaseTest < Minitest::Test
     assert_includes @io.string, "Released this ticket's task environment."
   end
 
-  # The runner removes NOTHING itself. It used to clear the recorded package folder before
-  # asking, which meant a refused release left the environment stripped of the accepted files
-  # while still allocated. The project is the only thing that removes anything now, so a refusal
-  # leaves the environment exactly as the run left it.
+  # The runner removes NOTHING in the environment itself, so a refused release leaves it exactly
+  # as the run left it. The refusal is a cleanup failure of its own: the publication stands as
+  # accepted, the pull request is named, and the invocation exits nonzero so nothing else is
+  # claimed on top of an environment nobody has accounted for.
   def test_a_refused_release_leaves_the_package_and_the_environment_untouched
     start_platform(release_mode: "refuse")
 
-    assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
 
+    assert_equal "published", @platform.last_specification_publication["outcome"]
+    assert_includes @io.string, PR_URL
     assert_equal PACKAGE_CONTENTS["spec.md"], File.read(File.join(task_package_root, "spec.md"))
     assert_path_exists File.join(task_workspace, "README.md")
     assert_path_exists File.join(task_workspace, "component-a", "app", "services", "export_report.rb")
-    assert_includes @io.string, "was NOT released"
+    assert_includes @io.string, "still allocated"
+    assert_includes @io.string, "Release it by hand"
   end
 
   # No claim about which files were cleared or retained. Only the project knows what is left.
@@ -125,11 +128,25 @@ class SpecificationTaskEnvironmentReleaseTest < Minitest::Test
     ProjectCommand.own!(@root, TASK, "run_somebody_else")
     start_platform
 
-    assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
 
     assert_equal PACKAGE_CONTENTS["spec.md"], File.read(File.join(task_package_root, "spec.md"))
     assert_path_exists task_workspace
-    assert_includes @io.string, "was NOT released"
+    assert_equal "run_somebody_else", File.read(File.join(@root, ".runs", "owners", TASK))
+    assert_includes @io.string, "still allocated"
+  end
+
+  # The publication snapshot could not be removed. That is a cleanup failure too, reported before
+  # the environment is asked for, so both stay where they are for the operator to repair.
+  def test_a_snapshot_that_cannot_be_removed_stops_before_the_release
+    start_platform
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, with_failing_snapshot_removal { run_cli }, @io.string
+
+    assert_equal "published", @platform.last_specification_publication["outcome"]
+    assert_includes @io.string, "could not be removed"
+    assert_empty worktree_invocations.grep(/\Arelease /), "the release ran after a failed snapshot removal"
+    assert_path_exists task_workspace
   end
 
   # A missing task directory is not a Runner-side "nothing to do". The project still decides,
@@ -170,19 +187,168 @@ class SpecificationTaskEnvironmentReleaseTest < Minitest::Test
     assert_empty worktree_invocations.grep(/\Arelease /), "no release may be asked for"
   end
 
-  # A failure BEFORE the publication reaches GitHub. Nothing was accepted, so nothing is cleaned.
-  def test_a_failed_publication_retains_the_package_and_the_environment
+  # ---------------------------------------------------------------- acknowledged failure
+
+  # A failure BEFORE the publication reaches GitHub, which Platform ACCEPTED. The Run is blocked
+  # on publication, not ended: its task environment goes back after the acceptance, but the
+  # proved snapshot stays, because it is exactly what `retry-publication` republishes.
+  def test_an_accepted_failure_before_the_push_releases_the_environment_and_keeps_the_snapshot
     start_platform(gh_mode: "unauthenticated")
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
 
-    assert_path_exists File.join(task_package_root, "spec.md")
-    assert_empty worktree_invocations.grep(/\Arelease /), "no release may be asked for"
+    assert_equal "failed", @platform.last_specification_publication["outcome"]
+    assert_path_exists File.join(@workspace.worktree_root, PACKAGE, "spec.md"),
+                       "the snapshot a publication retry needs was removed"
+    assert_includes worktree_invocations, "release #{TASK} --run-id #{SPEC_RUN} --json"
+    refute File.exist?(task_workspace)
+  end
+
+  # The same after the branch reached the remote. The environment goes; the snapshot and the
+  # pushed commit and branch stay exactly where they are.
+  def test_an_accepted_failure_after_the_push_keeps_the_snapshot_and_the_pushed_branch
+    start_platform(gh_mode: "create_fails")
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
+
+    publication = @platform.last_specification_publication
+    assert_equal "failed", publication["outcome"]
+    refute_empty publication["head_commit"].to_s
+    assert_path_exists File.join(@workspace.worktree_root, PACKAGE, "spec.md")
+    refute File.exist?(task_workspace)
+    assert_equal publication["head_commit"], remote_head(TASK), "the pushed branch was touched"
+  end
+
+  # The operator's `retry-publication` offers the same Run again. It republishes the retained
+  # package — no regeneration — and only that accepted success discards the snapshot.
+  def test_a_publication_retry_republishes_the_retained_snapshot_without_regenerating
+    start_platform(gh_mode: "unauthenticated")
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
+
+    @gh_dir, @gh_log, = FakeGithub.gh_bin(mode: "ok", pull_request_url: PR_URL, bare: @built.bares["."])
+    @platform.offer_again!
+    @io = StringIO.new
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
+    publication = @platform.last_specification_publication
+    assert_equal "published", publication["outcome"]
+    assert_equal @package_files.map { |file| file["path"] }.sort,
+                 publication["files"].map { |file| file["path"].delete_prefix("#{PACKAGE}/") }.sort
+    assert_empty @platform.specification_generations, "a retry must never regenerate"
+    refute File.exist?(@workspace.root), "the accepted success then discards the snapshot"
+  end
+
+  # An idempotent replay Platform answers `unchanged`, and a publication whose Jira hand-off
+  # stopped (`jira_writeback_blocked`), are both RECORDED successes: the snapshot and the
+  # environment are discarded as after any accepted publication.
+  %w[unchanged jira_writeback_blocked].each do |outcome|
+    define_method(:"test_a_recorded_#{outcome}_publication_discards_the_snapshot_and_the_environment") do
+      start_platform
+      @platform.publication_response = [ 201, { outcome: outcome, execution_state: "COMPLETED",
+                                                run_state: "AWAITING_SPECIFICATION_APPROVAL" } ]
+
+      assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
+
+      refute File.exist?(@workspace.root)
+      refute File.exist?(task_workspace)
+    end
+  end
+
+  # ---------------------------------------------------------------- superseded results
+
+  # Platform answered 201 but recorded nothing: the claim is no longer current. That is not an
+  # acknowledgement, on a success or on a failure, so both the snapshot and the environment stay.
+  def test_a_superseded_publication_success_keeps_the_snapshot_and_the_environment
+    start_platform
+    @platform.publication_response = [ 201, { outcome: "superseded", execution_state: "CANCELLED",
+                                              run_state: "CANCELLED" } ]
+
+    run_cli
+
+    assert_snapshot_and_environment_retained
+    refute_includes @io.string, "Platform recorded the result"
+  end
+
+  def test_a_superseded_publication_failure_keeps_the_snapshot_and_the_environment
+    start_platform(gh_mode: "unauthenticated")
+    @platform.publication_response = [ 201, { outcome: "superseded", execution_state: "CANCELLED",
+                                              run_state: "CANCELLED" } ]
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
+
+    assert_snapshot_and_environment_retained
+    refute_includes @io.string, "Platform recorded the result"
+  end
+
+  # A failure Platform never acknowledged — refused, or unreachable — keeps both.
+  def test_a_refused_failure_report_retains_the_snapshot_and_the_environment
+    start_platform(gh_mode: "unauthenticated")
+    @platform.publication_response = [ 422, { error: "not acceptable right now" } ]
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
+
+    assert_snapshot_and_environment_retained
+  end
+
+  def test_an_unreachable_failure_report_retains_the_snapshot_and_the_environment
+    start_platform(gh_mode: "unauthenticated")
+    @platform.publication_response = [ 500, { error: "internal server error" } ]
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
+
+    assert_snapshot_and_environment_retained
+  end
+
+  # ---------------------------------------------------------------- cancellation
+
+  # Platform explicitly cancelled the Run. Its own record is terminal already, so no publication
+  # result is sent, and the local snapshot and environment are discarded.
+  def test_an_explicit_cancellation_discards_the_snapshot_and_the_environment_without_a_result
+    start_platform
+    @platform.signal_cancelled!
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
+
+    assert_empty @platform.specification_publications, "a cancelled run received a late result"
+    refute File.exist?(@workspace.root)
+    refute File.exist?(task_workspace)
+  end
+
+  # An expired lease is not a definitive ending known to this process. Everything stays.
+  def test_an_expired_lease_retains_the_snapshot_and_the_environment
+    start_platform
+    @platform.signal_expired!
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
+
+    assert_empty @platform.specification_publications
+    assert_snapshot_and_environment_retained
   end
 
   private
 
   def task_workspace = @built.task_workspace(TASK)
+
+  def assert_snapshot_and_environment_retained
+    assert_path_exists File.join(@workspace.worktree_root, PACKAGE, "spec.md")
+    assert_path_exists File.join(task_package_root, "spec.md")
+    assert_empty worktree_invocations.grep(/\Arelease /), "no release may be asked for"
+  end
+
+  # The branch as the REMOTE holds it, read from the bare repository the fake `gh` pushes into.
+  def remote_head(branch)
+    git(@built.bares["."], "rev-parse", "refs/heads/#{branch}").strip
+  end
+
+  # Snapshot removal answering failure, the one injected cleanup fault this lane needs.
+  def with_failing_snapshot_removal
+    klass = SpecrelayRunner::Specification::PackageWorkspace
+    original = klass.instance_method(:remove!)
+    klass.define_method(:remove!) { |**| false }
+    yield
+  ensure
+    klass.define_method(:remove!, original)
+  end
   def task_package_root = File.join(task_workspace, PACKAGE)
 
   def worktree_invocations

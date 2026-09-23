@@ -177,10 +177,10 @@ class SpecificationPackageDeliveryFlowTest < Minitest::Test
     exit_code = start
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, exit_code, @io.string
-    # The worktree is untouched: nothing implemented anything from an unverified package.
-    edited = File.read(File.join(@root, ".runs", "worktrees", TASK, "demo-app", "index.html"))
-    assert_includes edited, "Hello Demo"
-    refute_includes edited, "Hello SpecRelay Demo"
+    # The worktree was untouched: nothing implemented anything from an unverified package. Read
+    # from the change set measured into the report, because the recorded failure then releases
+    # the environment.
+    refute_includes uploaded("evidence/diff.txt"), "Hello SpecRelay Demo"
 
     terminal = @platform.last_terminal_result
     assert_equal "failed", terminal["outcome"]

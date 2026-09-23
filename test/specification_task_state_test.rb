@@ -199,12 +199,12 @@ class SpecificationTaskStateTest < Minitest::Test
     build_previous_package_on_spec_branch(package: "lane/#{FOLDER}")
     outside = link_specification_root_outside("lane")
     start(revision: SPEC_PR, specification_root: "lane")
+    seen = observe_task_workspace_at_generation_result
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
     assert_outside_untouched(outside)
-    assert_equal git(@root, "rev-parse", "main").strip,
-                 git(task_workspace, "rev-parse", "HEAD").strip
-    assert File.symlink?(File.join(task_workspace, "lane")), "the committed link must survive"
+    assert_equal git(@root, "rev-parse", "main").strip, seen[:head]
+    assert seen[:link], "the committed link must survive"
   end
 
   # The same link, on a FIRST specification: the write of the generated package itself must not
@@ -498,6 +498,20 @@ class SpecificationTaskStateTest < Minitest::Test
             "PATH" => "#{@provider}:#{@gh_dir}:#{ENV['PATH']}" }
           .merge(SpecificationWorkspace.lane_env(@built.temp)).merge(env_extra)
     SpecrelayRunner::CLI.run(%W[claim-once --config #{@config.source_path}], out: @io, err: @io, env: env)
+  end
+
+  # The task workspace's HEAD and committed link as they stood when Platform received the
+  # generation result — before a recorded failure hands the environment back.
+  def observe_task_workspace_at_generation_result
+    seen = {}
+    original = @platform.method(:specification_generation)
+    read = ->() { { head: git(task_workspace, "rev-parse", "HEAD").strip,
+                    link: File.symlink?(File.join(task_workspace, "lane")) } }
+    @platform.define_singleton_method(:specification_generation) do |request|
+      seen.merge!(read.call)
+      original.call(request)
+    end
+    seen
   end
 
   def probe = JSON.parse(File.read(@probe))

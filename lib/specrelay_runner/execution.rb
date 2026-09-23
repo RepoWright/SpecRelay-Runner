@@ -33,7 +33,8 @@ module SpecrelayRunner
     # window closed and the attempt paused (MVP-0036 CR-002 F2).
     PLATFORM_AWAITING_INPUT = "AWAITING_INPUT"
 
-    Result = Struct.new(:outcome, :message, :reported_status, :release_attempted, keyword_init: true) do
+    Result = Struct.new(:outcome, :message, :reported_status, :release_attempted, :run_ended,
+                        keyword_init: true) do
       def success? = outcome == :completed
 
       # MAPIAI-107 — the attempt refused deterministically BEFORE any provider, and ATTEMPTED to
@@ -77,15 +78,14 @@ module SpecrelayRunner
       # nothing; only this pairing does.
       def report_unsubmitted? = outcome == :publication_failed && reported_status.nil?
 
-      # MAPIAI-97 — the attempt SUCCEEDED, both halves of it: the implementation reported success
-      # and Platform accepted that report.
+      # Platform holds a DEFINITIVE ending for this Run that this process observed: it recorded this
+      # attempt's terminal result, success or failure, or it explicitly returned cancellation. The
+      # one condition under which the Run's task environment may be handed back.
       #
-      # `success?` alone is not that. It reads Platform's answer to the upload, so a run whose
-      # verification or publication failed — and which said so in its own terminal result — is
-      # still `completed` here, because the report was received and stored. Releasing on it would
-      # delete the worktree holding the failure someone has to look at, and the retry that has to
-      # reuse it.
-      def completed_successfully? = success? && reported_status == ReportBundle::STATUS_SUCCEEDED
+      # Set only from an answer that came back. A superseded, refused or unreachable upload, a
+      # report that could not be built, an expired lease and a generic terminal signal all leave it
+      # unset — none of them is a recorded ending this process can show.
+      def run_ended? = !!run_ended
     end
 
     STOP_HEARTBEAT_ENV = "SPECRELAY_RUNNER_STOP_HEARTBEAT_AFTER_SECONDS"
@@ -94,6 +94,18 @@ module SpecrelayRunner
     # How much of one cause a terminal diagnostic carries. Long enough for a real exception
     # message or failure reason, short enough that neither can turn the ending into a transcript.
     MAX_DIAGNOSTIC_CHARS = 200
+
+    # The lease signal that is Platform's own terminal record of the Run, as opposed to an expired
+    # lease or a generic terminal state this process cannot attribute.
+    CANCELLED = "cancelled"
+
+    # The report outcomes that mean Platform RECORDED this attempt's terminal result. `superseded`
+    # is a 201 too, but it is Platform declining to record a claim that is no longer current.
+    RECORDED_OUTCOMES = %w[completed tests_failed].freeze
+
+    # The terminal envelope is a snapshot taken when the result is submitted, and the release it
+    # describes can only follow Platform's acceptance of that very result.
+    RELEASE_PENDING = "the task environment is released only after Platform accepts this result"
 
     # The lane discriminator Platform states on every assignment (MVP-0025).
     RUN_TYPE = "implementation"
@@ -203,12 +215,15 @@ module SpecrelayRunner
       raise Aborted, reason if reason
     end
 
+    # Explicit cancellation is already Platform's terminal record, so no late report is sent and
+    # the Run's environment goes back. Any other stop keeps it: this process cannot show the Run ended.
     def aborted_result(error)
       reason = error.message.to_s.empty? ? "the lease is no longer live" : error.message
+      cancelled = reason == CANCELLED
       log("Stopping #{run['task_id']}: Platform reports #{reason}. No report was uploaded.")
-      log("Platform owns the outcome — an expired lease is reclaimed for another runner; " \
-          "a cancelled run is terminal. Nothing to recover locally.")
-      Result.new(outcome: :aborted,
+      log(cancelled ? "The run is cancelled on Platform; its task environment is handed back." :
+                      "Platform owns the outcome; this run's task environment is kept.")
+      Result.new(outcome: :aborted, run_ended: cancelled,
                  message: "Runner outcome: aborted (#{reason}); claim released to Platform, no report uploaded.")
     end
 
@@ -622,11 +637,11 @@ module SpecrelayRunner
       terminal = terminal_result(status: ReportBundle::STATUS_FAILED, final_sequence: emitter.sequence,
                                  exit_code: executor_result.exit_code, base_commit: worktree.base_commit,
                                  changes: changes, error_classification: "worktree_unmeasurable")
-      client.submit_report(claim: claim, bundle: bundle, terminal_result: terminal)
+      response = client.submit_report(claim: claim, bundle: bundle, terminal_result: terminal)
       # The status is set from a submission that RETURNED, which is what separates this
       # acknowledged failure from one whose report never reached Platform at all.
       Result.new(outcome: :publication_failed, reported_status: ReportBundle::STATUS_FAILED,
-                 message: "Runner outcome: publication_failed (#{reason}).")
+                 run_ended: recorded?(response), message: "Runner outcome: publication_failed (#{reason}).")
     end
 
     # MVP-0014 — publish the changed repository output to GitHub, between verification
@@ -869,7 +884,8 @@ module SpecrelayRunner
       response = client.submit_report(claim: claim, bundle: bundle, terminal_result: terminal)
       outcome = response["outcome"].to_s
       log("Report stored: #{response.dig('report', 'url')} (run #{response['run_state']})")
-      Result.new(outcome: outcome.to_sym, message: "Runner outcome: #{outcome}.", reported_status: status)
+      Result.new(outcome: outcome.to_sym, message: "Runner outcome: #{outcome}.", reported_status: status,
+                 run_ended: recorded?(response))
     end
 
     # MVP-0034 S23 — the assignment's package did not reproduce what Platform pinned. Reported as
@@ -900,9 +916,11 @@ module SpecrelayRunner
       terminal = terminal_result(status: ReportBundle::STATUS_FAILED, final_sequence: emitter.sequence,
                                  exit_code: executor_result.exit_code, base_commit: worktree.base_commit,
                                  changes: changes, error_classification: classification)
-      client.submit_report(claim: claim, bundle: bundle, terminal_result: terminal)
-      Result.new(outcome: :executor_failed, message: message)
+      response = client.submit_report(claim: claim, bundle: bundle, terminal_result: terminal)
+      Result.new(outcome: :executor_failed, message: message, run_ended: recorded?(response))
     end
+
+    def recorded?(response) = RECORDED_OUTCOMES.include?(response.to_h["outcome"].to_s)
 
     # The ONE place report construction is allowed to fail, shared by the three paths that build
     # a bundle.
@@ -1036,7 +1054,8 @@ module SpecrelayRunner
         # detection failed announce a repository state nobody had measured (review-003 finding 2).
         # The cause travels in the error classification and the report's failure narrative instead.
         repositories: publication || [],
-        artifacts: terminal_artifacts
+        artifacts: terminal_artifacts,
+        cleanup_error: RELEASE_PENDING
       )
     end
 

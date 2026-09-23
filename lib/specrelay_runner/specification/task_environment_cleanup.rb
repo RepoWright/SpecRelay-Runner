@@ -2,8 +2,8 @@
 
 module SpecrelayRunner
   module Specification
-    # Returns the ticket's task environment once Platform has ACCEPTED a specification
-    # publication, by asking the project to release the environment this run owns.
+    # Returns the ticket's task environment once Platform has RECORDED how a specification run
+    # ended, by asking the project to release the environment this run owns.
     #
     # It exists because the specification lane LEAVES ITS ENVIRONMENT BEHIND. Generation
     # deliberately materializes the package into the ticket's canonical task worktree, beside the
@@ -12,17 +12,16 @@ module SpecrelayRunner
     #
     # It used to clear the package folder itself first, and to refuse an environment holding
     # uncommitted work. Both are gone, and ownership is why. An environment this run allocated is
-    # this run's: once the required publication has been accepted, every unpublished edit in it
-    # is disposable, including one a person made by hand. And an environment this run does NOT
+    # this run's: once Platform has recorded its ending, every unpublished edit in it is
+    # disposable, including one a person made by hand. And an environment this run does NOT
     # own is refused by the project before anything is removed — so there is nothing left for a
     # Runner-side protection rule to add except a second opinion that could disagree with the
     # authority that actually performs the removal.
     #
-    # What it keeps is the ORDER. Nothing is asked for until the publication has succeeded and
-    # Platform has accepted the result; see {Publication#clean_up}. And a refusal is never a
-    # publication failure: the pull request exists and Platform's run has advanced, so reporting
-    # the run as failed because a worktree could not be returned would tell an operator their
-    # specification was not published while a reviewer was already reading it.
+    # What it keeps is the ORDER. Nothing is asked for until Platform has recorded the result, or
+    # explicitly cancelled the run; see {Publication.discard_local_state!}. A release that is not
+    # proved never changes that recorded outcome, but it is a cleanup failure: the caller raises
+    # CleanupRequired, so the run exits non-zero and a loop claims nothing more.
     class TaskEnvironmentCleanup
       # `released` is the only success, and it is the project's own proof of one. A result with a
       # reason is an environment still allocated; it deliberately says nothing about which files

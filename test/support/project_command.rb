@@ -100,4 +100,23 @@ module ProjectCommand
     path = File.join(root, ".runs", "owners", task_id)
     File.exist?(path) ? File.read(path) : nil
   end
+
+  # A project that owns the run-aware command and holds NO task environment, so every release is
+  # answered with its proof of absence. For a lane test whose environment is not what it is about:
+  # a Run's ending still asks the project, and a project without the command would be refused.
+  def install_without_environments(root)
+    FileUtils.mkdir_p(File.join(root, "bin"))
+    path = File.join(root, "bin", "worktree")
+    File.write(path, <<~SH)
+      #!/usr/bin/env sh
+      set -u
+      ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+      #{arguments}
+      case "$VERB" in
+        release) #{release_guard} ;;
+        *) echo '{"error":"unknown task environment"}'; exit 4 ;;
+      esac
+    SH
+    FileUtils.chmod(0o755, path)
+  end
 end

@@ -129,8 +129,8 @@ class SpecificationTaskWorkspaceTest < Minitest::Test
   # ------------------------------------------------------------------ S08
 
   # A provider that changed a COMPONENT repository fails before success and before publication.
-  # The change is left in place: reverting an out-of-scope edit to manufacture a clean run would
-  # destroy the only evidence of what the provider did.
+  # Nothing is reverted to manufacture a clean run: the recorded failure names what the provider
+  # changed, and only once Platform has recorded it is the Run's environment handed back.
   def test_a_provider_change_in_a_component_repository_fails_before_success
     start(escape: "component-a/app/services/export_report.rb")
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
@@ -139,9 +139,7 @@ class SpecificationTaskWorkspaceTest < Minitest::Test
     assert_equal "failed", generation["outcome"]
     assert_equal "generation_provider_failed", generation["failure_class"]
     assert_includes generation["message"], "component-a"
-    refute_path_exists File.join(snapshot_worktree, PACKAGE)
-    assert_includes File.read(File.join(task_workspace, "component-a", "app", "services",
-                                        "export_report.rb")), "escaped"
+    assert_discarded_after_the_recorded_failure
   end
 
   # The same rule for a sibling path in the WORKSPACE repository itself, which is the repository
@@ -153,7 +151,7 @@ class SpecificationTaskWorkspaceTest < Minitest::Test
 
     assert_equal "generation_provider_failed",
                  @platform.last_specification_generation["failure_class"]
-    refute_path_exists File.join(snapshot_worktree, PACKAGE)
+    assert_discarded_after_the_recorded_failure
   end
 
   # An UNTRACKED file counts. A provider that dropped scratch output beside the package would
@@ -176,7 +174,7 @@ class SpecificationTaskWorkspaceTest < Minitest::Test
     generation = @platform.last_specification_generation
     assert_equal "generation_provider_failed", generation["failure_class"]
     assert_includes generation["message"], "component-a"
-    refute_path_exists File.join(snapshot_worktree, PACKAGE)
+    assert_discarded_after_the_recorded_failure
   end
 
   # Changing a repository's `origin` to something this product does not recognise used to remove
@@ -190,7 +188,7 @@ class SpecificationTaskWorkspaceTest < Minitest::Test
 
     assert_equal "generation_provider_failed",
                  @platform.last_specification_generation["failure_class"]
-    refute_path_exists File.join(snapshot_worktree, PACKAGE)
+    assert_discarded_after_the_recorded_failure
   end
 
   # A repository the environment held and no longer holds is a change to the source state the
@@ -202,7 +200,7 @@ class SpecificationTaskWorkspaceTest < Minitest::Test
 
     assert_equal "generation_provider_failed",
                  @platform.last_specification_generation["failure_class"]
-    refute_path_exists File.join(snapshot_worktree, PACKAGE)
+    assert_discarded_after_the_recorded_failure
   end
 
   # And one that appeared. A new git root inside an ignored directory is invisible to every
@@ -213,7 +211,7 @@ class SpecificationTaskWorkspaceTest < Minitest::Test
 
     assert_equal "generation_provider_failed",
                  @platform.last_specification_generation["failure_class"]
-    refute_path_exists File.join(snapshot_worktree, PACKAGE)
+    assert_discarded_after_the_recorded_failure
   end
 
   # ------------------------------------------------------------------ evidence
@@ -510,6 +508,13 @@ class SpecificationTaskWorkspaceTest < Minitest::Test
   def probe = JSON.parse(File.read(@probe))
   def task_workspace = File.realpath(@built.task_workspace(TASK))
   def snapshot_worktree = SpecificationWorkspace.isolated_worktree(@built.temp)
+
+  # A failure Platform recorded ends the Run: no package reached a snapshot that survives, and the
+  # environment was handed back through the project's own release, for this Run.
+  def assert_discarded_after_the_recorded_failure
+    assert_empty SpecificationWorkspace.isolated_workspaces(@built.temp)
+    assert_includes worktree_invocations, "release #{TASK} --run-id #{SPEC_RUN} --json"
+  end
 
   def worktree_invocations = MultiRepositoryWorkspace.worktree_invocations(@built.worktree_log)
 

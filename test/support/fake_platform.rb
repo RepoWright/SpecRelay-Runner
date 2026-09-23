@@ -53,6 +53,10 @@ class FakePlatform
   # the runner treats as a transport fault rather than a refusal.
   attr_accessor :publication_response
 
+  # The same scripted answer for the execution-report and specification-generation endpoints, so
+  # a test can tell an accepted terminal result from a superseded, refused or unreachable one.
+  attr_accessor :report_response, :generation_response
+
   # Script the review-result endpoint's answer, so a test can model Platform's
   # strict validation refusing a submission the runner considered fine.
   attr_accessor :review_response
@@ -152,6 +156,10 @@ class FakePlatform
       loop do
         socket = @server.accept
         handle(socket)
+      rescue Errno::EPIPE
+        # That client went away before its answer was written. It costs that one connection;
+        # ending the only accept thread here would leave every later request unanswered.
+        next
       rescue IOError, Errno::EBADF
         break
       end
@@ -237,9 +245,10 @@ class FakePlatform
     @mutex.synchronize { @question_refusals << [ 422, { accepted: false, errors: errors } ] }
   end
 
-  # F1: a slow answer poll, so a test can put the provider's exit INSIDE the poll the
-  # runner is waiting on, and a scripted answer for the acknowledgement itself.
-  attr_accessor :question_poll_delay, :delivery_response
+  # F1: a held answer poll, so a test can put the provider's exit INSIDE the poll the runner is
+  # waiting on, and a scripted answer for the acknowledgement itself. The hold is called on this
+  # fake's accept thread before the poll is answered.
+  attr_accessor :question_poll_hold, :delivery_response
 
   # The recorded portable checkpoint this fake hands back on the claim-bound download path, and
   # a scripted response so a test can put a transfer failure in front of a runner that has not
@@ -447,7 +456,7 @@ class FakePlatform
   # The POLL. Every read moves the counter, so a settlement scheduled for the Nth poll happens
   # while the runner is genuinely waiting.
   def executor_question_state
-    sleep @question_poll_delay if @question_poll_delay
+    question_poll_hold&.call
     state, answers = @mutex.synchronize do
       @question_polls += 1
       settled = @question_settle_state && @question_polls >= @question_settle_after
@@ -527,6 +536,8 @@ class FakePlatform
   end
 
   def specification_generation(request)
+    return @generation_response if @generation_response
+
     outcome = request.dig(:body, "generation", "outcome").to_s
     return [ 422, { error: "generation outcome is required" } ] if outcome.empty?
 
@@ -724,6 +735,8 @@ class FakePlatform
   end
 
   def report(request)
+    return @report_response if @report_response
+
     status = request.dig(:body, "report", "files")&.any? ? 201 : 422
     [ status, { outcome: "completed", execution_state: "COMPLETED",
                report: { round_label: "001-initial", status: "succeeded", url: "#{base_url}/reports/rpt_fake" },

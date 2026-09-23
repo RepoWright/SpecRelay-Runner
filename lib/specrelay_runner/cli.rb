@@ -551,10 +551,8 @@ module SpecrelayRunner
       # behaviour is unchanged.
       signal = loop_signal(result)
       yield signal if block_given? && signal
-      return RUN_FAILED unless result.handled?
-
-      release_task_environment(config, payload) if result.completed_successfully?
-      SUCCESS
+      release_task_environment(config, payload) if result.run_ended?
+      result.handled? ? SUCCESS : RUN_FAILED
     end
 
     # The two outcomes a session must not simply poll past, in the order they are decided.
@@ -571,18 +569,15 @@ module SpecrelayRunner
       nil
     end
 
-    # MAPIAI-97 — the environment a COMPLETED implementation leaves behind is released here, on
-    # the one path both `loop` and `claim-once` reach, because the preview lane addresses the same
-    # task id and would otherwise be built on top of it.
+    # The environment of an implementation Run that has definitively ENDED is released here, on the
+    # one path both `loop` and `claim-once` reach: Platform recorded its terminal result, success or
+    # failure, or explicitly cancelled it ({Execution::Result#run_ended?}). Always after that
+    # answer, never before, and never for a question-paused attempt, whose worktree holds the
+    # answer the operator has yet to give, or for an ending this process could not confirm.
     #
-    # `completed_successfully?`, not `handled?` and not `success?`. A question-paused attempt is an
-    # approved pause whose worktree holds the answer the operator has yet to give; and an attempt
-    # whose verification or publication FAILED reported that failure honestly and was accepted for
-    # it, so its environment is the evidence — and the thing a retry reuses.
-    #
-    # It does not retract the accepted result — the report is already uploaded — but a refused
-    # release raises {CleanupRequired}, because this machine is now holding something nobody has
-    # accounted for and must not claim anything else until a person resolves it.
+    # It does not retract the recorded outcome, but a refused release raises {CleanupRequired},
+    # because this machine is now holding something nobody has accounted for and must not claim
+    # anything else until a person resolves it.
     def release_task_environment(config, payload)
       return unless Execution.implementation?(payload)
 
