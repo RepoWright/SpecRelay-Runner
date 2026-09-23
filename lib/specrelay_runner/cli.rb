@@ -64,13 +64,13 @@ module SpecrelayRunner
       err.puts(Redaction.redact(e.message))
       RUN_FAILED
     rescue CommandRunner::TerminationFailed => e
-      # A command this runner supervised may still be running. Nothing may follow it on this
-      # machine — no report, no release, no next claim — so the invocation ends here, having done
-      # none of those, and says which process group to look for.
+      # A command this runner supervised may still be running, so nothing may follow it on this
+      # machine and the invocation ends here. The failing command may be any of them — the
+      # provider before a report, or the release after one — so say only what failed and which
+      # process group to look for, never what did or did not happen before it.
       err.puts("Runner stopped: a supervised command could not be shown to have ended: " \
                "#{Redaction.redact(e.message)}.")
-      err.puts("Nothing further was claimed and no task environment was released. Make sure that " \
-               "process group has ended before starting this runner again.")
+      err.puts("Make sure that process group has ended before starting this runner again.")
       RUN_FAILED
     end
 

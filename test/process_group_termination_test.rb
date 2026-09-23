@@ -234,17 +234,33 @@ class ProcessGroupTerminationTest < Minitest::Test
   # The implementation provider's group cannot be shown to have ended. The invocation fails at the
   # command-line boundary: no report, no release of the environment, and nothing claimed after it.
   def test_an_unfinished_provider_group_stops_claim_once_without_release_or_another_claim
-    code, output, platform, root = unfinished_provider_run(%w[claim-once])
+    code, output, platform, root = unfinished_run(%w[claim-once], group_of: :provider)
 
     assert_stopped_before_anything_else(code, output, platform, root)
   end
 
   # The same inside a loop that would otherwise go on to claim more work.
   def test_an_unfinished_provider_group_ends_the_loop_before_another_claim
-    code, output, platform, root = unfinished_provider_run(%w[loop --poll-interval 5 --on-failure continue],
-                                                          claim_limit: 2)
+    code, output, platform, root = unfinished_run(%w[loop --poll-interval 5 --on-failure continue],
+                                                  group_of: :provider, claim_limit: 2)
 
     assert_stopped_before_anything_else(code, output, platform, root)
+  end
+
+  # The group that cannot be shown to have ended is the RELEASE command's, after the result was
+  # acknowledged and the checkout removed. The invocation still fails, and says nothing that
+  # denies what had already happened.
+  def test_an_unfinished_release_group_fails_without_denying_the_release_it_made
+    code, output, platform, root = unfinished_run(%w[claim-once], group_of: :release)
+
+    refute_nil leader_pid, "the release command must really have run"
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, code, output
+    assert_includes output, "process group #{leader_pid}"
+    assert_equal 1, platform.requests_to("/api/runner/reports").size, "the result was already reported"
+    refute File.directory?(File.join(root, ".runs", "worktrees", TASK)), "the release had already removed it"
+    refute_match(/no task environment was released|nothing further was claimed/i, output)
+  ensure
+    FileUtils.remove_entry(root) if root && File.directory?(root)
   end
 
   private
@@ -253,13 +269,19 @@ class ProcessGroupTerminationTest < Minitest::Test
 
   TASK = "DEMO-0001"
 
-  def unfinished_provider_run(command, claim_limit: nil)
+  # `group_of` names the one supervised command whose group is made uninspectable: it records its
+  # own group — the one its CommandRunner spawn created — and only that group is denied.
+  def unfinished_run(command, group_of:, claim_limit: nil)
     root, executor = DemoWorkspace.build
-    # The provider records its own group — the one its CommandRunner spawn created.
     marker = File.join(@dir, "leader.pid")
-    File.write(executor, File.read(executor).sub("# frozen_string_literal: true\n",
-                                                 "# frozen_string_literal: true\n" \
-                                                 "File.write(#{marker.inspect}, \"\#{Process.pid} \#{Process.getpgrp}\")\n"))
+    if group_of == :provider
+      File.write(executor, File.read(executor).sub("# frozen_string_literal: true\n",
+                                                   "# frozen_string_literal: true\n" \
+                                                   "File.write(#{marker.inspect}, \"\#{Process.pid} \#{Process.getpgrp}\")\n"))
+    else
+      project = File.join(root, "bin", "worktree")
+      File.write(project, File.read(project).sub("release)", "release)\n    echo \"$$ $$\" > #{marker}"))
+    end
     platform = FakePlatform.new(claim_payload: claim_payload_for(task_id: TASK, root: root), claim_limit: claim_limit).start
     config = File.join(Dir.mktmpdir("cfg", @dir), "runner.yml")
     File.write(config, <<~YAML)
