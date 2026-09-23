@@ -183,12 +183,15 @@ class DeferredCancellationCleanupTest < Minitest::Test
   end
 
   # Scenario 8. A listed row that cannot be classified is not a manual environment: the list is
-  # unreadable, and nothing is asked or claimed while the owned environment stays.
+  # unreadable, and nothing is asked or claimed while the owned environment stays. Only an owner
+  # the project states as null is manual; a missing or empty owner proves nothing.
   def test_a_listed_environment_that_cannot_be_classified_stops_the_loop_before_a_claim
     { "owner without a task" => %([{"owner_run_id":"#{RUN}"}]),
       "owner that is not text" => %([{"task_id":"#{TASK}","owner_run_id":7}]),
       "blank task beside an owner" => %([{"task_id":"","owner_run_id":"#{RUN}"}]),
-      "row that is not an object" => %(["#{TASK}"]) }.each do |name, rows|
+      "row that is not an object" => %(["#{TASK}"]),
+      "owner field missing" => %([{"task_id":"#{TASK}"}]),
+      "empty owner" => %([{"task_id":"#{TASK}","owner_run_id":""}]) }.each do |name, rows|
       restart_platform
       allocate(TASK, RUN)
       listing = File.join(@root, "listing.json")

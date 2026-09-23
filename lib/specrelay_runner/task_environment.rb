@@ -114,12 +114,13 @@ module SpecrelayRunner
       [ owners.compact, nil ]
     end
 
-    # `[run_id, task_id]` for a Run-owned row, nil for a manual one, :unreadable otherwise.
+    # `[run_id, task_id]` for a Run-owned row, nil for a manual one, :unreadable otherwise. The
+    # project always lists the owner; only an owner it states as null is manual.
     def listed_owner(row)
-      return :unreadable unless row.is_a?(Hash) && listed_identity?(row["task_id"])
+      return :unreadable unless row.is_a?(Hash) && row.key?("owner_run_id") && listed_identity?(row["task_id"])
 
       owner = row["owner_run_id"]
-      return nil if owner.nil? || owner == ""
+      return nil if owner.nil?
 
       listed_identity?(owner) ? [ owner, row["task_id"] ] : :unreadable
     end
