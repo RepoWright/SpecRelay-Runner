@@ -43,12 +43,26 @@ module SpecrelayRunner
       def released? = released ? true : false
     end
 
+    # What {ownership} proved. OWNED lets this run use the environment. PROTECTED is a readable
+    # record of a manual environment or another run's, which nothing in this runner may take
+    # down. UNPROVED is every other answer — an absent environment included, because only the
+    # run-qualified release can prove absence.
+    OWNED = :owned
+    PROTECTED = :protected
+    UNPROVED = :unproved
+
     module_function
 
     # Why `run_id` may NOT use the environment `task_id`, or nil when the project proves it owns
     # it right now.
+    def unowned_reason(root:, task_id:, run_id:, canonical_branch: nil)
+      verdict, reason = ownership(root: root, task_id: task_id, run_id: run_id, canonical_branch: canonical_branch)
+      verdict == OWNED ? nil : reason
+    end
+
+    # `[verdict, reason]` for the environment `task_id`, the reason nil only when it is OWNED.
     #
-    # Nil is the narrow answer and every other path produces a reason, which is what stops an
+    # OWNED is the narrow answer and every other path produces a reason, which is what stops an
     # unanswered question being read as permission. Cleanliness is not ownership, and neither is
     # the canonical branch being checked out somewhere: both are true of an environment a person
     # made by hand, and adopting one would delete their work at the end of this run. So the
@@ -56,23 +70,23 @@ module SpecrelayRunner
     #
     # `canonical_branch` is compared when the caller knows it, because the answer must be about
     # the environment this run is actually going to use.
-    def unowned_reason(root:, task_id:, run_id:, canonical_branch: nil)
+    def ownership(root:, task_id:, run_id:, canonical_branch: nil)
       unavailable = unavailable_reason(root, task_id, run_id)
-      return sentence(task_id, "cannot be claimed: #{unavailable}") if unavailable
+      return [ UNPROVED, sentence(task_id, "cannot be claimed: #{unavailable}") ] if unavailable
 
       result = invoke(root, [ "status", task_id.to_s, "--json" ], STATUS_TIMEOUT)
       document = document_of(result)
-      return sentence(task_id, "could not be inspected: #{detail(result, 'status', task_id)}") if
+      return [ UNPROVED, sentence(task_id, "could not be inspected: #{detail(result, 'status', task_id)}") ] if
         document.nil?
 
       mismatch = identity_mismatch(document, task_id, canonical_branch)
-      return sentence(task_id, mismatch) if mismatch
+      return [ UNPROVED, sentence(task_id, mismatch) ] if mismatch
 
       owner = document["owner_run_id"].to_s
-      return sentence(task_id, "records no run owner, so it is a manual environment") if owner.empty?
-      return sentence(task_id, "is owned by a different run") unless owner == run_id.to_s
+      return [ PROTECTED, sentence(task_id, "records no run owner, so it is a manual environment") ] if owner.empty?
+      return [ PROTECTED, sentence(task_id, "is owned by a different run") ] unless owner == run_id.to_s
 
-      nil
+      [ OWNED, nil ]
     end
 
     # Hand back the environment this run owns, or say why it is still allocated.

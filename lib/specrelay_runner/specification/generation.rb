@@ -263,9 +263,10 @@ module SpecrelayRunner
         log("Fix the cause above and re-run, or release the claim so another runner can take it:")
         log("  #{release_command}")
         recorded = submit(refusal_payload(refusal, outcome: "refused", zero_files: true))
-        # A refusal comes before the package workspace exists, so only a task environment this Run
-        # already built can be left — and only one the project proves is this Run's is released.
-        discard(nil) if recorded && assignment && owns_task_environment?
+        # A refusal comes before the package workspace exists, so only a task environment can be
+        # left. A person's or another Run's is kept; anything else goes to the run-qualified
+        # release, which proves it absent, releases this Run's, or leaves the cleanup incomplete.
+        discard(nil) if recorded && assignment && !protected_task_environment?
         Result.new(outcome: REFUSED,
                    message: "Runner outcome: generation_refused (#{refusal.failure_class}); " \
                             "no output file was written.")
@@ -505,13 +506,17 @@ module SpecrelayRunner
                                          env: env, io: io)
       end
 
-      # Whether the project proves this Run owns the ticket's task environment right now. A manual
-      # environment, another Run's, an absent one and one that cannot be inspected are all false:
-      # none of them is this Run's to release.
-      def owns_task_environment?
+      # Whether the project proves the ticket's task environment is a person's or another Run's.
+      # An unmapped workspace root proves nothing: an earlier attempt may have allocated one while
+      # the mapping existed, and the release reports that cleanup as incomplete.
+      def protected_task_environment?
         root = config.workspace_root(assignment.workspace_key, env: env)
-        TaskEnvironment.unowned_reason(root: root, task_id: assignment.task_id, run_id: assignment.run_id,
-                                       canonical_branch: assignment.canonical_branch).nil?
+        verdict, reason = TaskEnvironment.ownership(root: root, task_id: assignment.task_id, run_id: assignment.run_id,
+                                                    canonical_branch: assignment.canonical_branch)
+        return false unless verdict == TaskEnvironment::PROTECTED
+
+        log("Kept: #{reason}.")
+        true
       rescue Config::Error
         false
       end
