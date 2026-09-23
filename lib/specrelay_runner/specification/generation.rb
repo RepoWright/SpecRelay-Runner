@@ -41,6 +41,10 @@ module SpecrelayRunner
       DEFAULT_RENEWAL_SECONDS = 30
 
       GENERATED = :generated
+
+      # The outcomes with which Platform RECORDS a generation result. `superseded` is a 201 as well,
+      # but it records nothing: the claim is no longer current.
+      RECORDED_OUTCOMES = %w[generated refused failed].freeze
       REFUSED = :generation_refused
       FAILED = :generation_failed
       ABORTED = :aborted
@@ -468,8 +472,8 @@ module SpecrelayRunner
       # report to. It is printed and returned rather than dropped silently; Platform recovers
       # such a claim through the lease sweep, which is the same path a crashed runner takes.
       #
-      # True only when Platform RECORDED the result. A refusal and an unanswered request are both
-      # false, and neither may authorize discarding anything.
+      # True only when Platform RECORDED the result. A superseded answer, a refusal and an
+      # unanswered request are all false, and none may authorize discarding anything.
       def submit(generation)
         claim = generation["runner_execution_id"].to_s
         if claim.empty?
@@ -478,7 +482,13 @@ module SpecrelayRunner
         end
 
         response = client.submit_specification_generation(claim: claim, generation: generation)
-        log("Platform recorded the result: run #{response['run_state']} (#{response['outcome']}).")
+        outcome = response["outcome"].to_s
+        unless RECORDED_OUTCOMES.include?(outcome)
+          log("Platform did not record this result (#{outcome}): this claim is no longer current.")
+          return false
+        end
+
+        log("Platform recorded the result: run #{response['run_state']} (#{outcome}).")
         true
       rescue PlatformClient::Error => e
         # The local outcome is already true — the package exists or it does not. Failing to

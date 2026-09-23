@@ -425,6 +425,25 @@ class SpecificationGenerationTest < Minitest::Test
     assert_snapshot_and_environment_kept
   end
 
+  # A 201 that records nothing — the claim is no longer current — is not an acknowledgement.
+  def test_a_superseded_failure_result_keeps_the_snapshot_and_the_environment
+    @platform.generation_response = SUPERSEDED
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, with_unreadable_final_manifest { run_cli }, @io.string
+
+    assert_snapshot_and_environment_kept
+    refute_includes @io.string, "Platform recorded the result"
+  end
+
+  def test_a_superseded_refusal_keeps_the_environment_this_run_built
+    @platform.generation_response = SUPERSEDED
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, with_broken_redaction { run_cli }, @io.string
+
+    refute_nil task_worktree, "the environment was released for a refusal Platform did not record"
+    refute_includes @io.string, "Platform recorded the result"
+  end
+
   def test_an_unreachable_failure_result_keeps_the_snapshot_and_the_environment
     @platform.generation_response = [ 500, { error: "internal server error" } ]
 
@@ -565,6 +584,8 @@ class SpecificationGenerationTest < Minitest::Test
   #
   # `define_singleton_method` + restore rather than a mocking library: this suite has no gems,
   # which is the same reason with_broken_redaction in the preflight test is written this way.
+  SUPERSEDED = [ 201, { outcome: "superseded", execution_state: "CANCELLED", run_state: "CANCELLED" } ].freeze
+
   def assert_snapshot_and_environment_kept
     refute_empty SpecificationWorkspace.isolated_workspaces(@temp), "the snapshot was removed without an acknowledgement"
     refute_nil task_worktree, "the environment was released without an acknowledgement"

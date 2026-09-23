@@ -60,6 +60,10 @@ module SpecrelayRunner
       # failure class of its own; this one names the condition in the runner's exit and log.
       REPORT_REFUSED = "publication_report_refused"
 
+      # The outcomes with which Platform RECORDS a publication result. `superseded` is a 201 as
+      # well, but it records nothing: the claim is no longer current.
+      RECORDED_OUTCOMES = %w[published failed jira_writeback_blocked unchanged].freeze
+
       Result = Struct.new(:outcome, :message, :pull_request_url, :branch, :head_commit, keyword_init: true) do
         def success? = outcome == PUBLISHED
       end
@@ -267,6 +271,11 @@ module SpecrelayRunner
                                         env: env, io: io)
       end
 
+      def retain_for_retry
+        discard(nil)
+        log("This runner keeps its local package so a publication retry republishes the same files.") if @workspace
+      end
+
       # Platform never answered, so it holds no record and will offer this run again. Keeping the
       # workspace is what makes that replay converge: the same files produce the same tree, so
       # {GitPublisher} creates no second commit and {PullRequestPublisher} reuses the pull request.
@@ -310,9 +319,10 @@ module SpecrelayRunner
         # Already a failure, so the outcome does not change — but the operator must not be left
         # believing Platform recorded a failure it in fact refused.
         log("Platform REFUSED this failure report: #{submission.message}") if submission.refused?
-        # A recorded failure ends the Run. Only a proved snapshot is removed; an assignment that
-        # never parsed names no environment to release.
-        discard(@workspace) if submission.accepted? && assignment
+        # A recorded failure blocks the Run on publication without ending it: `retry-publication`
+        # republishes this same package, so the snapshot stays and only the task environment is
+        # released. An assignment that never parsed names no environment to release.
+        retain_for_retry if submission.accepted? && assignment
         Result.new(outcome: FAILED, branch: pushed ? publication_branch : nil,
                    head_commit: pushed&.head_commit,
                    message: "Runner outcome: publication_failed (#{failure_class}).")
@@ -374,10 +384,12 @@ module SpecrelayRunner
 
       def claim_token = payload.dig("claim", "runner_execution_id").to_s
 
-      # THREE outcomes, not two, and MAPIAI-62 is why the third had to become distinguishable.
+      # FOUR outcomes, because cleanup acts on the difference between them.
       #
       #   accepted    — Platform read the result and recorded it. The only state in which the
       #                 local package may be deleted (design 4).
+      #   superseded  — Platform answered but recorded nothing, because the claim is no longer
+      #                 current. Nothing local is discarded for it.
       #   refused     — Platform read it and rejected it. The local outcome is invalidated as
       #                 something to report, and the package is kept for the operator's next move.
       #   unreachable — Platform never answered. The pull request exists either way, but Platform
@@ -401,7 +413,13 @@ module SpecrelayRunner
         end
 
         response = client.submit_specification_publication(claim: claim, publication: publication)
-        log("Platform recorded the result: run #{response['run_state']} (#{response['outcome']}).")
+        outcome = response["outcome"].to_s
+        unless RECORDED_OUTCOMES.include?(outcome)
+          log("Platform did not record this result (#{outcome}): this claim is no longer current.")
+          return Submission.new(state: :superseded)
+        end
+
+        log("Platform recorded the result: run #{response['run_state']} (#{outcome}).")
         Submission.new(state: :accepted)
       rescue PlatformClient::Error => e
         text = Redaction.redact(e.message)
