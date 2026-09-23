@@ -156,6 +156,10 @@ class FakePlatform
       loop do
         socket = @server.accept
         handle(socket)
+      rescue Errno::EPIPE
+        # That client went away before its answer was written. It costs that one connection;
+        # ending the only accept thread here would leave every later request unanswered.
+        next
       rescue IOError, Errno::EBADF
         break
       end
@@ -241,9 +245,10 @@ class FakePlatform
     @mutex.synchronize { @question_refusals << [ 422, { accepted: false, errors: errors } ] }
   end
 
-  # F1: a slow answer poll, so a test can put the provider's exit INSIDE the poll the
-  # runner is waiting on, and a scripted answer for the acknowledgement itself.
-  attr_accessor :question_poll_delay, :delivery_response
+  # F1: a held answer poll, so a test can put the provider's exit INSIDE the poll the runner is
+  # waiting on, and a scripted answer for the acknowledgement itself. The hold is called on this
+  # fake's accept thread before the poll is answered.
+  attr_accessor :question_poll_hold, :delivery_response
 
   # The recorded portable checkpoint this fake hands back on the claim-bound download path, and
   # a scripted response so a test can put a transfer failure in front of a runner that has not
@@ -451,7 +456,7 @@ class FakePlatform
   # The POLL. Every read moves the counter, so a settlement scheduled for the Nth poll happens
   # while the runner is genuinely waiting.
   def executor_question_state
-    sleep @question_poll_delay if @question_poll_delay
+    question_poll_hold&.call
     state, answers = @mutex.synchronize do
       @question_polls += 1
       settled = @question_settle_state && @question_polls >= @question_settle_after
