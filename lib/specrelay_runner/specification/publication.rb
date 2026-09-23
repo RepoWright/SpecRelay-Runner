@@ -66,6 +66,26 @@ module SpecrelayRunner
 
       def self.call(**kwargs) = new(**kwargs).call
 
+      # Discard what a specification Run left on this machine once its ending is definitive —
+      # Platform recorded its result, or explicitly cancelled it. The one rule for both phases:
+      # {Generation} calls it for its own failures and cancellations.
+      #
+      # The proved publication snapshot goes first, because it is this runner's own directory;
+      # then the project is ASKED to release the ticket's task environment, for the Run that owns
+      # it. Published commits, branches and pull requests are never touched. Either step failing
+      # is a cleanup failure of its own, raised as {CleanupRequired} so the invocation exits
+      # nonzero and a loop claims nothing more; an unremoved snapshot keeps the environment too.
+      def self.discard_local_state!(workspace:, assignment:, config:, env:, io:)
+        if workspace && !workspace.remove!(commands_for: ->(root) { GitCommands.new(checkout_root: root, env: env) })
+          raise CleanupRequired, "the package workspace #{workspace.id} could not be removed, so the " \
+                                 "task environment #{assignment.task_id} was not released"
+        end
+        released = TaskEnvironmentCleanup.call(assignment: assignment, config: config, env: env)
+        raise CleanupRequired, released.reason unless released.released?
+
+        io.puts("Released this ticket's task environment.")
+      end
+
       def initialize(config:, client:, payload:, env: ENV, io: $stdout, clock: Time, settings: nil,
                      workspaces: nil)
         @config = config
@@ -122,10 +142,14 @@ module SpecrelayRunner
         @heartbeater&.stop
       end
 
+      # `@workspace` is set only once the snapshot is PROVED to be the one Platform recorded; it is
+      # the only snapshot a later discard may remove.
       def publish_locked(assignment)
         checked = PackageWorkspaceCheck.call(workspaces: workspaces, assignment: assignment,
                                              config: config, env: env, clock: clock)
         return refuse_workspace(checked) unless checked.ok?
+
+        @workspace = checked.workspace
 
         checkpoint!
         push_and_open(assignment, checked.workspace, checked.files)
@@ -214,7 +238,6 @@ module SpecrelayRunner
         submission = submit(success_payload(verified, pushed, opened))
         return report_refused(submission.message, pushed, opened) if submission.refused?
 
-        submission.accepted? ? clean_up(workspace) : retain_for_replay
         log("")
         log("Published #{verified.length} files on #{publication_branch} as a draft pull request:")
         log("  #{opened.url}")
@@ -227,54 +250,21 @@ module SpecrelayRunner
         # Platform finalizes after accepting this result. That stays true whenever it is read.
         log("This runner does not write Jira. Platform finalizes the ticket — Spec PR field, " \
             "comment and status — after accepting this publication.")
+        submission.accepted? ? discard(workspace) : retain_for_replay
         Result.new(outcome: PUBLISHED, pull_request_url: opened.url, branch: publication_branch,
                    head_commit: pushed.head_commit,
                    message: "Runner outcome: published (draft pull request #{opened.url}).")
       end
 
-      # Local cleanup, and ONLY after Platform has accepted the result (design 4).
+      # Local cleanup, and ONLY after Platform has recorded this Run's ending (design 4): its
+      # accepted result, or its explicit cancellation. Removing the package before that would
+      # destroy the one copy a refused or unanswered report still needs to retry from.
       #
-      # The ordering is the whole point. The pull request exists and Platform's run has advanced;
-      # the local package is now a duplicate of committed history. Removing it before acceptance
-      # would destroy the one copy of a package a refused report still needs to retry from.
-      #
-      # A cleanup failure is a WARNING on a publication that succeeded, never a failure. Reporting
-      # it as one would tell an operator the specification was not published while a reviewer was
-      # already looking at it; the retention sweep collects the workspace later anyway.
-      #
-      # Already inside the workspace lock (see #publish), so this cannot race the sweep.
-      #
-      # TWO things are cleaned up, because generation left the package in two places: this
-      # runner's own publication snapshot, and the ticket's task environment the analysis ran in.
-      # The snapshot is this runner's own directory and it removes it; the environment is the
-      # project's, so the project is ASKED to release it, and only for the run that owns it.
-      def clean_up(workspace)
-        remove_snapshot(workspace)
-        return_task_environment
-      end
-
-      def remove_snapshot(workspace)
-        return if workspace.remove!(commands_for: ->(root) { GitCommands.new(checkout_root: root, env: env) })
-
-        log("The publication succeeded; this runner could not remove its local package workspace.")
-        log("It is retained and the next generation's retention sweep will collect it.")
-      end
-
-      # The ticket's task environment, handed back through the project's own release command.
-      #
-      # An incomplete release is reported as a WARNING for the same reason a snapshot-removal
-      # failure is: the pull request exists and the run has advanced, and an operator told the
-      # publication failed would go looking for a specification a reviewer is already reading.
-      #
-      # The message says only what was proved. It does not claim which files were cleared or
-      # retained, because this runner removed none of them and the project — which did — has
-      # recorded what is still there.
-      def return_task_environment
-        result = TaskEnvironmentCleanup.call(assignment: assignment, config: config, env: env)
-        return log("Released this ticket's task environment.") if result.released?
-
-        log("This ticket's task environment was NOT released:")
-        log("  #{result.reason}")
+      # The outcome is already printed when this runs, so a cleanup failure — raised, never a
+      # warning — is reported after it rather than instead of it.
+      def discard(workspace)
+        self.class.discard_local_state!(workspace: workspace, assignment: assignment, config: config,
+                                        env: env, io: io)
       end
 
       # Platform never answered, so it holds no record and will offer this run again. Keeping the
@@ -320,6 +310,9 @@ module SpecrelayRunner
         # Already a failure, so the outcome does not change — but the operator must not be left
         # believing Platform recorded a failure it in fact refused.
         log("Platform REFUSED this failure report: #{submission.message}") if submission.refused?
+        # A recorded failure ends the Run. Only a proved snapshot is removed; an assignment that
+        # never parsed names no environment to release.
+        discard(@workspace) if submission.accepted? && assignment
         Result.new(outcome: FAILED, branch: pushed ? publication_branch : nil,
                    head_commit: pushed&.head_commit,
                    message: "Runner outcome: publication_failed (#{failure_class}).")
@@ -328,12 +321,14 @@ module SpecrelayRunner
       # Platform cancelled the claim or the lease lapsed. NOTHING is reported: Platform already
       # owns the outcome, and a late success from a superseded attempt is what the liveness
       # signal exists to prevent. Anything already pushed stays on the remote — deleting a branch
-      # because a lease expired would be a worse surprise than an unreferenced one.
+      # because a lease expired would be a worse surprise than an unreferenced one. Only an explicit
+      # cancellation is a recorded ending, so only it discards the local state.
       def aborted(error)
         reason = error.message.to_s.empty? ? "the lease is no longer live" : error.message
         log("")
         log("Stopping: Platform reports #{reason}. No publication result was submitted.")
         log("Anything already pushed is left in place and is NOT recorded as this run's result.")
+        discard(@workspace) if reason == Execution::CANCELLED
         Result.new(outcome: ABORTED,
                    message: "Runner outcome: aborted (#{reason}); no publication result was reported.")
       end

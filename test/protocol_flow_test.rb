@@ -97,7 +97,9 @@ class ProtocolFlowTest < Minitest::Test
     assert_nil repo["head_commit"]
     assert_nil repo["branch"]
     assert_match(/read-only/, repo["publication_skipped_reason"])
-    assert terminal.dig("cleanup", "succeeded")
+    # Submitted before the release it describes can be attempted, so it cannot claim it succeeded.
+    refute terminal.dig("cleanup", "succeeded")
+    assert_match(/after Platform accepts/, terminal.dig("cleanup", "error"))
     refute_empty terminal["artifacts"]
   end
 

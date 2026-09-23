@@ -425,11 +425,17 @@ class MultiRepositoryPublicationTest < Minitest::Test
   # is clean and worktree-versus-HEAD measurement sees nothing. The change is still there — it is
   # the task branch's own commits, ahead of the repository's default branch — and the retry has to
   # find it, or the missing pull request can never be completed on this workspace.
+  #
+  # The first result is LOST rather than recorded. That is the ending after which the same Run is
+  # offered again with its environment still in place; a recorded failure ends the Run and hands
+  # the environment back, and its recovery is a replacement Run from the pushed branches.
   def test_a_retry_recovers_the_committed_repositories_and_completes_the_missing_publication
     start
     gh_dir, first_log, state = FakeGithub.gh_bin(urls: PR_URLS, bares: @bares,
                                                  fail_create_for: "SpecRelay/component-b")
+    @platform.report_response = [ 500, { error: "the response was lost" } ]
     run_cli(gh_dir: gh_dir)
+    @platform.report_response = nil
     assert_equal "failed", terminal["outcome"], "the first attempt published only one of two"
     heads = { "SpecRelay/component-a" => branches_of("SpecRelay/component-a")[BRANCH],
               "SpecRelay/component-b" => branches_of("SpecRelay/component-b")[BRANCH] }

@@ -130,12 +130,21 @@ class SpecificationGenerationRevisionTest < Minitest::Test
     start_with_revision(provider: SpecificationWorkspace.claude_stub(@temp, files: valid_generated_files,
                                                                             capture_prompt_to: capture))
 
+    component = File.join(@source, ".runs", "worktrees", BRANCH, SpecificationWorkspace::SPECS_CHECKOUT)
+    link_at_result = []
+    original = @platform.method(:specification_generation)
+    @platform.define_singleton_method(:specification_generation) do |request|
+      link_at_result << File.symlink?(File.join(component, "specs"))
+      original.call(request)
+    end
+
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
 
     refute_path_exists capture, "no provider may run against an escaping package destination"
-    component = File.join(@source, ".runs", "worktrees", BRANCH, SpecificationWorkspace::SPECS_CHECKOUT)
-    assert File.symlink?(File.join(component, "specs")),
-           "the committed link must survive: placement may not replace what the refusal protects"
+    # Read when Platform receives the refusal: the environment this Run built is handed back once
+    # the refusal is recorded, so afterwards there is no link left to look at.
+    assert_equal [ true ], link_at_result,
+                 "the committed link must survive: placement may not replace what the refusal protects"
   end
 
   def test_the_previous_packages_own_files_reach_the_provider_as_revision_context

@@ -53,6 +53,10 @@ class FakePlatform
   # the runner treats as a transport fault rather than a refusal.
   attr_accessor :publication_response
 
+  # The same scripted answer for the execution-report and specification-generation endpoints, so
+  # a test can tell an accepted terminal result from a superseded, refused or unreachable one.
+  attr_accessor :report_response, :generation_response
+
   # Script the review-result endpoint's answer, so a test can model Platform's
   # strict validation refusing a submission the runner considered fine.
   attr_accessor :review_response
@@ -527,6 +531,8 @@ class FakePlatform
   end
 
   def specification_generation(request)
+    return @generation_response if @generation_response
+
     outcome = request.dig(:body, "generation", "outcome").to_s
     return [ 422, { error: "generation outcome is required" } ] if outcome.empty?
 
@@ -724,6 +730,8 @@ class FakePlatform
   end
 
   def report(request)
+    return @report_response if @report_response
+
     status = request.dig(:body, "report", "files")&.any? ? 201 : 422
     [ status, { outcome: "completed", execution_state: "COMPLETED",
                report: { round_label: "001-initial", status: "succeeded", url: "#{base_url}/reports/rpt_fake" },

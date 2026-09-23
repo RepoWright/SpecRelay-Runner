@@ -155,13 +155,14 @@ class SpecificationPublishedContinuationTest < Minitest::Test
   private
 
   # Every refusal above must satisfy the same three things: the reason reaches Platform, no
-  # provider ran, and the environment and its contents are still there.
+  # provider ran, and the refusal left the environment and its contents where they were. Once
+  # Platform has RECORDED the refusal, the environment this Run built is handed back.
   def assert_refused(reason)
     generation = @platform.last_specification_generation.to_h
     assert_includes generation["message"].to_s, reason
     refute_path_exists @probe, "no provider may run once the revision base could not be built"
-    assert_path_exists task_workspace, "a refusal must leave the task environment alone"
-    assert_path_exists File.join(task_workspace, "README.md")
+    assert_equal [ true ], @environment_at_result, "a refusal must leave the task environment alone"
+    refute_path_exists task_workspace, "the recorded refusal hands back the environment this Run built"
   end
 
   # ---------------------------------------------------------------- phase 1: accepted round
@@ -203,7 +204,20 @@ class SpecificationPublishedContinuationTest < Minitest::Test
                                                     bare: @built.bares["."], state: @gh_state)
     start_platform(spec_creation_payload_for(issue_key: ISSUE, existing_pull_request_url: PR_URL),
                    workspace_root: workspace_root)
+    @environment_at_result = observe_at_generation_result { File.exist?(File.join(task_workspace, "README.md")) }
     run_cli
+  end
+
+  # What `probe` answers at the moment Platform receives each generation result — before anything
+  # this Run does once Platform has recorded it.
+  def observe_at_generation_result(&probe)
+    seen = []
+    original = @platform.method(:specification_generation)
+    @platform.define_singleton_method(:specification_generation) do |request|
+      seen << probe.call
+      original.call(request)
+    end
+    seen
   end
 
   # The provider under test: a real process that records the ENVIRONMENT it was handed, in git's

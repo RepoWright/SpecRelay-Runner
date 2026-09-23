@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require_relative "test_helper"
+require "base64"
 
 # Resuming an answered offline question — on the machine that still holds the uncommitted work,
 # and on one that has to restore it first.
@@ -349,9 +350,10 @@ class QuestionResumeTest < Minitest::Test
     assert_equal 1, @platform.delivery_acknowledgements.size
     assert_equal 1, @platform.requests_to("/api/runner/reports").size
     # The restored work really was the paused work: the fresh provider could only produce this
-    # heading by editing the interrupted one it was handed.
-    restored = File.read(File.join(other, ".runs", "worktrees", TASK, "demo-app", "index.html"))
-    assert_includes restored, "Hello Resumed Demo"
+    # heading by editing the interrupted one it was handed. Read from the change set measured into
+    # the report, because a recorded result then hands the environment back.
+    diff = @platform.last_report[:body].dig("report", "files").find { |f| f["relative_path"] == "evidence/diff.txt" }
+    assert_includes Base64.strict_decode64(diff.fetch("content_base64")), "Hello Resumed Demo"
   end
 
   # Scenario 10 — the package could not be transferred. Nothing was built, no provider started,

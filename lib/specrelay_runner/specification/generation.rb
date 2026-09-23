@@ -105,7 +105,7 @@ module SpecrelayRunner
         checkpoint!
         report_success(assignment, ready, written, documents)
       rescue Aborted => e
-        aborted(e)
+        aborted(e, ready)
       rescue Provider::Failed, DocumentSet::Invalid, PackageWriter::Error,
              PackagePath::Unsafe, PackageWorkspace::Error => e
         fail_generation(ready, e)
@@ -128,8 +128,8 @@ module SpecrelayRunner
       # write, so a run that changed too much produces no package at all.
       #
       # It never reverts what it found. Cleaning an out-of-scope change to make a run succeed
-      # would destroy the only evidence of what the provider did, and would report a specification
-      # as generated from a tree nobody can now inspect.
+      # would report a specification as generated from a tree the provider did not leave; the
+      # recorded failure names the changes instead.
       #
       # {Provider::Failed} is the failure this raises, and it is the existing boundary rather than
       # a new one for the occasion: the provider ran and did not produce a usable package, which
@@ -147,8 +147,7 @@ module SpecrelayRunner
 
         raise Provider::Failed,
               "the generation provider changed #{changed.length} thing(s) outside #{allowed}: " \
-              "#{changed.sort.first(10).join('; ')}. The prepared task workspace was left exactly " \
-              "as the provider left it so the change can be inspected."
+              "#{changed.sort.first(10).join('; ')}. Nothing the provider changed was reverted."
       end
 
       # Nil from {Preflight.repository_state} means the environment could not be inspected, which is
@@ -259,7 +258,10 @@ module SpecrelayRunner
         log("No output file was created, no local workspace was made, and Jira was not touched.")
         log("Fix the cause above and re-run, or release the claim so another runner can take it:")
         log("  #{release_command}")
-        submit(refusal_payload(refusal, outcome: "refused", zero_files: true))
+        recorded = submit(refusal_payload(refusal, outcome: "refused", zero_files: true))
+        # A refusal comes before the package workspace exists, so only a task environment this Run
+        # already built can be left — and only one the project proves is this Run's is released.
+        discard(nil) if recorded && assignment && owns_task_environment?
         Result.new(outcome: REFUSED,
                    message: "Runner outcome: generation_refused (#{refusal.failure_class}); " \
                             "no output file was written.")
@@ -270,39 +272,39 @@ module SpecrelayRunner
       # means generation was attempted and did not produce a usable package.
       #
       # Whether the package landed is ASKED, not asserted: only PackageWriter knows which side
-      # of its single rename a failure fell on, and an operator deciding whether the retained
-      # workspace is worth inspecting needs the answer.
+      # of its single rename a failure fell on.
       #
-      # The workspace is RETAINED either way (design 4). A partial or absent package in a
-      # Runner-owned directory is inspectable state with a seven-day life, not litter in
-      # someone's checkout, so there is nothing here to clean up and no reason to.
+      # Once Platform has RECORDED the failure the Run has ended, so its unpublished snapshot and
+      # task environment are discarded. A refused or unanswered report keeps both for inspection
+      # and for the retry that would report it again.
       def fail_generation(ready, error)
         message = Redaction.redact(error.message.to_s)
         wrote = wrote_package?(error)
         log("")
         log("Specification generation failed: #{message}")
-        log(wrote ? "A complete package for #{error.package_path} IS held in this runner's isolated " \
-                    "worktree and was not removed." :
+        log(wrote ? "A complete package for #{error.package_path} was written but not published." :
                     "No package was completed. Your specification checkout is unchanged either way.")
-        log("The workspace is retained for #{PackageWorkspaceStore::RETENTION_DAYS} days so it can be inspected.")
-        log("Re-run after fixing the cause, or release the claim:")
-        log("  #{assignment.release_command}")
         refusal = Preflight::Refusal.new(failure_class: failure_class_for(error),
                                          message: failure_message(error, message, wrote))
-        submit(refusal_payload(refusal, outcome: "failed", zero_files: !wrote, workspace: ready&.workspace))
+        if submit(refusal_payload(refusal, outcome: "failed", zero_files: !wrote, workspace: ready&.workspace))
+          discard(ready&.workspace)
+        else
+          log("The workspace is retained for #{PackageWorkspaceStore::RETENTION_DAYS} days so it can be inspected.")
+          log("Re-run after fixing the cause, or release the claim:")
+          log("  #{assignment.release_command}")
+        end
         Result.new(outcome: FAILED, message: "Runner outcome: generation_failed (#{failure_class_for(error)}).")
       end
 
       def wrote_package?(error) = error.is_a?(PackageWriter::Error) && error.wrote_package?
 
       # When a package IS on disk, the message names its repository-relative path — never the
-      # local one. The failure class sends an operator to the runner's configuration; the path
-      # tells them what the retained workspace holds.
+      # local one. It says what was true when the report was sent, and nothing about what happens to
+      # the package once Platform has recorded it.
       def failure_message(error, message, wrote)
         return message unless wrote
 
-        "#{message}. A complete package for #{error.package_path} is retained in this runner's " \
-          "isolated worktree and was not removed."
+        "#{message}. A complete package for #{error.package_path} was written but not published."
       end
 
       # Stable failure classes for the post-preflight failures, distinct from the preflight
@@ -322,15 +324,18 @@ module SpecrelayRunner
 
       # Platform cancelled the claim or the lease lapsed. NOTHING is reported: Platform
       # already owns the outcome, and a late success from a superseded attempt is exactly
-      # what the liveness signal exists to prevent. Any package already written stays on
-      # disk — deleting an operator's files because a lease expired would be a worse
-      # surprise than leaving an unreferenced draft.
-      def aborted(error)
+      # what the liveness signal exists to prevent. An explicit cancellation is Platform's own
+      # terminal record, so this Run's snapshot and environment are discarded; an expired or
+      # otherwise unattributable stop keeps them.
+      def aborted(error, ready)
         reason = error.message.to_s.empty? ? "the lease is no longer live" : error.message
         log("")
         log("Stopping: Platform reports #{reason}. No generation result was submitted.")
-        log("Platform owns the outcome — an expired lease is reclaimed, a cancelled run is terminal.")
-        log("Any isolated workspace already created is retained and is NOT recorded as this run's result.")
+        if reason == Execution::CANCELLED
+          discard(ready.workspace)
+        else
+          log("Any isolated workspace already created is retained and is NOT recorded as this run's result.")
+        end
         Result.new(outcome: ABORTED,
                    message: "Runner outcome: aborted (#{reason}); no generation result was reported.")
       end
@@ -462,18 +467,43 @@ module SpecrelayRunner
       # A refusal for an assignment whose claim token never parsed has nothing to address a
       # report to. It is printed and returned rather than dropped silently; Platform recovers
       # such a claim through the lease sweep, which is the same path a crashed runner takes.
+      #
+      # True only when Platform RECORDED the result. A refusal and an unanswered request are both
+      # false, and neither may authorize discarding anything.
       def submit(generation)
         claim = generation["runner_execution_id"].to_s
-        return log("(no claim identity in the assignment — nothing was reported to Platform)") if claim.empty?
+        if claim.empty?
+          log("(no claim identity in the assignment — nothing was reported to Platform)")
+          return false
+        end
 
         response = client.submit_specification_generation(claim: claim, generation: generation)
         log("Platform recorded the result: run #{response['run_state']} (#{response['outcome']}).")
+        true
       rescue PlatformClient::Error => e
         # The local outcome is already true — the package exists or it does not. Failing to
         # REPORT it is a separate problem with its own remedy, and it must not be reported as
         # a generation failure, which would tell the operator to look at the provider.
-        log("Could not report the result to Platform: #{Redaction.redact(e.message)}")
+        log(e.refused? ? "Platform REFUSED the result: #{Redaction.redact(e.message)}" :
+                         "Could not report the result to Platform: #{Redaction.redact(e.message)}")
         log("The local outcome above still stands. Platform will reclaim this run when the lease expires.")
+        false
+      end
+
+      def discard(workspace)
+        Publication.discard_local_state!(workspace: workspace, assignment: assignment, config: config,
+                                         env: env, io: io)
+      end
+
+      # Whether the project proves this Run owns the ticket's task environment right now. A manual
+      # environment, another Run's, an absent one and one that cannot be inspected are all false:
+      # none of them is this Run's to release.
+      def owns_task_environment?
+        root = config.workspace_root(assignment.workspace_key, env: env)
+        TaskEnvironment.unowned_reason(root: root, task_id: assignment.task_id, run_id: assignment.run_id,
+                                       canonical_branch: assignment.canonical_branch).nil?
+      rescue Config::Error
+        false
       end
 
       # ------------------------------------------------------------------- lifecycle

@@ -315,16 +315,25 @@ class PreviousAcceptedPackageTest < Minitest::Test
     task_root = create_task_workspace
     File.truncate(@built.worktree_log, 0)
     before = ACCEPTED.to_h { |name| [ name, head_of(task_root, name) ] }
+    # Read when the report arrives: a recorded result then hands the environment back.
+    at_report = []
+    observe = -> { [ File.exist?(File.join(task_root, "component-b", ACCEPTED_FILE)), head_of(task_root, "component-b") ] }
+    original = @platform.method(:report)
+    @platform.define_singleton_method(:report) do |request|
+      at_report << observe.call
+      original.call(request)
+    end
 
     code, = run_cli(gh_dir)
 
     assert_equal 0, code
     # No second allocation and no reset — only the ownership proof this run must pass before it
-    # may continue in an environment that was already there.
-    assert_equal [ "status #{TASK} --json" ], worktree_invocations
+    # may continue in an environment that was already there, and the release that follows the
+    # recorded result.
+    assert_equal [ "status #{TASK} --json", "release #{TASK} --run-id run_test123 --json" ],
+                 worktree_invocations
     assert_equal 0, FakeGithub.pr_views(gh_log)
-    refute_path_exists File.join(task_root, "component-b", ACCEPTED_FILE)
-    assert_equal before["component-b"], head_of(task_root, "component-b")
+    assert_equal [ [ false, before["component-b"] ] ], at_report
   end
 
   # S06 — a checkout with no run-aware project command refuses the automatic run, so there is
