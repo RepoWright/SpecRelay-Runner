@@ -315,7 +315,7 @@ uncertain transport all keep the environment and ask for no release.
 #### What a fresh environment contains
 
 A new environment starts from the project's current heads, never from a leftover task branch.
-Before the provider or any analysis runs, the runner places the run's approved inputs into it:
+Before the provider or final analysis runs, the runner places the run's approved inputs into it:
 
 - **The approved specification, at its pinned commit.** The assignment's repository, commit
   and package path must resolve to one contained repository; that exact commit is fetched if
