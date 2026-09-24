@@ -347,8 +347,9 @@ module SpecrelayRunner
       anchor = @package.anchor
       pinned = anchor ? ", approved specification #{anchor[:package_path]} pinned at " \
                         "#{anchor[:head]} in #{anchor[:repository]}" : ""
-      emit("workspace.prepared", "Prepared #{run['task_id']} at #{heads}#{pinned}",
-           phase: "workspace")
+      # Stated in the local log only. The protocol has no event for a prepared workspace, and the
+      # `core.started` that follows is the next state Platform records.
+      log("Prepared #{run['task_id']} at #{heads}#{pinned}")
       nil
     end
 

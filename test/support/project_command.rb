@@ -60,6 +60,23 @@ module ProjectCommand
     SH
   end
 
+  # `list --json`: every environment this project holds, each with the owner recorded at
+  # allocation — null for a manual one — read from the same owner files `status` reads.
+  def list_case
+    <<~SH
+      printf '{"environments":['
+      SEP=""
+      for FILE in "$OWNERS"/*; do
+        [ -f "$FILE" ] || continue
+        OWNER="$(cat "$FILE")"
+        if [ -n "$OWNER" ]; then OWNER_JSON="\\"$OWNER\\""; else OWNER_JSON=null; fi
+        printf '%s{"task_id":"%s","owner_run_id":%s}' "$SEP" "$(basename "$FILE")" "$OWNER_JSON"
+        SEP=","
+      done
+      printf ']}\\n'
+    SH
+  end
+
   # Run before anything is removed. An unowned release (no `--run-id`) is the manual command and
   # is left exactly as each fixture had it.
   def release_guard

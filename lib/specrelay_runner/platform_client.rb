@@ -159,6 +159,25 @@ module SpecrelayRunner
 
     # POST /api/runner/claim. Returns a ClaimResult: claimed with the run payload,
     # or not claimed when Platform authorizes no eligible work under the policy.
+    # The most task environments one project holds, and so the most candidates one cancellation
+    # read offers; and the longest identity either side of that read accepts.
+    MAX_CLEANUP_CANDIDATES = 90
+    MAX_CLEANUP_IDENTITY = 200
+
+    # POST /api/runner/cancellation_cleanup_target. `[run_id, task_id]` for the one offered Run
+    # Platform says this registered runner may now release, or nil for none.
+    #
+    # Anything but that exact shape raises. A target is acted on by deleting local work, so an
+    # answer this client cannot read in full is never guessed at.
+    def cancellation_cleanup_target(workspace_key:, candidates:)
+      offered = candidates.first(MAX_CLEANUP_CANDIDATES).map { |run_id, task_id| { run_id: run_id, task_id: task_id } }
+      status, body = post_json("/api/runner/cancellation_cleanup_target",
+                               { workspace_key: workspace_key, candidates: offered })
+      raise_for(status, body) unless status == 200
+
+      cleanup_target(body)
+    end
+
     def claim(runner_params)
       status, body = post_json("/api/runner/claim", { runner: runner_params })
       case status
@@ -515,6 +534,23 @@ module SpecrelayRunner
     # `payload` is always an explicit Hash at every call site: this method takes a keyword
     # argument, so a trailing `key: value` list would be parsed as keywords rather than converted
     # into the positional payload hash.
+    def cleanup_target(body)
+      unless body.is_a?(Hash) && body.keys == [ "target" ]
+        raise RequestFailed.new("Platform's cancellation answer carried no target field", status: 200)
+      end
+
+      target = body["target"]
+      return nil if target.nil?
+      return [ target["run_id"], target["task_id"] ] if cleanup_identity?(target)
+
+      raise RequestFailed.new("Platform named a cancellation target this runner could not read", status: 200)
+    end
+
+    def cleanup_identity?(target)
+      target.is_a?(Hash) && target.keys.sort == %w[run_id task_id] &&
+        target.values.all? { |value| value.is_a?(String) && !value.empty? && value.length <= MAX_CLEANUP_IDENTITY }
+    end
+
     def post_json(path, payload, headers: {})
       request_json(Net::HTTP::Post, path, payload: payload, headers: headers)
     end

@@ -405,6 +405,26 @@ class RunnerFlowTest < Minitest::Test
     refute_includes reported, @root, "no host path may appear in the report"
   end
 
+  # Against Platform's real event allowlist the run still reaches its provider: the exact inputs
+  # are stated in the local log, and only contracted events go over the wire, in one coherent
+  # sequence. An uncontracted type is refused with a 422 before the provider could start.
+  def test_a_run_reaches_its_provider_through_the_contracted_event_boundary
+    @platform.strict_events!
+    observe_provider
+    repin
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
+
+    assert provider_ran, "the provider never started"
+    events = @platform.protocol_events
+    types = events.map { |event| event["event_type"] }
+    assert_empty types - FakePlatform::V1_EVENT_TYPES, "an uncontracted event was sent"
+    assert_operator types.index("workspace.preparing"), :<, types.index("core.started")
+    sequences = events.map { |event| event["sequence"] }
+    assert_equal (1..sequences.size).to_a, sequences, "the event sequence has a gap or repeat"
+    assert_match(/^Prepared #{TASK} at \.@#{DemoWorkspace.git(@root, "rev-parse", "HEAD").strip}/, @io.string)
+  end
+
   private
 
   def decode_manifest(report)

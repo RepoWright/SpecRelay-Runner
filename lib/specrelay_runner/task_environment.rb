@@ -89,6 +89,44 @@ module SpecrelayRunner
       [ OWNED, nil ]
     end
 
+    # The Run-owned environments this project lists, as `[[run_id, task_id], ...]` with a nil
+    # reason, or nil and the reason the list could not be read.
+    #
+    # A project without the run-aware command lists nothing: an automatic run can allocate only
+    # through it, so such a project cannot hold a Run-owned environment. An environment with no
+    # recorded owner is a manual one and is never listed here. A row that is neither is unproved,
+    # not manual, so it makes the whole list unreadable.
+    def run_owned(root:)
+      return [ [], nil ] unless File.executable?(File.join(root.to_s, Workspace::PROJECT_COMMAND))
+
+      result = invoke(root, [ "list", "--json" ], STATUS_TIMEOUT)
+      rows = document_of(result)&.fetch("environments", nil)
+      unless rows.is_a?(Array)
+        return [ nil, "the project's task environments could not be listed: #{detail(result, 'list', '--json')}" ]
+      end
+
+      owners = rows.map { |row| listed_owner(row) }
+      if owners.include?(:unreadable)
+        return [ nil, "the project's task environments could not be listed: " \
+                      "`#{Workspace::PROJECT_COMMAND} list --json` named an environment this runner could not read" ]
+      end
+
+      [ owners.compact, nil ]
+    end
+
+    # `[run_id, task_id]` for a Run-owned row, nil for a manual one, :unreadable otherwise. The
+    # project always lists the owner; only an owner it states as null is manual.
+    def listed_owner(row)
+      return :unreadable unless row.is_a?(Hash) && row.key?("owner_run_id") && listed_identity?(row["task_id"])
+
+      owner = row["owner_run_id"]
+      return nil if owner.nil?
+
+      listed_identity?(owner) ? [ owner, row["task_id"] ] : :unreadable
+    end
+
+    def listed_identity?(value) = value.is_a?(String) && !value.empty?
+
     # Hand back the environment this run owns, or say why it is still allocated.
     #
     # The owner is passed to the project rather than checked here first: it is the project that
