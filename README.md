@@ -283,7 +283,13 @@ they were claimed for**, and in no other.
 bin/worktree create  <TASK-ID> --run-id <RUN-ID>          # allocate, recording the owner
 bin/worktree status  <TASK-ID> --json                     # who owns it, if anyone
 bin/worktree release <TASK-ID> --run-id <RUN-ID> --json   # hand it back
+bin/worktree list --json                                  # every environment, with its owner
 ```
+
+`list --json` prints `{"environments": [{"task_id": …, "owner_run_id": …}]}`: a Run's id for an
+environment a run allocated, `null` for one made by hand. A connected `loop` reads it before
+every claim, and a row it cannot classify stops the loop, so a project whose `bin/worktree` does
+not answer it that way cannot be watched by a connected `loop`.
 
 Allocation names the run and is then PROVED: the runner reads the owner back before it hands
 the environment to a provider, so a command that accepted `--run-id` and recorded nothing
@@ -300,8 +306,13 @@ A run hands its environment back once Platform has RECORDED how it ended, and no
 implementation report (success or failure), a specification publication or publication
 failure, or a generation failure or refusal. An explicit cancellation this runner observes
 while the run is active is an ending too: it ends the run's process group, sends no late
-result and hands the environment back. A cancellation discovered later, or while the runner
-was offline, releases nothing yet. Everything unpublished in it is that run's own by then and goes with it,
+result and hands the environment back. A question pause ends the provider session, so a
+cancellation after it reaches no process: before each claim, a connected `loop` offers the
+Run-owned environments its project lists and releases the one Platform names as cancelled
+after this machine's pause, then claims. It does the same after a restart. An unreadable list,
+an unconfirmed answer or an incomplete release stops the loop before it claims. `claim-once`
+and a `--config` loop do not ask, and any other late cancellation releases nothing yet.
+Everything unpublished in it is that run's own by then and goes with it,
 including edits you made there by hand; the runner removes none of it itself. Only an explicit
 `released` naming that run, or your project's own proof that there is nothing left, is
 completion. A timeout, a non-zero exit, an unreadable answer or a partial teardown is reported
