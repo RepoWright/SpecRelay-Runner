@@ -225,6 +225,18 @@ class FakePlatform
   # runner's waiting loop is exercised rather than short-circuited by the submission response.
   # Scripted answers to the pre-claim cancellation read, consumed one per request; with none left
   # Platform names no target, which is its answer for every Run it cannot prove.
+  # The event types Platform's v1 ingest accepts: the enum of the checked-in
+  # `contracts/runner/v1/run-event.schema.json`, which Platform enforces with a 422.
+  V1_EVENT_TYPES = %w[
+    attempt.started workspace.preparing core.started core.progress verification.started
+    verification.completed publication.started publication.completed artifact.created
+    log.chunk log.truncated attempt.completed
+  ].freeze
+
+  # Refuse events outside that allowlist, as the real endpoint does. Off by default: most suites
+  # assert other things, and a test about the wire turns it on.
+  def strict_events! = @strict_events = true
+
   def script_cleanup_targets(*answers) = @mutex.synchronize { @cleanup_targets.concat(answers) }
 
   def answer_question!(answers, after_polls: 1) = settle_question("ANSWER_READY", answers, after_polls)
@@ -698,6 +710,8 @@ class FakePlatform
   # stand-in; the real Platform request specs cover full classification.
   def events(request)
     event = request.dig(:body, "event") || {}
+    return [ 422, { error: "unknown event_type" } ] if @strict_events && !V1_EVENT_TYPES.include?(event["event_type"])
+
     sequence = event["sequence"]
     key = [ event["attempt_id"], sequence ]
     duplicate = !sequence.nil? && @seen_sequences.include?(key)
