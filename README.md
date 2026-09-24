@@ -283,7 +283,13 @@ they were claimed for**, and in no other.
 bin/worktree create  <TASK-ID> --run-id <RUN-ID>          # allocate, recording the owner
 bin/worktree status  <TASK-ID> --json                     # who owns it, if anyone
 bin/worktree release <TASK-ID> --run-id <RUN-ID> --json   # hand it back
+bin/worktree list --json                                  # every environment, with its owner
 ```
+
+`list --json` prints `{"environments": [{"task_id": …, "owner_run_id": …}]}`: a Run's id for an
+environment a run allocated, `null` for one made by hand. A connected `loop` reads it before
+every claim, and a row it cannot classify stops the loop, so a project whose `bin/worktree` does
+not answer it that way cannot be watched by a connected `loop`.
 
 Allocation names the run and is then PROVED: the runner reads the owner back before it hands
 the environment to a provider, so a command that accepted `--run-id` and recorded nothing
@@ -296,21 +302,73 @@ A project whose `bin/worktree` cannot record an owner refuses the run. The assig
 git creation command is not used as a fallback: it builds a worktree with no owner, which the
 run could neither prove on a retry nor hand back at the end.
 
-A successful run hands its environment back once its report — or, in the specification lane,
-its publication result — has been ACCEPTED, and not before. Everything unpublished in it is
-that run's own by then and goes with it, including edits you made there by hand; the runner
-removes none of it itself. Only an explicit `released` naming that run, or your project's own
-proof that there is nothing left, is completion. A timeout, a non-zero exit, an unreadable
-answer or a partial teardown is reported as still allocated — without guessing which files
-survived, because your project is what knows. What follows differs by lane, deliberately.
-After an implementation run this machine stops: it is holding an environment the next run
-would otherwise be put on top of, so a single run exits non-zero and a `loop` session ends
-until you release it by hand. After a specification publication it reports the same thing as
-a warning and carries on, because the pull request already exists and a reviewer may already
-be reading it — the environment stays allocated and is yours to release.
+A run hands its environment back once Platform has RECORDED how it ended, and not before: an
+implementation report (success or failure), a specification publication or publication
+failure, or a generation failure or refusal. An explicit cancellation this runner observes
+while the run is active is an ending too: it ends the run's process group, sends no late
+result and hands the environment back. A question pause ends the provider session, so a
+cancellation after it reaches no process: before each claim, a connected `loop` offers the
+Run-owned environments its project lists and releases the one Platform names as cancelled
+after this machine's pause, then claims. It does the same after a restart. An unreadable list,
+an unconfirmed answer or an incomplete release stops the loop before it claims. `claim-once`
+and a `--config` loop do not ask, and any other late cancellation releases nothing yet.
+Everything unpublished in it is that run's own by then and goes with it,
+including edits you made there by hand; the runner removes none of it itself. Only an explicit
+`released` naming that run, or your project's own proof that there is nothing left, is
+completion. A timeout, a non-zero exit, an unreadable answer or a partial teardown is reported
+as still allocated — without guessing which files survived, because your project is what
+knows — and this machine stops: a single run exits non-zero and a `loop` session ends before
+another claim, until you release it by hand.
 
-Waiting on a question, a failed or cancelled attempt, an unacknowledged publication and an
-uncertain transport all keep the environment and ask for no release.
+Two endings keep something back. After a recorded publication failure the runner keeps its
+package snapshot, so a publication retry republishes the same files. After a recorded
+generation refusal, an environment your project records as manual or another run's is kept
+without a cleanup error; any other answer goes to the release above, including an unmapped
+workspace root.
+
+Waiting on a question, an expired lease, a result Platform refused, did not record or could
+not be reached for, and a report that could not be built all keep the environment and ask for
+no release. The terminal result an implementation run submits therefore always says cleanup
+has not yet succeeded.
+
+#### What a fresh environment contains
+
+A new environment starts from the project's current heads, never from a leftover task branch.
+Before the provider or final analysis runs, the runner places the run's approved inputs into it:
+
+- **The approved specification, at its pinned commit.** The assignment's repository, commit
+  and package path must resolve to one contained repository; that exact commit is fetched if
+  needed (a newer branch tip never stands in) and its package files must reproduce the
+  approved bytes. The provider sees the package at its normal path, identical to its read-only
+  delivered copy.
+- **Accepted code from earlier rounds**, each head verified as before. Where one repository
+  holds both, the runner keeps whichever existing commit carries both inputs unchanged, and
+  otherwise refuses with an incompatible-inputs reason. It never merges or overlays files.
+- **A specification revision's previously published package**, placed before source is
+  gathered, together with any accepted code.
+
+Every repository is checked before the first one is placed. A missing, ambiguous or unsafe
+repository or package, an unavailable commit, a byte mismatch or a failed placement refuses
+before the provider and before anything is published.
+
+Final preparation, after placement and before any evidence is gathered or the provider starts,
+runs the project's own `bin/graph-check`. Allocation may already have built a graph for the
+seed; once inputs have been placed that graph is usually stale, so it is rebuilt with
+`bin/graph-build` and verified. A graph that is already fresh is not rebuilt. If the rebuild
+fails the run stops rather than reusing the old graph. A project without the wrappers continues on
+direct source inspection, and a specification lane's recorded Graphify substitute keeps its
+existing meaning. The runner then prints the final heads, relative paths only, for example:
+
+```text
+Prepared <TASK-ID> at .@<full-sha> repositories/component-a@<full-sha>, approved specification specs/<TASK-ID> pinned at <full-sha> in <owner>/<repository>
+```
+
+The specification lane records the same heads in its source evidence and manifest.
+
+A continued run — the same Run's retry, an answered question or a restored checkpoint — keeps
+its environment as it is. Its rework or restart target still wins over older accepted code, and
+it is never reset to a fresh seed to make validation pass. An incompatible visible package
+refuses instead.
 
 Within the specification lane the runner branches a second time, on
 `assignment_boundary.expected_runner_action` rather than on the run's state:
@@ -1068,6 +1126,17 @@ Each uploads a failed terminal result and report: the run stays out of review,
 Jira does not advance, and nothing reviewable is published. A real model that
 produces no usable change is a **valid failed run**, not a reason to fall back to
 the fake executor.
+
+**A supervised command ends with its whole process group.** The provider, verification and your
+project's `bin/worktree` commands each run in their own process group, and the runner goes on
+only once that whole group has ended, including after the command itself exits normally. A
+background process the command left in that group is terminated: TERM, then KILL, each with a
+5-second bound. If the runner cannot show that the group has ended, it stops the invocation with
+exit 1 and `Runner stopped: a supervised command could not be shown to have ended: process group
+<N> …`. A report or a release may already have happened by then, so the environment may or may
+not still be there; make sure that process group has ended before starting the runner again.
+This is process supervision only: a process that moved into its own session is not covered, and
+supervision itself releases no environment.
 
 Reports keep redacted command metadata (the prompt appears only as `<PROMPT>`),
 exit status, duration, a bounded redacted transcript, diff, test output, terminal

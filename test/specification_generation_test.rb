@@ -396,11 +396,12 @@ class SpecificationGenerationTest < Minitest::Test
                  "the previous workspace must be left intact, merely stale"
   end
 
-  # S07 — a failure AFTER the rename reports zero_output_files_written FALSE, names the package,
-  # and RETAINS the workspace so the partial work is inspectable. The operator checkout is
-  # unchanged on this path too.
-  def test_a_failure_after_the_rename_retains_an_inspectable_workspace
+  # A failure after the package landed, which Platform ACCEPTED. The report still says the package
+  # is on disk — that is true when it is sent — and only once Platform has recorded the failure are
+  # the unpublished snapshot and the ticket's task environment discarded.
+  def test_an_accepted_failure_after_the_rename_discards_the_snapshot_and_the_environment
     before = SpecificationWorkspace.checkout_snapshot(@specs)
+    seen = record_environment_at_submission
     exit_code = with_unreadable_final_manifest { run_cli }
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, exit_code, @io.string
@@ -408,13 +409,184 @@ class SpecificationGenerationTest < Minitest::Test
     assert_equal "failed", generation["outcome"]
     refute generation["zero_output_files_written"], "the package IS on disk; the report must say so"
     assert_includes generation["message"], PACKAGE
-    # The manifest digest is taken in the TASK environment, which is where the package lands
-    # first — so a failure there means the package is on disk and the publication snapshot is not.
-    assert File.file?(File.join(task_worktree, PACKAGE, "spec.md")), "the package landed before the failure"
-    refute File.exist?(File.join(worktree, PACKAGE)), "the snapshot is only taken after the digest"
-    # The workspace is reported so the run page can say which machine holds it and until when.
     assert_match(/\Aswp_/, generation.dig("package_workspace", "id").to_s)
+    assert_equal [ true ], seen, "the environment was discarded before Platform recorded the failure"
+    assert_empty SpecificationWorkspace.isolated_workspaces(@temp), "the unpublished snapshot outlived the failure"
+    assert_nil task_worktree, "the task environment outlived the accepted failure"
     assert_equal before, SpecificationWorkspace.checkout_snapshot(@specs)
+  end
+
+  # The same failure, refused or unanswered by Platform: nothing recorded it, so both stay.
+  def test_a_refused_failure_result_keeps_the_snapshot_and_the_environment
+    @platform.generation_response = [ 422, { error: "not acceptable right now" } ]
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, with_unreadable_final_manifest { run_cli }, @io.string
+
+    assert_snapshot_and_environment_kept
+  end
+
+  # A 201 that records nothing — the claim is no longer current — is not an acknowledgement.
+  def test_a_superseded_failure_result_keeps_the_snapshot_and_the_environment
+    @platform.generation_response = SUPERSEDED
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, with_unreadable_final_manifest { run_cli }, @io.string
+
+    assert_snapshot_and_environment_kept
+    refute_includes @io.string, "Platform recorded the result"
+  end
+
+  def test_a_superseded_refusal_keeps_the_environment_this_run_built
+    @platform.generation_response = SUPERSEDED
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, with_broken_redaction { run_cli }, @io.string
+
+    refute_nil task_worktree, "the environment was released for a refusal Platform did not record"
+    refute_includes @io.string, "Platform recorded the result"
+  end
+
+  def test_an_unreachable_failure_result_keeps_the_snapshot_and_the_environment
+    @platform.generation_response = [ 500, { error: "internal server error" } ]
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, with_unreadable_final_manifest { run_cli }, @io.string
+
+    assert_snapshot_and_environment_kept
+  end
+
+  # A refusal before any environment existed, accepted by Platform. There is nothing of this Run's
+  # to hand back, and no package workspace is invented to clean.
+  def test_an_accepted_refusal_before_the_environment_existed_releases_nothing
+    @platform.claim_payload = spec_creation_payload_for(issue_key: ISSUE, complete: false)
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
+
+    assert_equal "refused", @platform.last_specification_generation["outcome"]
+    refute_includes @io.string, "still allocated"
+    refute_includes @io.string, "Released the task environment"
+    assert_empty SpecificationWorkspace.task_worktrees(@source)
+  end
+
+  # A refusal after this Run built its task environment but before the package workspace. The
+  # environment is this Run's and goes back once Platform has recorded the refusal.
+  def test_an_accepted_refusal_after_the_environment_was_built_releases_it
+    exit_code = with_broken_redaction { run_cli }
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, exit_code, @io.string
+    assert_equal "refused", @platform.last_specification_generation["outcome"]
+    assert_nil task_worktree, "the environment this run built outlived its accepted refusal"
+    assert_empty SpecificationWorkspace.isolated_workspaces(@temp)
+  end
+
+  # A readable record of a person's environment or another Run's needs no cleanup: it is kept, the
+  # release is never asked for, and the refusal is not turned into a cleanup failure.
+  def test_an_accepted_refusal_keeps_a_manual_or_foreign_environment_without_a_cleanup_error
+    [ "", "run_somebody_else" ].each do |owner|
+      restart_platform
+      allocate_task_environment(owner)
+      log = log_project_command
+
+      assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
+
+      assert_equal "refused", @platform.last_specification_generation["outcome"]
+      assert_equal owner, ProjectCommand.recorded_owner(@source, ISSUE)
+      refute_nil task_worktree
+      refute_includes project_verbs(log), "release", "a protected environment was asked to be released"
+      refute_includes @io.string, "Release it by hand"
+    end
+  end
+
+  # A status that answers "no environment" proves nothing by itself. The run-qualified release is
+  # asked and proves the absence, which completes the cleanup. The missing specification checkout
+  # refuses before any environment is built.
+  def test_an_accepted_refusal_with_no_environment_asks_the_release_to_prove_absence
+    FileUtils.mv(@specs, "#{@specs}.moved")
+    log = log_project_command
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
+
+    assert_includes project_lines(log), "release #{ISSUE} --run-id #{SPEC_RUN} --json", @io.string
+    refute_includes @io.string, "Release it by hand"
+  end
+
+  # A status the Runner cannot read does not stand for absence: the release is asked, and the
+  # environment this Run owns is handed back.
+  def test_an_accepted_refusal_with_an_unreadable_status_releases_the_environment_this_run_owns
+    { "nonzero" => "exit 1", "malformed" => "echo 'not a status document'; exit 0" }.each do |name, answer|
+      restart_platform
+      allocate_task_environment(SPEC_RUN)
+      log_project_command(status: answer)
+
+      assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, "#{name}: #{@io.string}"
+
+      assert_equal "refused", @platform.last_specification_generation["outcome"], name
+      assert_nil ProjectCommand.recorded_owner(@source, ISSUE), "#{name}: the owned environment was kept"
+      assert_nil task_worktree, name
+      refute_includes @io.string, "Release it by hand", name
+    end
+  end
+
+  # With no readable status, the release command is still the authority that protects a person's
+  # environment and another Run's. It refuses, nothing is removed, and the incomplete cleanup is
+  # visible and nonzero.
+  def test_the_release_protects_a_manual_or_foreign_environment_when_status_is_unreadable
+    [ "", "run_somebody_else" ].each do |owner|
+      restart_platform
+      allocate_task_environment(owner)
+      log_project_command(status: "exit 1")
+
+      assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
+
+      assert_equal owner, ProjectCommand.recorded_owner(@source, ISSUE)
+      refute_nil task_worktree
+      assert_includes @io.string, "Release it by hand"
+    end
+  end
+
+  # A project without its run-aware command cannot prove anything was left behind or that nothing
+  # was, so the accepted refusal ends in an incomplete cleanup.
+  def test_an_accepted_refusal_without_the_project_command_is_an_incomplete_cleanup
+    FileUtils.rm_f(File.join(@source, "bin", "worktree"))
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
+
+    assert_equal "refused", @platform.last_specification_generation["outcome"]
+    assert_includes @io.string, "Release it by hand"
+  end
+
+  # An unmapped workspace root is not proof of absence: an earlier attempt may have allocated the
+  # environment while the mapping existed.
+  def test_an_accepted_refusal_with_an_unmapped_workspace_root_is_an_incomplete_cleanup
+    @config = build_config(workspace_roots: {})
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
+
+    assert_equal "refused", @platform.last_specification_generation["outcome"]
+    assert_includes @io.string, "Release it by hand"
+    refute_includes @io.string, @temp, "the cleanup reason exposed a local path"
+  end
+
+  # Every incomplete cleanup stops a loop that would otherwise go on claiming.
+  def test_an_incomplete_cleanup_after_an_accepted_refusal_stops_the_loop_before_another_claim
+    { "unreadable" => -> { allocate_task_environment("run_somebody_else")
+                           log_project_command(status: "exit 1") },
+      "unmapped" => -> { @config = build_config(workspace_roots: {}) },
+      "no command" => -> { FileUtils.rm_f(File.join(@source, "bin", "worktree")) } }.each do |name, cause|
+      restart_platform(claim_limit: 2)
+      cause.call
+
+      code = Timeout.timeout(45) { run_cli(command: %w[loop --poll-interval 5 --on-failure continue]) }
+
+      assert_equal SpecrelayRunner::CLI::RUN_FAILED, code, "#{name}: #{@io.string}"
+      assert_equal 1, @platform.requests_to("/api/runner/claim").size, "#{name}: the loop claimed again"
+      assert_equal "refused", @platform.last_specification_generation["outcome"], name
+    end
+  end
+
+  # Generation success is not the end of the Run: publication still needs both.
+  def test_a_generated_package_keeps_its_snapshot_and_environment_for_publication
+    assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
+
+    assert File.file?(File.join(worktree, PACKAGE, "spec.md"))
+    assert File.file?(File.join(task_worktree, PACKAGE, "spec.md"))
   end
 
   # ------------------------------------------------------------------ criterion 10
@@ -427,6 +599,29 @@ class SpecificationGenerationTest < Minitest::Test
     assert_empty @platform.specification_generations,
                  "a superseded attempt must not report a generation result"
     assert_includes @io.string, "No generation result was submitted"
+  end
+
+  # Explicit cancellation is Platform's own terminal record: no late result, and this Run's
+  # snapshot and environment are discarded.
+  def test_an_explicit_cancellation_discards_the_snapshot_and_the_environment
+    @platform.signal_cancelled!
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
+
+    assert_empty @platform.specification_generations
+    assert_empty SpecificationWorkspace.isolated_workspaces(@temp)
+    assert_nil task_worktree
+  end
+
+  # An expired lease is not a definitive ending known to this process. Everything stays.
+  def test_an_expired_lease_keeps_the_snapshot_and_the_environment
+    @platform.signal_expired!
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
+
+    assert_empty @platform.specification_generations
+    refute_empty SpecificationWorkspace.isolated_workspaces(@temp)
+    refute_nil task_worktree
   end
 
   # ------------------------------------------------------------------ helpers
@@ -478,11 +673,45 @@ class SpecificationGenerationTest < Minitest::Test
   end
 
   # A fresh claim for a second `claim-once` against the same checkouts.
-  def restart_platform
+  def restart_platform(claim_limit: nil)
     @platform.stop
-    @platform = FakePlatform.new(claim_payload: spec_creation_payload_for(issue_key: ISSUE)).start
+    @platform = FakePlatform.new(claim_payload: spec_creation_payload_for(issue_key: ISSUE),
+                                 claim_limit: claim_limit).start
     @config = build_config
     @io = StringIO.new
+  end
+
+  # Every verb the connected checkout's project command is asked, in order. `status`, when given,
+  # is the shell the status verb runs instead of the project's own answer. The command sits in
+  # front of the real one, which it calls for everything else, so the recorded owner stays the
+  # project's own file.
+  def log_project_command(status: nil)
+    command = File.join(@source, "bin", "worktree")
+    FileUtils.mv(command, "#{command}.project") unless File.exist?("#{command}.project")
+    log = File.join(@source, ".runs", "project-command.log")
+    FileUtils.mkdir_p(File.dirname(log))
+    FileUtils.rm_f(log)
+    SpecificationWorkspace.write_executable(command, <<~SH)
+      #!/usr/bin/env sh
+      echo "$*" >> "#{log}"
+      #{status ? %(if [ "$1" = status ]; then #{status}; fi) : ''}
+      exec "#{command}.project" "$@"
+    SH
+    log
+  end
+
+  def project_lines(log) = File.exist?(log) ? File.readlines(log, chomp: true) : []
+  def project_verbs(log) = project_lines(log).map { |line| line.split.first }
+
+  # An environment an earlier allocation left for this ticket, recorded as `owner`'s: a Run id, or
+  # an empty string for one a person made. Built by the project's own command, as a real one is.
+  def allocate_task_environment(owner)
+    unless task_worktree
+      command = [ File.join(@source, "bin", "worktree"), "create", ISSUE, "--run-id", "run_earlier", "--json" ]
+      _out, status = Open3.capture2e(*command, chdir: @source)
+      raise "the fixture could not allocate #{ISSUE}" unless status.success?
+    end
+    ProjectCommand.own!(@source, ISSUE, owner)
   end
 
   # Fail the manifest digest, which is taken from the FINAL location after the rename. The only
@@ -494,6 +723,37 @@ class SpecificationGenerationTest < Minitest::Test
   #
   # `define_singleton_method` + restore rather than a mocking library: this suite has no gems,
   # which is the same reason with_broken_redaction in the preflight test is written this way.
+  SUPERSEDED = [ 201, { outcome: "superseded", execution_state: "CANCELLED", run_state: "CANCELLED" } ].freeze
+
+  def assert_snapshot_and_environment_kept
+    refute_empty SpecificationWorkspace.isolated_workspaces(@temp), "the snapshot was removed without an acknowledgement"
+    refute_nil task_worktree, "the environment was released without an acknowledgement"
+    refute_includes @io.string, "Released the task environment"
+  end
+
+  # Whether the ticket's task environment still existed at the moment Platform received each
+  # generation result.
+  def record_environment_at_submission
+    seen = []
+    original = @platform.method(:specification_generation)
+    source = @source
+    @platform.define_singleton_method(:specification_generation) do |request|
+      seen << !SpecificationWorkspace.task_worktree(source, ISSUE).nil?
+      original.call(request)
+    end
+    seen
+  end
+
+  # The runner's redaction guard failing its own probe — a refusal preflight makes after the task
+  # environment exists and before the package workspace does.
+  def with_broken_redaction
+    original = SpecrelayRunner::Redaction.method(:redact)
+    SpecrelayRunner::Redaction.define_singleton_method(:redact) { |text| text }
+    yield
+  ensure
+    SpecrelayRunner::Redaction.define_singleton_method(:redact, original)
+  end
+
   def with_unreadable_final_manifest
     suffix = "#{PACKAGE}/generation-manifest.json"
     original = File.method(:binread)
@@ -507,7 +767,8 @@ class SpecificationGenerationTest < Minitest::Test
     File.define_singleton_method(:binread, original)
   end
 
-  def build_config(graphify_substitute: nil, context_plus_queries: [], context_plus_evidence: nil)
+  def build_config(graphify_substitute: nil, context_plus_queries: [], context_plus_evidence: nil,
+                   workspace_roots: { "tiny-demo-workspace" => @source })
     path = File.join(Dir.mktmpdir("cfg"), "runner.yml")
     File.write(path, <<~YAML)
       platform:
@@ -527,8 +788,7 @@ class SpecificationGenerationTest < Minitest::Test
             evidence: #{context_plus_evidence.nil? ? '~' : context_plus_evidence.to_json}
           graphify:
             substitute: #{graphify_substitute.nil? ? '~' : graphify_substitute.to_json}
-      workspace_roots:
-        tiny-demo-workspace: #{@source}
+      workspace_roots: #{workspace_roots.to_json}
     YAML
     SpecrelayRunner::Config.load(path)
   end
@@ -538,10 +798,10 @@ class SpecificationGenerationTest < Minitest::Test
   # without a model. Everything between the claim and the write is the real code path.
   def provider_stub = @provider_stub ||= SpecificationWorkspace.claude_stub(@temp, compose: true)
 
-  def run_cli(env_extra: {})
+  def run_cli(env_extra: {}, command: %w[claim-once])
     env = { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN,
             "PATH" => SpecificationWorkspace.provider_path(provider_stub) }
           .merge(SpecificationWorkspace.lane_env(@temp)).merge(env_extra)
-    SpecrelayRunner::CLI.run(%W[claim-once --config #{@config.source_path}], out: @io, err: @io, env: env)
+    SpecrelayRunner::CLI.run([ *command, "--config", @config.source_path ], out: @io, err: @io, env: env)
   end
 end

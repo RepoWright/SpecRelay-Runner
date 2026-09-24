@@ -31,7 +31,7 @@ class CodexExecutorFlowTest < Minitest::Test
   # The CANONICAL Codex profile, byte-for-byte what Platform serves. An override here produces a
   # payload the runner must refuse, which is exactly what the refusal examples assert.
   def codex_payload(overrides = {})
-    base_claim_payload(task_id: TASK)
+    base_claim_payload(task_id: TASK, root: @root)
       .merge("executor" => SpecrelayRunner::CodexProfile::CANONICAL.merge(overrides))
   end
 
@@ -163,7 +163,7 @@ class CodexExecutorFlowTest < Minitest::Test
   def test_the_fixture_path_never_probes_either_real_provider
     root, executor = DemoWorkspace.build
     @root = root
-    start_platform(base_claim_payload(task_id: TASK))
+    start_platform(base_claim_payload(task_id: TASK, root: @root))
     codex_bin, codex_argv = FakeCodexCli.build
     claude_bin, claude_argv = FakeClaudeCli.build
     path = [ fixture_bin(executor), codex_bin, claude_bin ].join(File::PATH_SEPARATOR)

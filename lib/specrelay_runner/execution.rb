@@ -33,7 +33,8 @@ module SpecrelayRunner
     # window closed and the attempt paused (MVP-0036 CR-002 F2).
     PLATFORM_AWAITING_INPUT = "AWAITING_INPUT"
 
-    Result = Struct.new(:outcome, :message, :reported_status, :release_attempted, keyword_init: true) do
+    Result = Struct.new(:outcome, :message, :reported_status, :release_attempted, :run_ended,
+                        keyword_init: true) do
       def success? = outcome == :completed
 
       # MAPIAI-107 — the attempt refused deterministically BEFORE any provider, and ATTEMPTED to
@@ -77,15 +78,14 @@ module SpecrelayRunner
       # nothing; only this pairing does.
       def report_unsubmitted? = outcome == :publication_failed && reported_status.nil?
 
-      # MAPIAI-97 — the attempt SUCCEEDED, both halves of it: the implementation reported success
-      # and Platform accepted that report.
+      # Platform holds a DEFINITIVE ending for this Run that this process observed: it recorded this
+      # attempt's terminal result, success or failure, or it explicitly returned cancellation. The
+      # one condition under which the Run's task environment may be handed back.
       #
-      # `success?` alone is not that. It reads Platform's answer to the upload, so a run whose
-      # verification or publication failed — and which said so in its own terminal result — is
-      # still `completed` here, because the report was received and stored. Releasing on it would
-      # delete the worktree holding the failure someone has to look at, and the retry that has to
-      # reuse it.
-      def completed_successfully? = success? && reported_status == ReportBundle::STATUS_SUCCEEDED
+      # Set only from an answer that came back. A superseded, refused or unreachable upload, a
+      # report that could not be built, an expired lease and a generic terminal signal all leave it
+      # unset — none of them is a recorded ending this process can show.
+      def run_ended? = !!run_ended
     end
 
     STOP_HEARTBEAT_ENV = "SPECRELAY_RUNNER_STOP_HEARTBEAT_AFTER_SECONDS"
@@ -94,6 +94,18 @@ module SpecrelayRunner
     # How much of one cause a terminal diagnostic carries. Long enough for a real exception
     # message or failure reason, short enough that neither can turn the ending into a transcript.
     MAX_DIAGNOSTIC_CHARS = 200
+
+    # The lease signal that is Platform's own terminal record of the Run, as opposed to an expired
+    # lease or a generic terminal state this process cannot attribute.
+    CANCELLED = "cancelled"
+
+    # The report outcomes that mean Platform RECORDED this attempt's terminal result. `superseded`
+    # is a 201 too, but it is Platform declining to record a claim that is no longer current.
+    RECORDED_OUTCOMES = %w[completed tests_failed].freeze
+
+    # The terminal envelope is a snapshot taken when the result is submitted, and the release it
+    # describes can only follow Platform's acceptance of that very result.
+    RELEASE_PENDING = "the task environment is released only after Platform accepts this result"
 
     # The lane discriminator Platform states on every assignment (MVP-0025).
     RUN_TYPE = "implementation"
@@ -203,12 +215,15 @@ module SpecrelayRunner
       raise Aborted, reason if reason
     end
 
+    # Explicit cancellation is already Platform's terminal record, so no late report is sent and
+    # the Run's environment goes back. Any other stop keeps it: this process cannot show the Run ended.
     def aborted_result(error)
       reason = error.message.to_s.empty? ? "the lease is no longer live" : error.message
+      cancelled = reason == CANCELLED
       log("Stopping #{run['task_id']}: Platform reports #{reason}. No report was uploaded.")
-      log("Platform owns the outcome — an expired lease is reclaimed for another runner; " \
-          "a cancelled run is terminal. Nothing to recover locally.")
-      Result.new(outcome: :aborted,
+      log(cancelled ? "The run is cancelled on Platform; its task environment is handed back." :
+                      "Platform owns the outcome; this run's task environment is kept.")
+      Result.new(outcome: :aborted, run_ended: cancelled,
                  message: "Runner outcome: aborted (#{reason}); claim released to Platform, no report uploaded.")
     end
 
@@ -311,6 +326,33 @@ module SpecrelayRunner
                  message: "Runner outcome: preflight_failed (claimed executor is not the selected profile; nothing executed).")
     end
 
+    # The pre-provider tree, named the way an operator can check it: one line per contained
+    # repository with its own path inside the environment and the exact commit it is on, then the
+    # approved package's location and the commit it was pinned to and verified against.
+    #
+    # Returns nil once it has announced that tree, or the reason it could not — which is a
+    # refusal, not a footnote. Announcing "prepared" over a failed inspection and launching anyway
+    # states the one thing this measurement exists to establish, on the strength of having failed
+    # to establish it.
+    #
+    # The commits are written in full. They are the identity of what the provider is about to
+    # work on and what publication will later be judged against, and an abbreviation is a value
+    # an operator cannot paste back into git.
+    def report_effective_inputs(worktree)
+      state = Specification::Preflight.repository_state(task_root: worktree.path, env: env)
+      return "the prepared repositories of #{run['task_id']} could not be inspected, so the " \
+             "inputs this run would execute against cannot be stated" if state.nil?
+
+      heads = Specification::Preflight.effective_heads(state)
+      anchor = @package.anchor
+      pinned = anchor ? ", approved specification #{anchor[:package_path]} pinned at " \
+                        "#{anchor[:head]} in #{anchor[:repository]}" : ""
+      # Stated in the local log only. The protocol has no event for a prepared workspace, and the
+      # `core.started` that follows is the next state Platform records.
+      log("Prepared #{run['task_id']} at #{heads}#{pinned}")
+      nil
+    end
+
     def run_flow(root, staging)
       # MAPIAI-87 CR-001 F1 — the continuation field is authority, so an absent or malformed one
       # is refused HERE: before a worktree is created or reused, before any git or GitHub read,
@@ -343,23 +385,57 @@ module SpecrelayRunner
 
         worktree = Workspace::Info.new(path: worktree.path, created: worktree.created?,
                                        base_commit: continuation.head_commit || worktree.base_commit)
-      elsif @continuation.package && worktree.created?
+      end
+
+      # The pinned package is verified and ANCHORED
+      # to the contained repository and commit it belongs to. It sits here, after any recorded
+      # target has been placed and before any fresh input is, for two reasons: a rework or restart
+      # target is this run's own recorded authority and keeps its precedence, including its own
+      # refusals; and the owner that chooses a head for the fresh inputs below has to know what the
+      # specification requires in order to pick a commit that satisfies both. The check reads the
+      # pinned COMMIT rather than the working tree, so it is answerable at this point.
+      @package = SpecificationPackage.call(payload: payload, staging_dir: staging,
+                                           task_root: worktree.path)
+      return package_refused(root, worktree, @package.failure) unless @package.ok?
+
+      if !continued && (@continuation.package || @package.anchor) && worktree.created?
         # MAPIAI-87 — the ticket's PREVIOUS accepted implementation, and only into a workspace
         # this attempt just built. Same-run authority wins: a rework or restart target is handled
         # above and never reaches here, and a resume reuses the worktree its question was asked
-        # from, so `created?` is false for it. A refusal stops before the provider, before the
-        # package, and before any external write.
-        reconstructed = @continuation.package.materialize(task_root: worktree.path)
+        # from, so `created?` is false for it.
+        #
+        # The verified specification anchor travels with the accepted code, so one authority
+        # chooses a commit that satisfies BOTH inputs — or refuses before placing any of them. A
+        # first run has no accepted code and still needs its approved specification placed, so the
+        # same owner is used with no accepted targets rather than a second placement path here.
+        placer = @continuation.package ||
+                 PreviousAcceptedPackage.for_specification(run["canonical_branch"], env: env)
+        reconstructed = placer.materialize(task_root: worktree.path,
+                                           specification: @package.anchor)
         return continuation_refused(reconstructed.reason) unless reconstructed.ok?
       end
 
-      # MVP-0034 contract 4 — the pinned package is verified and written read-only BEFORE the
-      # provider starts. A document whose bytes do not reproduce the digest Platform pinned ends
-      # the attempt here, with a failed report and no executor (S23).
-      @package = SpecificationPackage.call(payload: payload, staging_dir: staging)
-      unless @package.ok?
-        return package_refused(root, worktree, @package.failure)
-      end
+      # THE TREE, not the objects that were verified into it. Everything above proves what each
+      # input should be; this is the only check that reads what the environment actually holds,
+      # and it is the one a reused or continued environment needs — its placement steps are
+      # deliberately skipped, so nothing else here has looked at its files.
+      visible = SpecificationPackage.visible_failure(@package)
+      return package_refused(root, worktree, visible) if visible
+
+      # All input placement is done, so this checkout's own analysis is brought up to date with
+      # the tree as it FINALLY stands — the same seam, for the same reason, as the specification
+      # lane. A graph built while the environment was still being assembled describes inputs that
+      # have since been replaced, and a provider querying it would get answers about code that is
+      # no longer there. A project without the wrappers is unaffected.
+      unprepared = Specification::SourceEvidence.prepare(root: worktree.path, env: env)
+      return package_refused(root, worktree, unprepared) if unprepared
+
+      # What the provider is ABOUT to see, measured after every input has been placed. The seeds an
+      # environment was allocated from are not this: inputs are placed in stages, and reporting the
+      # starting point as the effective one would describe a tree that no longer exists. Identities
+      # are repository-relative and the values are commit ids, so nothing here carries a host path.
+      unmeasured = report_effective_inputs(worktree)
+      return package_refused(root, worktree, unmeasured) if unmeasured
 
       emit("core.started", "Running #{provider} executor for #{run['task_id']}", phase: "core")
       executor_result = run_executor(root, worktree, staging)
@@ -562,11 +638,11 @@ module SpecrelayRunner
       terminal = terminal_result(status: ReportBundle::STATUS_FAILED, final_sequence: emitter.sequence,
                                  exit_code: executor_result.exit_code, base_commit: worktree.base_commit,
                                  changes: changes, error_classification: "worktree_unmeasurable")
-      client.submit_report(claim: claim, bundle: bundle, terminal_result: terminal)
+      response = client.submit_report(claim: claim, bundle: bundle, terminal_result: terminal)
       # The status is set from a submission that RETURNED, which is what separates this
       # acknowledged failure from one whose report never reached Platform at all.
       Result.new(outcome: :publication_failed, reported_status: ReportBundle::STATUS_FAILED,
-                 message: "Runner outcome: publication_failed (#{reason}).")
+                 run_ended: recorded?(response), message: "Runner outcome: publication_failed (#{reason}).")
     end
 
     # MVP-0014 — publish the changed repository output to GitHub, between verification
@@ -809,7 +885,8 @@ module SpecrelayRunner
       response = client.submit_report(claim: claim, bundle: bundle, terminal_result: terminal)
       outcome = response["outcome"].to_s
       log("Report stored: #{response.dig('report', 'url')} (run #{response['run_state']})")
-      Result.new(outcome: outcome.to_sym, message: "Runner outcome: #{outcome}.", reported_status: status)
+      Result.new(outcome: outcome.to_sym, message: "Runner outcome: #{outcome}.", reported_status: status,
+                 run_ended: recorded?(response))
     end
 
     # MVP-0034 S23 — the assignment's package did not reproduce what Platform pinned. Reported as
@@ -840,9 +917,11 @@ module SpecrelayRunner
       terminal = terminal_result(status: ReportBundle::STATUS_FAILED, final_sequence: emitter.sequence,
                                  exit_code: executor_result.exit_code, base_commit: worktree.base_commit,
                                  changes: changes, error_classification: classification)
-      client.submit_report(claim: claim, bundle: bundle, terminal_result: terminal)
-      Result.new(outcome: :executor_failed, message: message)
+      response = client.submit_report(claim: claim, bundle: bundle, terminal_result: terminal)
+      Result.new(outcome: :executor_failed, message: message, run_ended: recorded?(response))
     end
+
+    def recorded?(response) = RECORDED_OUTCOMES.include?(response.to_h["outcome"].to_s)
 
     # The ONE place report construction is allowed to fail, shared by the three paths that build
     # a bundle.
@@ -976,7 +1055,8 @@ module SpecrelayRunner
         # detection failed announce a repository state nobody had measured (review-003 finding 2).
         # The cause travels in the error classification and the report's failure narrative instead.
         repositories: publication || [],
-        artifacts: terminal_artifacts
+        artifacts: terminal_artifacts,
+        cleanup_error: RELEASE_PENDING
       )
     end
 

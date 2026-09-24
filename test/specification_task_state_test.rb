@@ -52,6 +52,27 @@ class SpecificationTaskStateTest < Minitest::Test
   # A revision starts from the package the ticket's own specification pull request carries, and
   # that package is present IN THE TASK ENVIRONMENT before the provider runs — so a provider that
   # reads its own package directory reads the previous round rather than an empty folder.
+
+  # ------------------------------------------------ the heads the specification describes
+
+  # The environment is measured once, after every input is placed and before the provider starts,
+  # and that measurement is the baseline the change boundary later compares against. It also has
+  # to be STATED: a package whose evidence cannot say which commits it was written from cannot be
+  # checked against them. First generation has no previous package, so its heads are simply the
+  # seeds the environment holds — which is exactly why they need saying.
+  def test_a_first_generation_records_the_full_source_heads_it_was_written_from
+    start
+    head = git(@root, "rev-parse", "HEAD").strip
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
+    assert_path_exists @probe, "the provider must actually have run"
+
+    manifest = JSON.parse(File.read(File.join(task_workspace, PACKAGE, "generation-manifest.json")))
+    evidence = manifest.dig("source_evidence", "tools").map { |tool| tool["summary"] }.join("\n")
+    assert_includes evidence, ".@#{head}", "the task root's own head, in full, repository-relative"
+    refute_includes evidence, @root, "and no host path"
+  end
+
   def test_a_revision_makes_the_existing_pull_request_package_visible_before_generation
     build_previous_package_on_spec_branch
     start(revision: SPEC_PR)
@@ -178,12 +199,12 @@ class SpecificationTaskStateTest < Minitest::Test
     build_previous_package_on_spec_branch(package: "lane/#{FOLDER}")
     outside = link_specification_root_outside("lane")
     start(revision: SPEC_PR, specification_root: "lane")
+    seen = observe_task_workspace_at_generation_result
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
     assert_outside_untouched(outside)
-    assert_equal git(@root, "rev-parse", "main").strip,
-                 git(task_workspace, "rev-parse", "HEAD").strip
-    assert File.symlink?(File.join(task_workspace, "lane")), "the committed link must survive"
+    assert_equal git(@root, "rev-parse", "main").strip, seen[:head]
+    assert seen[:link], "the committed link must survive"
   end
 
   # The same link, on a FIRST specification: the write of the generated package itself must not
@@ -477,6 +498,20 @@ class SpecificationTaskStateTest < Minitest::Test
             "PATH" => "#{@provider}:#{@gh_dir}:#{ENV['PATH']}" }
           .merge(SpecificationWorkspace.lane_env(@built.temp)).merge(env_extra)
     SpecrelayRunner::CLI.run(%W[claim-once --config #{@config.source_path}], out: @io, err: @io, env: env)
+  end
+
+  # The task workspace's HEAD and committed link as they stood when Platform received the
+  # generation result — before a recorded failure hands the environment back.
+  def observe_task_workspace_at_generation_result
+    seen = {}
+    original = @platform.method(:specification_generation)
+    read = ->() { { head: git(task_workspace, "rev-parse", "HEAD").strip,
+                    link: File.symlink?(File.join(task_workspace, "lane")) } }
+    @platform.define_singleton_method(:specification_generation) do |request|
+      seen.merge!(read.call)
+      original.call(request)
+    end
+    seen
   end
 
   def probe = JSON.parse(File.read(@probe))

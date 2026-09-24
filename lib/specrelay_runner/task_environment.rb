@@ -43,12 +43,26 @@ module SpecrelayRunner
       def released? = released ? true : false
     end
 
+    # What {ownership} proved. OWNED lets this run use the environment. PROTECTED is a readable
+    # record of a manual environment or another run's, which nothing in this runner may take
+    # down. UNPROVED is every other answer — an absent environment included, because only the
+    # run-qualified release can prove absence.
+    OWNED = :owned
+    PROTECTED = :protected
+    UNPROVED = :unproved
+
     module_function
 
     # Why `run_id` may NOT use the environment `task_id`, or nil when the project proves it owns
     # it right now.
+    def unowned_reason(root:, task_id:, run_id:, canonical_branch: nil)
+      verdict, reason = ownership(root: root, task_id: task_id, run_id: run_id, canonical_branch: canonical_branch)
+      verdict == OWNED ? nil : reason
+    end
+
+    # `[verdict, reason]` for the environment `task_id`, the reason nil only when it is OWNED.
     #
-    # Nil is the narrow answer and every other path produces a reason, which is what stops an
+    # OWNED is the narrow answer and every other path produces a reason, which is what stops an
     # unanswered question being read as permission. Cleanliness is not ownership, and neither is
     # the canonical branch being checked out somewhere: both are true of an environment a person
     # made by hand, and adopting one would delete their work at the end of this run. So the
@@ -56,24 +70,62 @@ module SpecrelayRunner
     #
     # `canonical_branch` is compared when the caller knows it, because the answer must be about
     # the environment this run is actually going to use.
-    def unowned_reason(root:, task_id:, run_id:, canonical_branch: nil)
+    def ownership(root:, task_id:, run_id:, canonical_branch: nil)
       unavailable = unavailable_reason(root, task_id, run_id)
-      return sentence(task_id, "cannot be claimed: #{unavailable}") if unavailable
+      return [ UNPROVED, sentence(task_id, "cannot be claimed: #{unavailable}") ] if unavailable
 
       result = invoke(root, [ "status", task_id.to_s, "--json" ], STATUS_TIMEOUT)
       document = document_of(result)
-      return sentence(task_id, "could not be inspected: #{detail(result, 'status', task_id)}") if
+      return [ UNPROVED, sentence(task_id, "could not be inspected: #{detail(result, 'status', task_id)}") ] if
         document.nil?
 
       mismatch = identity_mismatch(document, task_id, canonical_branch)
-      return sentence(task_id, mismatch) if mismatch
+      return [ UNPROVED, sentence(task_id, mismatch) ] if mismatch
 
       owner = document["owner_run_id"].to_s
-      return sentence(task_id, "records no run owner, so it is a manual environment") if owner.empty?
-      return sentence(task_id, "is owned by a different run") unless owner == run_id.to_s
+      return [ PROTECTED, sentence(task_id, "records no run owner, so it is a manual environment") ] if owner.empty?
+      return [ PROTECTED, sentence(task_id, "is owned by a different run") ] unless owner == run_id.to_s
 
-      nil
+      [ OWNED, nil ]
     end
+
+    # The Run-owned environments this project lists, as `[[run_id, task_id], ...]` with a nil
+    # reason, or nil and the reason the list could not be read.
+    #
+    # A project without the run-aware command lists nothing: an automatic run can allocate only
+    # through it, so such a project cannot hold a Run-owned environment. An environment with no
+    # recorded owner is a manual one and is never listed here. A row that is neither is unproved,
+    # not manual, so it makes the whole list unreadable.
+    def run_owned(root:)
+      return [ [], nil ] unless File.executable?(File.join(root.to_s, Workspace::PROJECT_COMMAND))
+
+      result = invoke(root, [ "list", "--json" ], STATUS_TIMEOUT)
+      rows = document_of(result)&.fetch("environments", nil)
+      unless rows.is_a?(Array)
+        return [ nil, "the project's task environments could not be listed: #{detail(result, 'list', '--json')}" ]
+      end
+
+      owners = rows.map { |row| listed_owner(row) }
+      if owners.include?(:unreadable)
+        return [ nil, "the project's task environments could not be listed: " \
+                      "`#{Workspace::PROJECT_COMMAND} list --json` named an environment this runner could not read" ]
+      end
+
+      [ owners.compact, nil ]
+    end
+
+    # `[run_id, task_id]` for a Run-owned row, nil for a manual one, :unreadable otherwise. The
+    # project always lists the owner; only an owner it states as null is manual.
+    def listed_owner(row)
+      return :unreadable unless row.is_a?(Hash) && row.key?("owner_run_id") && listed_identity?(row["task_id"])
+
+      owner = row["owner_run_id"]
+      return nil if owner.nil?
+
+      listed_identity?(owner) ? [ owner, row["task_id"] ] : :unreadable
+    end
+
+    def listed_identity?(value) = value.is_a?(String) && !value.empty?
 
     # Hand back the environment this run owns, or say why it is still allocated.
     #

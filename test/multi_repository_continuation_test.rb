@@ -76,7 +76,8 @@ class MultiRepositoryContinuationTest < Minitest::Test
   def start(rework: nil, restart: nil, executor: nil, fixture_env: {}, seed: nil)
     use_fixture(fixture_dir, executor || @built.executor,
                 env: { "FAKE_EXECUTOR_EDITED" => ".,component-a" }.merge(fixture_env))
-    payload = claim_payload_for(task_id: TASK,
+    payload = claim_payload_for(task_id: TASK, root: @root,
+                                specification_repository: "component-c",
                                 publication: {}, rework: rework, restart: restart)
     @platform = FakePlatform.new(claim_payload: payload).start
     @gh_dir, @gh_log, = FakeGithub.gh_bin(urls: PR_URLS, bares: @bares, seed: seed || open_pull_requests)

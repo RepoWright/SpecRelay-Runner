@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require_relative "test_helper"
+require "timeout"
 
 # MVP-0036 Stage 1: the SpecRelay-owned local question bridge.
 #
@@ -49,7 +50,7 @@ class QuestionBridgeTest < Minitest::Test
     use_fixture(fixture_dir, executor || @executor,
                 env: { "FAKE_EXECUTOR_QUESTION_JSON" => request,
                        "FAKE_EXECUTOR_QUESTION_TIMEOUT_SECONDS" => timeout }.merge(env))
-    claim_payload_for(task_id: TASK)
+    claim_payload_for(task_id: TASK, root: @root)
   end
 
   def build_config
@@ -70,11 +71,13 @@ class QuestionBridgeTest < Minitest::Test
   end
 
   # Replace the running fake with one whose provider ASKS and then abandons its own question.
-  # `ask_seconds` places the provider's exit before or after the parent's next answer poll.
-  def use_abandoning_provider(provider_exit:, ask_seconds: nil)
+  # `ask_seconds` places the provider's exit before or after the parent's next answer poll;
+  # `leave_file` makes it leave when that file appears instead, within the same bound.
+  def use_abandoning_provider(provider_exit:, ask_seconds: nil, leave_file: nil)
     @platform.stop
     env = { "FAKE_EXECUTOR_QUESTION_EXIT_CODE" => provider_exit }
     env["FAKE_EXECUTOR_QUESTION_ASK_SECONDS"] = ask_seconds if ask_seconds
+    env["FAKE_EXECUTOR_QUESTION_LEAVE_FILE"] = leave_file if leave_file
     executor = DemoWorkspace.write_abandoning_executor(@root)
     @platform = FakePlatform.new(claim_payload: payload(executor: executor, env: env)).start
     @config = build_config
@@ -96,6 +99,16 @@ class QuestionBridgeTest < Minitest::Test
       end
     )
     [ status, runs ]
+  end
+
+  def wait_for(seconds)
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + seconds
+    until yield
+      return false if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
+
+      sleep 0.05
+    end
+    true
   end
 
   def run_cli(io)
@@ -145,24 +158,110 @@ class QuestionBridgeTest < Minitest::Test
     assert_path_exists File.join(@root, ".runs", "worktrees", TASK), "the dirty worktree is preserved"
   end
 
+  # The fake itself. A runner that gives up on a held answer costs this fake that one connection:
+  # the next request is still answered. Otherwise every later heartbeat waits out the client's
+  # read timeout on a fake that has silently stopped serving.
+  def test_the_fake_platform_still_answers_after_a_client_abandons_a_held_poll
+    @platform.question_poll_hold = -> { sleep 0.5 }
+    poll = "GET /api/runner/executor_questions/q1 HTTP/1.1\r\nHost: fake\r\n" \
+           "Authorization: Bearer #{FakePlatform::EXPECTED_TOKEN}\r\nContent-Length: 0\r\n\r\n"
+    abandoned = TCPSocket.new("127.0.0.1", @platform.port)
+    abandoned.setsockopt(Socket::SOL_SOCKET, Socket::SO_LINGER, [ 1, 0 ].pack("ii"))
+    abandoned.write(poll)
+    abandoned.close
+
+    answer = Timeout.timeout(5) do
+      client = TCPSocket.new("127.0.0.1", @platform.port)
+      client.write(poll)
+      client.read
+    end
+
+    assert_match(%r{\AHTTP/1\.1 200 }, answer)
+  end
+
   # CR-002 F1 — the same race one step later: the provider goes while the answer poll is still in
-  # flight, so the answers are written into a bridge whose session has already ended.
+  # flight.
+  #
+  # The ordering is established, not hoped for. The fake holds the runner's first answer poll and
+  # only then tells the provider to leave; the provider confirms by removing the leave file. The
+  # answer is released only after the runner's bounded log-stream shutdown, which is what precedes
+  # its stop of the bridge — so the session has ended before the answer is read, and the runner
+  # reports the unanswered question. The answer read BEFORE the ending and handed over after it is
+  # the handover case below.
   def test_a_provider_lost_while_the_answer_poll_is_in_flight_is_never_reported_as_delivered
-    use_abandoning_provider(provider_exit: "0", ask_seconds: "3")
+    leave = File.join(@root, ".runs", "provider-leave")
+    use_abandoning_provider(provider_exit: "0", ask_seconds: "30", leave_file: leave)
     @platform.answer_question!(ANSWERS)
-    @platform.question_poll_delay = 2.0
+    order = []
+    @platform.question_poll_hold = lambda do
+      next unless order.empty?
+
+      order << :poll_in_flight
+      File.write(leave, "")
+      order << :provider_left if wait_for(10) { !File.exist?(leave) }
+      sleep SpecrelayRunner::ExecutorLogStream::SHUTDOWN_SECONDS + 3
+    end
     io = StringIO.new
 
     exit_code = run_cli(io)
 
+    assert_equal %i[poll_in_flight provider_left], order, "the provider left while its answer poll was held"
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, exit_code, io.string
     assert_empty @platform.delivery_acknowledgements
     assert_equal "ANSWER_READY", @platform.question_state
     assert_equal 1, @platform.capture_failures.size
-    # The answers were written locally and then found to have nowhere to go: this is the
-    # in-flight race, not the earlier one the test above covers.
-    assert_includes io.string, SpecrelayRunner::QuestionBridge::ANSWER_UNDELIVERED
+    assert_includes io.string, SpecrelayRunner::QuestionBridge::PROVIDER_EXITED
     assert_empty @platform.requests_to("/api/runner/reports")
+    assert_path_exists File.join(@root, ".runs", "worktrees", TASK), "the dirty worktree is preserved"
+  end
+
+  # The handover race, pinned: the answer was READ while the session was running, and
+  # the session ends before it is handed over. The real bridge, with a scripted Platform client;
+  # the answer write is held until the bridge's stop is observably requested, so the answers are
+  # written into a bridge whose session has already ended.
+  def test_answers_read_before_the_session_ended_are_never_confirmed_as_delivered
+    client = HandoverClient.new(ANSWERS)
+    captured = SpecrelayRunner::Checkpoint::Captured.new(checkpoint: { "fixture" => true })
+    bridge = SpecrelayRunner::QuestionBridge.new(client: client, claim: "rex_test123", io: StringIO.new,
+                                                 staging_dir: Dir.mktmpdir("bridge", @root),
+                                                 capture: -> { captured }).start
+    entered = Queue.new
+    proceed = Queue.new
+    write = bridge.method(:write)
+    bridge.define_singleton_method(:write) do |name, body|
+      entered << name
+      proceed.pop
+      write.call(name, body)
+    end
+    File.write(File.join(bridge.path, SpecrelayRunner::QuestionBridge::REQUEST), BATCH.to_json)
+
+    assert_equal SpecrelayRunner::QuestionBridge::ANSWER, Timeout.timeout(15) { entered.pop }
+    stopper = Thread.new { bridge.stop }
+    assert wait_for(5) { bridge.send(:stopping?) }, "the bridge was asked to stop"
+    proceed << true
+    stopper.join(10)
+
+    assert_equal :failed, bridge.outcome
+    assert_equal SpecrelayRunner::QuestionBridge::ANSWER_UNDELIVERED, bridge.failure_reason
+    assert_equal 0, client.confirmations, "an answer handed over after the ending is never confirmed"
+  end
+
+  # Platform's side of one batch: accepted, then answered on the first poll.
+  class HandoverClient
+    attr_reader :confirmations
+
+    def initialize(answers)
+      @answers = answers
+      @confirmations = 0
+    end
+
+    def submit_executor_question(**) = { "question" => { "id" => "q1", "state" => "LIVE_WAIT" } }
+    def executor_question(**) = { "question" => { "id" => "q1", "state" => "ANSWER_READY", "answers" => @answers } }
+
+    def confirm_executor_question_delivery(**)
+      @confirmations += 1
+      { "question" => { "id" => "q1", "state" => "ANSWERED" } }
+    end
   end
 
   # CR-002 F1 — Platform never confirmed the delivery, so the attempt must not continue as if it
@@ -446,7 +545,7 @@ end
   def test_an_ordinary_provider_that_never_asks_follows_the_existing_path_unchanged
     root, executor = DemoWorkspace.build
     use_fixture(fixture_dir, executor)
-    platform = FakePlatform.new(claim_payload: claim_payload_for(task_id: TASK)).start
+    platform = FakePlatform.new(claim_payload: claim_payload_for(task_id: TASK, root: root)).start
     config_path = File.join(Dir.mktmpdir("cfg"), "runner.yml")
     File.write(config_path, <<~YAML)
       platform:

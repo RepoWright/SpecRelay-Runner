@@ -11,7 +11,8 @@ module SpecrelayRunner
   #   - the command is ALWAYS an argv array via Process.spawn, so no shell is
   #     involved and no argument (including executor prompt text) is interpolated
   #     into a shell line;
-  #   - the child runs in its own process group so a timeout kills the whole tree;
+  #   - the child runs in its own process group, and a command is finished only when that whole
+  #     group has ended — after a timeout, a stop, or the child simply exiting;
   #   - output is bounded so a runaway process cannot exhaust runner memory.
   #
   # MVP-0018 adds an OPTIONAL `on_output` consumer that receives each complete
@@ -63,6 +64,13 @@ module SpecrelayRunner
     # What a caller synthesising its own line should say: nothing was read, so nothing was cut.
     COMPLETE_LINE = Piece.new(:newline, false).freeze
 
+    # This command's own process group could not be shown to have ended. A result is never
+    # returned in its place: a command whose processes may still be running has not finished, and
+    # whatever follows — a report, a release, the next claim — would act on a tree that is still
+    # changing. Deliberately not a SystemCallError, which `Executor` turns into an ordinary launch
+    # failure; this one has to reach the command-line boundary.
+    class TerminationFailed < StandardError; end
+
     Result = Struct.new(:exit_code, :stdout, :stderr, :duration_seconds, :timed_out, keyword_init: true) do
       def success? = !timed_out && exit_code == 0
       def timed_out? = timed_out ? true : false
@@ -113,10 +121,15 @@ module SpecrelayRunner
       raise ArgumentError, "argv must not be empty" if argv.empty?
 
       started = monotonic
+      @command_name = File.basename(argv.first)
+      @denied = false
       out_r, err_r, pid = spawn_process(argv)
       timed_out, status = deliver_and_wait(pid)
       Result.new(exit_code: status&.exitstatus, stdout: out_r.value, stderr: err_r.value,
                  duration_seconds: (monotonic - started).round(3), timed_out: timed_out)
+    rescue TerminationFailed
+      abandon_readers
+      raise
     end
 
     private
@@ -165,7 +178,19 @@ module SpecrelayRunner
       pid = Process.spawn(env, *argv, chdir: chdir, out: out_w, err: err_w, in: in_r, pgroup: true)
       [ out_w, err_w, in_r ].each(&:close)
       @input_delivered = write_stdin(in_w)
-      [ reader_thread(out_r, STDOUT), reader_thread(err_r, STDERR), pid ]
+      @readers = [ [ out_r, reader_thread(out_r, STDOUT) ], [ err_r, reader_thread(err_r, STDERR) ] ]
+      [ @readers[0][1], @readers[1][1], pid ]
+    end
+
+    # A group that could not be shown to have ended may still hold the write ends of these pipes,
+    # so their readers could wait forever. They are stopped rather than joined, and the read ends
+    # closed; nothing they captured is reported, because no result is.
+    def abandon_readers
+      Array(@readers).each do |io, thread|
+        thread.report_on_exception = false
+        thread.kill
+        io.close unless io.closed?
+      end
     end
 
     # True when the child really has its input: there was none to give, or all of it was written.
@@ -272,17 +297,19 @@ module SpecrelayRunner
     # `Timeout.timeout(...) { waitpid }` because a blocking wait cannot also observe a stop
     # signal, and giving the two reasons separate implementations would mean two shutdown
     # graces that could drift apart.
+    #
+    # The direct child exiting on its own is not the end of the command either: whatever it left
+    # running in its group still has to finish. {#terminate_group} decides that for all three.
     def wait_or_kill(pid)
       deadline = monotonic + timeout_seconds
       loop do
-        return [ false, $? ] if reaped?(pid)
+        reaped, status = reap(pid)
+        return [ false, terminate_group(pid, reaped, status) ] if reaped
         return [ true, terminate_group(pid) ] if monotonic >= deadline
         return [ false, terminate_group(pid) ] if stop_requested?
 
         sleep WAIT_POLL_SECONDS
       end
-    rescue Errno::ECHILD
-      [ false, nil ]
     end
 
     # A stop predicate must never be able to fail the execution it is watching, for the same
@@ -293,28 +320,79 @@ module SpecrelayRunner
       false
     end
 
-    def terminate_group(pid)
-      signal_group(pid, "TERM")
-      deadline = monotonic + TERM_GRACE_SECONDS
-      until monotonic >= deadline
-        return $? if reaped?(pid)
+    # THE one shutdown authority for this command's process group, and the only place its result
+    # is allowed to come from. It returns the direct child's own status once that child has been
+    # reaped AND no member of the group it was spawned into remains. Two separate observations:
+    # the child exiting says nothing about what it forked.
+    #
+    # A group that is already empty costs nothing — the ordinary command with no descendants
+    # returns at once. Otherwise TERM, the existing grace, then KILL and the same bound again.
+    # Signals only ever go to the group this command's own `pgroup: true` spawn created, and only
+    # while that group is not yet shown to be gone.
+    def terminate_group(pid, reaped = false, status = nil)
+      return status if reaped && group_gone?(pid)
 
-        sleep 0.05
+      %w[TERM KILL].each do |signal|
+        signal_group(pid, signal)
+        reaped, status, gone = observe(pid, reaped, status)
+        return status if gone
       end
-      signal_group(pid, "KILL")
-      reaped?(pid) ? $? : nil
+      raise TerminationFailed, unfinished(pid, reaped)
     end
 
+    # Reaps the direct child when it can and waits, up to one grace, for the group to be empty.
+    def observe(pid, reaped, status)
+      deadline = monotonic + TERM_GRACE_SECONDS
+      loop do
+        reaped, status = reap(pid) unless reaped
+        return [ reaped, status, true ] if reaped && group_gone?(pid)
+        return [ reaped, status, false ] if monotonic >= deadline
+
+        sleep WAIT_POLL_SECONDS
+      end
+    end
+
+    # The direct child's status, read exactly once, from its own reap — never from `$?`, which
+    # belongs to whatever this thread waited for last. A child something else already reaped
+    # (ECHILD) is gone, and its status is unknown rather than borrowed.
+    def reap(pid)
+      _, status = Process.waitpid2(pid, Process::WNOHANG)
+      status.nil? ? [ false, nil ] : [ true, status ]
+    rescue Errno::ECHILD
+      [ true, nil ]
+    end
+
+    # Absence is the only evidence. EPERM is not: it is also what this platform answers for a group
+    # whose remaining members are zombies not yet reaped by their new parent, so it means "not yet
+    # shown", and a group that keeps answering it runs out of time rather than passing.
+    def group_gone?(pid)
+      Process.kill(0, -pid)
+      false
+    rescue Errno::ESRCH
+      true
+    rescue Errno::EPERM
+      @denied = true
+      false
+    end
+
+    # A group that is already gone needs no signal; one this process may not signal is left to the
+    # bounded observation to judge.
     def signal_group(pid, signal)
       Process.kill(signal, -pid)
-    rescue Errno::ESRCH, Errno::EPERM
+    rescue Errno::ESRCH
+      nil
+    rescue Errno::EPERM
+      @denied = true
       nil
     end
 
-    def reaped?(pid)
-      !Process.waitpid(pid, Process::WNOHANG).nil?
-    rescue Errno::ECHILD
-      true
+    # The group's own identity and the command's name, never its arguments, input or output.
+    def unfinished(pid, reaped)
+      reason = +"process group #{pid} (#{@command_name}) did not end within " \
+                "#{TERM_GRACE_SECONDS * 2}s of TERM and KILL"
+      reason << "; its direct child was not reaped" unless reaped
+      reason << "; the group could not be inspected or signalled (permission denied)" if @denied
+      reason
     end
 
     def monotonic = Process.clock_gettime(Process::CLOCK_MONOTONIC)

@@ -41,7 +41,7 @@ class PublicationFlowTest < Minitest::Test
   # --- harness -------------------------------------------------------------
 
   def start(publication: {})
-    payload = claim_payload_for(task_id: TASK,
+    payload = claim_payload_for(task_id: TASK, root: @root,
                                 publication: publication)
     @platform = FakePlatform.new(claim_payload: payload).start
     @config_path = write_config
@@ -154,17 +154,17 @@ class PublicationFlowTest < Minitest::Test
 
   # Re-run publication against the worktree the first attempt left behind, with the same
   # verified repository the first publication saw.
-  # Where a replayed publication runs. A SUCCESSFUL run hands its task environment back before
-  # this machine claims again (MAPIAI-97), so the replay works on a checkout of the branch that
-  # run pushed — which is exactly the state a retry finds. A FAILED attempt kept its environment,
-  # and the replay continues in it.
+  # Where a replayed publication runs. A run whose result Platform recorded — success or failure —
+  # hands its task environment back before this machine claims again, so the replay works on one
+  # checkout of the branch that run pushed, which is exactly the state a retry finds. An attempt
+  # whose result was not recorded kept its environment, and the replay continues in it.
   def publication_worktree
     path = File.join(@root, ".runs", "worktrees", TASK)
     return path if Dir.exist?(path)
 
-    replay = File.join(Dir.mktmpdir("republish"), TASK)
-    FakeGithub.git(@root, "worktree", "add", replay, BRANCH)
-    replay
+    @replay ||= File.join(Dir.mktmpdir("republish"), TASK).tap do |replay|
+      FakeGithub.git(@root, "worktree", "add", replay, BRANCH)
+    end
   end
 
   def republish(first, gh_dir: @gh_dir)
@@ -175,7 +175,7 @@ class PublicationFlowTest < Minitest::Test
       changed_files: [ "demo-app/index.html" ], diff: ""
     )
     SpecrelayRunner::Publication.new(
-      payload: claim_payload_for(task_id: TASK, publication: {}),
+      payload: claim_payload_for(task_id: TASK, publication: {}, root: @root),
       repository: repository,
       env: { "PATH" => "#{fixture_dir}:#{gh_dir}:#{ENV['PATH']}", "HOME" => ENV["HOME"].to_s }, io: StringIO.new
     ).call
@@ -622,7 +622,7 @@ class PublicationFlowTest < Minitest::Test
       changed_files: [ "demo-app/index.html" ], diff: ""
     )
     publication = SpecrelayRunner::Publication.new(
-      payload: claim_payload_for(task_id: TASK, publication: {}),
+      payload: claim_payload_for(task_id: TASK, publication: {}, root: @root),
       repository: repository,
       env: { "PATH" => "#{fixture_dir}:#{@gh_dir}:#{ENV['PATH']}", "HOME" => ENV["HOME"].to_s }, io: StringIO.new
     )
@@ -770,6 +770,13 @@ class PublicationFlowTest < Minitest::Test
   def test_a_transient_spawn_error_during_change_detection_fails_closed
     start
     inject_emfile_on_first_spawn
+    worktree = File.join(@root, ".runs", "worktrees", TASK)
+    edited_at_report = []
+    original = @platform.method(:report)
+    @platform.define_singleton_method(:report) do |request|
+      edited_at_report << File.read(File.join(worktree, "demo-app", "index.html"))
+      original.call(request)
+    end
 
     run_cli
 
@@ -788,9 +795,9 @@ class PublicationFlowTest < Minitest::Test
     assert_empty FakeGithub.remote_branches(@bare)
     assert_equal 0, FakeGithub.pr_creates(@gh_log)
 
-    # The executor's change really was made — this is exactly the false-success setup.
-    worktree = File.join(@root, ".runs", "worktrees", TASK)
-    assert_match(/Hello SpecRelay Demo/, File.read(File.join(worktree, "demo-app", "index.html")))
+    # The executor's change really was made — this is exactly the false-success setup. Read when
+    # the report arrived, because the recorded failure then hands the environment back.
+    assert_match(/Hello SpecRelay Demo/, edited_at_report.first.to_s)
   end
 
   # The operator-facing failure narrative, read from the uploaded report rather than reconstructed.
@@ -804,7 +811,13 @@ class PublicationFlowTest < Minitest::Test
   # run. Patching the spawn boundary keeps the rest of the flow real.
   def inject_emfile_on_first_spawn
     fired = false
-    guard = ->(argv) { argv.first == "git" && argv.include?("status") && !fired }
+    # The CHANGE-DETECTION status, not the read that reports the prepared heads: both ask git for
+    # status, and only the first is the measurement this test exhausts. They are told apart by
+    # `--untracked-files=all`, which only the evidence read passes.
+    guard = ->(argv) {
+      argv.first == "git" && argv.include?("status") &&
+        !argv.include?("--untracked-files=all") && !fired
+    }
     SpecrelayRunner::CommandRunner.class_eval do
       alias_method :spawn_process_without_injection, :spawn_process
       define_method(:spawn_process) do |argv|

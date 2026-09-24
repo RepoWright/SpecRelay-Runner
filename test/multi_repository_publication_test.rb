@@ -56,7 +56,8 @@ class MultiRepositoryPublicationTest < Minitest::Test
   def start(publication: {}, fixture_env: {}, executor: nil)
     use_fixture(fixture_dir, executor || @built.executor,
                 env: { "FAKE_EXECUTOR_EDITED" => "component-a,component-b" }.merge(fixture_env))
-    payload = claim_payload_for(task_id: TASK, publication: publication)
+    payload = claim_payload_for(task_id: TASK, publication: publication,
+                                root: @root, specification_repository: "component-c")
     @platform = FakePlatform.new(claim_payload: payload).start
     @config_path = write_config
     payload
@@ -232,6 +233,7 @@ class MultiRepositoryPublicationTest < Minitest::Test
     gh_dir, gh_log, = FakeGithub.gh_bin(bare: bare)
 
     payload = claim_payload_for(task_id: TASK, publication: {},
+                                root: @root, specification_repository: "component-c",
                                 worktree_create_command: "git worktree add .runs/worktrees/#{TASK} -b #{TASK}")
     @platform = FakePlatform.new(claim_payload: payload).start
     @config_path = write_config
@@ -423,11 +425,17 @@ class MultiRepositoryPublicationTest < Minitest::Test
   # is clean and worktree-versus-HEAD measurement sees nothing. The change is still there — it is
   # the task branch's own commits, ahead of the repository's default branch — and the retry has to
   # find it, or the missing pull request can never be completed on this workspace.
+  #
+  # The first result is LOST rather than recorded. That is the ending after which the same Run is
+  # offered again with its environment still in place; a recorded failure ends the Run and hands
+  # the environment back, and its recovery is a replacement Run from the pushed branches.
   def test_a_retry_recovers_the_committed_repositories_and_completes_the_missing_publication
     start
     gh_dir, first_log, state = FakeGithub.gh_bin(urls: PR_URLS, bares: @bares,
                                                  fail_create_for: "SpecRelay/component-b")
+    @platform.report_response = [ 500, { error: "the response was lost" } ]
     run_cli(gh_dir: gh_dir)
+    @platform.report_response = nil
     assert_equal "failed", terminal["outcome"], "the first attempt published only one of two"
     heads = { "SpecRelay/component-a" => branches_of("SpecRelay/component-a")[BRANCH],
               "SpecRelay/component-b" => branches_of("SpecRelay/component-b")[BRANCH] }

@@ -63,6 +63,15 @@ module SpecrelayRunner
       # not treat a machine holding an environment as a clean finish.
       err.puts(Redaction.redact(e.message))
       RUN_FAILED
+    rescue CommandRunner::TerminationFailed => e
+      # A command this runner supervised may still be running, so nothing may follow it on this
+      # machine and the invocation ends here. The failing command may be any of them — the
+      # provider before a report, or the release after one — so say only what failed and which
+      # process group to look for, never what did or did not happen before it.
+      err.puts("Runner stopped: a supervised command could not be shown to have ended: " \
+               "#{Redaction.redact(e.message)}.")
+      err.puts("Make sure that process group has ended before starting this runner again.")
+      RUN_FAILED
     end
 
     private
@@ -266,10 +275,53 @@ module SpecrelayRunner
         presence: loop_presence(config, client, interval),
         connector: loop_connector(config),
         status_reporter: loop_status_reporter(config, client),
-        claim: -> { client.claim(config.claim_runner_params) },
+        claim: -> { claim_after_cancellation_cleanup(config, client) },
         execute: ->(payload) { loop_disposition(config, client, payload) }
       )
       result == LoopRunner::OK ? SUCCESS : RUN_FAILED
+    end
+
+    # Release the task environment of a Run Platform cancelled after its question pause, then
+    # claim. Asked before every loop claim, because that cancellation reaches no process: the Run
+    # is no longer claimable and the paused attempt's claim token ended with its session.
+    #
+    # Only a connected loop asks; a `--config` loop has no runner identity for Platform to prove
+    # the paused attempt against. Nothing unproved lets a claim through: an unreadable project
+    # list, an unanswered, refused or unreadable Platform read, a target this machine did not list
+    # and an incomplete release all raise {CleanupRequired}, which stops the session. Only the
+    # claim itself keeps the loop's ordinary transport backoff.
+    def claim_after_cancellation_cleanup(config, client)
+      release_cancelled_environment(config, client) if config.connection
+      client.claim(config.claim_runner_params)
+    end
+
+    def release_cancelled_environment(config, client)
+      workspace_key = config.connection.workspace_key
+      root = config.workspace_root(workspace_key, env: env)
+      listed, unreadable = TaskEnvironment.run_owned(root: root)
+      raise CleanupRequired, unreadable if unreadable
+      return if listed.empty?
+
+      target = confirmed_cleanup_target(client, workspace_key, listed)
+      return if target.nil?
+      raise CleanupRequired, "Platform named a cancelled run this machine did not list" unless listed.include?(target)
+
+      run_id, task_id = target
+      presenter.line("[loop] run #{run_id} was cancelled on Platform; releasing its task environment")
+      TaskEnvironment.release!(root: root, task_id: task_id, run_id: run_id)
+      presenter.line("[loop] released the task environment #{task_id}")
+    rescue Config::Error => e
+      raise CleanupRequired, "the task environments could not be checked: #{PrivatePaths.sanitize(e.message)}"
+    end
+
+    # A rejected credential stays the loop's own stop, with its reconnect remedy.
+    def confirmed_cleanup_target(client, workspace_key, listed)
+      client.cancellation_cleanup_target(workspace_key: workspace_key, candidates: listed)
+    rescue PlatformClient::Unauthorized
+      raise
+    rescue PlatformClient::Error => e
+      raise CleanupRequired, "the task environments of cancelled runs could not be confirmed with Platform " \
+                             "(#{e.message}); they were kept"
     end
 
     # MAPIAI-107 — what one claimed assignment tells the SESSION, which is one fact more than its
@@ -542,10 +594,8 @@ module SpecrelayRunner
       # behaviour is unchanged.
       signal = loop_signal(result)
       yield signal if block_given? && signal
-      return RUN_FAILED unless result.handled?
-
-      release_task_environment(config, payload) if result.completed_successfully?
-      SUCCESS
+      release_task_environment(config, payload) if result.run_ended?
+      result.handled? ? SUCCESS : RUN_FAILED
     end
 
     # The two outcomes a session must not simply poll past, in the order they are decided.
@@ -562,18 +612,15 @@ module SpecrelayRunner
       nil
     end
 
-    # MAPIAI-97 — the environment a COMPLETED implementation leaves behind is released here, on
-    # the one path both `loop` and `claim-once` reach, because the preview lane addresses the same
-    # task id and would otherwise be built on top of it.
+    # The environment of an implementation Run that has definitively ENDED is released here, on the
+    # one path both `loop` and `claim-once` reach: Platform recorded its terminal result, success or
+    # failure, or explicitly cancelled it ({Execution::Result#run_ended?}). Always after that
+    # answer, never before, and never for a question-paused attempt, whose worktree holds the
+    # answer the operator has yet to give, or for an ending this process could not confirm.
     #
-    # `completed_successfully?`, not `handled?` and not `success?`. A question-paused attempt is an
-    # approved pause whose worktree holds the answer the operator has yet to give; and an attempt
-    # whose verification or publication FAILED reported that failure honestly and was accepted for
-    # it, so its environment is the evidence — and the thing a retry reuses.
-    #
-    # It does not retract the accepted result — the report is already uploaded — but a refused
-    # release raises {CleanupRequired}, because this machine is now holding something nobody has
-    # accounted for and must not claim anything else until a person resolves it.
+    # It does not retract the recorded outcome, but a refused release raises {CleanupRequired},
+    # because this machine is now holding something nobody has accounted for and must not claim
+    # anything else until a person resolves it.
     def release_task_environment(config, payload)
       return unless Execution.implementation?(payload)
 

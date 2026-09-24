@@ -29,6 +29,11 @@ class ReworkFlowTest < Minitest::Test
     # Addressed by the url the assignment carries, so the reviewed-repository identity these
     # tests turn on is the real one rather than a local path no `clone_url` could name.
     @bare = FakeGithub.add_remote(@root, url: ORIGIN_URL)
+    # The approved package is committed BEFORE the reviewed round, because that is the order the
+    # product produces: a reviewed head is a commit some earlier run made in an environment that
+    # already held the approved specification, so it carries it. A reviewed head created before
+    # the package exists is a history no run could have produced.
+    @package = specification_package_block(TASK, root: @root)
     git(@root, "push", "-q", "origin", "HEAD:refs/heads/main")
     @reviewed_head = publish_reviewed_round
   end
@@ -57,8 +62,10 @@ class ReworkFlowTest < Minitest::Test
   end
 
   def start(rework: nil, restart: nil, seed: nil, gh_mode: "ok")
-    payload = claim_payload_for(task_id: TASK,
-                                publication: {}, rework: rework, restart: restart)
+    payload = claim_payload_for(task_id: TASK, publication: {}, rework: rework, restart: restart)
+    # The package committed in `setup`, so the assignment pins the history the reviewed head was
+    # branched from rather than a commit made after it.
+    payload["specification_package"] = @package
     @platform = FakePlatform.new(claim_payload: payload).start
     @gh_dir, @gh_log, = FakeGithub.gh_bin(mode: gh_mode, pull_request_url: PR_URL, bare: @bare,
                                           seed: seed || [ { "url" => PR_URL, "state" => "OPEN",
@@ -197,8 +204,11 @@ class ReworkFlowTest < Minitest::Test
   def test_a_foreign_mirror_at_the_exact_reviewed_commit_refuses_rather_than_publishing_into_it
     mirror = File.join(@scratch, "mirror.git")
     system("git", "clone", "-q", "--bare", @bare, mirror, exception: true)
-    git(@root, "remote", "set-url", "origin", mirror)
+    # The assignment is built while this workspace still declares its own identity; the remote is
+    # redirected afterwards, because the mirror has to be what the RUN finds rather than what the
+    # fixture pinned. The redirect under test reaches the runner either way.
     start(rework: { "repositories" => [ reviewed_repository ] })
+    git(@root, "remote", "set-url", "origin", mirror)
     code, output = run_cli
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, code, output

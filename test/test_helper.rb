@@ -242,8 +242,9 @@ end
 # round, exactly as Platform does for a claim that follows a CHANGES_REQUESTED review. Omit it
 # to model a first execution, which carries no rework block at all.
 def claim_payload_for(task_id:, publication: nil, rework: nil, restart: nil,
-                      worktree_create_command: nil)
-  payload = base_claim_payload(task_id: task_id, worktree_create_command: worktree_create_command)
+                      worktree_create_command: nil, root: nil, specification_repository: nil)
+  payload = base_claim_payload(task_id: task_id, worktree_create_command: worktree_create_command,
+                               root: root, specification_repository: specification_repository)
   payload = payload.merge("rework" => rework_block(rework), "report_contract" => rework_round(task_id)) if rework
   # MVP-0036 Stage 2b — a REPLACEMENT run's recorded target. Its report round stays the first
   # one, because the replacement is a new run rather than another round of the old one.
@@ -269,7 +270,8 @@ end
 # contract 4): identity, then every document with the role, path, digest, byte size and content
 # Platform recomputed itself. `digest` is real, so a test that alters one byte without restating
 # it is testing the refusal rather than the fixture.
-def specification_package_block(task_id, documents: nil)
+def specification_package_block(task_id, documents: nil, root: nil, repository: nil,
+                                package_path: nil)
   documents ||= [
     [ "specification", "spec.md", "# Approved spec for #{task_id}\nImplement it.\n" ],
     [ "input_evidence", "analysis/input-evidence.md", "# Input evidence\n" ],
@@ -277,18 +279,49 @@ def specification_package_block(task_id, documents: nil)
     [ "technical_analysis", "analysis/technical.md", "# Technical analysis\n" ],
     [ "generation_manifest", "generation-manifest.json", "{\"round\":1}\n" ]
   ]
-  head = "a" * 40
+  location = package_path || "specs/#{task_id}"
+  pinned = root ? commit_specification_package(root, location, documents, repository: repository)
+                : { "repository_slug" => "SpecRelay/specs", "head_sha" => "a" * 40 }
   {
     "manifest_digest" => "d" * 64,
-    "spec_pull_request_url" => "https://github.com/SpecRelay/specs/pull/7",
-    "repository_slug" => "SpecRelay/specs", "pull_request_number" => 7,
-    "base_branch" => "main", "head_sha" => head, "package_path" => "specs/#{task_id}",
+    "spec_pull_request_url" => "https://github.com/#{pinned['repository_slug']}/pull/7",
+    "pull_request_number" => 7, "base_branch" => "main", "package_path" => location,
     "documents" => documents.map do |role, path, content|
       { "role" => role, "path" => path, "digest" => Digest::SHA256.hexdigest(content),
         "byte_size" => content.bytesize, "content" => content }
     end,
     "handoff_prompt" => "# Approved spec for #{task_id}\nImplement it."
-  }
+  }.merge(pinned)
+end
+
+# Put the approved documents where a success-path run must be able to SEE them, and pin what was
+# actually committed.
+#
+# The delivered copy may not be the only correct copy, so an assignment that names a repository,
+# a commit and a package location has to name ones that exist: the documents are written into a
+# contained repository, committed, and the identity and head are then read back OUT of git. A
+# fixture that invented those three values would be pinning a history no environment has.
+#
+# `repository` selects a contained COMPONENT checkout instead of the workspace root, because the
+# specification repository is allowed to be either and both have to work.
+def commit_specification_package(root, location, documents, repository: nil)
+  repo = repository ? File.join(root.to_s, repository) : root.to_s
+  documents.each do |_role, path, content|
+    absolute = File.join(repo, location, path)
+    FileUtils.mkdir_p(File.dirname(absolute))
+    File.binwrite(absolute, content)
+  end
+  DemoWorkspace.git(repo, "add", "--", location)
+  # `--allow-empty` so a test that builds the same block more than once still gets a commit to pin
+  # rather than failing on an unchanged tree.
+  DemoWorkspace.git(repo, "-c", "user.email=fixture@example.test", "-c", "user.name=Fixture",
+                    "commit", "--quiet", "--allow-empty", "-m", "approved specification package")
+  url = DemoWorkspace.git(repo, "remote", "get-url", "origin").strip
+  slug = SpecrelayRunner::GithubRemote.slug(url)
+  raise "the fixture repository at #{repo} declares no supported GitHub identity" if slug.nil?
+
+  { "repository_slug" => slug,
+    "head_sha" => DemoWorkspace.git(repo, "rev-parse", "HEAD").strip }
 end
 
 # The rework block exactly as Runner::Api::RunPayload builds it (MVP-0035 design 2): the settled
@@ -313,7 +346,8 @@ def rework_round(task_id)
     "report_path" => "specs/#{task_id}/execution-reports/002-review-fixes" }
 end
 
-def base_claim_payload(task_id:, worktree_create_command: nil)
+def base_claim_payload(task_id:, worktree_create_command: nil, root: nil,
+                      specification_repository: nil)
   {
     "contract_version" => "mvp-0010",
     "claim" => { "runner_execution_id" => "rex_test123", "claim_policy_mode" => "all_eligible" },
@@ -333,7 +367,9 @@ def base_claim_payload(task_id:, worktree_create_command: nil)
     # name (see `fixture_bin`). Which file a bare name resolves to on a host, and what that file
     # reads while it runs, is the host's business — not something a payload may say.
     "executor" => SpecrelayRunner::ImplementationProfile::FIXTURE_CANONICAL,
-    "specification_package" => specification_package_block(task_id),
+    "specification_package" => specification_package_block(
+      task_id, root: root, repository: specification_repository
+    ),
     # MAPIAI-87 — required on EVERY assignment and null only when the ticket has no accepted
     # implementation. Absence is malformed input, not a first run, so the fixture states it.
     "previous_accepted_package" => nil,

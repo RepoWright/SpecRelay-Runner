@@ -323,13 +323,16 @@ class SpecificationProviderTest < Minitest::Test
     File.join(SpecificationWorkspace.isolated_worktree(@temp), "specs", PACKAGE_DIR)
   end
 
-  # A provider failure or a rejected document set leaves NO package: the isolated worktree holds
-  # no `specs/` tree at all (the writer stages and renames once, so there are no leftovers), and
-  # the operator's checkout never had one to begin with.
+  # A provider failure or a rejected document set leaves NO package: the result says no file was
+  # written, any isolated worktree still standing holds no `specs/` tree (the writer stages and
+  # renames once, so there are no leftovers), and the operator's checkout never had one to begin
+  # with. Once Platform records the failure the isolated worktree is discarded as well.
   def assert_no_package(message = "no package was written")
-    worktree = SpecificationWorkspace.isolated_worktree(@temp)
-    assert_empty Dir.glob(File.join(worktree, "specs", "*"), File::FNM_DOTMATCH)
-                    .reject { |path| path.end_with?("/.", "/..") }, message
+    assert_equal true, @platform.last_specification_generation["zero_output_files_written"], message
+    SpecificationWorkspace.isolated_workspaces(@temp).each do |workspace|
+      assert_empty Dir.glob(File.join(workspace, "worktree", "specs", "*"), File::FNM_DOTMATCH)
+                      .reject { |path| path.end_with?("/.", "/..") }, message
+    end
     refute File.exist?(File.join(@specs, "specs", PACKAGE_DIR)), "the operator checkout must stay empty"
   end
 

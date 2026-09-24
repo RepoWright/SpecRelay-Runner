@@ -14,7 +14,7 @@ class RunnerFlowTest < Minitest::Test
     # The approved fixture name resolves to this test's own script on the CHILD PATH. The payload
     # stays canonical; only the host decides which file the approved name is.
     @executor_path = fixture_path(@executor)
-    @platform = FakePlatform.new(claim_payload: claim_payload_for(task_id: TASK)).start
+    @platform = FakePlatform.new(claim_payload: claim_payload_for(task_id: TASK, root: @root)).start
     @config = build_config
     @io = StringIO.new
   end
@@ -230,6 +230,199 @@ class RunnerFlowTest < Minitest::Test
     manifest = decode_manifest(@platform.last_report)
     assert_equal "failed", manifest["execution_status"]
     refute manifest["final_jira_update_ready"], "a failed attempt must not mark Jira ready"
+  end
+
+  # ---------------------------------------------------------------- exact inputs
+
+  # A provider must never be started against inputs that are not the ones this run was given.
+  #
+  # Everything up to here proves what each input SHOULD be: the package is verified against the
+  # commit it was pinned to, and placement puts a created environment on it. None of that looks at
+  # the tree — and a REUSED environment skips placement entirely, which is exactly where a
+  # different specification can be standing in the checkout while the pinned object sits in the
+  # history, intact and irrelevant.
+
+  # Records whether the provider ran, and from where, without disturbing what it does.
+  def observe_provider
+    @observed = File.join(@root, ".runs", "provider-ran.json")
+    code = File.read(@executor)
+    marker = "require 'json'\nFile.write(#{@observed.inspect}, " \
+             "JSON.generate({cwd: Dir.pwd, spec: File.read('specs/#{TASK}/spec.md')}))\n"
+    File.write(@executor, code.sub('puts "leaking', marker + 'puts "leaking'))
+  end
+
+  def provider_ran = File.exist?(@observed) ? JSON.parse(File.read(@observed)) : nil
+
+  # The assignment, re-pinned to the repository as it stands now. A test that commits to the
+  # fixture after `setup` has moved the history the original block named.
+  def repin
+    @platform.instance_variable_get(:@claim_payload)["specification_package"] =
+      specification_package_block(TASK, root: @root)
+  end
+
+  # The project's own command builds the environment, so the run REUSES one rather than creating
+  # it — which is the case where nothing else looks at the visible package.
+  def allocate_environment
+    out, status = Open3.capture2e(File.join(@root, "bin", "worktree"), "create", TASK,
+                                  "--run-id", "run_test123")
+    assert status.success?, out
+  end
+
+  def test_a_reused_environment_showing_a_different_specification_refuses_before_the_provider
+    observe_provider
+    repin
+    allocate_environment
+    visible = File.join(worktree, "specs", TASK, "spec.md")
+    File.write(visible, "# A LATER round's specification\n")
+    DemoWorkspace.git(worktree, "add", "specs")
+    DemoWorkspace.git(worktree, "commit", "-qm", "a later round replaced the package")
+
+    code = run_cli
+
+    refute_equal SpecrelayRunner::CLI::SUCCESS, code, @io.string
+    assert_nil provider_ran, "a mismatched visible package must not reach a provider"
+    # The recorded refusal ends the Run, so its checkout is released afterwards; the work it held
+    # is committed on the task branch, which the release keeps. That is where "not reset" is read.
+    assert_equal "# A LATER round's specification\n",
+                 DemoWorkspace.git(@root, "show", "#{TASK}:specs/#{TASK}/spec.md"),
+                 "the environment's own work may not be reset to make the check pass"
+  end
+
+  # The control for the test above: the same REUSED environment, showing the package it was given,
+  # runs normally. Without it, a version that simply refused every reused environment would pass.
+  def test_a_reused_environment_showing_the_assigned_specification_still_runs
+    observe_provider
+    repin
+    allocate_environment
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
+    assert provider_ran, "an environment showing the right package must not be blocked"
+  end
+
+  # The ancestor case, through the whole flow: a clean, same-owner, reused allocation whose
+  # committed `specs` is a link to matching documents outside it. Every byte agrees, and none of
+  # them is the package this run was given.
+  def test_a_reused_environment_whose_package_links_outside_it_refuses_before_the_provider
+    observe_provider
+    repin
+    allocate_environment
+    outside = File.join(@root, ".runs", "outside-specs")
+    FileUtils.mv(File.join(worktree, "specs"), outside)
+    File.symlink(outside, File.join(worktree, "specs"))
+    DemoWorkspace.git(worktree, "add", "specs")
+    DemoWorkspace.git(worktree, "commit", "-qm", "linked specification directory")
+
+    code = run_cli
+
+    refute_equal SpecrelayRunner::CLI::SUCCESS, code, @io.string
+    assert_nil provider_ran, "a package reached through an escaping link must not be launched against"
+    # Read from the task branch the released checkout was on: the link is still what it holds.
+    assert_equal "120000", DemoWorkspace.git(@root, "ls-tree", TASK, "specs").split.first,
+                 "and the environment is left as it was"
+  end
+
+  # ---------------------------------------------------------------- final analysis
+
+  # The checkout's own analysis has to describe the tree as it FINALLY stands. Inputs are placed
+  # in stages, so a graph built while the environment was being assembled answers questions about
+  # code that has since been replaced — worse than no graph, because it looks like an answer.
+  #
+  # The wrappers are COMMITTED: the environment is a real worktree at the branch head, so
+  # uncommitted ones would never be in it, and preparation would correctly find none.
+  def install_analysis_wrappers(check_exit)
+    @analysis_log = File.join(@root, ".runs", "analysis-called")
+    FileUtils.mkdir_p(File.dirname(@analysis_log))
+    %w[graph-check graph-build graph-query].each do |name|
+      code = name == "graph-check" ? check_exit : 0
+      File.write(File.join(@root, "bin", name), "#!/bin/sh\npwd >> #{@analysis_log}\nexit #{code}\n")
+      FileUtils.chmod(0o755, File.join(@root, "bin", name))
+    end
+    DemoWorkspace.git(@root, "add", "bin")
+    DemoWorkspace.git(@root, "commit", "-qm", "analysis wrappers")
+  end
+
+  # Outside the environment, because a successful run releases it.
+  def prepared_the_task_environment?
+    File.exist?(@analysis_log) && File.read(@analysis_log).include?(worktree)
+  end
+
+  def test_analysis_that_cannot_be_made_fresh_stops_before_the_provider
+    observe_provider
+    install_analysis_wrappers(3)
+    repin
+
+    code = run_cli
+
+    assert prepared_the_task_environment?, "preparation must run against the final tree"
+    refute_equal SpecrelayRunner::CLI::SUCCESS, code, @io.string
+    assert_nil provider_ran, "stale analysis must not be carried into a provider"
+  end
+
+  def test_a_fresh_analysis_graph_lets_the_run_proceed
+    observe_provider
+    install_analysis_wrappers(0)
+    repin
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
+    assert prepared_the_task_environment?
+    assert provider_ran
+  end
+
+  # ---------------------------------------------------------------- effective heads
+
+  # Announcing a prepared environment over a failed inspection states the one thing the
+  # measurement exists to establish, on the strength of having failed to establish it.
+  def test_inputs_that_cannot_be_measured_refuse_rather_than_reporting_preparation
+    observe_provider
+    repin
+
+    preflight = SpecrelayRunner::Specification::Preflight
+    original = preflight.method(:repository_state)
+    preflight.define_singleton_method(:repository_state) { |**| nil }
+    code = begin
+      run_cli
+    ensure
+      preflight.define_singleton_method(:repository_state, original)
+    end
+
+    refute_equal SpecrelayRunner::CLI::SUCCESS, code, @io.string
+    assert_nil provider_ran, "unmeasurable inputs must refuse before the provider"
+    refute_includes @io.string, "Prepared #{TASK} at",
+                    "nothing may be announced as prepared when it could not be inspected"
+  end
+
+  # Exact commits, because they are the identity of what the provider is about to work on and what
+  # publication is later judged against — and an abbreviation cannot be pasted back into git.
+  def test_the_effective_inputs_are_reported_as_full_commits_without_host_paths
+    repin
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
+
+    reported = @io.string[/Prepared #{TASK} at ([^\n]*)/, 1].to_s
+    refute_empty reported, @io.string
+    assert_match(/\.@[0-9a-f]{40}/, reported, "the task root's own head, in full")
+    assert_includes reported, DemoWorkspace.git(@root, "rev-parse", "HEAD").strip
+    refute_includes reported, @root, "no host path may appear in the report"
+  end
+
+  # Against Platform's real event allowlist the run still reaches its provider: the exact inputs
+  # are stated in the local log, and only contracted events go over the wire, in one coherent
+  # sequence. An uncontracted type is refused with a 422 before the provider could start.
+  def test_a_run_reaches_its_provider_through_the_contracted_event_boundary
+    @platform.strict_events!
+    observe_provider
+    repin
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
+
+    assert provider_ran, "the provider never started"
+    events = @platform.protocol_events
+    types = events.map { |event| event["event_type"] }
+    assert_empty types - FakePlatform::V1_EVENT_TYPES, "an uncontracted event was sent"
+    assert_operator types.index("workspace.preparing"), :<, types.index("core.started")
+    sequences = events.map { |event| event["sequence"] }
+    assert_equal (1..sequences.size).to_a, sequences, "the event sequence has a gap or repeat"
+    assert_match(/^Prepared #{TASK} at \.@#{DemoWorkspace.git(@root, "rev-parse", "HEAD").strip}/, @io.string)
   end
 
   private

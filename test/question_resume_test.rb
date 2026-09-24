@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require_relative "test_helper"
+require "base64"
 
 # Resuming an answered offline question — on the machine that still holds the uncommitted work,
 # and on one that has to restore it first.
@@ -68,15 +69,20 @@ class QuestionResumeTest < Minitest::Test
                 env: { "FAKE_EXECUTOR_QUESTION_JSON" => BATCH.to_json,
                        "FAKE_EXECUTOR_QUESTION_TIMEOUT_SECONDS" => "5",
                        "FAKE_EXECUTOR_QUESTION_EDIT_FIRST" => "1" })
-    claim_payload_for(task_id: TASK)
+    claim_payload_for(task_id: TASK).merge("specification_package" => approved_package)
   end
+
+  # Committed ONCE, into the first machine, before anything clones it. Both phases and both
+  # machines then name the same commit: the second machine is a clone, so re-committing the
+  # package there would move its history past the base the checkpoint recorded.
+  def approved_package = @approved_package ||= specification_package_block(TASK, root: @root)
 
   # Phase two: the same run, claimed again, carrying the answers and the recorded checkpoint —
   # metadata and the one claim-bound download path, never the bytes.
   def resume_payload(checkpoint, executor: nil, env: {}, root: @root)
     executor ||= DemoWorkspace.write_resume_executor(root)
     use_fixture(fixture_dir, executor, env: env)
-    claim_payload_for(task_id: TASK).merge(
+    claim_payload_for(task_id: TASK).merge("specification_package" => approved_package).merge(
       "resume" => { "question_id" => "exq_fake", "checkpoint" => assigned(checkpoint),
                     "continuation_context" => BATCH["continuation_context"],
                     "questions" => BATCH["questions"], "answers" => ANSWERS }
@@ -344,9 +350,10 @@ class QuestionResumeTest < Minitest::Test
     assert_equal 1, @platform.delivery_acknowledgements.size
     assert_equal 1, @platform.requests_to("/api/runner/reports").size
     # The restored work really was the paused work: the fresh provider could only produce this
-    # heading by editing the interrupted one it was handed.
-    restored = File.read(File.join(other, ".runs", "worktrees", TASK, "demo-app", "index.html"))
-    assert_includes restored, "Hello Resumed Demo"
+    # heading by editing the interrupted one it was handed. Read from the change set measured into
+    # the report, because a recorded result then hands the environment back.
+    diff = @platform.last_report[:body].dig("report", "files").find { |f| f["relative_path"] == "evidence/diff.txt" }
+    assert_includes Base64.strict_decode64(diff.fetch("content_base64")), "Hello Resumed Demo"
   end
 
   # Scenario 10 — the package could not be transferred. Nothing was built, no provider started,

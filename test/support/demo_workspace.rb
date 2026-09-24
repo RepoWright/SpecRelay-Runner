@@ -50,7 +50,9 @@ module DemoWorkspace
           git -C "$ROOT_DIR" worktree remove --force "$WT_ROOT/$TASK"
           #{ProjectCommand.release_report}
           ;;
-        list) git -C "$ROOT_DIR" worktree list ;;
+        list)
+          #{ProjectCommand.list_case}
+          ;;
         *) echo "usage: worktree create|status|release|list <task>" >&2; exit 1 ;;
       esac
     SH
@@ -300,8 +302,18 @@ module DemoWorkspace
       File.rename("#{request}.partial", request)
       puts "[abandoning-executor] asked, then leaving"
       # Long enough for the parent to submit the batch to Platform, so the question really is
-      # durable when this process disappears.
-      sleep ENV.fetch("FAKE_EXECUTOR_QUESTION_ASK_SECONDS", "3").to_f
+      # durable when this process disappears. With a leave file named, it leaves as soon as that
+      # file appears instead — within the same bound — and removes it on the way out, so a test
+      # can place this exit at an exact point in the parent's answer poll.
+      wait = ENV.fetch("FAKE_EXECUTOR_QUESTION_ASK_SECONDS", "3").to_f
+      leave = ENV["FAKE_EXECUTOR_QUESTION_LEAVE_FILE"]
+      if leave
+        deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + wait
+        sleep 0.05 until File.exist?(leave) || Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
+        File.delete(leave) if File.exist?(leave)
+      else
+        sleep wait
+      end
       exit ENV.fetch("FAKE_EXECUTOR_QUESTION_EXIT_CODE", "0").to_i
     RUBY
     File.write(path, with_selection_reporter(File.read(path)))

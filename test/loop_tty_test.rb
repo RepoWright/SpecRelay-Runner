@@ -37,7 +37,7 @@ class LoopTtyTest < Minitest::Test
     @root, executor = DemoWorkspace.build
     use_fixture(fixture_dir, executor)
     @platform = FakePlatform.new(
-      claim_payload: claim_payload_for(task_id: "DEMO-LOOP-0001")
+      claim_payload: claim_payload_for(task_id: "DEMO-LOOP-0001", root: @root)
     )
     @platform.offer_no_work!
     @platform.start

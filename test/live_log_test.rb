@@ -781,7 +781,7 @@ class LiveLogTest < Minitest::Test
   def with_execution(log_event_delay: nil)
     root, executor = DemoWorkspace.build
     use_fixture(fixture_dir, executor)
-    platform = FakePlatform.new(claim_payload: claim_payload_for(task_id: "DEMO-0018")).start
+    platform = FakePlatform.new(claim_payload: claim_payload_for(task_id: "DEMO-0018", root: root)).start
     platform.log_event_delay = log_event_delay
     path = File.join(Dir.mktmpdir("cfg"), "runner.yml")
     File.write(path, <<~YAML)

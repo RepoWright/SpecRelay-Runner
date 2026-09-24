@@ -26,6 +26,7 @@ class SpecificationPublicationTest < Minitest::Test
     @specs = File.join(@temp, "SpecRelay-Specs")
     @source = File.join(@temp, "tiny-demo-workspace")
     FileUtils.mkdir_p(@source)
+    ProjectCommand.install_without_environments(@source)
     build_specification_checkout
     @io = StringIO.new
   end
@@ -164,14 +165,18 @@ class SpecificationPublicationTest < Minitest::Test
     refute_includes git(@specs, "worktree", "list"), @workspace.id
   end
 
-  # S19 — cleanup failing after acceptance cannot turn a real publication into a failure.
-  def test_a_cleanup_failure_after_acceptance_is_a_warning_not_a_failure
+  # S19 — cleanup failing after acceptance does not turn a real publication into a failed one:
+  # the publication stands as accepted and the pull request is named. It is a cleanup failure of
+  # its own, so the invocation exits nonzero and nothing else is claimed on top of it.
+  def test_a_cleanup_failure_after_acceptance_is_visible_and_stops_the_runner
     start_platform
     exit_code = with_unremovable_workspace { run_cli }
 
-    assert_equal SpecrelayRunner::CLI::SUCCESS, exit_code, @io.string
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, exit_code, @io.string
     assert_equal "published", @platform.last_specification_publication["outcome"]
-    assert_includes @io.string, "could not remove its local package workspace"
+    assert_includes @io.string, PR_URL
+    assert_includes @io.string, "could not be removed"
+    assert_includes @io.string, "Release it by hand"
   end
 
   # ------------------------------------------------- the ticket's ONE pull request

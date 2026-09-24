@@ -117,22 +117,22 @@ class SpecificationPublishedContinuationTest < Minitest::Test
     commit_beside_the_published_head
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, continue_from_the_pull_request, @io.string
-    assert_refused("has diverged from the published specification head #{published[0, 12]}")
+    assert_refused("has diverged from the approved specification head #{published[0, 12]}")
   end
 
-  # The published head is present but cannot be checked out. A `reset --hard` that fails leaves
-  # the environment on some other commit, so the run must stop rather than hand a provider a tree
-  # that is not the specification it was asked to revise.
+  # The published head is present but the environment cannot be moved onto it. A placement that
+  # fails leaves the environment on some other commit, so the run must stop rather than hand a
+  # provider a tree that is not the specification it was asked to revise.
   #
   # The index is locked, which is the state a crashed or concurrent git leaves behind, and is the
-  # one condition that stops `reset` without touching the repository's content.
+  # one condition that stops the move without touching the repository's content.
   def test_an_environment_the_published_head_cannot_be_checked_out_into_refuses
     published = publish_the_accepted_package
     create_task_environment
     lock_the_task_environment_index
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, continue_from_the_pull_request, @io.string
-    assert_refused("could not be put on #{TASK} at the published specification head " \
+    assert_refused("could not be advanced to the approved specification head " \
                    "#{published[0, 12]}")
   end
 
@@ -148,20 +148,21 @@ class SpecificationPublishedContinuationTest < Minitest::Test
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED,
                  continue_from_the_pull_request(workspace_root: detached), @io.string
-    assert_refused("was read at #{published[0, 12]}, and this ticket's task environment cannot " \
-                   "reach that commit")
+    assert_refused("does not contain the approved specification head #{published[0, 12]} " \
+                   "after a fetch")
   end
 
   private
 
   # Every refusal above must satisfy the same three things: the reason reaches Platform, no
-  # provider ran, and the environment and its contents are still there.
+  # provider ran, and the refusal left the environment and its contents where they were. Once
+  # Platform has RECORDED the refusal, the environment this Run built is handed back.
   def assert_refused(reason)
     generation = @platform.last_specification_generation.to_h
     assert_includes generation["message"].to_s, reason
     refute_path_exists @probe, "no provider may run once the revision base could not be built"
-    assert_path_exists task_workspace, "a refusal must leave the task environment alone"
-    assert_path_exists File.join(task_workspace, "README.md")
+    assert_equal [ true ], @environment_at_result, "a refusal must leave the task environment alone"
+    refute_path_exists task_workspace, "the recorded refusal hands back the environment this Run built"
   end
 
   # ---------------------------------------------------------------- phase 1: accepted round
@@ -203,7 +204,20 @@ class SpecificationPublishedContinuationTest < Minitest::Test
                                                     bare: @built.bares["."], state: @gh_state)
     start_platform(spec_creation_payload_for(issue_key: ISSUE, existing_pull_request_url: PR_URL),
                    workspace_root: workspace_root)
+    @environment_at_result = observe_at_generation_result { File.exist?(File.join(task_workspace, "README.md")) }
     run_cli
+  end
+
+  # What `probe` answers at the moment Platform receives each generation result — before anything
+  # this Run does once Platform has recorded it.
+  def observe_at_generation_result(&probe)
+    seen = []
+    original = @platform.method(:specification_generation)
+    @platform.define_singleton_method(:specification_generation) do |request|
+      seen << probe.call
+      original.call(request)
+    end
+    seen
   end
 
   # The provider under test: a real process that records the ENVIRONMENT it was handed, in git's

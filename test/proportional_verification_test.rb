@@ -60,7 +60,8 @@ class ProportionalVerificationTest < Minitest::Test
     use_fixture(fixture_dir, @built.executor,
                 env: { "FAKE_EXECUTOR_EDITED" => "component-a,component-b",
                        "FAKE_EXECUTOR_RUN_SELECTED" => "1" }.merge(fixture_env).compact)
-    payload = claim_payload_for(task_id: TASK, publication: {})
+    payload = claim_payload_for(task_id: TASK, publication: {}, root: @root,
+                                specification_repository: "component-c")
     @platform = FakePlatform.new(claim_payload: payload).start
     @config_path = write_config
     payload

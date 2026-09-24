@@ -93,6 +93,60 @@ class SpecificationGenerationRevisionTest < Minitest::Test
 
   # ------------------------------------------------------------------ the happy path
 
+  # The specification repository is a contained COMPONENT here, so the package destination that
+  # matters is inside that component — not the task root. Judging the root inspected a path the
+  # package never touches, and the checkout that places the revision then replaced the link.
+  # A revision is measured AFTER the published specification is placed, so the heads it states are
+  # the placed ones: the contained specification checkout names the published head, and the
+  # provider is handed that same statement before it starts.
+  def test_a_revision_states_the_placed_heads_to_the_provider_and_in_the_package
+    build_previous_package_on_branch
+    published = git(@specs, "rev-parse", "origin/#{BRANCH}").strip
+    capture = File.join(@temp, "captured-packet.json")
+    start_with_revision(provider: SpecificationWorkspace.claude_stub(@temp, files: valid_generated_files,
+                                                                            capture_prompt_to: capture))
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
+
+    stated = "#{SpecificationWorkspace::SPECS_CHECKOUT}@#{published}"
+    packet = SpecificationWorkspace.captured_packet(capture)
+    assert_includes packet["tool_evidence"].map { |tool| tool["summary"] }.join("\n"), stated,
+                    "the provider is told which commits it is working from"
+    task = File.join(@source, ".runs", "worktrees", BRANCH)
+    manifest = JSON.parse(File.read(Dir.glob(File.join(task, "**", "generation-manifest.json")).first))
+    assert_includes manifest.dig("source_evidence", "tools").map { |tool| tool["summary"] }.join("\n"),
+                    stated, "and the package keeps the same statement"
+  end
+
+  def test_a_component_specification_root_that_escapes_refuses_before_placement
+    build_previous_package_on_branch
+    outside = File.join(@temp, "outside-component-package")
+    FileUtils.mkdir_p(outside)
+    FileUtils.rm_rf(File.join(@specs, "specs"))
+    File.symlink(outside, File.join(@specs, "specs"))
+    git(@specs, "add", "specs")
+    commit(@specs, "linked specification root in the component seed")
+    capture = File.join(@temp, "component-provider.json")
+    start_with_revision(provider: SpecificationWorkspace.claude_stub(@temp, files: valid_generated_files,
+                                                                            capture_prompt_to: capture))
+
+    component = File.join(@source, ".runs", "worktrees", BRANCH, SpecificationWorkspace::SPECS_CHECKOUT)
+    link_at_result = []
+    original = @platform.method(:specification_generation)
+    @platform.define_singleton_method(:specification_generation) do |request|
+      link_at_result << File.symlink?(File.join(component, "specs"))
+      original.call(request)
+    end
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
+
+    refute_path_exists capture, "no provider may run against an escaping package destination"
+    # Read when Platform receives the refusal: the environment this Run built is handed back once
+    # the refusal is recorded, so afterwards there is no link left to look at.
+    assert_equal [ true ], link_at_result,
+                 "the committed link must survive: placement may not replace what the refusal protects"
+  end
+
   def test_the_previous_packages_own_files_reach_the_provider_as_revision_context
     build_previous_package_on_branch
     capture = File.join(@temp, "captured-packet.json")

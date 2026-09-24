@@ -246,7 +246,8 @@ class PreviousAcceptedPackageTest < Minitest::Test
     # Which repository the double edits is a host-side control, installed behind the approved bare
     # name; the assignment carries the canonical fixture profile and nothing else.
     use_fixture(fixture_dir, @built.executor, env: { "FAKE_EXECUTOR_EDITED" => "component-a" })
-    payload = claim_payload_for(task_id: TASK,
+    payload = claim_payload_for(task_id: TASK, root: @root,
+                                specification_repository: "component-c",
                                 publication: {}, restart: restart)
     absent ? payload.delete("previous_accepted_package") :
       payload["previous_accepted_package"] = continuation_block
@@ -306,21 +307,33 @@ class PreviousAcceptedPackageTest < Minitest::Test
   end
 
   def test_reuses_an_exact_clean_task_workspace_without_creating_or_resetting_it
+    gh_dir, gh_log, = gh_bin
+    # The assignment's package is committed by `start`, so the environment is built AFTER it: one
+    # created earlier predates the approved specification and could not show it, which is a
+    # different refusal from the reuse this test is about.
+    start(continuation_block: continuation)
     task_root = create_task_workspace
     File.truncate(@built.worktree_log, 0)
     before = ACCEPTED.to_h { |name| [ name, head_of(task_root, name) ] }
-    gh_dir, gh_log, = gh_bin
-    start(continuation_block: continuation)
+    # Read when the report arrives: a recorded result then hands the environment back.
+    at_report = []
+    observe = -> { [ File.exist?(File.join(task_root, "component-b", ACCEPTED_FILE)), head_of(task_root, "component-b") ] }
+    original = @platform.method(:report)
+    @platform.define_singleton_method(:report) do |request|
+      at_report << observe.call
+      original.call(request)
+    end
 
     code, = run_cli(gh_dir)
 
     assert_equal 0, code
     # No second allocation and no reset — only the ownership proof this run must pass before it
-    # may continue in an environment that was already there.
-    assert_equal [ "status #{TASK} --json" ], worktree_invocations
+    # may continue in an environment that was already there, and the release that follows the
+    # recorded result.
+    assert_equal [ "status #{TASK} --json", "release #{TASK} --run-id run_test123 --json" ],
+                 worktree_invocations
     assert_equal 0, FakeGithub.pr_views(gh_log)
-    refute_path_exists File.join(task_root, "component-b", ACCEPTED_FILE)
-    assert_equal before["component-b"], head_of(task_root, "component-b")
+    assert_equal [ [ false, before["component-b"] ] ], at_report
   end
 
   # S06 — a checkout with no run-aware project command refuses the automatic run, so there is
@@ -346,7 +359,7 @@ class PreviousAcceptedPackageTest < Minitest::Test
                 "headRefOid" => @heads.fetch(".") } ]
     )
 
-    payload = claim_payload_for(task_id: TASK, publication: {},
+    payload = claim_payload_for(task_id: TASK, publication: {}, root: @root,
                                 worktree_create_command: "git worktree add .runs/worktrees/#{TASK} -b #{TASK}")
     payload["previous_accepted_package"] = continuation(components: [ "." ]).merge(
       "implementation_pull_requests" => [ accepted_row(".", "pull_request_url" => url) ]

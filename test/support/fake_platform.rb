@@ -53,6 +53,10 @@ class FakePlatform
   # the runner treats as a transport fault rather than a refusal.
   attr_accessor :publication_response
 
+  # The same scripted answer for the execution-report and specification-generation endpoints, so
+  # a test can tell an accepted terminal result from a superseded, refused or unreachable one.
+  attr_accessor :report_response, :generation_response
+
   # Script the review-result endpoint's answer, so a test can model Platform's
   # strict validation refusing a submission the runner considered fine.
   attr_accessor :review_response
@@ -133,6 +137,7 @@ class FakePlatform
     @question_polls = 0
     @question_delivered = false
     @question_refusals = []
+    @cleanup_targets = []
     @mutex = Mutex.new
   end
 
@@ -152,6 +157,10 @@ class FakePlatform
       loop do
         socket = @server.accept
         handle(socket)
+      rescue Errno::EPIPE
+        # That client went away before its answer was written. It costs that one connection;
+        # ending the only accept thread here would leave every later request unanswered.
+        next
       rescue IOError, Errno::EBADF
         break
       end
@@ -214,6 +223,22 @@ class FakePlatform
 
   # Play the Product Owner. The settlement lands on the Nth POLL rather than immediately, so the
   # runner's waiting loop is exercised rather than short-circuited by the submission response.
+  # Scripted answers to the pre-claim cancellation read, consumed one per request; with none left
+  # Platform names no target, which is its answer for every Run it cannot prove.
+  # The event types Platform's v1 ingest accepts: the enum of the checked-in
+  # `contracts/runner/v1/run-event.schema.json`, which Platform enforces with a 422.
+  V1_EVENT_TYPES = %w[
+    attempt.started workspace.preparing core.started core.progress verification.started
+    verification.completed publication.started publication.completed artifact.created
+    log.chunk log.truncated attempt.completed
+  ].freeze
+
+  # Refuse events outside that allowlist, as the real endpoint does. Off by default: most suites
+  # assert other things, and a test about the wire turns it on.
+  def strict_events! = @strict_events = true
+
+  def script_cleanup_targets(*answers) = @mutex.synchronize { @cleanup_targets.concat(answers) }
+
   def answer_question!(answers, after_polls: 1) = settle_question("ANSWER_READY", answers, after_polls)
   def release_question!(after_polls: 1) = settle_question("OFFLINE_WAIT", [], after_polls)
 
@@ -237,9 +262,10 @@ class FakePlatform
     @mutex.synchronize { @question_refusals << [ 422, { accepted: false, errors: errors } ] }
   end
 
-  # F1: a slow answer poll, so a test can put the provider's exit INSIDE the poll the
-  # runner is waiting on, and a scripted answer for the acknowledgement itself.
-  attr_accessor :question_poll_delay, :delivery_response
+  # F1: a held answer poll, so a test can put the provider's exit INSIDE the poll the runner is
+  # waiting on, and a scripted answer for the acknowledgement itself. The hold is called on this
+  # fake's accept thread before the poll is answered.
+  attr_accessor :question_poll_hold, :delivery_response
 
   # The recorded portable checkpoint this fake hands back on the claim-bound download path, and
   # a scripted response so a test can put a transfer failure in front of a runner that has not
@@ -386,6 +412,7 @@ class FakePlatform
     when "/api/runner/workspace_connections" then workspace_connection(request)
     when %r{\A/api/runner/workspace_connections/(?<key>.+)\z} then member(request, Regexp.last_match[:key])
     when "/api/runner/claim" then claim
+    when "/api/runner/cancellation_cleanup_target" then cancellation_cleanup_target
     when "/api/runner/events" then events(request)
     when "/api/runner/heartbeat" then [ 200, { acknowledged: true, state: "EXECUTING", lease: lease_signal } ]
     when "/api/runner/reports" then report(request)
@@ -447,7 +474,7 @@ class FakePlatform
   # The POLL. Every read moves the counter, so a settlement scheduled for the Nth poll happens
   # while the runner is genuinely waiting.
   def executor_question_state
-    sleep @question_poll_delay if @question_poll_delay
+    question_poll_hold&.call
     state, answers = @mutex.synchronize do
       @question_polls += 1
       settled = @question_settle_state && @question_polls >= @question_settle_after
@@ -527,6 +554,8 @@ class FakePlatform
   end
 
   def specification_generation(request)
+    return @generation_response if @generation_response
+
     outcome = request.dig(:body, "generation", "outcome").to_s
     return [ 422, { error: "generation outcome is required" } ] if outcome.empty?
 
@@ -681,6 +710,8 @@ class FakePlatform
   # stand-in; the real Platform request specs cover full classification.
   def events(request)
     event = request.dig(:body, "event") || {}
+    return [ 422, { error: "unknown event_type" } ] if @strict_events && !V1_EVENT_TYPES.include?(event["event_type"])
+
     sequence = event["sequence"]
     key = [ event["attempt_id"], sequence ]
     duplicate = !sequence.nil? && @seen_sequences.include?(key)
@@ -689,6 +720,10 @@ class FakePlatform
     [ 201, { recorded: true, classification: classification, duplicate: duplicate,
              event: { sequence: sequence, event_type: event["event_type"], classification: classification },
              lease: lease_signal } ]
+  end
+
+  def cancellation_cleanup_target
+    @mutex.synchronize { @cleanup_targets.shift } || [ 200, { target: nil } ]
   end
 
   def claim
@@ -724,6 +759,8 @@ class FakePlatform
   end
 
   def report(request)
+    return @report_response if @report_response
+
     status = request.dig(:body, "report", "files")&.any? ? 201 : 422
     [ status, { outcome: "completed", execution_state: "COMPLETED",
                report: { round_label: "001-initial", status: "succeeded", url: "#{base_url}/reports/rpt_fake" },
