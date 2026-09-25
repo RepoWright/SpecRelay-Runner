@@ -110,6 +110,8 @@ module MultiRepositoryWorkspace
   #   FAKE_EXECUTOR_BREAK     - comma-separated repositories whose edit is left in a state `bin/verify`
   #                    rejects, so an unresolved failure is expressible.
   #   FAKE_EXECUTOR_REPAIR    - after a selected command fails, fix the edit and rerun it.
+  #   FAKE_EXECUTOR_ADDED     - comma-separated new, untracked files to create, relative to the task
+  #                    workspace, beside the ordinary edits.
   def write_selecting_executor(root)
     path = File.join(root, "bin", "multi-executor")
     File.write(path, <<~'RUBY')
@@ -136,6 +138,10 @@ module MultiRepositoryWorkspace
         marker = broken.include?(relative) ? "half-edited by the executor" : "edited by the executor"
         File.write(target(relative), "#{File.read(target(relative))}#{marker}\n")
         puts "[multi-executor] edited #{relative}"
+      end
+      ENV.fetch("FAKE_EXECUTOR_ADDED", "").split(",").reject(&:empty?).each do |added|
+        File.write(added, "added by the executor\n")
+        puts "[multi-executor] added #{added}"
       end
 
       reported = ENV.fetch("FAKE_EXECUTOR_SELECTED", edited.join(",")).split(",").reject(&:empty?)

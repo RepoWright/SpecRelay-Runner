@@ -325,6 +325,64 @@ class ProportionalVerificationTest < Minitest::Test
                  terminal["repositories"].find { |r| r["id"] == "SpecRelay/component-a" }["pull_request_url"]
   end
 
+  # A new file becomes intent-to-add when it is first measured, which moves it in `git status`.
+  # Verification that leaves every file alone must still measure the same publishable state.
+  def test_a_new_file_beside_a_tracked_edit_measures_the_same_state_and_publishes
+    start(fixture_env: { "FAKE_EXECUTOR_ADDED" => "component-a/a-new.js" })
+    code, output = run_cli
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, code, output
+    assert_equal "succeeded", terminal["outcome"]
+    assert_includes manifest.dig("git", "changed_files"), "component-a/a-new.js"
+    assert_equal PR_URLS.fetch("SpecRelay/component-a"),
+                 terminal["repositories"].find { |r| r["id"] == "SpecRelay/component-a" }["pull_request_url"]
+  end
+
+  def test_a_command_that_rewrites_a_new_file_fails_before_any_external_write
+    start(fixture_env: { "FAKE_EXECUTOR_ADDED" => "component-a/a-new.js",
+                          "FAKE_EXECUTOR_COMMANDS" => JSON.generate(
+                            { "component-a" => [ [ "sh", "-c", "echo rewritten >> a-new.js" ] ] }
+                          ),
+                          "FAKE_EXECUTOR_RUN_SELECTED" => nil })
+    run_cli
+
+    assert_equal "failed", terminal["outcome"]
+    assert_equal "verification_changed_publishable_state", terminal.dig("core", "error_classification")
+    assert_no_external_write
+  end
+
+  def test_consecutive_captures_of_an_unchanged_tree_with_a_new_file_are_equal
+    Dir.mktmpdir("capture") do |repository|
+      git = ->(*args) { Open3.capture3("git", "-C", repository, *args).last.success? || flunk("git #{args.join(' ')}") }
+      git.call("init", "-q")
+      File.write(File.join(repository, "b-tracked.txt"), "base\n")
+      git.call("add", "b-tracked.txt")
+      git.call("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "base")
+      File.write(File.join(repository, "b-tracked.txt"), "edited\n")
+      File.write(File.join(repository, "a-new.txt"), "new\n")
+
+      workspace = SpecrelayRunner::Workspace.new(root: repository, canonical_branch: BRANCH, create_command: "")
+      first = workspace.capture_changes(repository)
+      second = workspace.capture_changes(repository)
+
+      assert_equal first.diff, second.diff
+      assert_equal first.changed_files, second.changed_files
+      assert_equal %w[a-new.txt b-tracked.txt], first.changed_files.sort
+    end
+  end
+
+  # The bound keeps the same files for the same set, whatever order they were reported in.
+  def test_the_file_bound_selects_the_same_files_regardless_of_input_order
+    workspace = SpecrelayRunner::Workspace.new(root: Dir.tmpdir, canonical_branch: BRANCH, create_command: "")
+    files = Array.new(600) { |index| format("file-%03d.txt", index) }
+
+    shuffled = workspace.send(:limit, files.shuffle(random: Random.new(1)) + [ "", files.first ])
+    reversed = workspace.send(:limit, files.reverse)
+
+    assert_equal 500, shuffled.length
+    assert_equal shuffled, reversed
+  end
+
   # The stability gate belongs only to the path that would otherwise publish. An ordinary command
   # failure already blocks publication, and its own reason must not be replaced by a drift reason.
   def test_an_ordinary_command_failure_still_reports_its_own_cause
