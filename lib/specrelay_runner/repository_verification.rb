@@ -53,7 +53,9 @@ module SpecrelayRunner
     def initialize(repository:, commands:, env: {}, timeout_seconds: TIMEOUT_SECONDS)
       @repository = repository
       @commands = Array(commands)
-      @env = { "PATH" => env["PATH"].to_s }
+      # The same child environment rule the executor runs under, so the replay and the executor's
+      # own commands start from one environment and only the project's entrypoint activates more.
+      @env = CommandRunner.project_env("PATH" => env["PATH"].to_s)
       @timeout_seconds = timeout_seconds
     end
 

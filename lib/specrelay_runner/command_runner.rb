@@ -76,7 +76,21 @@ module SpecrelayRunner
       def timed_out? = timed_out ? true : false
     end
 
+    # The Runner's OWN Ruby, gem and Bundler activation. The parent shell that started this
+    # interpreter may carry it, and a project child that inherited it would load the Runner's
+    # libraries or install into the Runner's gem directory instead of its own. A project's own
+    # entrypoint selects its runtime and dependency location; these keys are not its declaration.
+    RUNNER_ACTIVATION = %w[GEM_HOME GEM_PATH RUBYOPT RUBYLIB BUNDLE_GEMFILE BUNDLE_BIN_PATH BUNDLE_PATH].freeze
+
     def self.run(argv, **kwargs) = new(**kwargs).run(argv)
+
+    # THE child environment for a project-owned command: `overrides` on top of the inherited
+    # environment, minus the Runner's activation. A nil value is a deletion, so this is an
+    # overlay for Process.spawn and never a change to this process's ENV. Opt-in by the callers
+    # that launch project work; every other command keeps the ordinary inheritance.
+    def self.project_env(overrides = {})
+      RUNNER_ACTIVATION.to_h { |key| [ key, nil ] }.merge(overrides.to_h.transform_keys(&:to_s))
+    end
 
     # `stop_check` (MVP-0036) is an OPTIONAL predicate polled while the child runs. When it
     # answers truthfully, the process group is ended through the same bounded TERM-then-KILL
@@ -89,7 +103,8 @@ module SpecrelayRunner
     def initialize(chdir:, env: {}, timeout_seconds: 1800, stdin_data: nil, on_output: nil,
                    stop_check: nil, on_start: nil)
       @chdir = chdir.to_s
-      @env = env.to_h.transform_keys(&:to_s).transform_values(&:to_s)
+      # nil survives normalization: Process.spawn unsets that key, where "" would leave it set.
+      @env = env.to_h.to_h { |key, value| [ key.to_s, value&.to_s ] }
       @timeout_seconds = timeout_seconds
       @stdin_data = stdin_data
       @on_output = on_output
