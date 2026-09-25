@@ -444,8 +444,10 @@ module SpecrelayRunner
       end)
     end
 
-    # One bound on a reported change set, wherever it was measured from.
-    def limit(files) = files.reject(&:empty?).uniq.first(500)
+    # One bound on a reported change set, wherever it was measured from. Sorted before the cap
+    # because git lists a new file in a different place once it is intent-to-add, and the same
+    # tree must measure as the same state.
+    def limit(files) = files.reject(&:empty?).uniq.sort.first(500)
 
     def rev_parse(path, ref)
       result = git(path, [ "rev-parse", ref ])
