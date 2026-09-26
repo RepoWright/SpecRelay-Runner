@@ -47,6 +47,7 @@ module PreviewWorkspace
       File.write(File.join(runs, "splittail.#{verb}"), tail)
     end
     def status!(document) = File.write(File.join(runs, "status.json"), JSON.generate(document))
+    def require_preview_owner! = File.write(File.join(runs, "require-preview-owner"), "1")
 
     # An environment the project already holds for somebody: another run, or — with an empty
     # `run_id` — a person.
@@ -138,12 +139,19 @@ module PreviewWorkspace
       fi
       case "$VERB" in
         create)
+          if [ -f "$RUNS/require-preview-owner" ] && [ -z "${SPECRELAY_PREVIEW_ID:-}" ]; then
+            echo "preview owner required" >&2
+            exit 1
+          fi
           mkdir -p "$RUNS/worktrees"
           git -C "$ROOT_DIR" worktree add -b "$TASK" "$WT" HEAD >/dev/null 2>&1 || exit 1
           for repo in $COMPONENTS; do
             git -C "$ROOT_DIR/$repo" worktree add -b "$TASK" "$WT/$repo" HEAD >/dev/null 2>&1 || exit 1
           done
           #{ProjectCommand.record_owner}
+          if [ -f "$RUNS/require-preview-owner" ]; then
+            printf '%s' "$SPECRELAY_PREVIEW_ID" > "$RUNS/preview-owner"
+          fi
           echo "created $WT"
           ;;
         up)
@@ -165,12 +173,20 @@ module PreviewWorkspace
             echo "unknown task environment '$TASK'" >&2
             exit 4
           fi
+          if [ -f "$RUNS/require-preview-owner" ]; then
+            [ -n "${SPECRELAY_PREVIEW_ID:-}" ] &&
+              [ "$(cat "$RUNS/preview-owner" 2>/dev/null)" = "$SPECRELAY_PREVIEW_ID" ] || {
+                echo "the preview does not own this worktree" >&2
+                exit 1
+              }
+          fi
           #{ProjectCommand.release_guard}
           for repo in $COMPONENTS; do
             git -C "$ROOT_DIR/$repo" worktree remove --force "$WT/$repo" >/dev/null 2>&1 || true
           done
           git -C "$ROOT_DIR" worktree remove --force "$WT" >/dev/null 2>&1 || true
           #{ProjectCommand.release_report(%(echo "released $TASK"))}
+          rm -f "$RUNS/preview-owner"
           ;;
         *)
           echo "usage: worktree create|up|status|release <task>" >&2

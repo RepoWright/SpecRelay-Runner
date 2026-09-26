@@ -114,6 +114,29 @@ class PreviewExecutionTest < Minitest::Test
     assert_equal [ REPO_A, REPO_B ], snapshots.first.map { |entry| entry["repository"] }
   end
 
+  def test_preview_owner_is_sent_to_the_project_for_create_and_release
+    @workspace.require_preview_owner!
+    preview = execution
+
+    assert_predicate preview.start, :available?
+    assert_equal "prv_abc", File.read(File.join(@workspace.runs, "preview-owner"))
+    assert_equal SpecrelayRunner::PreviewExecution::RELEASED, preview.release.state
+    refute File.exist?(File.join(@workspace.runs, "preview-owner"))
+  end
+
+  def test_a_preexisting_manual_worktree_is_not_used_or_released_by_a_preview
+    command = File.join(root, "bin", "worktree")
+    assert system(command, "create", TASK, chdir: root, out: File::NULL, err: File::NULL)
+    @workspace.require_preview_owner!
+
+    outcome = execution.start
+
+    assert_equal SpecrelayRunner::PreviewExecution::FAILED_CLEAN, outcome.state
+    refute outcome.cleanup_required?
+    assert File.directory?(task_root)
+    assert_equal [ "create #{TASK}" ], @workspace.invocations.map(&:last)
+  end
+
   # Steps 8-9 really happened: each repository sits at the resolved pull-request head on the
   # canonical branch, holding that head's content.
   def test_every_resolved_head_is_materialized_on_the_canonical_branch

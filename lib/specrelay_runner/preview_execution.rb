@@ -142,6 +142,8 @@ module SpecrelayRunner
     # owns invoking it once and LOCATING the result by asking git which worktree holds the
     # canonical branch, so no layout convention is needed here either.
     def create
+      return clean(WORKTREE_FAILED, "a worktree for #{task_id} already exists") if workspace.existing
+
       emit("#{PROJECT_COMMAND} create #{task_id}")
       workspace.create
     rescue Workspace::Error, SystemCallError => e
@@ -152,7 +154,8 @@ module SpecrelayRunner
       # No create command travels in a preview assignment: the project's own is the only authority
       # this lane accepts, and `project?` has already proved it exists.
       @workspace ||= Workspace.new(root: root, canonical_branch: assignment.canonical_branch,
-                                   create_command: "", task_id: task_id, on_output: @on_output)
+                                   create_command: "", task_id: task_id, env: preview_env,
+                                   on_output: @on_output)
     end
 
     # The one boundary that may prove creation never happened. Anything other than the documented
@@ -205,13 +208,17 @@ module SpecrelayRunner
     def project(verb, *flags)
       argv = [ File.join(root, PROJECT_COMMAND), verb, task_id, *flags ]
       emit([ PROJECT_COMMAND, verb, task_id, *flags ].join(" "))
-      CommandRunner.run(argv, chdir: root, env: {}, timeout_seconds: TIMEOUTS.fetch(verb),
+      CommandRunner.run(argv, chdir: root, env: (verb == "release" ? preview_env : {}),
+                        timeout_seconds: TIMEOUTS.fetch(verb),
                         on_output: @on_output, stop_check: (@stop_check if verb == "up"))
     rescue SystemCallError
       nil
     end
 
     def project? = File.executable?(File.join(root, PROJECT_COMMAND))
+
+    # The project records this identity on create and requires it again on release.
+    def preview_env = { "SPECRELAY_PREVIEW_ID" => assignment.preview_id }
 
     def released?(result) = result&.success? || result&.exit_code == UNKNOWN_ENVIRONMENT
 
