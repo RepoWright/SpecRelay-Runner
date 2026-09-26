@@ -157,6 +157,16 @@ class RepositorySelectionTest < Minitest::Test
     assert_match(/too long/i, read.error)
   end
 
+  def test_a_2000_character_argv_element_is_accepted
+    argument = "x" * 2_000
+    write(JSON.generate({ "repositories" => [ { "path" => "component-a", "commands" => [ [ "bin/test", argument ] ] } ] }))
+
+    result = read
+
+    assert result.ok?, result.error
+    assert_equal argument, result.entries.first.commands.first.last
+  end
+
   def test_an_entry_with_a_blank_or_missing_path_is_refused
     [ [ {} ], [ { "path" => "", "commands" => [] } ], [ { "path" => "   ", "commands" => [] } ],
       [ "component-a" ] ].each do |repositories|

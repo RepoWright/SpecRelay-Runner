@@ -36,7 +36,7 @@ module SpecrelayRunner
     MAX_ENTRIES = 50
     MAX_COMMANDS = 10
     MAX_ARGUMENTS = 20
-    MAX_ARGUMENT_LENGTH = 200
+    MAX_ARGUMENT_LENGTH = 2_000
     KEY = "repositories"
     PATH = "path"
     COMMANDS = "commands"
