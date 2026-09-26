@@ -240,20 +240,15 @@ no per-invocation configuration:
   therefore request `--print`, `--output-format stream-json` and `--verbose`; a list that does not
   is refused before the provider is launched, and writing no `args:` at all gets the supported
   default.
-- **The reviewed repository is resolved from at most two places:** the connected workspace root
-  itself, or one direct child named by the **repository segment** of the pinned key. Platform pins
-  `owner/repository`, so `RepoWright/tiny-demo-crm` is looked for at `<root>/tiny-demo-crm` — never
-  at a nested `<root>/RepoWright/tiny-demo-crm`. Exactly one of them must be a Git
-  repository *at its own top level* whose `origin` matches the assignment's clone URL by identity
-  (`host/owner/repo`). Both shapes are normal: a single-repository machine connects the
-  repository itself, while a project workspace holds its repositories as direct children.
-- **The child must be physically contained.** Its real path must have the real workspace root as
-  its parent, checked *before* git is asked anything about it, so a correctly named symlink cannot
-  select a repository outside the connected workspace. The configured root itself may still be
-  reached through a symlink. A child that resolves to nothing — absent, or a broken link — is
-  simply not a location and produces the ordinary refusal.
-- **Nothing else is ever inspected** — no parent, sibling, grandchild, registry, or search — and
-  a directory's name is never taken as repository identity.
+- **The reviewed repository is resolved from three anchored places:** the connected workspace
+  root, its direct child named by the repository segment of the pinned `owner/repository` key,
+  or `repositories/<repository>` under that root. Exactly one must be a Git repository at its
+  own top level whose `origin` matches the pinned clone URL by `host/owner/repo` identity.
+- **Derived paths must be physically contained.** Each child must resolve directly under its
+  parent before Git inspects it. A symlink to a repository outside the connected workspace is
+  refused; the configured root itself may still be reached through a symlink.
+- **Nothing else is inspected** — no arbitrary parent, sibling, grandchild, registry, or search.
+  A directory name alone never establishes repository identity.
 - **It fails closed.** No match, more than one match, a different remote, a missing pinned
   commit, or an unreadable remote head all refuse *before* a reviewer is launched, and are
   reported to Platform as a retryable failed attempt rather than a verdict. A head that moved on

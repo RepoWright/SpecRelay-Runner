@@ -83,8 +83,8 @@ class ReviewFlowTest < Minitest::Test
 
   # --- resolving the reviewed repository (MAPIAI-91) ------------------------
   #
-  # Exactly two locations are allowed: the configured workspace root itself, and its direct
-  # `repository_key` child. A guided connection stores the validated CHECKOUT as its root, so
+  # The configured root, its named direct child and its canonical repositories child are allowed.
+  # A guided connection stores the validated CHECKOUT as its root, so
   # unconditionally appending the key produced a duplicated, nonexistent path and refused every
   # review on a single-repository machine (MAPIAI-82).
 
@@ -142,8 +142,8 @@ class ReviewFlowTest < Minitest::Test
 
   # `git rev-parse` walks UPWARD, so a plain subdirectory of a clone answers for that clone. A
   # candidate must therefore be the repository's own top level: a matching repository in a parent
-  # — or in a grandchild, or a sibling — is not one of the two allowed locations.
-  def test_a_matching_repository_outside_the_two_allowed_locations_is_refused
+  # — or in an arbitrary grandchild or sibling — is not one of the anchored locations.
+  def test_a_matching_repository_outside_the_anchored_locations_is_refused
     @actual_head = build_repo_at(@root, remote: "https://github.com/SpecRelay/tiny-demo-workspace.git")
     nested = File.join(@root, "nested")
     FileUtils.mkdir_p(File.join(nested, "specrelay-platform", "inner"))
@@ -156,8 +156,8 @@ class ReviewFlowTest < Minitest::Test
     assert_includes result.reason, "no local checkout"
   end
 
-  # Not merely "the right answer": the two allowed locations are the ONLY paths git is asked
-  # about, so no parent, sibling, grandchild or registry can influence the result.
+  # With no repositories directory, only the root and named direct child reach git.
+  # No parent, sibling, arbitrary grandchild or registry can influence the result.
   def test_verification_inspects_only_the_workspace_root_and_its_direct_child
     build_repo
     recorder = RecordingGit.new
@@ -222,6 +222,79 @@ class ReviewFlowTest < Minitest::Test
 
     assert verified.ok?, verified.reason
     assert_equal File.join(@root, "tiny-demo-crm"), verified.roots["RepoWright/tiny-demo-crm"]
+  end
+
+  def test_a_canonical_repositories_child_reaches_the_reviewer_with_the_workspace_root
+    workspace = pin_repository("tiny-demo-workspace", at: @root)
+    nested = File.join(@root, "repositories", "tiny-demo-crm")
+    crm = pin_repository("tiny-demo-crm", at: nested)
+    capture = File.join(@root, "launched.txt")
+
+    result = run_review(command: reviewer_script(%({"outcome":"ACCEPT","summary":"Read the diff."}),
+                                                 capture: capture),
+                        payload: review_payload.merge("repositories" => [ workspace, crm ]))
+
+    assert result.success?, result.message
+    assert File.exist?(capture), "the reviewer must launch after both repository pins verify"
+    assert_equal "ACCEPT", @platform.last_review["outcome"]
+  end
+
+  def test_a_canonical_repositories_child_with_the_wrong_remote_is_refused
+    nested = File.join(@root, "repositories", "tiny-demo-crm")
+    head = build_repo_at(nested, remote: "https://github.com/someone-else/other.git")
+    expected = repository_entry("RepoWright/tiny-demo-crm",
+                                "https://github.com/RepoWright/tiny-demo-crm.git", head)
+
+    result = verify_repositories([ expected ])
+
+    refute result.ok?
+    assert_includes result.reason, "different remote"
+  end
+
+  def test_a_canonical_repositories_child_symlinked_outside_never_reaches_git
+    outside = File.join(@remotes, "outside-workspace", "tiny-demo-crm")
+    crm = pin_repository("tiny-demo-crm", at: outside)
+    FileUtils.mkdir_p(File.join(@root, "repositories"))
+    link = File.join(@root, "repositories", "tiny-demo-crm")
+    File.symlink(outside, link)
+    recorder = RecordingGit.new
+
+    result = SpecrelayRunner::Review::Checkout.verify(
+      assignment: SpecrelayRunner::Review::Assignment.new(
+        review_payload.merge("repositories" => [ crm ])
+      ), workspace_root: @root, git: recorder
+    )
+
+    refute result.ok?
+    assert_equal [ @root ], recorder.roots.uniq
+    refute_includes recorder.roots, link
+  end
+
+  def test_a_canonical_repositories_directory_symlinked_outside_never_reaches_git
+    outside = File.join(@remotes, "outside-workspace")
+    crm = pin_repository("tiny-demo-crm", at: File.join(outside, "tiny-demo-crm"))
+    File.symlink(outside, File.join(@root, "repositories"))
+    recorder = RecordingGit.new
+
+    result = SpecrelayRunner::Review::Checkout.verify(
+      assignment: SpecrelayRunner::Review::Assignment.new(
+        review_payload.merge("repositories" => [ crm ])
+      ), workspace_root: @root, git: recorder
+    )
+
+    refute result.ok?
+    assert_equal [ @root ], recorder.roots.uniq
+  end
+
+  def test_a_direct_and_canonical_repositories_child_with_the_same_remote_are_ambiguous
+    remote = "https://github.com/RepoWright/tiny-demo-crm.git"
+    head = build_repo_at(File.join(@root, "tiny-demo-crm"), remote: remote)
+    build_repo_at(File.join(@root, "repositories", "tiny-demo-crm"), remote: remote)
+
+    result = verify_repositories([ repository_entry("RepoWright/tiny-demo-crm", remote, head) ])
+
+    refute result.ok?
+    assert_includes result.reason, "ambiguous"
   end
 
   # The whole MAPIAI-95 layout in one assignment. Each key keeps its own selected root, and
@@ -299,9 +372,9 @@ class ReviewFlowTest < Minitest::Test
     assert_includes result.reason, "its 'tiny-demo-crm' directory"
   end
 
-  # Not merely the right answer: for EVERY repository the only paths git is asked about are the
-  # workspace root and the one direct child named by the repository segment, and only when that
-  # child physically is one. The nested owner-qualified path is never among them, and set equality
+  # With no repositories directory in this fixture, git sees the root and the direct child
+  # named by the repository segment, only when that child physically exists. The nested
+  # owner-qualified path is never among them, and set equality
   # excludes parents, siblings and grandchildren. The workspace repository IS the root here, so
   # `<root>/tiny-demo-workspace` does not exist and there is no second location to ask about.
   def test_only_the_root_and_the_repository_name_child_are_inspected_for_each_repository
@@ -790,7 +863,7 @@ class ReviewFlowTest < Minitest::Test
     )
   end
 
-  # The workspace root itself, or one of its direct children — the only two anchored locations.
+  # This fixture has no canonical repositories directory, so only these locations are inspected.
   def contained_location?(path) = path == @root || File.dirname(path) == @root
 
   def verify(workspace_root)
