@@ -242,6 +242,19 @@ class PreviewSessionTest < Minitest::Test
     assert client.beats.empty?, "a release assignment started a heartbeater"
   end
 
+  def test_a_reconnected_preview_releases_only_with_its_original_owner
+    @workspace.require_preview_owner!
+    command = File.join(@workspace.root, "bin", "worktree")
+    assert system({ "SPECRELAY_PREVIEW_ID" => "prv_abc" }, command, "create", TASK,
+                  chdir: @workspace.root, out: File::NULL, err: File::NULL)
+    client = FakeClient.new
+
+    assert session(client, release_payload), @io.string
+
+    assert_equal [ "released" ], client.results.map { |result| result[:kind] }
+    refute File.directory?(File.join(@workspace.runs, "worktrees", TASK))
+  end
+
   # An honest report is a successful claim. The obligation persists on Platform and the identical
   # assignment returns on the next poll, so there is nothing for this process to retry.
   def test_a_refused_release_is_reported_and_still_exits_zero
