@@ -30,7 +30,7 @@ class SpecificationProviderPropagationTest < Minitest::Test
     "provider" => "claude", "command" => "claude", "mode" => "print",
     "args" => [ "--print", "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions" ],
     "prompt_delivery" => "argument",
-    "timeout_seconds" => 1800, "env" => {}
+    "timeout_seconds" => 3600, "env" => {}
   }.freeze
 
   CODEX_PROFILE = {

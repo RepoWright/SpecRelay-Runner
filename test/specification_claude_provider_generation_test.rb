@@ -157,6 +157,16 @@ class SpecificationClaudeProviderGenerationTest < Minitest::Test
                 "only PATH, HOME and the profile's own extra_env travel — never an unrelated variable")
   end
 
+  # The specification writer shares the exact implementation profile, and with it the approved
+  # 3,600-second process limit.
+  def test_the_approved_profile_bounds_the_specification_writer_at_3600_seconds
+    profile = SpecrelayRunner::ImplementationProfile.for(SpecrelayRunner::ImplementationProfile.canonical("claude"))
+
+    _documents, runner = generate({ "issue_key" => "SR-700" }, profile: profile)
+
+    assert_equal 3600, runner.calls.fetch(0).timeout_seconds
+  end
+
   # MVP-0028 remediation, defect 3 — the prompt must actually name the new required key and the
   # D3 synthesis rules the live MAPIAI-52 package violated, or a real model has no way to know
   # this runner's document contract changed.

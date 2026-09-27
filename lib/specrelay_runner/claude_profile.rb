@@ -198,6 +198,10 @@ module SpecrelayRunner
     # Mirrors Executor's fallback so `identity` compares effective values.
     DEFAULT_TIMEOUT_SECONDS = 1800
 
+    # The approved process limit for implementation and specification writing. It is stated in the
+    # canonical profile rather than left to a fallback, so a claim must carry exactly this value.
+    APPROVED_TIMEOUT_SECONDS = 3600
+
     # The ONE approved Claude invocation, assembled from this profile's own constants so the
     # canonical identity and the validation rules below cannot describe different things. It is the
     # exact hash Platform stores and serves; {ImplementationProfile} compares a claimed payload
@@ -205,7 +209,7 @@ module SpecrelayRunner
     CANONICAL_ARGS = [ PRINT_FLAGS.first, "--output-format", STREAM_FORMAT, "--verbose", PERMISSION_FLAG ].freeze
     CANONICAL = {
       "provider" => PROVIDER, "command" => EXECUTABLE, "mode" => MODE, "args" => CANONICAL_ARGS,
-      "prompt_delivery" => PROMPT_DELIVERY, "timeout_seconds" => DEFAULT_TIMEOUT_SECONDS, "env" => {}
+      "prompt_delivery" => PROMPT_DELIVERY, "timeout_seconds" => APPROVED_TIMEOUT_SECONDS, "env" => {}
     }.freeze
 
     # Labels for the identity tuple, so a mismatch names the dimension that differed
