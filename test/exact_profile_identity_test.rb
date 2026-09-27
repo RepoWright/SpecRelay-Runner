@@ -81,6 +81,12 @@ class ExactProfileIdentityTest < Minitest::Test
     "prompt_delivery" => "stdin", "timeout_seconds" => 1800, "env" => {}
   }.freeze
 
+  CLAUDE = {
+    "provider" => "claude", "command" => "claude", "mode" => "print",
+    "args" => %w[--print --output-format stream-json --verbose --dangerously-skip-permissions],
+    "prompt_delivery" => "argument", "timeout_seconds" => 3600, "env" => {}
+  }.freeze
+
   # Every dimension is restated here rather than read from the production constant, so this file is
   # an independent statement of what Platform serves rather than a mirror of what the runner holds.
   # The environment is the one exception: its edit instruction is a long JSON document whose
@@ -176,6 +182,26 @@ class ExactProfileIdentityTest < Minitest::Test
     refuses(CODEX.merge("provider" => "some-other-agent", "command" => marker_executable("unknown")))
   end
 
+  # --- the Claude limit is part of the exact identity -------------------------
+
+  # The former 1,800-second limit is no longer the approved profile. The marker stands behind the
+  # approved bare name on the child PATH, so accepting the old value would leave evidence.
+  def test_the_former_claude_limit_is_refused_before_anything_runs
+    marker_executable("claude")
+    refuses(CLAUDE.merge("timeout_seconds" => 1800), path: "#{@scratch}:#{ENV['PATH']}")
+  end
+
+  def test_a_forged_claude_limit_is_refused_before_anything_runs
+    marker_executable("claude")
+    refuses(CLAUDE.merge("timeout_seconds" => 3601), path: "#{@scratch}:#{ENV['PATH']}")
+  end
+
+  def test_the_claude_limit_written_as_a_string_is_refused
+    assert_raises(SpecrelayRunner::ImplementationProfile::Error) do
+      SpecrelayRunner::ImplementationProfile.for(CLAUDE.merge("timeout_seconds" => "3600"))
+    end
+  end
+
   # --- F1 as a unit: the resolver is the one authority ------------------------
 
   def test_the_resolver_refuses_a_noncanonical_fixture
@@ -198,5 +224,10 @@ class ExactProfileIdentityTest < Minitest::Test
   # cross-repository contract check that does not require Platform to be running.
   def test_the_canonical_codex_identity_is_the_audited_invocation
     assert_equal CODEX, SpecrelayRunner::ImplementationProfile.canonical("codex")
+  end
+
+  def test_the_canonical_claude_identity_is_the_audited_invocation
+    assert_equal CLAUDE, SpecrelayRunner::ImplementationProfile.canonical("claude")
+    assert_equal 3600, SpecrelayRunner::ImplementationProfile.for(CLAUDE).timeout_seconds
   end
 end

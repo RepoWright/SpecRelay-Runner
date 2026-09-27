@@ -339,6 +339,11 @@ class ClaudeProfileTest < Minitest::Test
     assert_nil selected.mismatch_reason(bare.merge("timeout_seconds" => 1800), env: NO_PATH)
   end
 
+  # The reviewer is configured on its own and keeps its own limit when the Claude profile's limit changes.
+  def test_the_reviewer_keeps_its_own_1800_second_limit
+    assert_equal 1800, SpecrelayRunner::Review::Settings.new({ "provider" => "claude" }, env: {}).timeout_seconds
+  end
+
   # The identity is what the guard compares; it must carry every launch-deciding
   # dimension, not a subset.
   def test_identity_covers_every_launch_deciding_dimension

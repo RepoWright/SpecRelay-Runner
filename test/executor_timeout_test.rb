@@ -7,8 +7,8 @@ require_relative "test_helper"
 #
 # This proof used to live in real_executor_flow_test.rb, driven by a claimed payload carrying a
 # two-second timeout. Once a claimed profile had to be EXACT, a payload could no longer shorten the
-# approved 1800-second timeout — so provoking it through the whole flow would mean waiting half an
-# hour. It is exercised here at the boundary that actually owns the timeout instead. What the flow
+# approved provider timeout — so provoking it through the whole flow would mean waiting half an
+# hour or more. It is exercised here at the boundary that actually owns the timeout instead. What the flow
 # added on top was the CLASSIFICATION, which claude_profile_test.rb and codex_profile_test.rb prove
 # against this same `timed_out` result.
 class ExecutorTimeoutTest < Minitest::Test
@@ -61,6 +61,54 @@ class ExecutorTimeoutTest < Minitest::Test
     refute result.timed_out
     refute_nil result.launch_error
     refute result.success?
+  end
+
+  # --- the approved Claude process limit ---------------------------------------
+
+  CLAUDE = SpecrelayRunner::ImplementationProfile.canonical("claude")
+
+  # The implementation executor hands CommandRunner the exact profile's limit.
+  def test_the_claude_implementation_executor_is_bounded_at_3600_seconds
+    captured = nil
+    original = SpecrelayRunner::CommandRunner.method(:run)
+    SpecrelayRunner::CommandRunner.define_singleton_method(:run) do |_argv, **options|
+      captured = options[:timeout_seconds]
+      SpecrelayRunner::CommandRunner::Result.new(exit_code: 0, stdout: "", stderr: "", duration_seconds: 0.0,
+                                                 timed_out: false)
+    end
+
+    SpecrelayRunner::Executor.new(config: CLAUDE, worktree_path: @worktree, staging_dir: @staging,
+                                  env: { "PATH" => "#{@bin}:/usr/bin:/bin" }).run("the prompt")
+
+    assert_equal 3600, captured
+  ensure
+    SpecrelayRunner::CommandRunner.define_singleton_method(:run, original)
+  end
+
+  # A runner whose clock jumps `skew` seconds once the deadline has been set, so a real child is
+  # judged against the 3,600-second limit without a real hour's wait.
+  def skewed_runner(skew)
+    runner = SpecrelayRunner::CommandRunner.new(chdir: @worktree, env: { "PATH" => "/usr/bin:/bin" },
+                                                timeout_seconds: SpecrelayRunner::ImplementationProfile.for(CLAUDE).timeout_seconds)
+    calls = 0
+    runner.define_singleton_method(:monotonic) do
+      calls += 1
+      Process.clock_gettime(Process::CLOCK_MONOTONIC) + (calls > 2 ? skew : 0)
+    end
+    runner
+  end
+
+  def test_a_claude_child_finishing_before_3600_seconds_is_not_killed
+    result = skewed_runner(3595).run([ "/bin/sh", "-c", "exit 0" ])
+
+    refute result.timed_out
+    assert_equal 0, result.exit_code
+  end
+
+  def test_a_claude_child_still_running_at_3600_seconds_is_terminated
+    result = skewed_runner(3600).run([ "/bin/sh", "-c", "sleep 600" ])
+
+    assert result.timed_out
   end
 
   # The timeout is bounded by the profile's own value, so a child well inside it is untouched.

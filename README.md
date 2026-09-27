@@ -1034,7 +1034,7 @@ is no plugin registry, no auto-detection and no fallback from one provider to an
 
 | Provider | Command | Invocation | Prompt | Timeout |
 | --- | --- | --- | --- | --- |
-| `claude` | `claude` | `--print --output-format stream-json --verbose --dangerously-skip-permissions` | one argv element | 1800s |
+| `claude` | `claude` | `--print --output-format stream-json --verbose --dangerously-skip-permissions` | one argv element | 3600s |
 | `codex` | `codex` | `exec --json --ephemeral --dangerously-bypass-approvals-and-sandbox` | stdin | 1800s |
 | `fake` | `specrelay-fake-executor` | none | prompt file path | 120s |
 

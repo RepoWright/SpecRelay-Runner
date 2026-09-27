@@ -435,8 +435,8 @@ class RealExecutorFlowTest < Minitest::Test
   end
 
   # The wall-clock timeout proof moved to executor_timeout_test.rb when the claimed profile became
-  # EXACT: a payload may no longer shorten the approved 1800-second timeout, so a flow-level timeout
-  # can no longer be provoked without waiting half an hour. The mechanism (real Timeout, real
+  # EXACT: a payload may no longer shorten the approved provider timeout, so a flow-level timeout
+  # can no longer be provoked without waiting half an hour or more. The mechanism (real Timeout, real
   # process-group kill, `timed_out` result) is proven there against a real hanging process, and the
   # classification it produces is proven in claude_profile_test.rb and codex_profile_test.rb.
 
