@@ -72,7 +72,8 @@ module SpecrelayRunner
         "evidence/stdout.log" => Redaction.redact(executor.stdout.to_s),
         "evidence/stderr.log" => Redaction.redact(executor.stderr.to_s),
         "evidence/verification.log" => verification_log,
-        "evidence/diff.txt" => changes.diff.to_s,
+        # Only this uploaded copy is redacted; the commit and pull request keep the reviewed code.
+        "evidence/diff.txt" => Redaction.redact(changes.diff.to_s),
         "evidence/summary.md" => readme
       }
     end

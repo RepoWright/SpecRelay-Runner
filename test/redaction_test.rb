@@ -80,6 +80,17 @@ class RedactionTest < Minitest::Test
     end
   end
 
+  # Platform's report import rejects a labelled secret key, so the uploaded copy must not carry one.
+  def test_labelled_secret_keys_are_redacted
+    [ "secret_key = synthetic-fixture-value",
+      "secret-key: synthetic-fixture-value",
+      "SECRET_KEY=synthetic-fixture-value",
+      "AWS_SECRET_KEY: synthetic-fixture-value" ].each do |line|
+      assert_equal "[REDACTED]", R.redact(line), line
+    end
+    assert_equal "the secret key was rotated", R.redact("the secret key was rotated")
+  end
+
   def test_private_key_body_is_redacted_not_just_its_header
     pem = <<~KEY
       -----BEGIN OPENSSH PRIVATE KEY-----
