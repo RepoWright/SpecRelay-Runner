@@ -32,7 +32,7 @@ module SpecrelayRunner
       # Labelled secrets. The trailing-word form deliberately allows a prefix so
       # CI_JOB_TOKEN= and GITHUB_TOKEN= match: a \b before "token" does not, because the
       # underscore is a word character (review-003 finding 3).
-      /\b[A-Za-z0-9_]*(?:secret|token|password|passwd|api[_-]?key|access[_-]?key)\s*[:=]\s*\S+/i,
+      /\b[A-Za-z0-9_]*(?:secret[_-]?key|secret|token|password|passwd|api[_-]?key|access[_-]?key)\s*[:=]\s*\S+/i,
       /\bbearer\s+[A-Za-z0-9._\-]{8,}\b/i,
       # The other Authorization scheme, where the base64 blob IS the credential. `git` and
       # `gh` both echo request headers under GIT_CURL_VERBOSE / GH_DEBUG=api, and no pattern

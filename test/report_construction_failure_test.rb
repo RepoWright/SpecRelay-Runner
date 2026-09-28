@@ -555,9 +555,10 @@ class ReportConstructionFailureTest < Minitest::Test
   def inject_measurement_failure(message)
     fired = false
     # The executor's CHANGE measurement, not the pre-provider inventory of the prepared inputs,
-    # which asks for every untracked file and is not the path under test here.
+    # which asks git for the same status and is not the path under test here.
     guard = lambda do |argv|
-      argv.first == "git" && argv.include?("status") && !argv.include?("--untracked-files=all") && !fired
+      argv.first == "git" && argv.include?("status") && !fired &&
+        caller_locations.any? { |location| location.label.end_with?("capture_changes") }
     end
     SpecrelayRunner::CommandRunner.class_eval do
       alias_method :spawn_process_without_injection, :spawn_process

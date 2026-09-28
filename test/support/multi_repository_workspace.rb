@@ -118,6 +118,7 @@ module MultiRepositoryWorkspace
       #!/usr/bin/env ruby
       # frozen_string_literal: true
       require "json"
+      require "fileutils"
 
       prompt = ARGV.last.to_s
       prompt = File.read(prompt) if File.file?(prompt)
@@ -140,6 +141,7 @@ module MultiRepositoryWorkspace
         puts "[multi-executor] edited #{relative}"
       end
       ENV.fetch("FAKE_EXECUTOR_ADDED", "").split(",").reject(&:empty?).each do |added|
+        FileUtils.mkdir_p(File.dirname(added))
         File.write(added, "added by the executor\n")
         puts "[multi-executor] added #{added}"
       end

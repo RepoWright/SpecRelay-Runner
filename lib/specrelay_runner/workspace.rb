@@ -173,8 +173,11 @@ module SpecrelayRunner
     # and an EMPTY file list, and the caller decides: truthful on the failure path,
     # fatal on the success path. Returning a bare empty list here is what let a
     # single transient spawn error be announced to Jira as "no code changes".
+    #
+    # Untracked files are listed one by one: by default git collapses a new directory into one
+    # entry until intent-to-add, so the same tree would measure differently the second time.
     def capture_changes(path)
-      status = git(path, %w[status --porcelain])
+      status = git(path, %w[status --porcelain --untracked-files=all])
       return unmeasured("git status failed: #{first_line(status.stderr, status.stdout)}") unless status.success?
 
       git(path, %w[add -A -N])

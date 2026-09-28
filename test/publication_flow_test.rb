@@ -812,11 +812,11 @@ class PublicationFlowTest < Minitest::Test
   def inject_emfile_on_first_spawn
     fired = false
     # The CHANGE-DETECTION status, not the read that reports the prepared heads: both ask git for
-    # status, and only the first is the measurement this test exhausts. They are told apart by
-    # `--untracked-files=all`, which only the evidence read passes.
+    # the same status, and only the first is the measurement this test exhausts. They are told
+    # apart by the caller.
     guard = ->(argv) {
-      argv.first == "git" && argv.include?("status") &&
-        !argv.include?("--untracked-files=all") && !fired
+      argv.first == "git" && argv.include?("status") && !fired &&
+        caller_locations.any? { |location| location.label.end_with?("capture_changes") }
     }
     SpecrelayRunner::CommandRunner.class_eval do
       alias_method :spawn_process_without_injection, :spawn_process
