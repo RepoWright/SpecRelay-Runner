@@ -81,7 +81,25 @@ module SpecrelayRunner
       return file if file.flock(File::LOCK_EX | File::LOCK_NB)
 
       file.close
-      raise Busy, BUSY_MESSAGE
+      raise Busy, busy_message
+    end
+
+    def busy_message
+      pid = lock_holder_pid
+      return BUSY_MESSAGE unless pid
+
+      "another SpecRelay runner session is already running on this machine (PID #{pid}). " \
+        "To stop it, run:\n  kill -CONT #{pid}\n  kill -TERM #{pid}\nThen start this one."
+    end
+
+    # The lock file stays empty, so this also identifies a session started before this version.
+    # An ambiguous or unavailable OS lookup keeps the existing refusal without guessing a PID.
+    def lock_holder_pid
+      output = IO.popen([ "lsof", "-nP", "-t", "--", path ], err: File::NULL, &:read)
+      pids = output.lines.map(&:strip).uniq
+      pids.first if pids.length == 1 && pids.first.match?(/\A[1-9]\d*\z/)
+    rescue Errno::ENOENT, IOError, SystemCallError
+      nil
     end
 
     def open_lock_file

@@ -119,19 +119,43 @@ class SessionExclusionTest < Minitest::Test
   # --- the CLI's two execution entry points ---------------------------------
 
   def test_loop_is_refused_while_a_session_is_held
-    out, err, status = with_held_session { run_cli([ "loop" ]) }
+    holder_pid = nil
+    out, err, status = with_held_session do |holder|
+      holder_pid = holder[:pid]
+      run_cli([ "loop" ])
+    end
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, status
     assert_match(/already running/i, err)
+    assert_includes err, "kill -CONT #{holder_pid}"
+    assert_includes err, "kill -TERM #{holder_pid}"
     # Nothing about the refused invocation reached the connection or the provider.
     assert_equal "", out
   end
 
   def test_claim_once_is_refused_while_a_session_is_held
-    _out, err, status = with_held_session { run_cli([ "claim-once" ]) }
+    holder_pid = nil
+    _out, err, status = with_held_session do |holder|
+      holder_pid = holder[:pid]
+      run_cli([ "claim-once" ])
+    end
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, status
     assert_match(/already running/i, err)
+    assert_includes err, "kill -CONT #{holder_pid}"
+    assert_includes err, "kill -TERM #{holder_pid}"
+  end
+
+  def test_a_second_process_with_the_lock_file_open_does_not_get_a_kill_suggestion
+    with_held_session do
+      File.open(SpecrelayRunner::SessionLock.path(env: env), "r") do
+        _out, err, status = run_cli([ "loop" ])
+
+        assert_equal SpecrelayRunner::CLI::RUN_FAILED, status
+        assert_match(/already running/i, err)
+        refute_match(/kill -/, err)
+      end
+    end
   end
 
   # The refusal must beat the resolution that would otherwise complain about something else
@@ -330,7 +354,7 @@ class SessionExclusionTest < Minitest::Test
     started = File.join(@home, "holder-started")
     holder = spawn_holder(started)
     wait_for { File.exist?(started) }
-    yield
+    yield holder
   ensure
     release_holder(holder)
   end
