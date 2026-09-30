@@ -73,24 +73,26 @@ class MultiRepositoryContinuationTest < Minitest::Test
   # `fixture_env` is the environment the double runs under on this host, installed behind the
   # approved bare name on the child PATH. The assignment itself is always the canonical fixture
   # profile, environment included.
-  def start(rework: nil, restart: nil, executor: nil, fixture_env: {}, seed: nil)
+  def start(rework: nil, restart: nil, executor: nil, fixture_env: {}, seed: nil, fail_view_for: nil)
     use_fixture(fixture_dir, executor || @built.executor,
                 env: { "FAKE_EXECUTOR_EDITED" => ".,component-a" }.merge(fixture_env))
     payload = claim_payload_for(task_id: TASK, root: @root,
                                 specification_repository: "component-c",
                                 publication: {}, rework: rework, restart: restart)
     @platform = FakePlatform.new(claim_payload: payload).start
-    @gh_dir, @gh_log, = FakeGithub.gh_bin(urls: PR_URLS, bares: @bares, seed: seed || open_pull_requests)
+    @gh_dir, @gh_log, = FakeGithub.gh_bin(fail_view_for: fail_view_for, urls: PR_URLS, bares: @bares,
+                                          seed: seed || open_pull_requests)
     @config_path = write_config
     payload
   end
 
   # Both continued pull requests, already open on their own repository's branch, so publication
   # reuse is proven rather than assumed.
-  def open_pull_requests
+  def open_pull_requests(child: {})
     [ WORKSPACE_SLUG, CHILD_SLUG ].map do |slug|
-      { "url" => PR_URLS.fetch(slug), "state" => "OPEN", "headRefName" => BRANCH,
-        "repo" => slug, "headRefOid" => "live" }
+      row = { "url" => PR_URLS.fetch(slug), "state" => "OPEN", "headRefName" => BRANCH,
+              "repo" => slug, "headRefOid" => "live" }
+      slug == CHILD_SLUG ? row.merge(child) : row
     end
   end
 
@@ -391,20 +393,28 @@ class MultiRepositoryContinuationTest < Minitest::Test
   #   :unspawnable — raises SystemCallError, which is what an absent or unexecutable git does and
   #                  what the runner's own `run` wrappers turn into the `nil` result under test
   #   :nonzero     — git ran and refused
+  #   :timed_out   — killed at the timeout before answering: no exit status and no output
+  #   :timed_out_exit_1 — killed at the timeout, with a status of 1 that is not an answer
+  #   :timed_out_after_running — the real command ran and printed its real output, but the result
+  #                  is a timeout with no exit status, so output alone must not count as success
   #
-  # `only_under` narrows the interception to one checkout, so a failure can be aimed at the second
-  # repository of a set rather than the first.
+  # `subcommand` is one argument or several that must all appear. `only_under` narrows the
+  # interception to one checkout, so a failure can be aimed at the second repository of a set
+  # rather than the first.
   def with_failing_git(subcommand, mode, only_under: nil)
     singleton = SpecrelayRunner::CommandRunner.singleton_class
     singleton.send(:alias_method, :run_without_git_stub, :run)
     singleton.send(:define_method, :run) do |argv, **kwargs|
-      targeted = argv.first == "git" && argv.include?(subcommand) &&
+      targeted = argv.first == "git" && Array(subcommand).all? { |arg| argv.include?(arg) } &&
                  (only_under.nil? || argv[argv.index("-C") + 1].to_s.end_with?(only_under))
       next send(:run_without_git_stub, argv, **kwargs) unless targeted
       raise Errno::ENOENT, "git" if mode == :unspawnable
 
-      SpecrelayRunner::CommandRunner::Result.new(exit_code: 1, stdout: "", stderr: "fatal: #{subcommand} refused",
-                                                 duration_seconds: 0, timed_out: false)
+      real = send(:run_without_git_stub, argv, **kwargs) if mode == :timed_out_after_running
+      SpecrelayRunner::CommandRunner::Result.new(
+        exit_code: { nonzero: 1, timed_out_exit_1: 1 }[mode], stdout: real&.stdout.to_s,
+        stderr: "fatal: #{Array(subcommand).join(' ')} refused", duration_seconds: 0, timed_out: mode != :nonzero
+      )
     end
     yield
   ensure
@@ -496,6 +506,14 @@ class MultiRepositoryContinuationTest < Minitest::Test
     refute_includes File.read(prompt_path), "Change request"
   end
 
+  # Only a REVIEW round proves its pull requests; a replacement run's behaviour is unchanged.
+  def test_a_replacement_run_does_not_refuse_on_its_pull_request_state
+    start(restart: { "repositories" => both_targets }, executor: observing_executor,
+          seed: open_pull_requests(child: { "state" => "CLOSED" }))
+    code, output = run_cli
+    assert_equal SpecrelayRunner::CLI::SUCCESS, code, output
+  end
+
   def test_a_replacement_whose_second_recorded_head_moved_refuses_the_whole_continuation
     start(restart: { "repositories" => [ recorded_repository(WORKSPACE_SLUG),
                                          recorded_repository(CHILD_SLUG, head_commit: "b" * 40) ] },
@@ -507,6 +525,280 @@ class MultiRepositoryContinuationTest < Minitest::Test
     assert_includes output, "recorded", "a restart refusal names a recorded target, not a reviewed one"
     refute_equal @recorded.fetch(WORKSPACE_SLUG), head_of(WORKSPACE_SLUG)
     assert_zero_external_effect(output)
+  end
+
+  # --- a review round after the first environment was released ---------------
+  #
+  # The environment this claim builds is NEW, and the project command prepares its components
+  # detached at their base. That checkout is run-owned and holds nothing, so once every target is
+  # proved it is put on the reviewed branch and head. A REUSED detached checkout still refuses
+  # (see above): nothing proves why it is detached.
+
+  def test_a_new_environment_places_a_detached_child_on_the_reviewed_branch_and_head
+    detach_components_on_create
+    start(rework: { "repositories" => both_targets }, executor: observing_executor)
+    code, output = run_cli
+    assert_equal SpecrelayRunner::CLI::SUCCESS, code, output
+
+    observed = YAML.safe_load(File.read(observed_path))
+    assert_equal @recorded.fetch(WORKSPACE_SLUG), observed.fetch("workspace_head")
+    assert_equal @recorded.fetch(CHILD_SLUG), observed.fetch("child_head")
+    assert_equal BRANCH, observed.fetch("child_branch")
+    assert_includes change_request_section, "The edit is not idempotent."
+  end
+
+  # The same machine: the shared clone still has the task branch at the reviewed head.
+  def test_a_local_branch_already_at_the_reviewed_head_is_reused
+    detach_components_on_create
+    local_branch(CHILD_SLUG, @recorded.fetch(CHILD_SLUG))
+    start(rework: { "repositories" => both_targets }, executor: observing_executor)
+    code, output = run_cli
+    assert_equal SpecrelayRunner::CLI::SUCCESS, code, output
+
+    observed = YAML.safe_load(File.read(observed_path))
+    assert_equal @recorded.fetch(CHILD_SLUG), observed.fetch("child_head")
+    assert_equal BRANCH, observed.fetch("child_branch")
+  end
+
+  # An existing branch anywhere but the exact reviewed head is never moved — ahead or behind.
+  def test_a_local_branch_with_unpublished_commits_refuses_and_is_not_moved
+    detach_components_on_create
+    unpublished = local_branch(CHILD_SLUG, @recorded.fetch(CHILD_SLUG), extra_commit: true)
+    assert_local_branch_refused(unpublished)
+  end
+
+  def test_a_local_branch_behind_the_reviewed_head_refuses_and_is_not_moved
+    detach_components_on_create
+    behind = local_branch(CHILD_SLUG, git(checkout_of(CHILD_SLUG), "rev-parse", "HEAD").strip)
+    assert_local_branch_refused(behind)
+  end
+
+  def assert_local_branch_refused(local_head)
+    start(rework: { "repositories" => both_targets }, executor: observing_executor)
+    code, output = run_cli
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, code, output
+    assert_includes output, "local branch '#{BRANCH}' of 'component-a' is not at the reviewed head"
+    assert_equal local_head, local_branch_head(CHILD_SLUG), "the existing branch was not moved"
+    assert_untouched_new_environment
+    assert_zero_external_effect(output)
+  end
+
+  # The branch changes AFTER it was proved and before it is placed. Selecting an existing branch
+  # is confirmed afterwards; creating one refuses when a branch appeared in the meantime.
+  def test_an_existing_branch_moved_between_proof_and_placement_never_reaches_the_provider
+    detach_components_on_create
+    local_branch(CHILD_SLUG, @recorded.fetch(CHILD_SLUG))
+    base = git(checkout_of(CHILD_SLUG), "rev-parse", "HEAD").strip
+    start(rework: { "repositories" => both_targets }, executor: observing_executor)
+    code, output = before_child_checkout(-> { git(checkout_of(CHILD_SLUG), "update-ref", "refs/heads/#{BRANCH}", base) }) { run_cli }
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, code, output
+    assert_includes output, "'component-a' is not on the reviewed branch at the reviewed head after placement"
+    assert_equal base, local_branch_head(CHILD_SLUG), "the runner never moved the branch back"
+    assert_zero_external_effect(output)
+  end
+
+  def test_a_branch_created_between_proof_and_placement_is_not_overwritten
+    detach_components_on_create
+    base = git(checkout_of(CHILD_SLUG), "rev-parse", "HEAD").strip
+    start(rework: { "repositories" => both_targets }, executor: observing_executor)
+    code, output = before_child_checkout(-> { git(checkout_of(CHILD_SLUG), "branch", BRANCH, base) }) { run_cli }
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, code, output
+    assert_includes output, "could not check out the reviewed head of 'component-a'"
+    assert_equal base, local_branch_head(CHILD_SLUG), "the concurrently created branch was not overwritten"
+    assert_zero_external_effect(output)
+  end
+
+  def test_a_local_branch_checked_out_elsewhere_refuses_before_any_placement
+    detach_components_on_create
+    local_branch(CHILD_SLUG, @recorded.fetch(CHILD_SLUG))
+    git(checkout_of(CHILD_SLUG), "worktree", "add", "-q", File.join(@scratch, "elsewhere"), BRANCH)
+    start(rework: { "repositories" => both_targets }, executor: observing_executor)
+    code, output = run_cli
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, code, output
+    assert_includes output, "'#{BRANCH}' of 'component-a' is checked out in another worktree"
+    assert_untouched_new_environment
+    assert_zero_external_effect(output)
+  end
+
+  def test_a_new_environment_whose_child_head_moved_refuses_without_placing_anything
+    detach_components_on_create
+    start(rework: { "repositories" => [ recorded_repository(WORKSPACE_SLUG),
+                                        recorded_repository(CHILD_SLUG, head_commit: "a" * 40) ] },
+          executor: observing_executor)
+    code, output = run_cli
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, code, output
+    assert_includes output, "moved"
+    assert_untouched_new_environment
+    assert_zero_external_effect(output)
+  end
+
+  def test_a_new_environment_whose_child_has_a_foreign_origin_refuses_without_placing_anything
+    detach_components_on_create
+    git(checkout_of(CHILD_SLUG), "remote", "set-url", "origin", "https://github.com/SpecRelay/component-z.git")
+    start(rework: { "repositories" => both_targets }, executor: observing_executor)
+    code, output = run_cli
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, code, output
+    assert_includes output, "different remote"
+    assert_untouched_new_environment
+    assert_zero_external_effect(output)
+  end
+
+  def test_a_new_environment_correction_reuses_both_existing_pull_requests
+    detach_components_on_create
+    start(rework: { "repositories" => both_targets })
+    code, output = run_cli
+    assert_equal SpecrelayRunner::CLI::SUCCESS, code, output
+
+    assert_equal [ CHILD_SLUG, WORKSPACE_SLUG ], results.map { |repo| repo["id"] }.sort
+    results.each do |repo|
+      slug = repo["id"]
+      assert_equal BRANCH, repo["branch"]
+      assert_equal PR_URLS.fetch(slug), repo["pull_request_url"]
+      assert_nil repo["publication_error"]
+      pushed = remote_head(slug)
+      refute_equal @recorded.fetch(slug), pushed, "#{slug} received the correction"
+      assert ancestor?(slug, @recorded.fetch(slug), pushed), "#{slug}'s correction descends from its reviewed head"
+    end
+    assert_equal 0, FakeGithub.pr_creates(@gh_log), "both pull requests already existed"
+  end
+
+  # --- a git command that timed out is never a success ----------------------
+  #
+  # A timed-out result has no exit status, and `nil.to_i` is 0. Each check below must read that as
+  # a failure — whatever the command printed — and the run must stop before the provider.
+
+  def test_a_placement_checkout_that_timed_out_never_reaches_the_provider
+    assert_timed_out_git_refused("checkout", :timed_out_after_running,
+                                 "could not check out the reviewed head of 'component-a'")
+  end
+
+  def test_a_confirmation_head_read_that_timed_out_never_reaches_the_provider
+    assert_timed_out_git_refused(%w[rev-parse HEAD], :timed_out_after_running,
+                                 "'component-a' is not on the reviewed branch at the reviewed head after placement")
+  end
+
+  def test_a_confirmation_branch_read_that_timed_out_never_reaches_the_provider
+    assert_timed_out_git_refused(%w[symbolic-ref --short], :timed_out_after_running,
+                                 "'component-a' is not on the reviewed branch at the reviewed head after placement")
+  end
+
+  def test_a_status_read_that_timed_out_is_not_a_clean_checkout
+    assert_timed_out_git_refused(%w[status --porcelain], :timed_out, "'component-a'")
+  end
+
+  def test_a_local_branch_lookup_that_timed_out_with_status_1_is_not_an_absent_branch
+    assert_timed_out_git_refused(%w[rev-parse --verify], :timed_out_exit_1,
+                                 "could not read the local branch '#{BRANCH}' of 'component-a'")
+  end
+
+  def test_a_worktree_listing_that_timed_out_is_not_an_empty_one
+    assert_timed_out_git_refused(%w[worktree list], :timed_out,
+                                 "could not read the local branch '#{BRANCH}' of 'component-a'")
+  end
+
+  def assert_timed_out_git_refused(subcommand, mode, expected)
+    detach_components_on_create
+    start(rework: { "repositories" => both_targets }, executor: observing_executor)
+    code, output = with_failing_git(subcommand, mode, only_under: "component-a") { run_cli }
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, code, output
+    assert_includes output, expected
+    assert_zero_external_effect(output)
+  end
+
+  # --- every reviewed pull request is proved before any placement -----------
+
+  def test_a_closed_reviewed_pull_request_refuses_the_whole_continuation
+    assert_pull_request_refused("is closed, not open", seed: open_pull_requests(child: { "state" => "CLOSED" }))
+  end
+
+  def test_a_reviewed_pull_request_on_another_branch_refuses
+    assert_pull_request_refused("is on branch 'wip/other', not '#{BRANCH}'",
+                                seed: open_pull_requests(child: { "headRefName" => "wip/other",
+                                                                  "headRefOid" => @recorded.fetch(CHILD_SLUG) }))
+  end
+
+  def test_a_reviewed_pull_request_at_another_head_refuses
+    assert_pull_request_refused("is at #{'b' * 12}, not the reviewed head",
+                                seed: open_pull_requests(child: { "headRefOid" => "b" * 40 }))
+  end
+
+  def test_a_reviewed_pull_request_from_a_fork_refuses
+    assert_pull_request_refused("comes from a fork", seed: open_pull_requests(child: { "isCrossRepository" => true }))
+  end
+
+  def test_a_reviewed_pull_request_that_cannot_be_read_refuses
+    assert_pull_request_refused("could not read the reviewed pull request of 'component-a'", fail_view_for: CHILD_SLUG)
+  end
+
+  def test_a_reviewed_pull_request_of_another_repository_refuses_without_reading_it
+    other = recorded_repository(CHILD_SLUG, pull_request_url: PR_URLS.fetch("SpecRelay/component-b"))
+    assert_pull_request_refused("is not a pull request of the recorded repository",
+                                targets: [ recorded_repository(WORKSPACE_SLUG), other ])
+  end
+
+  def assert_pull_request_refused(expected, targets: both_targets, **gh)
+    detach_components_on_create
+    start(rework: { "repositories" => targets }, executor: observing_executor, **gh)
+    code, output = run_cli
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, code, output
+    assert_includes output, "reviewed pull request of 'component-a'"
+    assert_includes output, expected
+    assert_untouched_new_environment
+    assert_zero_external_effect(output)
+  end
+
+  # Runs `change` immediately before the runner's own checkout in the child, through the same
+  # CommandRunner wrapping {#with_failing_git} uses.
+  def before_child_checkout(change)
+    singleton = SpecrelayRunner::CommandRunner.singleton_class
+    singleton.send(:alias_method, :run_without_race, :run)
+    singleton.send(:define_method, :run) do |argv, **kwargs|
+      if argv.first == "git" && argv.include?("checkout") && argv[argv.index("-C") + 1].to_s.end_with?("component-a")
+        change.call
+      end
+      send(:run_without_race, argv, **kwargs)
+    end
+    yield
+  ensure
+    singleton.send(:alias_method, :run, :run_without_race)
+    singleton.send(:remove_method, :run_without_race)
+  end
+
+  def local_branch_head(slug) = git(checkout_of(slug), "rev-parse", "refs/heads/#{BRANCH}").strip
+
+  def detach_components_on_create
+    FileUtils.mkdir_p(File.join(@root, ".runs"))
+    FileUtils.touch(File.join(@root, ".runs", "detach-components"))
+  end
+
+  # The task branch in the child's SHARED clone, as a previous environment on this machine left it.
+  # Returns the branch head.
+  def local_branch(slug, head, extra_commit: false)
+    clone = checkout_of(slug)
+    git(clone, "fetch", "-q", "origin", "refs/heads/#{BRANCH}")
+    git(clone, "branch", BRANCH, head)
+    return head unless extra_commit
+
+    tree = git(clone, "rev-parse", "#{head}^{tree}").strip
+    commit = git(clone, "commit-tree", tree, "-p", head, "-m", "unpublished").strip
+    git(clone, "update-ref", "refs/heads/#{BRANCH}", commit)
+    commit
+  end
+
+  # A refused new environment is exactly as the project built it: the root was not reset, and the
+  # child is still detached at its base.
+  def assert_untouched_new_environment
+    refute_equal @recorded.fetch(WORKSPACE_SLUG), head_of(WORKSPACE_SLUG)
+    refute_equal @recorded.fetch(CHILD_SLUG), head_of(CHILD_SLUG)
+    assert_empty git(workspace_checkout(CHILD_SLUG), "branch", "--show-current").strip
   end
 
   # --- probes --------------------------------------------------------------
@@ -534,6 +826,7 @@ class MultiRepositoryContinuationTest < Minitest::Test
       File.write(#{observed_path.inspect}, YAML.dump(
         "workspace_head" => `git rev-parse HEAD`.strip,
         "child_head" => `git -C component-a rev-parse HEAD`.strip,
+        "child_branch" => `git -C component-a branch --show-current`.strip,
         "workspace_file" => File.read("workspace.txt"),
         "child_file" => File.read("component-a/app.txt")
       ))
