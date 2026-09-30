@@ -778,7 +778,10 @@ boundary or line end; privacy takes precedence over retaining that suffix. Quote
 paths and explicit adjacent shell operators retain their deterministic boundaries.
 The attempt fails closed without displaying the frame for malformed output, a
 missing terminal result, or a second terminal result without a matching refused
-question turn. Both workflows use this one decoder and this one stream; there is
+question turn or a proven continuation. A continuation is the same Claude session
+re-announcing itself with `system/init` after a result and then reporting the next
+`result_index`; only its final result is evidence, and a stream that ends before
+it, or announces another session, fails closed. Both workflows use this one decoder and this one stream; there is
 no lane-specific path rule.
 
 A `core.progress` **heartbeat** still names the elapsed time after 15s of genuine

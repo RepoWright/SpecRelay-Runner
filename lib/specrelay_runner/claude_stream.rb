@@ -41,9 +41,9 @@ module SpecrelayRunner
   # FAIL CLOSED. Malformed output, no terminal result, or two terminal results all mean the
   # runner can no longer prove which bytes are progress and which are the authoritative result.
   # It refuses both rather than guessing, and it never displays or stores the offending frame.
-  # The ONE exception is causal and is not this decoder's to grant: a question turn the attempt's
-  # bridge refused ends in a result frame of its own, and the same process then continues. Such a
-  # result is superseded by the frame that follows it — see {#capture_result}.
+  # Two exceptions let a later result supersede a held one, both from the same process — see
+  # {#capture_result}: a question turn the attempt's bridge refused, and a session the provider
+  # itself visibly continued after a background task or monitor event woke it.
   #
   # Deliberately Claude-specific: there is no provider registry, no event SDK and no plugin
   # surface here, because exactly one provider emits this format.
@@ -108,6 +108,9 @@ module SpecrelayRunner
       @result_seen = false
       @result_refusals = 0
       @superseded = 0
+      @result_session = nil
+      @result_index = nil
+      @session_restarted = false
       @failure = nil
       @diagnostic_reported = false
     end
@@ -142,7 +145,9 @@ module SpecrelayRunner
       return self if @failure
 
       return fail!(FAILURE_INCOMPLETE) unless @pending.empty?
-      return fail!(FAILURE_NO_RESULT) unless @result_seen
+      # A session that visibly continued made its held result provisional; ending before the
+      # continued session reports its own result leaves no final result at all.
+      return fail!(FAILURE_NO_RESULT) unless @result_seen && !@session_restarted
 
       self
     end
@@ -180,6 +185,7 @@ module SpecrelayRunner
 
     def handle(message)
       capture_result(message) if message["type"].to_s == "result"
+      note_session_restart(message)
       return if @failure
 
       statuses(message).each { |text| forward(STATUS, text) }
@@ -361,14 +367,19 @@ module SpecrelayRunner
 
     # ---- the terminal result ------------------------------------------------
 
-    # ONE result, with one causal exception. A refused question turn ends in a result frame of its
-    # own and the session then continues, so a held result may be SUPERSEDED by a later frame — from
-    # the same process, on the same stream — when a refusal the bridge recorded BEFORE the held
-    # result has not already explained an earlier one. Nothing else lets a second result through:
-    # no refusal, a refusal recorded only after the result, or one more result than refusals all
-    # still fail closed. A superseded result is dropped, never kept in a list, and never shown.
+    # ONE result, with two causal exceptions, and a held result may be SUPERSEDED by a later frame
+    # from the same process, on the same stream, only through one of them.
+    #
+    # A refused question turn ends in a result frame of its own and the session then continues: a
+    # refusal the bridge recorded BEFORE the held result, and not already spent on an earlier one,
+    # explains it. A refusal recorded only after the result, or one more result than refusals, does
+    # not.
+    #
+    # A provider woken by a background task or monitor event continues on its own: see
+    # {#continuation?}. Anything else — a bare second result, another session, a skipped index —
+    # still fails closed. A superseded result is dropped, never kept in a list, and never shown.
     def capture_result(message)
-      return fail!(FAILURE_TWO_RESULTS) if @result_seen && !supersede
+      return fail!(FAILURE_TWO_RESULTS) if @result_seen && !supersede && !continuation?(message)
 
       text = message["result"].to_s
       return fail!(FAILURE_RESULT_TOO_LARGE) if text.bytesize > MAX_RESULT_BYTES
@@ -376,6 +387,30 @@ module SpecrelayRunner
       @result_seen = true
       @result = text
       @result_refusals = refusals_observed
+      @result_session = message["session_id"]
+      @result_index = message["result_index"]
+      @session_restarted = false
+    end
+
+    # The boundary measured from the supported CLI when a woken session continues: after its result
+    # the SAME process re-announces the session with `system/init`, then numbers its next result one
+    # higher — both under the held result's `session_id`. A result that carries no session or index
+    # can prove none of that.
+    def continuation?(message)
+      @session_restarted && message["session_id"] == @result_session &&
+        @result_index.is_a?(Integer) && message["result_index"] == @result_index + 1
+    end
+
+    # Only an init of the held result's own, identified session can continue it. Any other init
+    # after a result contradicts the one process this stream belongs to, so nothing it held can be
+    # proven final.
+    def note_session_restart(message)
+      return unless @result_seen && message["type"].to_s == "system" && message["subtype"].to_s == "init"
+      unless @result_session.is_a?(String) && !@result_session.empty? && message["session_id"] == @result_session
+        return fail!(FAILURE_UNREADABLE)
+      end
+
+      @session_restarted = true
     end
 
     # Explaining the held result spends one refusal, so the allowance is exactly the count.

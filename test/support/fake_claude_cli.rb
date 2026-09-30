@@ -35,18 +35,20 @@ module FakeClaudeCli
   #
   #   version: :ok | :error | :hang
   #   auth:    :logged_in | :logged_out | :error | :hang
-  #   run:     :edit | :fail | :auth_failure | :hang | :no_change | :refused_question
+  #   run:     :edit | :fail | :auth_failure | :hang | :no_change | :refused_question | :continued
   #   refused_turn: what a :refused_question provider does once its first question is refused —
   #            :correct re-asks and finishes on the answer; :exit leaves without asking again;
   #            :repeat ends the refused turn with a second result frame before correcting.
-  def build(install: true, version: :ok, auth: :logged_in, run: :edit, refused_turn: :correct,
+  #   restart: whether a :continued provider re-announces its session between its two results,
+  #            as the supported CLI does when a background task or monitor event wakes it.
+  def build(install: true, version: :ok, auth: :logged_in, run: :edit, refused_turn: :correct, restart: true,
             from_heading: "Hello Demo", to_heading: "Hello SpecRelay Demo")
     bin_dir = Dir.mktmpdir("fake-claude-bin-")
     argv_log = File.join(bin_dir, "argv.json")
     return [ bin_dir, argv_log ] unless install
 
     path = File.join(bin_dir, "claude")
-    File.write(path, script(argv_log, version, auth, run, refused_turn, from_heading, to_heading))
+    File.write(path, script(argv_log, version, auth, run, refused_turn, restart, from_heading, to_heading))
     FileUtils.chmod(0o755, path)
     [ bin_dir, argv_log ]
   end
@@ -55,7 +57,7 @@ module FakeClaudeCli
   # own Timeout/process-group kill is what ends it — a real timeout, not a stub.
   HANG_SECONDS = 600
 
-  def script(argv_log, version, auth, run, refused_turn, from_heading, to_heading)
+  def script(argv_log, version, auth, run, refused_turn, restart, from_heading, to_heading)
     <<~RUBY
       #!/usr/bin/env ruby
       # frozen_string_literal: true
@@ -73,7 +75,7 @@ module FakeClaudeCli
         #{auth_branch(auth)}
       end
 
-      #{run_branch(run, refused_turn, from_heading, to_heading)}
+      #{run_branch(run, refused_turn, restart, from_heading, to_heading)}
     RUBY
   end
 
@@ -102,7 +104,7 @@ module FakeClaudeCli
     }.inspect
   end
 
-  def run_branch(run, refused_turn, from_heading, to_heading)
+  def run_branch(run, refused_turn, restart, from_heading, to_heading)
     case run
     when :fail then %(warn "the model produced no usable change"; exit 4)
     when :auth_failure then %(warn "Not logged in. Please run `claude auth login`."; exit 1)
@@ -113,6 +115,7 @@ module FakeClaudeCli
       # no document at all is a different fact (the executor did not answer), and the runner
       # refuses that rather than guessing it meant "nothing".
       %(puts "considered the task and changed nothing"\n#{DemoWorkspace.selection_snippet(changed: 'false')}\nexit 0)
+    when :continued then edit_branch(from_heading, to_heading, continued: restart)
     else edit_branch(from_heading, to_heading)
     end
   end
@@ -127,7 +130,11 @@ module FakeClaudeCli
   #
   # The planted token travels in an assistant TEXT block — private prose that must never be
   # displayed — so a test can assert both that it is not shown and that nothing else leaked.
-  def edit_branch(from_heading, to_heading)
+  #
+  # `continued:` (true/false) first reports a provisional numbered result for one session, then —
+  # when true — the `system/init` the supported CLI emits as that session continues, and finally
+  # the next numbered result.
+  def edit_branch(from_heading, to_heading, continued: nil)
     <<~RUBY.strip
       prompt = ARGV.last.to_s
       abort "refusing to run without a prompt" if prompt.strip.empty?
@@ -154,16 +161,27 @@ module FakeClaudeCli
       tool("Bash", "command" => "npm test")
       tool_done
       sleep 0.4
+      #{continued.nil? ? "" : provisional_turn(continued)}
       # The token also travels in the TERMINAL RESULT, which does reach the report's stdout
       # evidence — so the existing redaction of that evidence stays under test even though the
       # assistant prose above never reaches a surface at all.
       say("type" => "result", "subtype" => "success", "is_error" => false,
           "result" => (applied ? "applied the heading change" : "the heading change is already applied; nothing to do") +
-                      " (transcript echoed #{LEAKED_TOKEN})")
+                      " (transcript echoed #{LEAKED_TOKEN})"#{continued.nil? ? "" : ', "session_id" => ' + SESSION.inspect + ', "result_index" => 1'})
       #{DemoWorkspace.selection_snippet(changed: 'applied')}
       exit 0
     RUBY
   end
+
+SESSION = "fake-session"
+PROVISIONAL_RESULT = "provisional result before the session continued"
+
+def provisional_turn(restart)
+  result = { "type" => "result", "subtype" => "success", "is_error" => false, "session_id" => SESSION,
+             "result_index" => 0, "result" => PROVISIONAL_RESULT }
+  init = { "type" => "system", "subtype" => "init", "session_id" => SESSION }
+  [ "say(#{result.inspect})", ("say(#{init.inspect})" if restart) ].compact.join("\n")
+end
 
 # The refused question turn's own result frame and the final one, told apart by content so a test
 # can prove which of them became evidence.

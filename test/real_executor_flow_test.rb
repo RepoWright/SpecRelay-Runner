@@ -540,6 +540,47 @@ def test_a_result_sequence_that_outruns_the_recorded_refusals_fails_closed_witho
   assert_path_exists worktree_path, "the dirty worktree is preserved"
 end
 
+# --- a session the provider continued on its own ----------------------------
+
+# A background task or monitor event woke the same process after its first result; the supported
+# CLI re-announced the session and reported the next numbered result. Only that one is evidence.
+def test_a_continued_session_finishes_on_its_final_result
+  start_platform(claude_payload)
+  bin_dir, = FakeClaudeCli.build(run: :continued)
+
+  exit_code = run_cli(claude_config, bin_dir: bin_dir)
+
+  assert_equal SpecrelayRunner::CLI::SUCCESS, exit_code, @io.string
+  assert_equal "succeeded", @platform.last_terminal_result["outcome"]
+  stdout_log = decode_file("evidence/stdout.log")
+  assert_includes stdout_log, "applied the heading change"
+  refute_includes stdout_log, FakeClaudeCli::PROVISIONAL_RESULT
+  refute_includes @io.string, SpecrelayRunner::ClaudeStream::FAILURE_TWO_RESULTS
+  assert_coherent(YAML.safe_load(decode_file("manifest.yml")))
+end
+
+# The same two results without the session restart prove nothing. Verification never started, and
+# the failed report says exactly that: the measured change, no repository result, and the cause.
+def test_an_unproven_second_result_reports_the_measured_change_as_unverified
+  start_platform(claude_payload)
+  bin_dir, = FakeClaudeCli.build(run: :continued, restart: false)
+
+  exit_code = run_cli(claude_config, bin_dir: bin_dir)
+
+  assert_equal SpecrelayRunner::CLI::RUN_FAILED, exit_code, @io.string
+  assert_equal 1, @platform.requests_to("/api/runner/reports").size
+  terminal = @platform.last_terminal_result
+  assert_equal "failed", terminal["outcome"]
+  assert(terminal.fetch("repositories").none? { |repo| repo["pull_request_url"] })
+  manifest = YAML.safe_load(decode_file("manifest.yml"))
+  assert_equal "failed", manifest["execution_status"]
+  assert_equal [ "demo-app/index.html" ], manifest.dig("git", "changed_files")
+  assert_equal [], manifest["repository_verifications"]
+  assert_includes manifest["sanitized_failure_details"], SpecrelayRunner::ClaudeStream::FAILURE_TWO_RESULTS
+  refute manifest["final_jira_update_ready"], "a failed attempt must not mark Jira ready for review"
+  assert_empty @platform.protocol_events.select { |event| event["event_type"].start_with?("verification.", "publication.") }
+end
+
 # Platform's report contract, asserted on what the runner SENT: a measured change and the
 # verification collection must agree about whether anything changed.
 def assert_coherent(manifest)
