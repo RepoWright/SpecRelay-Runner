@@ -147,7 +147,7 @@ module SpecrelayRunner
       @package = nil
       # MVP-0035 — nil for an ordinary first execution, which is every claim that does not
       # follow a CHANGES_REQUESTED review.
-      @rework = Rework.for(payload)
+      @rework = Rework.for(payload, env: env)
       # MVP-0036 Stage 2b — nil unless this claim is a REPLACEMENT run continuing the pull
       # request an abandoned run had already published. A run is never both this and a rework:
       # a replacement is new, so nothing has reviewed it.

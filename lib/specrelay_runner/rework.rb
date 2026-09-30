@@ -16,9 +16,9 @@ module SpecrelayRunner
   # that is genuinely about a change request: the findings, and how they reach the provider.
   class Rework
     # The reviewed target, or nil when this claim is an ordinary first execution.
-    def self.for(payload)
+    def self.for(payload, env: ENV)
       block = payload["rework"]
-      block.is_a?(Hash) ? new(block, ContinuedTarget.for(payload, "rework")) : nil
+      block.is_a?(Hash) ? new(block, ContinuedTarget.for(payload, "rework", env: env)) : nil
     end
 
     def initialize(block, target)

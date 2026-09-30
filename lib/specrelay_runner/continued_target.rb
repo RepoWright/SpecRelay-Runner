@@ -51,6 +51,9 @@ module SpecrelayRunner
     # would go looking for a review that does not exist.
     NOUNS = { "rework" => "reviewed", "restart" => "recorded" }.freeze
 
+    # A reviewed pull request's own address, which names the repository it belongs to.
+    PULL_REQUEST_URL = %r{\Ahttps://github\.com/([^/\s]+/[^/\s]+)/pull/\d+\z}i
+
     # The recorded target this claim must continue, or nil when it carries none.
     #
     # MAPIAI-84 — the target block now carries its own `clone_url`, and the branch this claim
@@ -59,17 +62,22 @@ module SpecrelayRunner
     # is the executor's decision, so Platform declares none. Nothing about the proof changed —
     # identity and branch are still checked before any commit is checked out — only where the two
     # facts it checks against come from.
-    def self.for(payload, key)
+    #
+    # Only a REVIEW round proves its pull requests, so only it carries the environment `gh` reads
+    # them with; a replacement run keeps its behaviour.
+    def self.for(payload, key, env: ENV)
       block = payload[key]
       return nil unless block.is_a?(Hash)
 
-      new(Array(block["repositories"]), payload.dig("run", "canonical_branch"), noun: NOUNS.fetch(key))
+      new(Array(block["repositories"]), payload.dig("run", "canonical_branch"), noun: NOUNS.fetch(key),
+          pull_request_env: key == "rework" ? env : nil)
     end
 
-    def initialize(targets, publication_branch = nil, noun: "recorded")
+    def initialize(targets, publication_branch = nil, noun: "recorded", pull_request_env: nil)
       @targets = targets
       @publication_branch = publication_branch.to_s
       @noun = noun
+      @pull_request_env = pull_request_env
     end
 
     # Put every recorded repository in this task workspace on its own recorded head, or refuse.
@@ -84,8 +92,8 @@ module SpecrelayRunner
     # `created` says THIS attempt built the task workspace. A multi-repository project prepares its
     # components detached at their base, so a review round that follows a released environment
     # finds its reviewed repositories detached. Such a checkout is run-owned and holds nothing yet,
-    # so it is put on the recorded branch once proved; in a REUSED workspace nothing proves why a
-    # checkout is detached, and it still refuses.
+    # so it is put on the recorded branch once proved — without moving any existing branch; in a
+    # REUSED workspace nothing proves why a checkout is detached, and it still refuses.
     def materialize(worktree_path:, created: false, git: Review::Checkout::Git)
       return Result.new(ok: true) if targets.empty?
 
@@ -97,7 +105,7 @@ module SpecrelayRunner
 
     private
 
-    attr_reader :targets, :publication_branch, :noun
+    attr_reader :targets, :publication_branch, :noun, :pull_request_env
 
     # Every target located and PROVED, before any of them is moved. All-or-nothing: the first
     # fact that fails refuses the whole continuation, and until this returns a plan nothing on
@@ -114,8 +122,11 @@ module SpecrelayRunner
         refusal = duplicate_refusal(repository, seen) || verify(repository, root, observed, placing, git)
         return refusal if refusal
 
+        placement = placing ? local_placement(repository, root) : :reset
+        return placement if placement.is_a?(Result)
+
         seen << Review::Checkout.identity(repository["clone_url"])
-        planned << [ repository, root, placing ]
+        planned << [ repository, root, placement ]
       end
       planned
     end
@@ -125,8 +136,8 @@ module SpecrelayRunner
     # meaningless in the others.
     def place(planned, worktree_path)
       root_head = nil
-      planned.each do |repository, root, placing|
-        refusal = reset_to(repository, root, placing)
+      planned.each do |repository, root, placement|
+        refusal = put(repository, root, placement)
         return refusal if refusal
 
         root_head = repository["head_commit"].to_s if same_directory?(root, worktree_path)
@@ -173,8 +184,8 @@ module SpecrelayRunner
       branch_refusal(key.to_s, repository) ||
         checkout_branch_refusal(key.to_s, repository, observed, placing) ||
         remote_refusal(repository, root, head, git) ||
-        fetch_head(repository, root, head, git) ||
-        (local_branch_refusal(key.to_s, repository, root) if placing)
+        pull_request_refusal(repository, root) ||
+        fetch_head(repository, root, head, git)
     end
 
     # WHICH branch, before which commit.
@@ -248,24 +259,58 @@ module SpecrelayRunner
       refuse("'#{repository['repository_key']}' does not contain the #{noun} head #{head[0, 12]} after a fetch")
     end
 
-    # A checkout being placed gets the recorded branch created or moved under it. That branch may
-    # already exist in the clone this checkout shares with other environments, so it may move only
-    # when nothing is lost: no other worktree has it checked out, and it is absent or already
-    # contained in the recorded head. Read after {#fetch_head}, so that head is present locally.
-    def local_branch_refusal(key, repository, root)
+    # WHAT GITHUB SAYS NOW about a REVIEWED pull request. The findings are about that pull
+    # request at that head, so one that is unreadable, closed, from a fork, in another repository,
+    # on another branch or at another head refuses the whole set before anything is placed.
+    def pull_request_refusal(repository, root)
+      return nil if pull_request_env.nil?
+
+      url = repository["pull_request_url"].to_s
+      slug = url[PULL_REQUEST_URL, 1].to_s
+      subject = "the #{noun} pull request of '#{repository['repository_key']}'"
+      return refuse("#{subject} is not a pull request of the recorded repository") unless
+        "github.com/#{slug.downcase}" == Review::Checkout.identity(repository["clone_url"])
+
+      observed = PreviousAcceptedPackage::GitHub.pull_request(root: root, slug: slug, url: url, env: pull_request_env)
+      return refuse("SpecRelay could not read #{subject}; refusing to continue from a head it cannot confirm") if
+        observed.nil?
+
+      pull_request_mismatch(subject, observed, repository, url)
+    end
+
+    def pull_request_mismatch(subject, observed, repository, url)
+      head = repository["head_commit"].to_s
+      state = observed["state"].to_s
+      return refuse("#{subject} is not a pull request of the recorded repository") unless observed["url"].to_s.casecmp?(url)
+      return refuse("#{subject} is #{state.downcase}, not open") unless state == "OPEN"
+      return refuse("#{subject} comes from a fork") unless observed["isCrossRepository"] == false
+      return refuse("#{subject} is on branch '#{observed['headRefName']}', not '#{repository['branch']}'") unless
+        observed["headRefName"].to_s == repository["branch"].to_s
+      return nil if observed["headRefOid"].to_s.casecmp?(head)
+
+      refuse("#{subject} is at #{observed['headRefOid'].to_s[0, 12]}, not the #{noun} head #{head[0, 12]}")
+    end
+
+    # HOW a checkout being placed gets the recorded branch, without moving any existing ref: the
+    # branch may already exist in the clone this checkout shares with other environments. Absent,
+    # it is created at the recorded head; present, it is selected only when it is exactly there and
+    # no other worktree has it checked out. Read after {#fetch_head}, so that head is local.
+    def local_placement(repository, root)
+      key = repository["repository_key"]
       branch = repository["branch"].to_s
       worktrees = run(root, %w[worktree list --porcelain])
       # Exit 1 is "no such branch"; anything higher is git failing to answer, which refuses.
       local = run(root, [ "rev-parse", "--verify", "--quiet", "refs/heads/#{branch}^{commit}" ])
-      return refuse("could not read the local branch '#{branch}' of '#{key}'; refusing to move it") if
+      return refuse("could not read the local branch '#{branch}' of '#{key}'; refusing to place it") if
         [ worktrees, local ].any?(&:nil?) || !worktrees.exit_code.to_i.zero? || local.exit_code.to_i > 1
+      return :create if local.exit_code.to_i == 1
       return refuse("the branch '#{branch}' of '#{key}' is checked out in another worktree; " \
                     "release that worktree before retrying") if
         worktrees.stdout.to_s.lines.include?("branch refs/heads/#{branch}\n")
-      return nil if local.exit_code.to_i == 1 || ancestor?(root, local.stdout.to_s.strip, repository["head_commit"].to_s)
+      return :select if local.stdout.to_s.strip.casecmp?(repository["head_commit"].to_s)
 
-      refuse("the local branch '#{branch}' of '#{key}' holds commits the #{noun} head does not; " \
-             "preserve them before retrying")
+      refuse("the local branch '#{branch}' of '#{key}' is not at the #{noun} head; it is never moved, " \
+             "so align or delete it before retrying")
     end
 
     # `reset --hard` onto the canonical task branch, so the branch each checkout is on — and that
@@ -283,19 +328,28 @@ module SpecrelayRunner
     # reported an unrun reset as a successful one; `clean?` above has always answered the same
     # question the closed way, and now so does this.
     #
-    # A checkout being placed is detached, where `reset --hard` would move no branch at all, so it
-    # is checked out onto the recorded branch at the recorded head instead.
-    def reset_to(repository, root, placing)
+    # A checkout being placed is detached, where `reset --hard` would move no branch at all. Its
+    # branch is created with `-b`, which refuses if one appeared since the proof, or selected
+    # without moving it. Either way the checkout is then CONFIRMED on the recorded branch at the
+    # recorded head, so a branch that changed after it was proved never reaches the provider.
+    def put(repository, root, placement)
+      key = repository["repository_key"]
       head = repository["head_commit"].to_s
-      result = run(root, placing ? [ "checkout", "--quiet", "-B", repository["branch"].to_s, head ] : [ "reset", "--hard", head ])
-      return nil if !result.nil? && result.exit_code.to_i.zero?
+      branch = repository["branch"].to_s
+      args = { reset: [ "reset", "--hard", head ], create: [ "checkout", "--quiet", "-b", branch, head ],
+               select: [ "checkout", "--quiet", branch ] }.fetch(placement)
+      result = run(root, args)
+      return refuse("could not check out the #{noun} head of '#{key}' in this task workspace") if
+        result.nil? || !result.exit_code.to_i.zero?
+      return nil if placed?(root, branch, head)
 
-      refuse("could not check out the #{noun} head of '#{repository['repository_key']}' in this task workspace")
+      refuse("'#{key}' is not on the #{noun} branch at the #{noun} head after placement; nothing was started")
     end
 
-    def ancestor?(root, ancestor, descendant)
-      result = run(root, [ "merge-base", "--is-ancestor", ancestor, descendant ])
-      !result.nil? && result.exit_code.to_i.zero?
+    def placed?(root, branch, head)
+      on = run(root, %w[symbolic-ref --quiet --short HEAD])
+      at = run(root, %w[rev-parse HEAD])
+      [ on, at ].none?(&:nil?) && on.stdout.to_s.strip == branch && at.stdout.to_s.strip.casecmp?(head)
     end
 
     def clean?(root)
