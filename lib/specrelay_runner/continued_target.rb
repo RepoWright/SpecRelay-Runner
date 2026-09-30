@@ -299,11 +299,13 @@ module SpecrelayRunner
       key = repository["repository_key"]
       branch = repository["branch"].to_s
       worktrees = run(root, %w[worktree list --porcelain])
-      # Exit 1 is "no such branch"; anything higher is git failing to answer, which refuses.
+      # Exit 1 from a lookup that COMPLETED is "no such branch"; a timeout or any other status is
+      # git failing to answer, which refuses.
       local = run(root, [ "rev-parse", "--verify", "--quiet", "refs/heads/#{branch}^{commit}" ])
-      return refuse("could not read the local branch '#{branch}' of '#{key}'; refusing to place it") if
-        [ worktrees, local ].any?(&:nil?) || !worktrees.exit_code.to_i.zero? || local.exit_code.to_i > 1
-      return :create if local.exit_code.to_i == 1
+      absent = !local.nil? && !local.timed_out? && local.exit_code == 1
+      return refuse("could not read the local branch '#{branch}' of '#{key}'; refusing to place it") unless
+        succeeded?(worktrees) && (absent || succeeded?(local))
+      return :create if absent
       return refuse("the branch '#{branch}' of '#{key}' is checked out in another worktree; " \
                     "release that worktree before retrying") if
         worktrees.stdout.to_s.lines.include?("branch refs/heads/#{branch}\n")
@@ -339,8 +341,8 @@ module SpecrelayRunner
       args = { reset: [ "reset", "--hard", head ], create: [ "checkout", "--quiet", "-b", branch, head ],
                select: [ "checkout", "--quiet", branch ] }.fetch(placement)
       result = run(root, args)
-      return refuse("could not check out the #{noun} head of '#{key}' in this task workspace") if
-        result.nil? || !result.exit_code.to_i.zero?
+      return refuse("could not check out the #{noun} head of '#{key}' in this task workspace") unless
+        succeeded?(result)
       return nil if placed?(root, branch, head)
 
       refuse("'#{key}' is not on the #{noun} branch at the #{noun} head after placement; nothing was started")
@@ -349,13 +351,18 @@ module SpecrelayRunner
     def placed?(root, branch, head)
       on = run(root, %w[symbolic-ref --quiet --short HEAD])
       at = run(root, %w[rev-parse HEAD])
-      [ on, at ].none?(&:nil?) && on.stdout.to_s.strip == branch && at.stdout.to_s.strip.casecmp?(head)
+      succeeded?(on) && succeeded?(at) && on.stdout.to_s.strip == branch && at.stdout.to_s.strip.casecmp?(head)
     end
 
     def clean?(root)
       result = run(root, %w[status --porcelain])
-      !result.nil? && result.exit_code.to_i.zero? && result.stdout.to_s.strip.empty?
+      succeeded?(result) && result.stdout.to_s.strip.empty?
     end
+
+    # Ran, finished within its timeout, and exited 0. A timed-out result has no exit status, and
+    # `nil.to_i` is 0, so reading `exit_code.to_i` would count it — and whatever it printed — as a
+    # success.
+    def succeeded?(result) = !result.nil? && result.success?
 
     # Compared through `realpath`, because git and the configured root may spell one directory
     # differently. {Review::Checkout} answers the same question the same way.

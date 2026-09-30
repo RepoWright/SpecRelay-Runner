@@ -393,20 +393,28 @@ class MultiRepositoryContinuationTest < Minitest::Test
   #   :unspawnable — raises SystemCallError, which is what an absent or unexecutable git does and
   #                  what the runner's own `run` wrappers turn into the `nil` result under test
   #   :nonzero     — git ran and refused
+  #   :timed_out   — killed at the timeout before answering: no exit status and no output
+  #   :timed_out_exit_1 — killed at the timeout, with a status of 1 that is not an answer
+  #   :timed_out_after_running — the real command ran and printed its real output, but the result
+  #                  is a timeout with no exit status, so output alone must not count as success
   #
-  # `only_under` narrows the interception to one checkout, so a failure can be aimed at the second
-  # repository of a set rather than the first.
+  # `subcommand` is one argument or several that must all appear. `only_under` narrows the
+  # interception to one checkout, so a failure can be aimed at the second repository of a set
+  # rather than the first.
   def with_failing_git(subcommand, mode, only_under: nil)
     singleton = SpecrelayRunner::CommandRunner.singleton_class
     singleton.send(:alias_method, :run_without_git_stub, :run)
     singleton.send(:define_method, :run) do |argv, **kwargs|
-      targeted = argv.first == "git" && argv.include?(subcommand) &&
+      targeted = argv.first == "git" && Array(subcommand).all? { |arg| argv.include?(arg) } &&
                  (only_under.nil? || argv[argv.index("-C") + 1].to_s.end_with?(only_under))
       next send(:run_without_git_stub, argv, **kwargs) unless targeted
       raise Errno::ENOENT, "git" if mode == :unspawnable
 
-      SpecrelayRunner::CommandRunner::Result.new(exit_code: 1, stdout: "", stderr: "fatal: #{subcommand} refused",
-                                                 duration_seconds: 0, timed_out: false)
+      real = send(:run_without_git_stub, argv, **kwargs) if mode == :timed_out_after_running
+      SpecrelayRunner::CommandRunner::Result.new(
+        exit_code: { nonzero: 1, timed_out_exit_1: 1 }[mode], stdout: real&.stdout.to_s,
+        stderr: "fatal: #{Array(subcommand).join(' ')} refused", duration_seconds: 0, timed_out: mode != :nonzero
+      )
     end
     yield
   ensure
@@ -658,6 +666,50 @@ class MultiRepositoryContinuationTest < Minitest::Test
       assert ancestor?(slug, @recorded.fetch(slug), pushed), "#{slug}'s correction descends from its reviewed head"
     end
     assert_equal 0, FakeGithub.pr_creates(@gh_log), "both pull requests already existed"
+  end
+
+  # --- a git command that timed out is never a success ----------------------
+  #
+  # A timed-out result has no exit status, and `nil.to_i` is 0. Each check below must read that as
+  # a failure — whatever the command printed — and the run must stop before the provider.
+
+  def test_a_placement_checkout_that_timed_out_never_reaches_the_provider
+    assert_timed_out_git_refused("checkout", :timed_out_after_running,
+                                 "could not check out the reviewed head of 'component-a'")
+  end
+
+  def test_a_confirmation_head_read_that_timed_out_never_reaches_the_provider
+    assert_timed_out_git_refused(%w[rev-parse HEAD], :timed_out_after_running,
+                                 "'component-a' is not on the reviewed branch at the reviewed head after placement")
+  end
+
+  def test_a_confirmation_branch_read_that_timed_out_never_reaches_the_provider
+    assert_timed_out_git_refused(%w[symbolic-ref --short], :timed_out_after_running,
+                                 "'component-a' is not on the reviewed branch at the reviewed head after placement")
+  end
+
+  def test_a_status_read_that_timed_out_is_not_a_clean_checkout
+    assert_timed_out_git_refused(%w[status --porcelain], :timed_out, "'component-a'")
+  end
+
+  def test_a_local_branch_lookup_that_timed_out_with_status_1_is_not_an_absent_branch
+    assert_timed_out_git_refused(%w[rev-parse --verify], :timed_out_exit_1,
+                                 "could not read the local branch '#{BRANCH}' of 'component-a'")
+  end
+
+  def test_a_worktree_listing_that_timed_out_is_not_an_empty_one
+    assert_timed_out_git_refused(%w[worktree list], :timed_out,
+                                 "could not read the local branch '#{BRANCH}' of 'component-a'")
+  end
+
+  def assert_timed_out_git_refused(subcommand, mode, expected)
+    detach_components_on_create
+    start(rework: { "repositories" => both_targets }, executor: observing_executor)
+    code, output = with_failing_git(subcommand, mode, only_under: "component-a") { run_cli }
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, code, output
+    assert_includes output, expected
+    assert_zero_external_effect(output)
   end
 
   # --- every reviewed pull request is proved before any placement -----------
