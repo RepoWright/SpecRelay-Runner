@@ -27,8 +27,8 @@ module SpecrelayRunner
     end
 
     # Put every reviewed repository on its reviewed head, or refuse.
-    def materialize(worktree_path:, git: Review::Checkout::Git)
-      target.materialize(worktree_path: worktree_path, git: git)
+    def materialize(worktree_path:, created: false, git: Review::Checkout::Git)
+      target.materialize(worktree_path: worktree_path, created: created, git: git)
     end
 
     # The section the executor's prompt carries: which heads it is on, which pull requests it is

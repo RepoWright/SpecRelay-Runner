@@ -52,6 +52,10 @@ module MultiRepositoryWorkspace
   # linked worktree on that same branch. It records every invocation, so "invoked exactly once
   # with `create <TASK-ID>`" is an observable fact rather than an inference.
   #
+  # A `.runs/detach-components` marker makes it build every component DETACHED at its base
+  # instead, which is how a real multi-repository workspace prepares its component checkouts. The
+  # marker sits under the ignored `.runs/`, so planting it never dirties the workspace repository.
+  #
   # It implements the accepted project's OWNERSHIP contract, because that is the contract the
   # runner is being tested against: `create --run-id` records the owner durably, `status --json`
   # reports it (null for an environment created without one), and `release --run-id` refuses any
@@ -78,7 +82,11 @@ module MultiRepositoryWorkspace
           mkdir -p "$ROOT_DIR/.runs/worktrees"
           git -C "$ROOT_DIR" worktree add -b "$TASK" "$WT" HEAD >/dev/null 2>&1 || exit 1
           for repo in #{components.join(' ')}; do
-            git -C "$ROOT_DIR/$repo" worktree add -b "$TASK" "$WT/$repo" HEAD >/dev/null 2>&1 || exit 1
+            if [ -f "$ROOT_DIR/.runs/detach-components" ]; then
+              git -C "$ROOT_DIR/$repo" worktree add --detach "$WT/$repo" HEAD >/dev/null 2>&1 || exit 1
+            else
+              git -C "$ROOT_DIR/$repo" worktree add -b "$TASK" "$WT/$repo" HEAD >/dev/null 2>&1 || exit 1
+            fi
           done
           #{ProjectCommand.record_owner}
           echo "created $WT"

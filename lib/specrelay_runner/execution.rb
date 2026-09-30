@@ -380,7 +380,7 @@ module SpecrelayRunner
       # provider, before the package, and before any external write.
       continued = @rework || @restart
       if continued
-        continuation = continued.materialize(worktree_path: worktree.path)
+        continuation = continued.materialize(worktree_path: worktree.path, created: worktree.created?)
         return continuation_refused(continuation.reason) unless continuation.ok?
 
         worktree = Workspace::Info.new(path: worktree.path, created: worktree.created?,

@@ -509,6 +509,136 @@ class MultiRepositoryContinuationTest < Minitest::Test
     assert_zero_external_effect(output)
   end
 
+  # --- a review round after the first environment was released ---------------
+  #
+  # The environment this claim builds is NEW, and the project command prepares its components
+  # detached at their base. That checkout is run-owned and holds nothing, so once every target is
+  # proved it is put on the reviewed branch and head. A REUSED detached checkout still refuses
+  # (see above): nothing proves why it is detached.
+
+  def test_a_new_environment_places_a_detached_child_on_the_reviewed_branch_and_head
+    detach_components_on_create
+    start(rework: { "repositories" => both_targets }, executor: observing_executor)
+    code, output = run_cli
+    assert_equal SpecrelayRunner::CLI::SUCCESS, code, output
+
+    observed = YAML.safe_load(File.read(observed_path))
+    assert_equal @recorded.fetch(WORKSPACE_SLUG), observed.fetch("workspace_head")
+    assert_equal @recorded.fetch(CHILD_SLUG), observed.fetch("child_head")
+    assert_equal BRANCH, observed.fetch("child_branch")
+    assert_includes change_request_section, "The edit is not idempotent."
+  end
+
+  # The same machine: the shared clone still has the task branch at the reviewed head.
+  def test_a_local_branch_already_at_the_reviewed_head_is_reused
+    detach_components_on_create
+    local_branch(CHILD_SLUG, @recorded.fetch(CHILD_SLUG))
+    start(rework: { "repositories" => both_targets }, executor: observing_executor)
+    code, output = run_cli
+    assert_equal SpecrelayRunner::CLI::SUCCESS, code, output
+
+    observed = YAML.safe_load(File.read(observed_path))
+    assert_equal @recorded.fetch(CHILD_SLUG), observed.fetch("child_head")
+    assert_equal BRANCH, observed.fetch("child_branch")
+  end
+
+  def test_a_local_branch_with_unpublished_commits_refuses_and_is_not_moved
+    detach_components_on_create
+    unpublished = local_branch(CHILD_SLUG, @recorded.fetch(CHILD_SLUG), extra_commit: true)
+    start(rework: { "repositories" => both_targets }, executor: observing_executor)
+    code, output = run_cli
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, code, output
+    assert_includes output, "local branch '#{BRANCH}' of 'component-a' holds commits"
+    assert_equal unpublished, git(checkout_of(CHILD_SLUG), "rev-parse", "refs/heads/#{BRANCH}").strip
+    assert_untouched_new_environment
+    assert_zero_external_effect(output)
+  end
+
+  def test_a_local_branch_checked_out_elsewhere_refuses_before_any_placement
+    detach_components_on_create
+    local_branch(CHILD_SLUG, @recorded.fetch(CHILD_SLUG))
+    git(checkout_of(CHILD_SLUG), "worktree", "add", "-q", File.join(@scratch, "elsewhere"), BRANCH)
+    start(rework: { "repositories" => both_targets }, executor: observing_executor)
+    code, output = run_cli
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, code, output
+    assert_includes output, "'#{BRANCH}' of 'component-a' is checked out in another worktree"
+    assert_untouched_new_environment
+    assert_zero_external_effect(output)
+  end
+
+  def test_a_new_environment_whose_child_head_moved_refuses_without_placing_anything
+    detach_components_on_create
+    start(rework: { "repositories" => [ recorded_repository(WORKSPACE_SLUG),
+                                        recorded_repository(CHILD_SLUG, head_commit: "a" * 40) ] },
+          executor: observing_executor)
+    code, output = run_cli
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, code, output
+    assert_includes output, "moved"
+    assert_untouched_new_environment
+    assert_zero_external_effect(output)
+  end
+
+  def test_a_new_environment_whose_child_has_a_foreign_origin_refuses_without_placing_anything
+    detach_components_on_create
+    git(checkout_of(CHILD_SLUG), "remote", "set-url", "origin", "https://github.com/SpecRelay/component-z.git")
+    start(rework: { "repositories" => both_targets }, executor: observing_executor)
+    code, output = run_cli
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, code, output
+    assert_includes output, "different remote"
+    assert_untouched_new_environment
+    assert_zero_external_effect(output)
+  end
+
+  def test_a_new_environment_correction_reuses_both_existing_pull_requests
+    detach_components_on_create
+    start(rework: { "repositories" => both_targets })
+    code, output = run_cli
+    assert_equal SpecrelayRunner::CLI::SUCCESS, code, output
+
+    assert_equal [ CHILD_SLUG, WORKSPACE_SLUG ], results.map { |repo| repo["id"] }.sort
+    results.each do |repo|
+      slug = repo["id"]
+      assert_equal BRANCH, repo["branch"]
+      assert_equal PR_URLS.fetch(slug), repo["pull_request_url"]
+      assert_nil repo["publication_error"]
+      pushed = remote_head(slug)
+      refute_equal @recorded.fetch(slug), pushed, "#{slug} received the correction"
+      assert ancestor?(slug, @recorded.fetch(slug), pushed), "#{slug}'s correction descends from its reviewed head"
+    end
+    assert_equal 0, FakeGithub.pr_creates(@gh_log), "both pull requests already existed"
+  end
+
+  def detach_components_on_create
+    FileUtils.mkdir_p(File.join(@root, ".runs"))
+    FileUtils.touch(File.join(@root, ".runs", "detach-components"))
+  end
+
+  # The task branch in the child's SHARED clone, as a previous environment on this machine left it.
+  # Returns the branch head.
+  def local_branch(slug, head, extra_commit: false)
+    clone = checkout_of(slug)
+    git(clone, "fetch", "-q", "origin", "refs/heads/#{BRANCH}")
+    git(clone, "branch", BRANCH, head)
+    return head unless extra_commit
+
+    tree = git(clone, "rev-parse", "#{head}^{tree}").strip
+    commit = git(clone, "commit-tree", tree, "-p", head, "-m", "unpublished").strip
+    git(clone, "update-ref", "refs/heads/#{BRANCH}", commit)
+    commit
+  end
+
+  # A refused new environment is exactly as the project built it: the root was not reset, and the
+  # child is still detached at its base.
+  def assert_untouched_new_environment
+    refute_equal @recorded.fetch(WORKSPACE_SLUG), head_of(WORKSPACE_SLUG)
+    refute_equal @recorded.fetch(CHILD_SLUG), head_of(CHILD_SLUG)
+    assert_empty git(workspace_checkout(CHILD_SLUG), "branch", "--show-current").strip
+  end
+
   # --- probes --------------------------------------------------------------
 
   # Build the task workspace up front, so a test can plant local state the continuation then has
@@ -534,6 +664,7 @@ class MultiRepositoryContinuationTest < Minitest::Test
       File.write(#{observed_path.inspect}, YAML.dump(
         "workspace_head" => `git rev-parse HEAD`.strip,
         "child_head" => `git -C component-a rev-parse HEAD`.strip,
+        "child_branch" => `git -C component-a branch --show-current`.strip,
         "workspace_file" => File.read("workspace.txt"),
         "child_file" => File.read("component-a/app.txt")
       ))
