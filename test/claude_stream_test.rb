@@ -208,6 +208,82 @@ def test_a_refused_turn_never_lifts_the_size_bounds_on_a_result
   assert_equal "", stream.final_text
 end
 
+# ---- the same Claude session continuing after a result ------------------
+#
+# A background task or monitor event can wake the SAME process after it reported a result. The
+# supported CLI then re-announces the session with `system/init` and reports the next numbered
+# result, both under the held result's `session_id`. That boundary, and nothing weaker, lets the
+# later result replace the earlier one.
+
+def test_a_proven_continuation_keeps_only_the_final_result
+  stream = feed(numbered_result("provisional", 0), session_init, numbered_result("final", 1))
+
+  assert_nil stream.close.failure
+  assert_equal "final", stream.final_text
+  refute_includes texts.join("\n"), "provisional", "a provisional result is never displayed"
+end
+
+def test_every_proven_continuation_advances_the_final_result
+  stream = feed(numbered_result("first", 0), session_init, numbered_result("second", 1),
+                session_init, numbered_result("third", 2))
+
+  assert_nil stream.close.failure
+  assert_equal "third", stream.final_text
+end
+
+# Once the session has visibly continued, the earlier result is provisional. A stream that ends
+# before the continued session reports its own result has no final result to hand over.
+def test_a_continued_session_that_ends_without_its_result_fails_closed
+  stream = feed(numbered_result("provisional", 0), session_init)
+
+  assert_equal SpecrelayRunner::ClaudeStream::FAILURE_NO_RESULT, stream.close.failure
+  assert_equal "", stream.final_text
+end
+
+def test_a_continuation_contradicted_by_another_session_fails_closed
+  stream = feed(numbered_result("provisional", 0), session_init, session_init("other-session"))
+
+  refute_nil stream.close.failure
+  assert_equal "", stream.final_text
+  refute_includes texts.join("\n"), "provisional"
+end
+
+def test_a_numbered_second_result_without_a_session_restart_fails_closed
+  stream = feed(numbered_result("first", 0), numbered_result("second", 1))
+
+  assert_equal SpecrelayRunner::ClaudeStream::FAILURE_TWO_RESULTS, stream.close.failure
+  assert_equal "", stream.final_text
+end
+
+def test_a_restart_of_another_session_does_not_prove_a_continuation
+  stream = feed(numbered_result("first", 0), session_init("other-session"), numbered_result("second", 1))
+
+  assert_equal SpecrelayRunner::ClaudeStream::FAILURE_UNREADABLE, stream.close.failure
+  assert_equal "", stream.final_text
+end
+
+def test_a_result_from_another_session_after_the_restart_fails_closed
+  stream = feed(numbered_result("first", 0), session_init,
+                numbered_result("second", 1).merge("session_id" => "other-session"))
+
+  assert_equal SpecrelayRunner::ClaudeStream::FAILURE_TWO_RESULTS, stream.close.failure
+end
+
+def test_a_continuation_must_report_the_next_result_index
+  [ 0, 2, nil ].each do |index|
+    stream = feed(numbered_result("first", 0), session_init, numbered_result("second", index))
+
+    assert_equal SpecrelayRunner::ClaudeStream::FAILURE_TWO_RESULTS, stream.close.failure, "result_index #{index.inspect}"
+  end
+end
+
+def test_unidentified_results_are_never_a_continuation
+  stream = feed(result_message("first"), init, result_message("second"))
+
+  assert_equal SpecrelayRunner::ClaudeStream::FAILURE_UNREADABLE, stream.close.failure
+  assert_equal "", stream.final_text
+end
+
   def test_a_non_object_json_line_fails_closed
     stream = build_stream
     stream.accept("stdout", "42")
@@ -275,6 +351,14 @@ end
 
   def result_message(text = "final result text")
     { "type" => "result", "subtype" => "success", "is_error" => false, "result" => text }
+  end
+
+  SESSION = "session-a"
+
+  def session_init(session = SESSION) = init.merge("session_id" => session)
+
+  def numbered_result(text, index)
+    result_message(text).merge("session_id" => SESSION, "result_index" => index)
   end
 
   def write_script(body)
