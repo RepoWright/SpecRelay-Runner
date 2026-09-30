@@ -335,7 +335,7 @@ class SpecificationPreflightTest < Minitest::Test
     # question. Creating it here, through the real owner and the same HOME the run will use,
     # puts it on BOTH sides. Nothing is excluded and no assertion is relaxed: an unexpected file
     # still fails the snapshot, and the disjointness check below is untouched.
-    SpecrelayRunner::SessionLock.hold(env: SpecificationWorkspace.lane_env(state_root)) {}
+    SpecrelayRunner::SessionLock.exclusive(env: SpecificationWorkspace.lane_env(state_root)).hold { }
     files = { specs: snapshot(@specs), source: snapshot(@source) }
     # Only the seed is a git checkout in this fixture; the source is a plain directory, so it is
     # compared at the file level alone.

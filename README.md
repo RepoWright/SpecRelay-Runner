@@ -165,21 +165,23 @@ bin/specrelay-runner claim-once                      # exactly one claim, then e
 bin/specrelay-runner claim-once --workspace <selector>
 ```
 
-**One of these runs at a time per OS user.** Both take one local lock
-(`~/.specrelay/runner/session.lock`) for the whole invocation, so a second is refused
-at once — before it probes a provider, reports presence, starts a connector or claims
-anything — whatever project, working directory, config or state file it names:
+**Which sessions may run together.** Each terminal works on one ticket at a time.
+Terminals using saved connections of different projects may run side by side. A
+second session for the same project's registration — through another of its
+workspaces, or after a reconnect — is refused, and a session started from a
+hand-written `--config` runs only alone. A refused command stops at once, before it
+probes a provider, reports presence, starts a connector or claims anything:
 
 ```text
-another SpecRelay runner session is already running on this machine. Stop it first
-(Ctrl-C in its terminal), then start this one.
+another SpecRelay runner session for this Runner registration is already running on
+this machine. Stop it first (Ctrl-C in its terminal), then start this one.
 ```
 
-Stopping the first releases it: a clean finish, a startup failure and `Ctrl-C` all do,
+Stopping a session releases it: a clean finish, a startup failure and `Ctrl-C` all do,
 with nothing to clean up by hand. It is a same-user, same-machine guard, and every
-installation in concurrent use must be updated — an older binary does not take it.
-`connect`, the dashboard, listings and the readiness test are not sessions and stay
-usable while one runs.
+installation in concurrent use must be updated — an older binary does not follow
+these rules. `connect`, the dashboard, listings and the readiness test are not
+sessions and stay usable while one runs.
 
 Neither needs a config file, an exported credential, a workspace-root environment
 variable, or a reviewer-provider environment variable: the credential is read from
