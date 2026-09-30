@@ -45,11 +45,11 @@ module SpecrelayRunner
       command, *rest = argv
       case command
       when "connect" then connect(rest)
-      # The two commands that RUN WORK, and the only two that take the local session. Both go
-      # through here, so a dashboard dispatch and an explicit `--config` invocation are guarded on
-      # the same line as a typed one.
-      when "claim-once" then in_session { claim_once(rest) }
-      when "loop" then in_session { loop_mode(rest) }
+      # The two commands that RUN WORK, and the only two that take a local session. Both go
+      # through here, so a dashboard dispatch and an explicit `--config` invocation are guarded the
+      # same way as a typed one.
+      when "claim-once" then claim_once(rest)
+      when "loop" then loop_mode(rest)
       when "connections" then connections(rest)
       when nil then no_arguments
       when "help", "-h", "--help" then print_help
@@ -114,14 +114,17 @@ module SpecrelayRunner
 
     def connection_operations = ConnectionOperations.new(env: env, secret_store: @injected_secret_store)
 
-    # Hold the machine's one work-running session for the whole invocation, or refuse it before it
-    # does anything another session could observe.
+    # Hold this invocation's work-running session for the rest of the command, or refuse it before
+    # it does anything a session it conflicts with could observe. A saved connection conflicts only
+    # with another session of its own stored registration and with a hand-written-config session;
+    # a hand-written-config session conflicts with every other one (see SessionLock).
     #
-    # It wraps the WHOLE command rather than the claim, so the refusal beats the provider probe,
-    # the presence report, the connector start and the claim itself — and beats the connection
-    # resolution too, because "another session is running" is the honest answer even on a machine
-    # that is not connected at all. The block's own ensure boundary releases it, so a startup
-    # failure and a Ctrl-C free the session exactly as a clean finish does.
+    # It is taken as soon as the selection and its local credential are resolved and before
+    # anything else, so the refusal beats the provider probe, the presence report, the connector
+    # start and the claim. A selection or credential that fails takes nothing, so it reports its
+    # own problem.
+    # The block's own ensure boundary releases it, so a startup failure and a Ctrl-C free the
+    # session exactly as a clean finish does.
     #
     # `connect`, the dashboard, listings, readiness tests and help are not execution sessions and
     # take nothing: an operator must still be able to look at, fix, and choose a connection while
@@ -131,16 +134,22 @@ module SpecrelayRunner
     # is local state that cannot be used (2) — the same distinction the `connections` commands
     # document, so a wrapper script can tell "try later" from "fix your setup".
     #
-    # Only these two named classes are caught. The block is the whole command, so a broad rescue
-    # here would swallow work-execution failures and report them as a session problem.
-    def in_session(&block)
-      SessionLock.hold(env: env, &block)
+    # Only these two named classes are caught. The block is the rest of the command, so a broad
+    # rescue here would swallow work-execution failures and report them as a session problem.
+    def in_session(config, &block)
+      session_lock(config).hold(&block)
     rescue SessionLock::Busy => e
       err.puts e.message
       RUN_FAILED
     rescue SessionLock::Error => e
       err.puts e.message
       USAGE_ERROR
+    end
+
+    def session_lock(config)
+      return SessionLock.exclusive(env: env) if config.connection.nil?
+
+      SessionLock.saved(base_url: config.base_url, runner_public_id: config.connection.runner_public_id, env: env)
     end
 
     def secret_store = @injected_secret_store || SecretStore.for(platform: RUBY_PLATFORM)
@@ -196,21 +205,7 @@ module SpecrelayRunner
       return USAGE_ERROR if config.nil?
 
       auth = config.resolve_auth(env: env)
-      announce(config, auth)
-      # MVP-0016: when this runner selected the real Claude Code profile, prove the
-      # local dependency is ready BEFORE asking Platform for work. Claiming first
-      # and discovering a missing CLI afterwards burns a real run and leaves it
-      # stuck; this exits non-zero having sent no claim request at all.
-      return RUN_FAILED unless executor_ready?(config)
-
-      client = PlatformClient.new(base_url: config.base_url, token: auth.token)
-      result = client.claim(config.claim_runner_params)
-      unless result.claimed?
-        out.puts not_claimed_message(result)
-        return SUCCESS
-      end
-
-      execute(config, client, result.payload)
+      in_session(config) { claim_selected(config, auth) }
     rescue ImplementationProfile::Error, ClaudeProfile::Error, CodexProfile::Error => e
       err.puts "Invalid executor profile: #{e.message}"
       USAGE_ERROR
@@ -227,6 +222,24 @@ module SpecrelayRunner
     rescue PlatformClient::Error => e
       err.puts "Runner failed: #{e.message}"
       RUN_FAILED
+    end
+
+    def claim_selected(config, auth)
+      announce(config, auth)
+      # When this runner selected a real provider profile, prove the
+      # local dependency is ready BEFORE asking Platform for work. Claiming first
+      # and discovering a missing CLI afterwards burns a real run and leaves it
+      # stuck; this exits non-zero having sent no claim request at all.
+      return RUN_FAILED unless executor_ready?(config)
+
+      client = PlatformClient.new(base_url: config.base_url, token: auth.token)
+      result = client.claim(config.claim_runner_params)
+      unless result.claimed?
+        out.puts not_claimed_message(result)
+        return SUCCESS
+      end
+
+      execute(config, client, result.payload)
     end
 
     # MVP-0018 — the normal operator mode for a connected personal runner: poll,
@@ -254,17 +267,21 @@ module SpecrelayRunner
       return USAGE_ERROR if config.nil?
 
       auth = config.resolve_auth(env: env)
-      announce(config, auth)
-      out.puts "Poll interval: #{interval.notice || "#{interval.seconds}s"}"
-      return RUN_FAILED unless executor_ready?(config)
-
-      run_loop(config, auth, interval, policy)
+      in_session(config) { start_selected_loop(config, auth, interval, policy) }
     rescue ImplementationProfile::Error, ClaudeProfile::Error, CodexProfile::Error => e
       err.puts "Invalid executor profile: #{e.message}"
       USAGE_ERROR
     rescue Config::Error => e
       err.puts "Invalid runner config: #{e.message}"
       USAGE_ERROR
+    end
+
+    def start_selected_loop(config, auth, interval, policy)
+      announce(config, auth)
+      out.puts "Poll interval: #{interval.notice || "#{interval.seconds}s"}"
+      return RUN_FAILED unless executor_ready?(config)
+
+      run_loop(config, auth, interval, policy)
     end
 
     def run_loop(config, auth, interval, policy)
