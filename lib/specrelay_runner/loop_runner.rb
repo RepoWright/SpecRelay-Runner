@@ -153,12 +153,14 @@ module SpecrelayRunner
     attr_reader :claim, :execute, :poll_seconds, :on_failure, :max_iterations, :sleeper, :presenter,
                 :clock, :label, :presence, :connector, :status_reporter
 
-    # The session's two preconditions, LOCAL before remote: a machine that cannot run its own
-    # preview connector is told so before it asks Platform for anything, so it never holds work it
-    # could not have published. Either refusal has already recorded one actionable failure.
+    # The session's two preconditions, admission first: a terminal Platform has not admitted starts
+    # no preview connector and asks for no work. The caller normally admitted it already, which
+    # makes the first check inert. A machine that then cannot run its own connector is told so
+    # before it asks Platform for anything, so it never holds work it could not have published.
+    # Either refusal has already recorded one actionable failure.
     def session_status
-      return FAILED if start_connector == :stop
       return FAILED if announce_presence == :stop
+      return FAILED if start_connector == :stop
 
       poll_loop
     end
@@ -197,7 +199,15 @@ module SpecrelayRunner
       fatal("this runner's credential was rejected by Platform (#{Redaction.redact(e.message)})",
             "Reconnect this machine: specrelay-runner connect <enrollment-code>")
     rescue PlatformClient::Error => e
-      back_off(e)
+      e.refused? ? refused_claim(e) : back_off(e)
+    end
+
+    # Platform read the claim and refused it — most often because this terminal's session is no
+    # longer admitted. Repeating the same request cannot change that, so the loop stops rather
+    # than polling without a slot.
+    def refused_claim(error)
+      fatal("Platform refused this terminal's claim (#{Redaction.redact(error.message)})",
+            "Start this runner again.")
     end
 
     # A healthy no-work answer is the thing this loop does most and the thing an
@@ -414,8 +424,14 @@ module SpecrelayRunner
       act_on_session(presence.resume)
     end
 
+    # Admission must be granted, not merely not refused: an unreachable Platform at the start leaves
+    # this terminal without a slot, and a terminal without a slot does no work.
     def announce_presence
-      act_on_session(presence.started)
+      outcome = presence.started
+      return :continue if outcome.ok?
+
+      @stop_requested = true
+      fatal(outcome.message, outcome.remedy || "Check that Platform is reachable, then start this runner again.")
     end
 
     def start_connector

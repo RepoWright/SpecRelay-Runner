@@ -169,17 +169,21 @@ module SpecrelayRunner
     #
     # Anything but that exact shape raises. A target is acted on by deleting local work, so an
     # answer this client cannot read in full is never guessed at.
-    def cancellation_cleanup_target(workspace_key:, candidates:)
+    def cancellation_cleanup_target(workspace_key:, candidates:, session_id:)
       offered = candidates.first(MAX_CLEANUP_CANDIDATES).map { |run_id, task_id| { run_id: run_id, task_id: task_id } }
       status, body = post_json("/api/runner/cancellation_cleanup_target",
-                               { workspace_key: workspace_key, candidates: offered })
+                               { workspace_key: workspace_key, candidates: offered, session_id: session_id })
       raise_for(status, body) unless status == 200
 
       cleanup_target(body)
     end
 
-    def claim(runner_params)
-      status, body = post_json("/api/runner/claim", { runner: runner_params })
+    # `session_id` names the admitted session this claim is for. A development-token caller has
+    # none and sends none.
+    def claim(runner_params, session_id: nil)
+      payload = { runner: runner_params }
+      payload[:session_id] = session_id if session_id
+      status, body = post_json("/api/runner/claim", payload)
       case status
       when 201 then ClaimResult.new(claimed: true, payload: body)
       when 200 then ClaimResult.new(claimed: false, payload: body)
@@ -204,26 +208,23 @@ module SpecrelayRunner
       end
     end
 
-    # POST /api/runner/presence (MVP-0031). One IDLE presence signal for one workspace
-    # connection: started, heartbeat, or stopped.
+    # POST /api/runner/presence. One session signal: started (admission), heartbeat or
+    # stopped.
     #
     # A sibling of #heartbeat, never a variant of it. A heartbeat renews the lease on a run
     # this process CLAIMED and is proof of active work; this says only that a loop is watching
     # and owns nothing. Platform keeps them apart so an idle watcher can never appear to hold
     # work, and the two must not share a method that could send one where the other is meant.
     #
-    # Platform decides the outcome — `accepted` or `superseded` — and advertises the cadence to
-    # keep, so the response is read for what it DECIDED rather than assumed. Both are 200: a
-    # superseded session is a well-formed request with a meaningful answer, not a transport
-    # failure to retry.
-    # `session_id` is absent on the opening call — that call is the request for a session, and
-    # Platform answers it with the sequence the following `started` must present. Keys that do
-    # not apply to an event are omitted rather than sent as null, so the payload stays the
-    # closed set the endpoint validates.
-    def report_presence(workspace_key:, event:, session_id: nil, session_seq: nil)
-      payload = { workspace_key: workspace_key, event: event }
-      payload[:session_id] = session_id if session_id
-      payload[:session_seq] = session_seq if session_seq
+    # Platform decides the outcome — `accepted`, `superseded` or `full` — and advertises the cadence
+    # to keep, so the response is read for what it DECIDED rather than assumed. All three are 200:
+    # each is a well-formed request with a meaningful answer, not a transport failure to retry.
+    # `workspace_key` names the saved connection a start selected; a hand-written config has none.
+    # It is omitted rather than sent as null, so the payload stays the closed set the endpoint
+    # validates.
+    def report_presence(event:, session_id:, workspace_key: nil)
+      payload = { event: event, session_id: session_id }
+      payload[:workspace_key] = workspace_key if workspace_key
       status, body = post_json("/api/runner/presence", payload)
       status == 200 ? body : raise_for(status, body)
     end

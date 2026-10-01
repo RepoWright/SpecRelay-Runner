@@ -2,26 +2,24 @@
 
 require_relative "test_helper"
 
-# Which work-running sessions may run together on one OS account.
+# Which work-running sessions may run together on one OS account, and how many of one
+# registration Platform admits.
 #
-# Platform keeps one presence session and one active execution per REGISTERED RUNNER, and a
-# machine holds a separate registration per project. Two terminals working for two SAVED
-# connections of different registrations therefore meet nothing shared on the server, and each
-# keeps its own project, credential, root and provider children. Two terminals for the SAME
-# registration would overwrite each other's presence, so they may not run together.
+# A saved connection's session takes the local gate SHARED, so saved sessions of any registration
+# — including several of the same one — run side by side. How many terminals one registration may
+# run is Platform's decision: each session asks to be admitted against the registration's stored
+# maximum before it probes a provider, starts a connector, polls or claims, and every claim names
+# the session it is made for. A hand-written config has no stored registration identity on this
+# machine, so its session takes the gate EXCLUSIVE and runs alone; a registered credential in it is
+# still admitted by Platform and counts against the same maximum.
 #
-# A saved connection names its registration by the Platform-issued public id it stores, which
-# survives reconnect and credential rotation. A hand-written config has no such identity — its
-# declared id is the client's own claim — so a session started from one runs alone.
+# What the tests below have to prove:
 #
-# What the tests below have to prove is narrow and exact:
-#
-#   - two saved connections of different registrations run at the same time, and stopping one
-#     leaves the other running;
-#   - a second saved session of the same registration — through another saved workspace, or after
-#     the credential was rotated — is refused before anything the first would observe;
-#   - a hand-written-config session and any other session refuse each other in both start orders,
-#     whatever config path, declared id or credential the second one uses;
+#   - two saved sessions of one registration are both admitted, claim through their own session,
+#     run their tickets and connectors side by side, and stop independently;
+#   - a start over the maximum is refused — for loop, claim-once and a registered hand-written
+#     config — before the provider probe, the connector and the claim, naming the count and maximum;
+#   - a hand-written-config session and any other session refuse each other in both start orders;
 #   - a failed selection takes no lock, and every ending releases exactly what was acquired.
 #
 # The contention cases run REAL processes. Two threads in one process share a file description
@@ -31,7 +29,6 @@ class SessionExclusionTest < Minitest::Test
   RUBY_BIN = RbConfig.ruby
   # Bounded so a lock that never releases fails this test rather than hanging the suite.
   WAIT_TIMEOUT_SECONDS = 30
-  ORIGIN = "http://platform.test"
 
   def setup
     @home = Dir.mktmpdir("runner-home")
@@ -59,59 +56,29 @@ class SessionExclusionTest < Minitest::Test
 
   # --- the lock itself ------------------------------------------------------
 
-  def saved(public_id, origin: ORIGIN)
-    SpecrelayRunner::SessionLock.saved(base_url: origin, runner_public_id: public_id, env: env)
-  end
+  def saved = SpecrelayRunner::SessionLock.saved(env: env)
 
   def exclusive = SpecrelayRunner::SessionLock.exclusive(env: env)
 
-  def registration_path(origin, public_id, environment = env)
-    SpecrelayRunner::SessionLock.registration_path(base_url: origin, runner_public_id: public_id, env: environment)
-  end
-
-  def test_the_gate_and_the_registration_locks_live_under_the_local_users_home
+  def test_the_gate_lives_under_the_local_users_home
     assert_equal File.join(@home, ".specrelay/runner/session.lock"), SpecrelayRunner::SessionLock.path(env: env)
-    path = registration_path(ORIGIN, "rnr_alpha")
-
-    assert_equal File.join(@home, ".specrelay/runner/sessions"), File.dirname(path)
-    assert_match(/\A\h{64}\.lock\z/, File.basename(path))
   end
 
-  # One registration is one stored public id on one Platform: a path or trailing slash on the same
-  # origin is the same registration, another public id or another Platform is not, and nothing
-  # else the invocation points at moves it.
-  def test_the_registration_lock_follows_the_stored_public_id_and_nothing_else
-    moved = env("SPECRELAY_RUNNER_STATE_FILE" => File.join(Dir.mktmpdir("other"), "connections.json"),
-                "SPECRELAY_RUNNER_CONFIG" => "/tmp/other.yml", "PWD" => Dir.mktmpdir("cwd"))
-
-    assert_equal registration_path(ORIGIN, "rnr_alpha"), registration_path("#{ORIGIN}/", "rnr_alpha", moved)
-    refute_equal registration_path(ORIGIN, "rnr_alpha"), registration_path(ORIGIN, "rnr_beta")
-    refute_equal registration_path(ORIGIN, "rnr_alpha"), registration_path("http://other-platform.test", "rnr_alpha")
-  end
-
-  def test_saved_sessions_of_different_registrations_hold_together
-    with_holder("saved", "rnr_alpha") do
-      assert_equal :beta, saved("rnr_beta").hold { :beta }
-    end
-  end
-
-  def test_a_saved_session_of_the_same_registration_is_refused
-    with_holder("saved", "rnr_alpha") do
-      refused = assert_raises(SpecrelayRunner::SessionLock::Busy) { saved("rnr_alpha").hold { flunk "ran" } }
-
-      assert_match(/for this Runner registration is already running/, refused.message)
+  def test_saved_sessions_hold_together
+    with_holder("saved") do
+      assert_equal :second, saved.hold { :second }
     end
   end
 
   def test_an_exclusive_session_and_a_saved_one_refuse_each_other
-    with_holder("saved", "rnr_alpha") do
+    with_holder("saved") do
       refused = assert_raises(SpecrelayRunner::SessionLock::Busy) { exclusive.hold { flunk "ran" } }
 
       assert_match(/hand-written config runs only alone/, refused.message)
       refute_match(/registration/, refused.message)
     end
     with_holder("exclusive") do
-      refused = assert_raises(SpecrelayRunner::SessionLock::Busy) { saved("rnr_beta").hold { flunk "ran" } }
+      refused = assert_raises(SpecrelayRunner::SessionLock::Busy) { saved.hold { flunk "ran" } }
 
       assert_match(/hand-written config is already running/, refused.message)
       refute_match(/registration/, refused.message)
@@ -119,38 +86,26 @@ class SessionExclusionTest < Minitest::Test
     end
   end
 
-  # A saved session that gets the gate but not its registration must hand the gate back, or it
-  # would keep a later hand-written session out after it had already been refused.
-  def test_a_partly_acquired_session_releases_what_it_took
-    with_holder("saved", "rnr_alpha") do
-      assert_raises(SpecrelayRunner::SessionLock::Busy) { saved("rnr_alpha").hold { flunk "ran" } }
-    end
-
-    assert_equal 0, run_holder_once("exclusive"), "the refused session kept the gate"
-  end
-
   def test_every_ending_releases_both_modes
-    [ -> { saved("rnr_alpha") }, -> { exclusive } ].each do |lock|
+    [ -> { saved }, -> { exclusive } ].each do |lock|
       lock.call.hold { :done }
       assert_raises(RuntimeError) { lock.call.hold { raise "startup failed" } }
       assert_raises(Interrupt) { lock.call.hold { raise Interrupt } }
 
       assert_equal 0, run_holder_once("exclusive"), "a released session still held the gate"
-      assert_equal 0, run_holder_once("saved", "rnr_alpha"), "a released session still held its registration"
     end
     assert File.file?(SpecrelayRunner::SessionLock.path(env: env)), "releasing removed the gate file"
   end
 
-  # A provider or connector the session launches must not inherit either descriptor. If it did,
+  # A provider or connector the session launches must not inherit the gate's descriptor. If it did,
   # an orphaned child outliving the runner would keep the session claimed with nothing to Ctrl-C.
-  def test_a_surviving_child_process_retains_neither_lock
+  def test_a_surviving_child_process_does_not_retain_the_gate
     stop = File.join(@home, "child-stop")
-    child = saved("rnr_alpha").hold do
+    child = saved.hold do
       Process.spawn(RUBY_BIN, "-e", "sleep 0.05 until File.exist?(#{stop.inspect})")
     end
 
     assert_equal 0, run_holder_once("exclusive"), "the child kept the gate"
-    assert_equal 0, run_holder_once("saved", "rnr_alpha"), "the child kept the registration"
   ensure
     File.write(stop, "go")
     Process.waitpid(child) if child
@@ -210,27 +165,137 @@ class SessionExclusionTest < Minitest::Test
     end
   end
 
-  # Scenario 3: another saved workspace of the same registration is the same registration.
-  def test_another_saved_workspace_of_the_same_registration_is_refused_before_any_side_effect
-    alpha = saved_connection("alpha")
-    second = saved_connection("alpha-second", platform: alpha[:platform], public_id: alpha[:public_id])
+  # --- one registration, several admitted sessions ----------------------------
 
-    assert_refused_while_held(spawn_saved_loop(alpha), alpha[:platform],
-                              ->(command) { [ run_saved([ command, "--workspace", second[:workspace_key] ]) ] },
-                              message: /for this Runner registration is already running/)
+  # Scenario 11 and AC1: two terminals of ONE registration — the same saved connection, against its
+  # one Platform — are both admitted, each claims under its own session id, and stopping one stops
+  # only its own session while the other keeps polling.
+  def test_two_saved_sessions_of_one_registration_are_admitted_and_stop_independently
+    alpha = saved_connection("alpha")
+    alpha[:platform].maximum_sessions = 2
+    first_loop = spawn_saved_loop(alpha)
+    second_loop = spawn_saved_loop(alpha, label: "alpha-second-loop")
+    wait_for { claims(alpha[:platform]) >= 2 && alpha[:platform].admitted_sessions.size == 2 }
+
+    admitted = alpha[:platform].admitted_sessions
+    assert_equal admitted.sort, claim_session_ids(alpha[:platform]).uniq.sort
+
+    stop_process(first_loop[:pid])
+    wait_for { alpha[:platform].admitted_sessions.size == 1 }
+    polled = claims(alpha[:platform])
+    wait_for { claims(alpha[:platform]) > polled }
+
+    assert running?(second_loop[:pid]), "stopping one session stopped the other"
+    assert_equal [ alpha[:platform].admitted_sessions.first ], claim_session_ids(alpha[:platform]).last(1)
   end
 
-  # Scenario 3: rotating the credential keeps the registration, so it keeps the lock too. The one
-  # fake Platform stands for that one registration and accepts both its old and its new credential.
-  def test_a_rotated_credential_of_the_same_registration_is_refused_before_any_side_effect
+  # Scenario 11: a start over the registration's maximum is refused before the provider probe, the
+  # preview connector and the claim, for `loop` and `claim-once` alike, and names the count and
+  # maximum Platform reported.
+  def test_a_saved_session_over_the_maximum_is_refused_before_any_work
     alpha = saved_connection("alpha")
-    holder = spawn_saved_loop(alpha)
-    wait_for { claims(alpha[:platform]) >= 1 }
-    store_secret(SpecrelayRunner::SecretStore.account_for_runner(alpha[:public_id]), FakePlatform::ISSUED_CREDENTIAL)
+    alpha[:platform].maximum_sessions = 1
+    alpha[:platform].occupy_session!("another-terminal-session")
 
-    assert_refused_while_held(holder, alpha[:platform],
-                              ->(command) { [ run_saved([ command, "--workspace", alpha[:workspace_key] ]) ] },
-                              message: /for this Runner registration is already running/)
+    %w[loop claim-once].each do |command|
+      refused = run_saved([ command, "--workspace", alpha[:workspace_key] ])
+
+      assert_equal SpecrelayRunner::CLI::RUN_FAILED, refused[:status], "#{command}: #{refused[:stderr]}"
+      assert_match(/1 of 1 sessions/, refused[:stderr])
+    end
+    assert_equal 0, claims(alpha[:platform]), "a refused session claimed"
+    assert_empty alpha[:platform].requests_to("/api/runner/cancellation_cleanup_target")
+    refute File.exist?(connector_marker), "a refused session started its preview connector"
+    assert_equal [ "started" ], alpha[:platform].requests_to("/api/runner/presence").map { |r| r[:body]["event"] }.uniq
+  end
+
+  # Only an explicit `accepted` admits a terminal. An unknown, missing or malformed answer is not
+  # an admission, so neither command probes its provider, starts its connector or claims.
+  def test_an_unrecognized_admission_answer_starts_no_work
+    [ { "outcome" => "admitted" }, { "slot_number" => 1 }, "accepted" ].each do |answer|
+      alpha = saved_connection("alpha-#{SecureRandom.hex(2)}")
+      alpha[:platform].answer_starts_with!(answer)
+      %w[loop claim-once].each do |command|
+        refused = run_saved([ command, "--workspace", alpha[:workspace_key] ])
+
+        assert_equal SpecrelayRunner::CLI::RUN_FAILED, refused[:status], "#{answer.inspect} #{command}: #{refused[:stderr]}"
+      end
+      assert_equal 0, claims(alpha[:platform]), "#{answer.inspect}: an unadmitted session claimed"
+      assert_empty alpha[:platform].requests_to("/api/runner/cancellation_cleanup_target")
+      refute File.exist?(connector_marker), "#{answer.inspect}: an unadmitted session started its connector"
+
+      platform = idle_platform
+      platform.answer_starts_with!(answer)
+      probe = File.join(@home, "provider-probed")
+      refused = run_config([ "claim-once", "--config", config_for(platform, "alpha-runner", provider: "claude") ],
+                           overrides: { "PATH" => "#{File.dirname(provider_probe(probe))}:/usr/bin:/bin" })
+
+      assert_equal SpecrelayRunner::CLI::RUN_FAILED, refused[:status], refused[:stdout] + refused[:stderr]
+      refute File.exist?(probe), "#{answer.inspect}: the provider was probed without admission"
+      assert_equal 0, claims(platform)
+    end
+  end
+
+  # Scenario 11: a registered credential in a hand-written config is admitted by Platform too, with
+  # no selected workspace, and is refused at the same maximum before its provider probe runs.
+  def test_a_registered_hand_written_config_counts_against_the_same_maximum
+    platform = idle_platform
+    platform.maximum_sessions = 1
+    platform.occupy_session!("another-terminal-session")
+    probe = File.join(@home, "provider-probed")
+
+    refused = run_config([ "claim-once", "--config", config_for(platform, "alpha-runner", provider: "claude") ],
+                         overrides: { "PATH" => "#{File.dirname(provider_probe(probe))}:/usr/bin:/bin" })
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, refused[:status], refused[:stdout] + refused[:stderr]
+    assert_match(/1 of 1 sessions/, refused[:stderr])
+    refute File.exist?(probe), "the provider was probed before admission"
+    assert_equal 0, claims(platform)
+    started = platform.requests_to("/api/runner/presence").first[:body]
+    assert_equal "started", started["event"]
+    refute started.key?("workspace_key"), "a hand-written config selected a workspace"
+  end
+
+  # Scenario 12: two terminals of one saved connection, in its ONE checkout, each claim a different
+  # ticket and execute it at the same time. Each executor finishes only once the other has started,
+  # so both runs complete only if their task environments really ran side by side.
+  def test_two_sessions_of_one_registration_execute_their_own_tickets_in_one_checkout
+    root, = DemoWorkspace.build
+    markers = Dir.mktmpdir("executors")
+    platform = start_platform(claim_payload_for(task_id: "DEMO-UNUSED", root: root))
+    platform.maximum_sessions = 2
+    connection = saved_connection("lane", platform: platform, root: root)
+    platform.queue_claims(%w[ALPHA BETA].map { |name| lane_payload(name, connection[:workspace_key], root) })
+    executor = handshake_pair(root, markers)
+
+    started = %w[alpha beta].map do |name|
+      spawn_saved([ "claim-once", "--workspace", connection[:workspace_key] ], name,
+                  overrides: { "PATH" => fixture_path(executor, base: saved_path) })
+    end
+    results = started.map { |process| finish(process) }
+
+    results.each { |result| assert_equal 0, result[:status], result[:stdout] + result[:stderr] }
+    assert_equal 2, platform.requests_to("/api/runner/reports").size
+    assert_equal 2, claim_session_ids(platform).uniq.size
+    assert_empty platform.admitted_sessions, "a finished claim-once kept its session"
+  end
+
+  # Scenario 12: each loop of one registration launches its own preview connector child. Stopping
+  # one session stops its own connector and leaves the other's running and answering.
+  def test_two_sessions_of_one_registration_keep_their_own_preview_connectors
+    alpha = saved_connection("alpha")
+    alpha[:platform].maximum_sessions = 2
+    first_loop = spawn_saved_loop(alpha)
+    spawn_saved_loop(alpha, label: "alpha-second-loop")
+    wait_for { connector_pids.size == 2 && connector_pids.all? { |pid| alive?(pid) } }
+    connectors = connector_pids
+
+    stop_process(first_loop[:pid])
+    wait_for { connectors.one? { |pid| alive?(pid) } }
+
+    survivor = connectors.find { |pid| alive?(pid) }
+    assert survivor, "stopping one session stopped every connector"
+    assert connector_answers?(survivor), "the remaining connector stopped answering"
   end
 
   # --- hand-written configs, as real processes -------------------------------
@@ -399,6 +464,53 @@ class SessionExclusionTest < Minitest::Test
 
   def claims(platform) = platform.requests_to("/api/runner/claim").size
 
+  def claim_session_ids(platform) = platform.requests_to("/api/runner/claim").map { |r| r[:body]["session_id"] }
+
+  # One terminal's own ticket in the shared workspace.
+  def lane_payload(name, workspace_key, root)
+    payload = claim_payload_for(task_id: "DEMO-#{name}", root: root)
+    payload["workspace"]["workspace_key"] = workspace_key
+    payload["run"]["id"] = "run_#{name.downcase}"
+    payload["claim"]["runner_execution_id"] = "rex_#{name.downcase}"
+    payload
+  end
+
+  # One executor for both terminals: whichever ticket it runs, it records its start and finishes
+  # only once the OTHER ticket's executor has started too.
+  def handshake_pair(root, markers)
+    path = File.join(root, "bin", "handshake-pair-executor")
+    File.write(path, <<~RUBY)
+      #!/usr/bin/env ruby
+      mine = Dir.pwd.include?("DEMO-ALPHA") ? "alpha" : "beta"
+      peer = mine == "alpha" ? "beta" : "alpha"
+      File.write(File.join(#{markers.inspect}, mine), "started")
+      deadline = Time.now + #{WAIT_TIMEOUT_SECONDS}
+      sleep 0.05 until File.exist?(File.join(#{markers.inspect}, peer)) || Time.now > deadline
+      abort "the \#{peer} executor never ran alongside this one" unless File.exist?(File.join(#{markers.inspect}, peer))
+      file = "demo-app/index.html"
+      File.write(file, File.read(file).gsub("Hello Demo", "Hello SpecRelay Demo"))
+      #{DemoWorkspace.selection_snippet}
+      exit 0
+    RUBY
+    FileUtils.chmod(0o755, path)
+    path
+  end
+
+  def alive?(pid)
+    Process.kill(0, pid)
+    true
+  rescue Errno::ESRCH
+    false
+  end
+
+  # A provider CLI stand-in that records that it was probed at all.
+  def provider_probe(marker)
+    path = File.join(Dir.mktmpdir("probe"), "claude")
+    File.write(path, "#!/bin/sh\ntouch #{marker}\nexit 1\n")
+    FileUtils.chmod(0o755, path)
+    path
+  end
+
   # The one credential a fake Platform accepts besides the fake's issued one.
   def credential_of(platform) = platform.instance_variable_get(:@token)
 
@@ -492,7 +604,9 @@ class SessionExclusionTest < Minitest::Test
       File.write(path, <<~RUBY)
         #!#{RUBY_BIN}
         require "socket"
-        server = TCPServer.new("127.0.0.1", ARGV[ARGV.index("--metrics") + 1].split(":").last.to_i)
+        port = ARGV[ARGV.index("--metrics") + 1].split(":").last.to_i
+        server = TCPServer.new("127.0.0.1", port)
+        File.write(File.join(#{connector_directory.inspect}, Process.pid.to_s), port.to_s)
         loop do
           client = server.accept
           client.print("HTTP/1.1 200 OK\\r\\nContent-Length: 0\\r\\nConnection: close\\r\\n\\r\\n")
@@ -504,13 +618,25 @@ class SessionExclusionTest < Minitest::Test
     end
   end
 
+  # Each connector stand-in records its pid and readiness port here when it starts.
+  def connector_directory = @connector_directory ||= Dir.mktmpdir("connectors")
+  def connector_marker = Dir.glob(File.join(connector_directory, "*")).first.to_s
+  def connector_pids = Dir.children(connector_directory).map(&:to_i)
+
+  def connector_answers?(pid)
+    port = File.read(File.join(connector_directory, pid.to_s)).to_i
+    TCPSocket.new("127.0.0.1", port).close
+    true
+  rescue SystemCallError
+    false
+  end
+
   def spawn_saved(argv, label, overrides: {})
     spawn_process([ RUBY_BIN, saved_driver, *argv ], label, { "PATH" => saved_path }.merge(overrides))
   end
 
-  def spawn_saved_loop(connection)
-    spawn_saved([ "loop", "--workspace", connection[:workspace_key], "--poll-interval", "5" ],
-                "#{connection[:name]}-loop")
+  def spawn_saved_loop(connection, label: "#{connection[:name]}-loop")
+    spawn_saved([ "loop", "--workspace", connection[:workspace_key], "--poll-interval", "5" ], label)
   end
 
   def spawn_config_loop(config)
@@ -569,9 +695,8 @@ class SessionExclusionTest < Minitest::Test
   # A lock taken in ANOTHER process, because `flock` is per file description: a second `flock` on
   # the same description in this process would be granted and prove nothing. Without `release` it
   # lets go at once, so its exit status says whether the lock was free.
-  def holder_script(mode, public_id, started, release)
-    saved = "saved(base_url: #{ORIGIN.inspect}, runner_public_id: #{public_id.inspect}, env: ENV)"
-    lock = mode == "saved" ? saved : "exclusive(env: ENV)"
+  def holder_script(mode, started, release)
+    lock = mode == "saved" ? "saved(env: ENV)" : "exclusive(env: ENV)"
     wait = release ? "sleep 0.05 until File.exist?(#{release.inspect})" : ""
     <<~RUBY
       require_relative #{File.expand_path('../lib/specrelay_runner', __dir__).inspect}
@@ -582,12 +707,12 @@ class SessionExclusionTest < Minitest::Test
     RUBY
   end
 
-  def with_holder(mode, public_id = nil)
+  def with_holder(mode)
     started = File.join(@home, "holder-started")
     release = File.join(@home, "holder-release")
     [ started, release ].each { |path| FileUtils.rm_f(path) }
     script = File.join(@home, "holder.rb")
-    File.write(script, holder_script(mode, public_id, started, release))
+    File.write(script, holder_script(mode, started, release))
     pid = Process.spawn(env, RUBY_BIN, script)
     wait_for { File.exist?(started) }
     yield
@@ -596,9 +721,9 @@ class SessionExclusionTest < Minitest::Test
     Process.waitpid(pid) if pid
   end
 
-  def run_holder_once(mode, public_id = nil)
+  def run_holder_once(mode)
     script = File.join(@home, "once.rb")
-    File.write(script, holder_script(mode, public_id, File.join(@home, "once-started"), nil))
+    File.write(script, holder_script(mode, File.join(@home, "once-started"), nil))
     _pid, status = Process.waitpid2(Process.spawn(env, RUBY_BIN, script, err: File::NULL))
     status.exitstatus
   end

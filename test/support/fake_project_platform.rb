@@ -151,6 +151,9 @@ class FakeProjectPlatform
     when "/api/runner/workspace_connections" then [ 201, readiness(request) ]
     when %r{\A/api/runner/workspace_connections/(?<key>.+)\z} then describe(request, Regexp.last_match[:key])
     when "/api/runner/claim" then [ 200, { claimed: false, reason: "no_eligible_runs" } ]
+    # Every start is admitted: these specs are about which connection a terminal runs, not how many.
+    when "/api/runner/presence" then [ 200, { "presence" => { "outcome" => "accepted", "slot_number" => 1,
+                                                              "heartbeat_seconds" => 30 } } ]
     else [ 404, { error: "not found" } ]
     end
   end

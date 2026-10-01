@@ -13,6 +13,7 @@ require "open3"
 # the fake Platform, on a real git worktree allocated and released by the project's own
 # `bin/worktree`.
 class DeferredCancellationCleanupTest < Minitest::Test
+  SESSION_ID = "session-deferred-0001"
   CREDENTIAL = "src_deferred-cleanup-credential"
   KEY = "tiny-demo-workspace"
   RUN = "run_paused"
@@ -73,6 +74,9 @@ class DeferredCancellationCleanupTest < Minitest::Test
     assert_equal %w[target claim], exchanges
     assert_empty @platform.requests_to("/api/runner/heartbeat")
     refute_includes @platform.requests_to("/api/runner/cancellation_cleanup_target").first[:body].keys, "claim"
+    assert_equal [ SESSION_ID, SESSION_ID ], %w[cancellation_cleanup_target claim].map { |path|
+      @platform.requests_to("/api/runner/#{path}").first.dig(:body, "session_id")
+    }, "the cleanup read and the claim must both name this terminal's admitted session"
     refute File.directory?(worktree(TASK))
   end
 
@@ -255,7 +259,7 @@ class DeferredCancellationCleanupTest < Minitest::Test
     SpecrelayRunner::LoopRunner.call(
       out: @io, err: @io, install_signals: false, max_iterations: iterations, poll_seconds: 0,
       sleeper: ->(_seconds) { }, on_failure: SpecrelayRunner::LoopRunner::ON_FAILURE_CONTINUE,
-      claim: -> { cli.send(:claim_after_cancellation_cleanup, config, client) },
+      claim: -> { cli.send(:claim_after_cancellation_cleanup, config, client, SESSION_ID) },
       execute: ->(_payload) { true }
     )
   end

@@ -99,6 +99,22 @@ class FakePlatform
 
   attr_reader :requests
 
+  # Session admission, as Platform decides it: up to this many admitted sessions, a repeated start
+  # keeping its slot, a stop freeing it. nil admits every start, which is what a test that is not
+  # about admission needs.
+  attr_accessor :maximum_sessions
+
+  def admitted_sessions = @mutex.synchronize { @sessions.keys }
+
+  # Answer every start with this `presence` value instead of an admission decision, so a test can
+  # send an unknown, missing or malformed outcome.
+  def answer_starts_with!(presence) = @mutex.synchronize { @start_answer = [ presence ] }
+  def occupy_session!(session_id) = @mutex.synchronize { @sessions[session_id] = free_slot }
+
+  # Distinct assignments served one per claim, in order, then no more work — so two terminals of
+  # one registration can each be given their own ticket.
+  def queue_claims(payloads) = @mutex.synchronize { @queued_claims = payloads.dup }
+
   # `token` is the shared development token (fallback mode). A guided connection issues
   # ISSUED_CREDENTIAL, which the fake then accepts as a registered bearer for the remaining
   # endpoints (registered mode).
@@ -138,6 +154,8 @@ class FakePlatform
     @question_delivered = false
     @question_refusals = []
     @cleanup_targets = []
+    @sessions = {}
+    @queued_claims = nil
     @mutex = Mutex.new
   end
 
@@ -412,6 +430,7 @@ class FakePlatform
     when "/api/runner/workspace_connections" then workspace_connection(request)
     when %r{\A/api/runner/workspace_connections/(?<key>.+)\z} then member(request, Regexp.last_match[:key])
     when "/api/runner/claim" then claim
+    when "/api/runner/presence" then presence(request)
     when "/api/runner/cancellation_cleanup_target" then cancellation_cleanup_target
     when "/api/runner/events" then events(request)
     when "/api/runner/heartbeat" then [ 200, { acknowledged: true, state: "EXECUTING", lease: lease_signal } ]
@@ -728,6 +747,7 @@ class FakePlatform
 
   def claim
     return [ 401, { error: "claim_limit_reached" } ] if claim_limit_reached?
+    return queued_claim unless @queued_claims.nil?
     if @claimed
       [ 200, { claimed: false, reason: "already claimed" } ]
     else
@@ -742,6 +762,45 @@ class FakePlatform
   # this limit the fake answers the one thing the loop treats as fatal, so a session that should
   # have stopped by itself ends with a claim count that says it did not.
   def claim_limit_reached? = !@claim_limit.nil? && @claims_served >= @claim_limit
+
+  def queued_claim
+    payload = @mutex.synchronize { @queued_claims.shift }
+    return [ 200, { claimed: false, reason: "no eligible run under this runner's claim policy" } ] if payload.nil?
+
+    @claims_served += 1
+    [ 201, payload ]
+  end
+
+  def presence(request)
+    body = request[:body].to_h
+    forced = @mutex.synchronize { @start_answer if body["event"] == "started" }
+    return [ 200, { "presence" => forced.first } ] if forced
+
+    decided = @mutex.synchronize { presence_outcome(body["event"], body["session_id"].to_s) }
+    [ 200, { "presence" => decided.merge("heartbeat_seconds" => 30, "recent_for_seconds" => 90) } ]
+  end
+
+  def presence_outcome(event, session_id)
+    case event
+    when "started" then admit_session(session_id)
+    when "heartbeat" then { "outcome" => @sessions.key?(session_id) ? "accepted" : "superseded" }
+    else
+      @sessions.delete(session_id)
+      { "outcome" => "accepted" }
+    end
+  end
+
+  def admit_session(session_id)
+    return { "outcome" => "accepted", "slot_number" => @sessions[session_id] } if @sessions.key?(session_id)
+    if maximum_sessions && @sessions.size >= maximum_sessions
+      return { "outcome" => "full", "active_sessions" => @sessions.size, "maximum_sessions" => maximum_sessions }
+    end
+
+    @sessions[session_id] = free_slot
+    { "outcome" => "accepted", "slot_number" => @sessions[session_id] }
+  end
+
+  def free_slot = (1..).find { |slot| !@sessions.value?(slot) }
 
   # A released run is CLAIMABLE AGAIN, which is the whole point of releasing it and
   # the reason a repeated claim loop was possible at all. The fake said "already claimed"
