@@ -102,7 +102,15 @@ module SpecrelayRunner
     # touched, and every target is proven clean at the recorded base before its objects are
     # imported — so a package that is not the recorded one, or a workspace that is not the
     # recorded base, never reaches a working tree at all.
-    def restore(checkpoint, payload:, task_root:, workspace:)
+    #
+    # `created` says THIS attempt built the task workspace. A project whose task environment is
+    # several independent repositories prepares its components DETACHED at their base, so a
+    # continuation on a machine that never held the work builds its environment with the project's
+    # own command and then finds every component without the branch this checkpoint recorded. Such
+    # a checkout is run-owned and holds nothing yet, so the branch is established on it — at the
+    # base it is already sitting on, and only once every other term has passed. A worktree this
+    # attempt did not create is never placed, because nothing there proves why it is detached.
+    def restore(checkpoint, payload:, task_root:, workspace:, created: false)
       entries = recorded_entries(checkpoint)
       return refuse(entries) if entries.is_a?(String)
 
@@ -110,8 +118,11 @@ module SpecrelayRunner
       return refuse(packs) if packs.is_a?(String)
 
       entries.each_with_index do |entry, index|
-        target = clean_target(entry, task_root)
+        target = clean_target(entry, task_root, placing: created)
         return refuse(target.reason) unless target.ok?
+
+        placed = created ? place(target.path, entry) : nil
+        return refuse(placed) if placed
 
         failure = import(target.path, entry, packs[index])
         return refuse(failure) if failure
@@ -261,7 +272,11 @@ module SpecrelayRunner
     # The repository this entry names, proven to be the one that was recorded, or the reason it
     # is not. Containment comes first, then git, then identity, then position — so a refusal
     # names the most specific cause rather than a consequence of it.
-    def locate(entry, task_root)
+    #
+    # `placing` is passed ONLY while {.restore} is preparing a checkout this attempt's own create
+    # left detached. It relaxes exactly one term — see {.identified} — and never reaches {.verify},
+    # the gate a provider start waits on.
+    def locate(entry, task_root, placing: false)
       relative = entry["path"].to_s
       outside = "the recorded path #{quoted(relative)} is not inside the task workspace"
       return unlocated(outside) if rooted?(relative)
@@ -281,29 +296,68 @@ module SpecrelayRunner
       return unlocated("no git repository at the recorded path #{quoted(relative)}") if toplevel.nil?
       return unlocated("the recorded path #{quoted(relative)} is not a git repository root") unless real(toplevel) == resolved
 
-      reason = identified(entry, relative, resolved)
+      reason = identified(entry, relative, resolved, placing)
       reason ? unlocated(reason) : Located.new(path: resolved)
     end
 
     def unlocated(reason) = Located.new(reason: reason)
 
     # The identity and position terms, or the first one that failed.
-    def identified(entry, relative, resolved)
+    #
+    # A checkout being placed is DETACHED, so it has no branch to compare and the base is the one
+    # position term left. Everything else is unchanged, including the refusal for a checkout
+    # already on some other branch: a detached checkout holds nothing, and one somebody has put on
+    # a branch of their own is still somebody else's.
+    def identified(entry, relative, resolved, placing)
       origin = GithubRemote.slug(capture_git(resolved, %w[remote get-url origin]))
       return "the origin of #{quoted(relative)} is not the recorded repository" unless origin.to_s.casecmp?(entry["origin"].to_s)
+
+      observed = capture_git(resolved, %w[symbolic-ref --quiet --short HEAD])
+      return placing_base(entry, relative, resolved) if placing && observed.nil?
       return "the branch of #{quoted(relative)} is not the recorded #{quoted(entry['branch'])}" unless
-        capture_git(resolved, %w[symbolic-ref --quiet --short HEAD]) == entry["branch"].to_s
+        observed == entry["branch"].to_s
       return "the base commit of #{quoted(relative)} is not the recorded one" unless
         capture_git(resolved, %w[rev-parse HEAD]).to_s.downcase == entry["base"].to_s
 
       nil
     end
 
+    # The base, for a checkout about to be placed. A fresh environment is built from whatever this
+    # machine's clone already holds and nothing here fetches, resets or moves it, so a clone that
+    # has advanced past the recorded base simply cannot continue this work — and an operator can
+    # only see that from BOTH commits, which is why this refusal names them where the ordinary
+    # base term does not.
+    def placing_base(entry, relative, resolved)
+      observed = capture_git(resolved, %w[rev-parse HEAD]).to_s.downcase
+      return nil if observed == entry["base"].to_s
+
+      "the base commit of #{quoted(relative)} is not the recorded one: #{entry['base']} was " \
+        "recorded, #{observed.empty? ? 'no readable commit' : observed} is checked out"
+    end
+
+    # The recorded branch, established on a checkout this attempt's own create left DETACHED.
+    #
+    # {BranchPlacement} owns the rule — created when absent, selected only when it is already
+    # exactly there and no other worktree holds it, never moved — and a reviewed continuation
+    # places its own head through the same owner. The only difference is the commit: this one
+    # establishes the branch at the recorded base, which {.identified} has just proved is `HEAD`.
+    # A checkout the create left ON the recorded branch has nothing to place and is left alone.
+    def place(path, entry)
+      return nil unless capture_git(path, %w[symbolic-ref --quiet --short HEAD]).nil?
+
+      planned = BranchPlacement.new(root: path, branch: entry["branch"].to_s, commit: entry["base"].to_s,
+                                    subject: quoted(entry["path"]), noun: "recorded",
+                                    target: "recorded base").plan
+      return planned.reason if planned.is_a?(BranchPlacement::Refusal)
+
+      planned.put&.reason
+    end
+
     # The same repository, additionally proven to hold nothing of its own. Restoring into a
     # working tree somebody else is using would destroy their work, so an unclean target is a
     # refusal and never something to clean.
-    def clean_target(entry, task_root)
-      located = locate(entry, task_root)
+    def clean_target(entry, task_root, placing: false)
+      located = locate(entry, task_root, placing: placing)
       return located unless located.ok?
 
       status = git(located.path, %w[status --porcelain])
