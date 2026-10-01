@@ -2,6 +2,7 @@
 
 require "yaml"
 require "base64"
+require "json"
 
 module SpecrelayRunner
   # Assembles the execution-report bundle the standalone runner uploads to
@@ -22,12 +23,32 @@ module SpecrelayRunner
     STATUS_SUCCEEDED = "succeeded"
     STATUS_FAILED = "failed"
 
+    # Scenario evidence: the executor's record of the acceptance scenarios it actually checked,
+    # written into this child of the attempt's staging directory — outside every checkout, so it
+    # is never part of the measured diff — and declared in a local `index.json` that reuses the
+    # manifest's own `evidence_files` and `screenshots` entry keys. Only declared files that pass
+    # these checks are uploaded; Platform's import policy stays the final authority on what it
+    # stores. Every refusal names the index entry by position, never by its declared value.
+    SCENARIO_EVIDENCE = "scenario-evidence"
+    SCENARIO_INDEX = "index.json"
+    SCENARIO_PATH = %r{\Ascenarios/(\d{2}-[a-z0-9][a-z0-9-]*)\.md\z}
+    SCREENSHOT_PATH = %r{\Ascreenshots/[a-z0-9][a-z0-9-]*\.(?:png|jpe?g)\z}
+    IMAGE_SIGNATURES = [ "\x89PNG\r\n\x1A\n".b, "\xFF\xD8\xFF".b ].freeze
+    SCENARIO_INDEX_MAX_BYTES = 32_768
+    SCENARIO_MAX_ENTRIES = 40
+    SCENARIO_MAX_FILE_BYTES = 5_000_000
+    SCENARIO_MAX_TEXT = 200
+    SCREENSHOT_FIELDS = %w[viewport scenario result].freeze
+
     def self.build(**kwargs) = new(**kwargs).build
 
+    def self.scenario_evidence_path(staging_dir) = File.join(staging_dir.to_s, SCENARIO_EVIDENCE)
+
     # executor: Executor::Result, verifications: [RepositoryVerification::Result],
-    # changes: Workspace::Changes, base_commit:, worktree_path:.
+    # changes: Workspace::Changes, base_commit:, worktree_path:. `scenario_evidence_dir` is nil
+    # when no executor ran, and then the report says nothing about scenario evidence.
     def initialize(payload:, status:, executor:, verifications:, changes:, base_commit:, worktree_path:,
-                   failure_details: nil)
+                   failure_details: nil, scenario_evidence_dir: nil)
       @payload = payload
       @status = status
       @executor = executor
@@ -36,6 +57,7 @@ module SpecrelayRunner
       @base_commit = base_commit
       @worktree_path = worktree_path
       @failure_details = failure_details
+      @scenario_evidence_dir = scenario_evidence_dir
     end
 
     def build
@@ -45,7 +67,7 @@ module SpecrelayRunner
     private
 
     attr_reader :payload, :status, :executor, :verifications, :changes, :base_commit, :worktree_path,
-                :failure_details
+                :failure_details, :scenario_evidence_dir
 
     def run = payload.fetch("run")
     def workspace = payload.fetch("workspace")
@@ -75,7 +97,7 @@ module SpecrelayRunner
         # Only this uploaded copy is redacted; the commit and pull request keep the reviewed code.
         "evidence/diff.txt" => Redaction.redact(changes.diff.to_s),
         "evidence/summary.md" => readme
-      }
+      }.merge(scenario_evidence[:files])
     end
 
     def manifest
@@ -88,7 +110,8 @@ module SpecrelayRunner
         "execution_status" => status, "final_jira_update_ready" => !failed?,
         "sanitized_failure_details" => (failure_details.to_s if failed?),
         "repository_verifications" => verifications.map { |result| verification_entry(result) },
-        "evidence_files" => evidence_entries, "screenshots" => [],
+        "evidence_files" => evidence_entries + scenario_evidence[:evidence_files],
+        "screenshots" => scenario_evidence[:screenshots],
         "worktree_identity" => worktree_identity,
         "version" => MANIFEST_VERSION, "executor" => executor_block,
         "worktree" => { "path" => worktree_path.to_s, "created" => true }, "git" => git_block,
@@ -196,7 +219,7 @@ module SpecrelayRunner
         - Executor: `#{provider}` (exit #{executor.exit_code}, #{executor.duration_seconds}s)
         - Verification: #{verification_summary}
         - Changed files: #{Array(changes.changed_files).size}
-        #{failure_line}
+        #{failure_line}#{scenario_lines}
         See `manifest.yml` for the machine-readable report and `evidence/` for the
         captured stdout, stderr, verification output, and diff. The live executor output the
         operator watched is the run's ordered protocol events in Platform.
@@ -210,5 +233,128 @@ module SpecrelayRunner
     end
 
     def failure_line = failed? ? "- Failure: #{failure_details}\n" : ""
+
+    # What was collected, and every declaration that was not. Absent when no executor ran.
+    def scenario_lines
+      return "" if scenario_evidence_dir.nil?
+
+      counts = "- Scenario evidence: #{scenario_evidence[:evidence_files].size} scenario(s), " \
+               "#{scenario_evidence[:screenshots].size} screenshot(s)\n"
+      counts + scenario_evidence[:notes].map { |note| "- Scenario evidence limitation: #{note}\n" }.join
+    end
+
+    def scenario_evidence = @scenario_evidence ||= collect_scenario_evidence
+
+    def collect_scenario_evidence
+      evidence = { files: {}, evidence_files: [], screenshots: [], notes: [] }
+      return evidence if scenario_evidence_dir.nil?
+
+      index = scenario_index(evidence[:notes])
+      return evidence if index.nil?
+
+      scenarios = collect_scenarios(index.fetch("evidence_files"), evidence)
+      collect_screenshots(index.fetch("screenshots", []), scenarios, evidence)
+      evidence
+    end
+
+    def scenario_index(notes)
+      path = File.join(scenario_evidence_dir, SCENARIO_INDEX)
+      return scenario_note(notes, "the executor wrote no #{SCENARIO_INDEX}") unless declared_file?(path)
+      if File.size(path) > SCENARIO_INDEX_MAX_BYTES
+        return scenario_note(notes, "#{SCENARIO_INDEX} is larger than #{SCENARIO_INDEX_MAX_BYTES} bytes")
+      end
+
+      index = JSON.parse(File.read(path))
+      unless index.is_a?(Hash) && index["evidence_files"].is_a?(Array) && index.fetch("screenshots", []).is_a?(Array)
+        return scenario_note(notes, "#{SCENARIO_INDEX} must be an object with evidence_files and screenshots lists")
+      end
+
+      declared = index["evidence_files"].size + index.fetch("screenshots", []).size
+      return index if declared <= SCENARIO_MAX_ENTRIES
+
+      scenario_note(notes, "#{SCENARIO_INDEX} declares #{declared} entries; at most #{SCENARIO_MAX_ENTRIES} are read")
+    rescue JSON::ParserError, EncodingError
+      scenario_note(notes, "#{SCENARIO_INDEX} is not valid JSON")
+    end
+
+    # Each collected scenario's identifier: its numbered file name without `.md`.
+    def collect_scenarios(entries, evidence)
+      entries.each_with_index.filter_map do |entry, index|
+        label = "evidence_files[#{index}]"
+        path = entry.is_a?(Hash) ? entry["path"].to_s : ""
+        id = path[SCENARIO_PATH, 1]
+        next scenario_note(evidence[:notes], "#{label} is not a numbered scenarios/NN-name.md file") unless id
+        next scenario_note(evidence[:notes], "#{label} repeats an earlier path") if evidence[:files].key?(path)
+        next unless (bytes = read_declared(path, label, evidence[:notes]))
+
+        text = bytes.force_encoding(Encoding::UTF_8)
+        next scenario_note(evidence[:notes], "#{label} is not UTF-8 text") unless text.valid_encoding?
+
+        evidence[:files][path] = Redaction.redact(text)
+        evidence[:evidence_files] << { "path" => path, "kind" => "markdown",
+                                       "description" => scenario_text(entry["description"]) }.compact
+        id
+      end
+    end
+
+    def collect_screenshots(entries, scenarios, evidence)
+      entries.each_with_index do |entry, index|
+        label = "screenshots[#{index}]"
+        path = entry.is_a?(Hash) ? entry["path"].to_s : ""
+        fields = SCREENSHOT_FIELDS.to_h { |field| [ field, entry.is_a?(Hash) ? scenario_text(entry[field]) : nil ] }
+        problem = screenshot_problem(path, fields, scenarios, evidence[:files])
+        next scenario_note(evidence[:notes], "#{label} #{problem}") if problem
+        next unless (bytes = read_declared(path, label, evidence[:notes]))
+        unless IMAGE_SIGNATURES.any? { |signature| bytes.start_with?(signature) }
+          next scenario_note(evidence[:notes], "#{label} is not a PNG or JPEG image")
+        end
+
+        evidence[:files][path] = bytes
+        evidence[:screenshots] << { "path" => path }.merge(fields)
+      end
+    end
+
+    def screenshot_problem(path, fields, scenarios, files)
+      return "is not a screenshots/name.png or .jpg file" unless path.match?(SCREENSHOT_PATH)
+      return "repeats an earlier path" if files.key?(path)
+      return "needs short viewport, scenario and result values" if fields.value?(nil)
+
+      "names no collected scenario" unless scenarios.include?(fields["scenario"])
+    end
+
+    # The bytes of one declared file, or nil after recording why it was refused. The path has
+    # already matched a fixed shape, so it has no `..` and no leading `/`; what remains is a
+    # symlink, a non-regular file, or a directory component that resolves elsewhere.
+    def read_declared(path, label, notes)
+      full = File.join(scenario_evidence_dir, path)
+      return scenario_note(notes, "#{label} names a file that does not exist") unless File.exist?(full) || File.symlink?(full)
+      return scenario_note(notes, "#{label} is not a regular file") unless declared_file?(full)
+      unless File.realpath(full).start_with?("#{File.realpath(scenario_evidence_dir)}/")
+        return scenario_note(notes, "#{label} resolves outside the scenario evidence directory")
+      end
+      return scenario_note(notes, "#{label} is larger than #{SCENARIO_MAX_FILE_BYTES} bytes") if File.size(full) > SCENARIO_MAX_FILE_BYTES
+
+      File.binread(full)
+    end
+
+    # A regular file that is not itself a symlink, inside a scenario directory that is not one.
+    def declared_file?(path)
+      File.lstat(path).file? && File.lstat(scenario_evidence_dir).directory?
+    rescue SystemCallError
+      false
+    end
+
+    # A short, redacted, single-line metadata value, or nil when there is none usable.
+    def scenario_text(value)
+      return nil unless value.is_a?(String)
+
+      text = Redaction.redact(value.strip)
+      text.empty? || text.length > SCENARIO_MAX_TEXT || text.include?("\n") ? nil : text
+    end
+
+    def scenario_note(notes, text)
+      notes << text
+      nil
+    end
   end
 end

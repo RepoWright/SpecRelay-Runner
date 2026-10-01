@@ -745,9 +745,13 @@ module SpecrelayRunner
                                    capture: -> { capture_checkpoint(root, worktree, staging) },
                                    resume_question_id: @resume&.question_id).start
       @provider_stream = provider_stream(worktree)
+      # Scenario evidence lives beside the selection document in STAGING for the same reason: it
+      # must never appear in the diff it describes. Every report built from here on reads it.
+      @scenario_evidence_dir = FileUtils.mkdir_p(ReportBundle.scenario_evidence_path(staging)).first
       result = Executor.new(config: payload.fetch("executor"), worktree_path: worktree.path,
                             staging_dir: staging, env: env)
-                       .run(prompt_text(worktree.path, @bridge.path, RepositorySelection.path(staging)),
+                       .run(prompt_text(worktree.path, @bridge.path, RepositorySelection.path(staging),
+                                        @scenario_evidence_dir),
                             on_output: (@provider_stream || @log_stream).sink,
                             on_start: -> { @bridge.confirm_resume },
                             stop_check: -> { @bridge.stop_provider? })
@@ -936,7 +940,7 @@ module SpecrelayRunner
     # is not a report problem and still escapes; the submission that follows is deliberately
     # outside it, because a refused upload is an upload failure and already means something else.
     def build_report(**attributes)
-      ReportBundle.build(**attributes)
+      ReportBundle.build(scenario_evidence_dir: @scenario_evidence_dir, **attributes)
     rescue StandardError, LoadError => e
       @report_error = e
       nil
@@ -1083,7 +1087,7 @@ module SpecrelayRunner
       check_stop!
     end
 
-    def prompt_text(worktree_path, bridge_path, selection_path)
+    def prompt_text(worktree_path, bridge_path, selection_path, scenario_dir)
       preamble = <<~MD.strip
         # Automated execution task — #{run['task_id']}
 
@@ -1101,6 +1105,8 @@ module SpecrelayRunner
         - Make the change idempotently.
 
         #{selection_lines(selection_path)}
+
+        #{scenario_evidence_lines(scenario_dir)}
 
         #{question_lines(bridge_path)}
       MD
@@ -1161,6 +1167,32 @@ module SpecrelayRunner
       return "" if @rework.nil?
 
       @rework.prompt_section(payload.dig("report_contract", "round_label").to_s)
+    end
+
+    # The executor's record of what it actually checked. {ReportBundle} reads only what the index
+    # declares and states every refused declaration in the round README; the runner's own
+    # verification still decides the outcome.
+    def scenario_evidence_lines(scenario_dir)
+      <<~MD.strip
+        Record each acceptance scenario you actually checked in `#{scenario_dir}`:
+
+        - Write one Markdown file per checked scenario as `scenarios/NN-short-name.md` (two digits,
+          then lowercase letters, digits and hyphens). It states only: the acceptance criterion; the
+          tested target (for a browser check, the URL and viewport); `PASS`, `FAIL` or `BLOCKED`;
+          the numbered actions with what you observed; and any limitation.
+        - For a UI scenario checked in a browser, save only the material states (for example a
+          validation error or a success) as `screenshots/<name>.png` or `.jpg`. A scenario without
+          UI needs no image: write `Browser check: NOT_APPLICABLE` and why. If no browser was
+          available, mark the scenario `BLOCKED` and say so. Never invent a screenshot or a pass.
+        - Write `index.json` last, as `{ "evidence_files": [ { "path": "scenarios/NN-short-name.md",
+          "description": "<one line>" } ], "screenshots": [ { "path": "screenshots/<name>.png",
+          "viewport": "<width>x<height>", "scenario": "NN-short-name", "result": "<captured UI state>" } ] }`.
+          Paths are relative to that directory; `scenario` is the scenario file name without `.md`.
+          Only declared files are read.
+        - Do not link images from the Markdown, and never include credentials, tokens or private
+          reasoning. A scenario records what you observed; SpecRelay's own verification decides the
+          outcome.
+      MD
     end
 
     # MVP-0036 — the ONE way to reach the Product Owner. Named explicitly because a provider's
