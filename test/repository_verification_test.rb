@@ -91,6 +91,25 @@ class RepositoryVerificationTest < Minitest::Test
     assert result.attempts.first.timed_out, "a command killed at the deadline did not pass"
   end
 
+  # The ceiling a caller gets when it names none. Asserted on what REACHES CommandRunner, because
+  # the constant alone would not catch a call site that stopped forwarding it — and a real
+  # 4,500-second wait is not a test.
+  def test_every_replayed_command_is_bounded_by_the_approved_per_command_ceiling
+    captured = []
+    original = SpecrelayRunner::CommandRunner.method(:run)
+    SpecrelayRunner::CommandRunner.define_singleton_method(:run) do |_argv, **options|
+      captured << options[:timeout_seconds]
+      SpecrelayRunner::CommandRunner::Result.new(exit_code: 0, stdout: "", stderr: "",
+                                                 duration_seconds: 0.0, timed_out: false)
+    end
+
+    verify([ [ "first" ], [ "second" ] ])
+
+    assert_equal [ 4500, 4500 ], captured, "each command is an independent process with its own ceiling"
+  ensure
+    SpecrelayRunner::CommandRunner.define_singleton_method(:run, original)
+  end
+
   # Every changed repository must receive a COMPLETE outcome, so an ordinary failure does not
   # stop the remaining bounded commands — the operator sees all of them, not just the first.
   def test_a_failure_does_not_stop_the_remaining_commands

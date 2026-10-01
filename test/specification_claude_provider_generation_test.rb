@@ -158,13 +158,13 @@ class SpecificationClaudeProviderGenerationTest < Minitest::Test
   end
 
   # The specification writer shares the exact implementation profile, and with it the approved
-  # 3,600-second process limit.
-  def test_the_approved_profile_bounds_the_specification_writer_at_3600_seconds
+  # 18,000-second process limit.
+  def test_the_approved_profile_bounds_the_specification_writer_at_18000_seconds
     profile = SpecrelayRunner::ImplementationProfile.for(SpecrelayRunner::ImplementationProfile.canonical("claude"))
 
     _documents, runner = generate({ "issue_key" => "SR-700" }, profile: profile)
 
-    assert_equal 3600, runner.calls.fetch(0).timeout_seconds
+    assert_equal 18_000, runner.calls.fetch(0).timeout_seconds
   end
 
   # MVP-0028 remediation, defect 3 — the prompt must actually name the new required key and the

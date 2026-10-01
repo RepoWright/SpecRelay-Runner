@@ -21,9 +21,10 @@ module SpecrelayRunner
     NOT_FOUND = "not_found"
     FAILED = "failed"
 
-    # The same ceiling the singular project test command had. Per command rather than per
-    # repository, because each selected command is an independent process.
-    TIMEOUT_SECONDS = 900
+    # The ceiling for one replayed command. Per command rather than per repository, because each
+    # selected command is an independent process, so a repository with several suites is bounded
+    # by this value once per suite and not once in total.
+    TIMEOUT_SECONDS = 4500
     # Enough to carry a failing command's actual message; small enough that fifty repositories
     # of runaway output cannot become one unbounded report upload.
     MAX_OUTPUT_BYTES = 4_000
