@@ -84,7 +84,7 @@ class ExactProfileIdentityTest < Minitest::Test
   CLAUDE = {
     "provider" => "claude", "command" => "claude", "mode" => "print",
     "args" => %w[--print --output-format stream-json --verbose --dangerously-skip-permissions],
-    "prompt_delivery" => "argument", "timeout_seconds" => 3600, "env" => {}
+    "prompt_delivery" => "argument", "timeout_seconds" => 18_000, "env" => {}
   }.freeze
 
   # Every dimension is restated here rather than read from the production constant, so this file is
@@ -193,12 +193,12 @@ class ExactProfileIdentityTest < Minitest::Test
 
   def test_a_forged_claude_limit_is_refused_before_anything_runs
     marker_executable("claude")
-    refuses(CLAUDE.merge("timeout_seconds" => 3601), path: "#{@scratch}:#{ENV['PATH']}")
+    refuses(CLAUDE.merge("timeout_seconds" => 18_001), path: "#{@scratch}:#{ENV['PATH']}")
   end
 
   def test_the_claude_limit_written_as_a_string_is_refused
     assert_raises(SpecrelayRunner::ImplementationProfile::Error) do
-      SpecrelayRunner::ImplementationProfile.for(CLAUDE.merge("timeout_seconds" => "3600"))
+      SpecrelayRunner::ImplementationProfile.for(CLAUDE.merge("timeout_seconds" => "18000"))
     end
   end
 
@@ -228,6 +228,6 @@ class ExactProfileIdentityTest < Minitest::Test
 
   def test_the_canonical_claude_identity_is_the_audited_invocation
     assert_equal CLAUDE, SpecrelayRunner::ImplementationProfile.canonical("claude")
-    assert_equal 3600, SpecrelayRunner::ImplementationProfile.for(CLAUDE).timeout_seconds
+    assert_equal 18_000, SpecrelayRunner::ImplementationProfile.for(CLAUDE).timeout_seconds
   end
 end

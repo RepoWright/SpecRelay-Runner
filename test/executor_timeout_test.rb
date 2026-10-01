@@ -68,7 +68,7 @@ class ExecutorTimeoutTest < Minitest::Test
   CLAUDE = SpecrelayRunner::ImplementationProfile.canonical("claude")
 
   # The implementation executor hands CommandRunner the exact profile's limit.
-  def test_the_claude_implementation_executor_is_bounded_at_3600_seconds
+  def test_the_claude_implementation_executor_is_bounded_at_18000_seconds
     captured = nil
     original = SpecrelayRunner::CommandRunner.method(:run)
     SpecrelayRunner::CommandRunner.define_singleton_method(:run) do |_argv, **options|
@@ -80,13 +80,13 @@ class ExecutorTimeoutTest < Minitest::Test
     SpecrelayRunner::Executor.new(config: CLAUDE, worktree_path: @worktree, staging_dir: @staging,
                                   env: { "PATH" => "#{@bin}:/usr/bin:/bin" }).run("the prompt")
 
-    assert_equal 3600, captured
+    assert_equal 18_000, captured
   ensure
     SpecrelayRunner::CommandRunner.define_singleton_method(:run, original)
   end
 
   # A runner whose clock jumps `skew` seconds once the deadline has been set, so a real child is
-  # judged against the 3,600-second limit without a real hour's wait.
+  # judged against the 18,000-second limit without a real five-hour wait.
   def skewed_runner(skew)
     runner = SpecrelayRunner::CommandRunner.new(chdir: @worktree, env: { "PATH" => "/usr/bin:/bin" },
                                                 timeout_seconds: SpecrelayRunner::ImplementationProfile.for(CLAUDE).timeout_seconds)
@@ -98,15 +98,15 @@ class ExecutorTimeoutTest < Minitest::Test
     runner
   end
 
-  def test_a_claude_child_finishing_before_3600_seconds_is_not_killed
-    result = skewed_runner(3595).run([ "/bin/sh", "-c", "exit 0" ])
+  def test_a_claude_child_finishing_before_18000_seconds_is_not_killed
+    result = skewed_runner(17_995).run([ "/bin/sh", "-c", "exit 0" ])
 
     refute result.timed_out
     assert_equal 0, result.exit_code
   end
 
-  def test_a_claude_child_still_running_at_3600_seconds_is_terminated
-    result = skewed_runner(3600).run([ "/bin/sh", "-c", "sleep 600" ])
+  def test_a_claude_child_still_running_at_18000_seconds_is_terminated
+    result = skewed_runner(18_000).run([ "/bin/sh", "-c", "sleep 600" ])
 
     assert result.timed_out
   end

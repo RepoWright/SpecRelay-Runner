@@ -200,7 +200,7 @@ module SpecrelayRunner
 
     # The approved process limit for implementation and specification writing. It is stated in the
     # canonical profile rather than left to a fallback, so a claim must carry exactly this value.
-    APPROVED_TIMEOUT_SECONDS = 3600
+    APPROVED_TIMEOUT_SECONDS = 18_000
 
     # The ONE approved Claude invocation, assembled from this profile's own constants so the
     # canonical identity and the validation rules below cannot describe different things. It is the
