@@ -143,6 +143,25 @@ module SpecrelayRunner
       NO_BULLET_YET = :no_bullet_yet
       private_constant :NO_BULLET_YET
 
+      # The ONE provider misspelling this gate resolves instead of rejecting: a document name
+      # carrying exactly one leading ASCII space. A real generation run spent a full provider turn
+      # writing a complete, valid package and was then discarded whole because one key in the
+      # returned map read " analysis/business.md" — a duplicate of a document the same map already
+      # carried under its correct name. The turn is the expensive thing here; the space is not.
+      #
+      # It is a fixed MAP of the exact aliases, not a strip-and-retry rule, because the containment
+      # IS the point. Every other spelling — two spaces, a trailing space, a tab, a non-breaking
+      # space, a case variant, an absolute or traversing path — still falls through to the
+      # unexpected-files rejection untouched, and widening this is a deliberate edit to a visible
+      # list rather than a change to one character class.
+      #
+      # {PackagePath::MANIFEST_JSON} is deliberately absent. That file is this runner's own output,
+      # written by the package writer after validation; a provider that returns it under ANY
+      # spelling is returning something it does not author, and tolerance there would be tolerance
+      # of the wrong thing.
+      DOCUMENT_ALIASES = (PackagePath::ALL_FILES - [ PackagePath::MANIFEST_JSON ])
+                         .to_h { |name| [ " #{name}", name ] }.freeze
+
       attr_reader :files
 
       # `issue_key` is required for validation and absent from `.new`, because only the TITLE
@@ -151,8 +170,21 @@ module SpecrelayRunner
       # needs no such context, and demanding one there would be ceremony.
       def self.validate!(files, issue_key:) = new(files).validate!(issue_key: issue_key)
 
+      # Aliases resolve HERE, as the map is built, so every check below — the required set, the
+      # closed file set, the content rules — and everything downstream of them sees only canonical
+      # names. Tolerating an alias without rewriting its key would be worse than rejecting it:
+      # `#each_file` yields the canonical names and `#open_questions` reads one, so the document
+      # would pass validation and then silently never be written.
+      #
+      # `to_h` is deliberately NOT used. It keeps whichever entry is written last for a repeated
+      # key, so resolving an alias inside it would quietly drop one of the two documents and make
+      # the surviving content depend on provider ordering. Two entries that resolve to the same
+      # name are reconciled explicitly instead: identical content is one document, and differing
+      # content is a refusal — before anything reaches disk, with no winner chosen.
       def initialize(files)
-        @files = files.to_h { |name, content| [ name.to_s, content.to_s ] }
+        @files = files.each_with_object({}) do |(name, content), resolved|
+          merge_document(resolved, DOCUMENT_ALIASES.fetch(name.to_s, name.to_s), content.to_s)
+        end
       end
 
       # Raises Invalid on the FIRST structural problem, naming the document and the section.
@@ -218,6 +250,26 @@ module SpecrelayRunner
       end
 
       private
+
+      # One canonical name, one document. Reached twice with byte-identical content — the observed
+      # case, where the provider returned the same document under both spellings — the two are the
+      # same document and collapse to one. Reached twice with DIFFERENT content, there is no honest
+      # answer: either body would be published under a name the provider did not pair it with, and
+      # which one survived would depend on nothing but map order. So it refuses, in both orders.
+      #
+      # Compared as the provider wrote them, before the writer's redaction runs: two documents that
+      # differ only inside a secret-shaped value genuinely differ, and comparing redacted forms
+      # would call them equal.
+      #
+      # The message names the document and the shape of the problem and stops there, like every
+      # other refusal in this class — a diagnostic that quoted either body would put generated
+      # content into a run page and into the operator's log.
+      def merge_document(resolved, name, content)
+        raise Invalid, "the provider returned #{name} both with and without a leading space, and " \
+                       "the two documents differ" if resolved.key?(name) && resolved[name] != content
+
+        resolved[name] = content
+      end
 
       def resolved?(fields) = fields["status"]&.first.to_s.casecmp?(RESOLVED_STATUS)
 
