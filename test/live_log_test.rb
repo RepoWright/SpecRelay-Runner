@@ -362,6 +362,43 @@ class LiveLogTest < Minitest::Test
     assert_match(/\A\r +\r\z/, terminal.writes.last, "a quiet-executor row is only true while it runs")
   end
 
+  # ---- the terminal names the run; the upload is untouched ----------------
+  #
+  # The terminal and the report are separate surfaces. The runner already prints one string and
+  # buffers another, so the operator's scrollback can name the ticket on every line while the
+  # live log stream in the report UI stays byte-identical to what it is today.
+
+  def test_the_printed_line_names_the_run_and_the_uploaded_chunk_does_not
+    terminal = RecordingTerminal.new
+    presenter = SpecrelayRunner::TerminalPresenter.new(out: terminal, transient: true, columns: 200)
+    presenter.ticket_key = "DEMO-260"
+    stream, _io, emitter = build_stream(io: presenter, delivering: false)
+    stream.accept("stdout", "Reading the approved specification")
+    stream.send(:flush_all)
+
+    assert_equal [ "\e[36m[DEMO-260]\e[0m   [fake:stdout] Reading the approved specification" ],
+                 terminal.durable_lines
+    chunk = emitter.chunks.first[:log_chunk]
+    assert_equal "Reading the approved specification", chunk
+    assert_equal "fake stdout: 1 line of executor output", emitter.chunks.first[:summary]
+  end
+
+  def test_a_quiet_periods_progress_event_is_untouched_while_its_row_names_the_run
+    clock = FakeClock.new
+    terminal = RecordingTerminal.new
+    presenter = SpecrelayRunner::TerminalPresenter.new(out: terminal, transient: true, columns: 200)
+    presenter.ticket_key = "DEMO-260"
+    stream, _io, emitter = build_stream(clock: clock, heartbeat_interval: 10, io: presenter,
+                                        delivering: false)
+    clock.advance(11)
+    stream.send(:heartbeat_if_quiet)
+
+    assert_includes terminal.writes.last, "[DEMO-260]"
+    summary = emitter.events_of("core.progress").first[:summary]
+    assert_equal "fake running for 11s on DEMO-0018 (no new output yet)", summary
+    stream.finish
+  end
+
   # With no row to redraw, the same fact stays a plain bounded line: a CI log has nowhere else
   # to show that a silent executor is still alive.
   def test_without_a_terminal_the_quiet_heartbeat_remains_line_oriented

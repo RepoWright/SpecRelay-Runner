@@ -26,6 +26,16 @@ module SpecrelayRunner
     RUN_FAILED = 1
     USAGE_ERROR = 2
 
+    # Each assignment shape STATES its ticket; the runner reads it and never derives one from a
+    # task id or from provider output. The four paths belong to shapes that cannot be confused
+    # for one another, so the first one stated is unambiguous.
+    TICKET_KEY_PATHS = [
+      %w[work_item issue_key],
+      %w[specification_package_preflight ticket_key],
+      %w[preview ticket_key],
+      %w[ticket external_id]
+    ].freeze
+
     def self.run(argv, out: $stdout, err: $stderr, env: ENV, input: $stdin) =
       new(out:, err:, env:, input:).run(argv)
 
@@ -473,6 +483,25 @@ module SpecrelayRunner
     # readiness assumptions, the worktree, or the report contract — and a specification
     # assignment reaching an older code path is impossible rather than merely unlikely.
     def execute(config, client, payload, &released)
+      presenter.ticket_key = ticket_key_for(payload)
+      dispatch(config, client, payload, &released)
+    ensure
+      # Cleared on EVERY exit path, including a raised one, so the next claim in a `loop`
+      # session cannot inherit this run's key and the lines written between claims carry none.
+      presenter.ticket_key = nil
+    end
+
+    def ticket_key_for(payload)
+      return nil unless payload.is_a?(Hash)
+
+      TICKET_KEY_PATHS.each do |path|
+        stated = payload.dig(*path) if payload[path.first].is_a?(Hash)
+        return stated.to_s if stated.is_a?(String) && !stated.strip.empty?
+      end
+      nil
+    end
+
+    def dispatch(config, client, payload, &released)
       # MVP-0033 — a REVIEW assignment is recognised by its explicit `assignment_type`, never
       # by what it lacks, so a future assignment kind can never be executed as an
       # implementation run by an older runner build.

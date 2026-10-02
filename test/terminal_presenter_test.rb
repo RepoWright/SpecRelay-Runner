@@ -206,6 +206,160 @@ class TerminalPresenterTest < Minitest::Test
     refute_includes err.string, "sk-live-DO-NOT-LEAK-0123456789"
   end
 
+  # ---- the active run's ticket key ---------------------------------------
+  #
+  # One terminal, one scrollback, many runs. The claims:
+  #   - a durable line and the transient row name the run that produced them, in front of
+  #     the source tag they already carried;
+  #   - a message carrying embedded newlines is named on each LOGICAL line;
+  #   - with no key the output is byte-identical to what it was before;
+  #   - colour names the key on a terminal and nothing anywhere else, and a pipe still
+  #     carries the bracketed key as plain text; and
+  #   - a key belongs to one run: it is gone the moment it is cleared, and the next one
+  #     replaces it.
+
+  def test_a_durable_line_names_the_active_run_before_the_existing_source_tag
+    io = StringIO.new
+    presenter = Presenter.new(out: io, transient: false)
+    presenter.ticket_key = "DEMO-260"
+    presenter.line("  [claude:stdout] Run launcher test suite")
+
+    assert_equal "[DEMO-260]   [claude:stdout] Run launcher test suite\n", io.string
+  end
+
+  def test_an_embedded_newline_is_named_on_each_logical_line_and_adds_no_row
+    io = StringIO.new
+    presenter = Presenter.new(out: io, transient: false)
+    presenter.ticket_key = "DEMO-260"
+    presenter.line("[loop] first\nsecond\nthird")
+
+    assert_equal "[DEMO-260] [loop] first\n[DEMO-260] second\n[DEMO-260] third\n", io.string
+  end
+
+  # One write, so a status frame or another thread's line cannot land between the rows of
+  # one multiline message.
+  def test_a_multiline_message_is_still_a_single_write
+    presenter, sink = terminal_presenter
+    presenter.ticket_key = "DEMO-260"
+    presenter.line("first\nsecond")
+
+    assert_equal 1, sink.writes.length
+  end
+
+  def test_stderr_is_named_too
+    out = StringIO.new
+    err = StringIO.new
+    presenter = Presenter.new(out: out, err: err, transient: false)
+    presenter.ticket_key = "DEMO-260"
+    presenter.error("the credential was rejected")
+
+    assert_equal "[DEMO-260] the credential was rejected\n", err.string
+  end
+
+  # The regression guard for every surface outside a claimed assignment — and the proof that
+  # a runner claiming from a Platform that states no key degrades cleanly rather than
+  # printing empty brackets.
+  def test_without_an_active_key_the_output_is_what_it_always_was
+    %w[unset empty blank].each do |state|
+      io = StringIO.new
+      presenter = Presenter.new(out: io, transient: false)
+      presenter.ticket_key = { "empty" => "", "blank" => "   " }[state]
+      presenter.line("[loop] started")
+
+      assert_equal "[loop] started\n", io.string, "a #{state} key must prefix nothing"
+    end
+  end
+
+  def test_the_transient_row_names_the_active_run
+    presenter, sink = terminal_presenter
+    presenter.ticket_key = "DEMO-260"
+    presenter.status("claude running for 15s (no new output yet)")
+
+    assert_match(/\A\r\e\[36m\[DEMO-260\]\e\[0m [|\/\-\\] claude running/, sink.writes.last)
+  end
+
+  # Criterion 3 on a terminal: the key is painted, and no other text gains or loses colour.
+  def test_colour_names_the_key_and_nothing_else
+    presenter, sink = terminal_presenter
+    presenter.ticket_key = "DEMO-260"
+    presenter.line("  [claude:stdout] Run launcher test suite")
+
+    written = sink.writes.last
+    assert_equal "\e[36m[DEMO-260]\e[0m   [claude:stdout] Run launcher test suite\n", written
+    assert_equal 1, written.scan("\e[").length - written.scan("\e[0m").length,
+                 "exactly one span is opened, and it closes before the existing text"
+  end
+
+  # Criterion 3 with no terminal: a pipe, a redirect, or a CI log still names the ticket.
+  def test_without_a_terminal_the_key_is_plain_text_and_still_there
+    io = StringIO.new
+    presenter = Presenter.new(out: io, transient: false)
+    presenter.ticket_key = "DEMO-260"
+    presenter.line("  [claude:stdout] Run launcher test suite")
+    presenter.status("claude running for 15s (no new output yet)", fallback: :line)
+
+    refute_includes io.string, "\e[", "a captured transcript must carry no escape sequences"
+    assert_equal 2, io.string.lines.count { |line| line.start_with?("[DEMO-260] ") }
+  end
+
+  # Criterion 5, the half a StringIO can prove: colour has length but occupies no columns, so
+  # a row measured on the painted string would overflow into a second one.
+  def test_a_named_row_is_still_exactly_one_row_on_a_narrow_terminal
+    presenter, sink = terminal_presenter(columns: 40)
+    presenter.ticket_key = "DEMO-260"
+    presenter.status("a project name that is far too long to fit in forty columns")
+
+    frame = sink.writes.last.delete("\r")
+    refute_includes frame, "\n"
+    assert_operator visible_length(frame), :<=, 39
+    assert_includes frame, "…", "truncation is visible rather than silent"
+  end
+
+  # The same arithmetic seen from the other side: the erase padding is counted in columns, so
+  # a shorter replacement leaves no tail of the longer named row it replaced.
+  def test_a_shorter_named_row_leaves_no_tail_of_the_longer_one
+    presenter, sink = terminal_presenter
+    long = "no eligible work under this runner's claim policy; next check in 60s"
+    presenter.ticket_key = "DEMO-260"
+    presenter.status(long)
+    presenter.status("claimed")
+
+    frame = sink.writes.last.delete("\r")
+    assert_operator visible_length(frame), :>=, long.length + "[DEMO-260] ".length
+    assert_match(/claimed\s+\z/, frame, "the remainder is erased with spaces")
+  end
+
+  # Criterion 4. A machine left in `loop` mode executes one run after another into one
+  # scrollback, and the key is the only thing telling them apart.
+  def test_a_key_belongs_to_one_run_and_the_next_run_states_its_own
+    io = StringIO.new
+    presenter = Presenter.new(out: io, transient: false)
+    presenter.ticket_key = "DEMO-260"
+    presenter.line("[loop] executing")
+    presenter.ticket_key = nil
+    presenter.line("[loop] no eligible work")
+    presenter.ticket_key = "DEMO-261"
+    presenter.line("[loop] executing")
+
+    assert_equal [ "[DEMO-260] [loop] executing",
+                   "[loop] no eligible work",
+                   "[DEMO-261] [loop] executing" ], io.string.lines.map(&:chomp)
+  end
+
+  def test_redaction_still_runs_before_a_named_line
+    io = StringIO.new
+    presenter = Presenter.new(out: io, transient: false)
+    presenter.ticket_key = "DEMO-260"
+    presenter.line("stdout sk-live-DO-NOT-LEAK-0123456789")
+
+    refute_includes io.string, "sk-live-DO-NOT-LEAK-0123456789"
+    assert io.string.start_with?("[DEMO-260] "), "the key is applied after redaction, not through it"
+  end
+
+  # Columns occupied, which is what a terminal counts — an escape sequence has length and
+  # occupies none.
+  def visible_length(text) = text.gsub(/\e\[[0-9;]*m/, "").length
+
   # ---- IO compatibility --------------------------------------------------
 
   # Heartbeater, Execution, Publication, and the specification lanes write with `io.puts`.
