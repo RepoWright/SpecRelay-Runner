@@ -204,9 +204,16 @@ module SpecrelayRunner
     # frame cannot land in the middle of a multiline message.
     def write_line(message, sink: out)
       erase
-      rows = message.split("\n", -1).map { |row| "#{paint_key(prefixed(row), sink)}\n" }
-      push_text(sink, rows.join)
+      push_text(sink, logical_rows(message).map { |row| "#{paint_key(prefixed(row), sink)}\n" }.join)
       nil
+    end
+
+    # The logical lines of a message. `split` answers an EMPTY message with no lines at all,
+    # which would silently drop the blank separator line `puts`/`line("")` has always written;
+    # an empty message is one empty line, exactly as it was before.
+    def logical_rows(message)
+      rows = message.split("\n", -1)
+      rows.empty? ? [ "" ] : rows
     end
 
     # The key as it is MEASURED: plain text, no escape sequences.

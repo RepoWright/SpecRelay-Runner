@@ -374,6 +374,35 @@ class TerminalPresenterTest < Minitest::Test
     assert_equal "[heartbeat] Platform signalled the claim is no longer live\n", sink.writes[-1]
   end
 
+  # A blank separator line is a line. Splitting a message into its logical rows must not answer
+  # the EMPTY message with no rows at all: `puts` and `line("")` have always written one blank
+  # line, and every spacer an existing writer emits depends on it.
+  def test_an_empty_message_is_still_one_blank_line
+    presenter, sink = terminal_presenter
+
+    presenter.line("alpha")
+    presenter.puts
+    presenter.line("")
+    presenter.line("beta")
+
+    assert_equal "alpha\n\n\nbeta\n", sink.string,
+                 "with no key the output is byte-identical to the unprefixed presenter's"
+  end
+
+  # The blank line belongs to the run too, and carries the key on the same terms as the blank
+  # row inside a multiline message.
+  def test_an_empty_message_carries_the_key_like_any_other_logical_line
+    sink = StringIO.new
+    presenter = Presenter.new(out: sink)
+    presenter.ticket_key = "DEMO-260"
+
+    presenter.line("alpha")
+    presenter.puts
+    presenter.line("beta")
+
+    assert_equal "[DEMO-260] alpha\n[DEMO-260] \n[DEMO-260] beta\n", sink.string
+  end
+
   # ---- concurrency: criterion 16 -----------------------------------------
 
   # An executor reader thread, a heartbeat timer, and the loop's own status all write here.
