@@ -116,8 +116,8 @@ module SpecrelayRunner
 
     # Hold this invocation's work-running session for the rest of the command, or refuse it before
     # it does anything a session it conflicts with could observe. A saved connection conflicts only
-    # with another session of its own stored registration and with a hand-written-config session;
-    # a hand-written-config session conflicts with every other one (see SessionLock).
+    # with a hand-written-config session, which conflicts with every other one (see SessionLock);
+    # how many terminals of one registration may run is Platform's admission decision.
     #
     # It is taken as soon as the selection and its local credential are resolved and before
     # anything else, so the refusal beats the provider probe, the presence report, the connector
@@ -146,11 +146,7 @@ module SpecrelayRunner
       USAGE_ERROR
     end
 
-    def session_lock(config)
-      return SessionLock.exclusive(env: env) if config.connection.nil?
-
-      SessionLock.saved(base_url: config.base_url, runner_public_id: config.connection.runner_public_id, env: env)
-    end
+    def session_lock(config) = config.connection.nil? ? SessionLock.exclusive(env: env) : SessionLock.saved(env: env)
 
     def secret_store = @injected_secret_store || SecretStore.for(platform: RUBY_PLATFORM)
 
@@ -226,20 +222,24 @@ module SpecrelayRunner
 
     def claim_selected(config, auth)
       announce(config, auth)
+      client = PlatformClient.new(base_url: config.base_url, token: auth.token)
+      presence = session_presence(config, auth, client, PollInterval::DEFAULT)
+      return RUN_FAILED unless admitted?(config, presence)
       # When this runner selected a real provider profile, prove the
       # local dependency is ready BEFORE asking Platform for work. Claiming first
       # and discovering a missing CLI afterwards burns a real run and leaves it
       # stuck; this exits non-zero having sent no claim request at all.
       return RUN_FAILED unless executor_ready?(config)
 
-      client = PlatformClient.new(base_url: config.base_url, token: auth.token)
-      result = client.claim(config.claim_runner_params)
+      result = client.claim(config.claim_runner_params, session_id: presence.session_id)
       unless result.claimed?
         out.puts not_claimed_message(result)
         return SUCCESS
       end
 
       execute(config, client, result.payload)
+    ensure
+      presence&.stopped
     end
 
     # MVP-0018 — the normal operator mode for a connected personal runner: poll,
@@ -279,23 +279,40 @@ module SpecrelayRunner
     def start_selected_loop(config, auth, interval, policy)
       announce(config, auth)
       out.puts "Poll interval: #{interval.notice || "#{interval.seconds}s"}"
+      client = PlatformClient.new(base_url: config.base_url, token: auth.token)
+      presence = session_presence(config, auth, client, interval.seconds)
+      return RUN_FAILED unless admitted?(config, presence)
       return RUN_FAILED unless executor_ready?(config)
 
-      run_loop(config, auth, interval, policy)
+      run_loop(config, client, interval, policy, presence)
+    ensure
+      presence&.stopped
     end
 
-    def run_loop(config, auth, interval, policy)
-      client = PlatformClient.new(base_url: config.base_url, token: auth.token)
+    def run_loop(config, client, interval, policy, presence)
       result = LoopRunner.call(
         out: out, err: err, presenter: presenter, label: loop_label(config),
         poll_seconds: interval.seconds, on_failure: policy,
-        presence: loop_presence(config, client, interval),
+        presence: presence,
         connector: loop_connector(config),
         status_reporter: loop_status_reporter(config, client),
-        claim: -> { claim_after_cancellation_cleanup(config, client) },
+        claim: -> { claim_after_cancellation_cleanup(config, client, presence.session_id) },
         execute: ->(payload) { loop_disposition(config, client, payload) }
       )
       result == LoopRunner::OK ? SUCCESS : RUN_FAILED
+    end
+
+    # Platform's admission of this terminal, asked once, before the provider probe, the connector and
+    # the first claim. A refusal, an unknown answer or an unreachable Platform all leave this
+    # invocation unadmitted, and an unadmitted terminal does no work: it says why and stops.
+    def admitted?(config, presence)
+      outcome = presence.started
+      return true if outcome.ok?
+
+      out.flush if out.respond_to?(:flush)
+      err.puts "Not started: #{loop_label(config) || 'this runner'} — #{outcome.message}"
+      err.puts "Remedy: #{outcome.remedy || 'Check that Platform is reachable, then start this runner again.'}"
+      false
     end
 
     # Release the task environment of a Run Platform cancelled after its question pause, then
@@ -307,19 +324,19 @@ module SpecrelayRunner
     # list, an unanswered, refused or unreadable Platform read, a target this machine did not list
     # and an incomplete release all raise {CleanupRequired}, which stops the session. Only the
     # claim itself keeps the loop's ordinary transport backoff.
-    def claim_after_cancellation_cleanup(config, client)
-      release_cancelled_environment(config, client) if config.connection
-      client.claim(config.claim_runner_params)
+    def claim_after_cancellation_cleanup(config, client, session_id)
+      release_cancelled_environment(config, client, session_id) if config.connection
+      client.claim(config.claim_runner_params, session_id: session_id)
     end
 
-    def release_cancelled_environment(config, client)
+    def release_cancelled_environment(config, client, session_id)
       workspace_key = config.connection.workspace_key
       root = config.workspace_root(workspace_key, env: env)
       listed, unreadable = TaskEnvironment.run_owned(root: root)
       raise CleanupRequired, unreadable if unreadable
       return if listed.empty?
 
-      target = confirmed_cleanup_target(client, workspace_key, listed)
+      target = confirmed_cleanup_target(client, workspace_key, listed, session_id)
       return if target.nil?
       raise CleanupRequired, "Platform named a cancelled run this machine did not list" unless listed.include?(target)
 
@@ -332,8 +349,8 @@ module SpecrelayRunner
     end
 
     # A rejected credential stays the loop's own stop, with its reconnect remedy.
-    def confirmed_cleanup_target(client, workspace_key, listed)
-      client.cancellation_cleanup_target(workspace_key: workspace_key, candidates: listed)
+    def confirmed_cleanup_target(client, workspace_key, listed, session_id)
+      client.cancellation_cleanup_target(workspace_key: workspace_key, candidates: listed, session_id: session_id)
     rescue PlatformClient::Unauthorized
       raise
     rescue PlatformClient::Error => e
@@ -356,21 +373,17 @@ module SpecrelayRunner
       disposition || code == SUCCESS
     end
 
-    # MVP-0031 — the idle presence session for this loop.
+    # This terminal's admitted session, for `loop` and `claim-once` alike.
     #
-    # Presence is recorded per runner/WORKSPACE connection, so a loop that has no connection
-    # record (an advanced `--config` invocation) can address none and reports none. That is a
-    # real limitation of the legacy path rather than something to paper over: Platform would
-    # have no connection to attach the signal to.
-    #
-    # `claim-once` deliberately gets none at all. A single controlled shot is never Watching —
-    # it may be Busy for the lease it holds, and Connected before and after.
-    def loop_presence(config, client, interval)
-      connection = config.connection
-      return Presence::NONE if connection.nil?
+    # Every registered credential is admitted by Platform against its registration's maximum,
+    # including one in a hand-written config, whose session selects no saved workspace. The
+    # development token identifies no registration, so there is nothing to admit it against and it
+    # reports no session; Platform gives it no work either.
+    def session_presence(config, auth, client, interval_seconds)
+      return Presence::NONE unless auth.mode == :registered
 
-      Presence.new(client: client, workspace_key: connection.workspace_key,
-                   interval_seconds: interval.seconds,
+      Presence.new(client: client, workspace_key: config.connection&.workspace_key,
+                   interval_seconds: interval_seconds,
                    on_notice: ->(message) { presenter.line("[loop] #{message}") })
     end
 

@@ -20,40 +20,57 @@ class LoopPresenceTest < Minitest::Test
     client = FakePresenceClient.new(on_call: ->(event) { order << event })
     run_loop(client: client, claim: -> { order << :claim; not_claimed }, max_iterations: 1)
 
-    assert_equal %w[open started], order.first(2),
-                 "presence must be established, in that order, before any claim is attempted"
+    assert_equal "started", order.first, "the session must be admitted before any claim is attempted"
     assert_includes order, :claim
   end
 
-  # CR-001 F1. The runner ships no ordering logic of its own: it asks Platform for a place in
-  # line and hands that exact value back. Anything derived on this machine — a clock, a
-  # counter, a random id — is what the defect was.
-  def test_the_start_presents_the_place_in_line_platform_issued
-    client = FakePresenceClient.new
-    run_loop(client: client, max_iterations: 1)
+  # The start names this terminal's session and the workspace it selected; every later signal names
+  # the session alone, because Platform already knows which grant it selected.
+  def test_the_start_names_the_session_and_its_workspace_and_later_signals_the_session_only
+    client = FakePresenceClient.new(heartbeat_seconds: 10)
+    run_loop(client: client, poll_seconds: 60, max_iterations: 1)
 
-    opened = client.calls.find { |call| call[:event] == "open" }
-    started = client.calls.find { |call| call[:event] == "started" }
-
-    assert_nil opened[:session_id], "the opening call carries no session — it is the request for one"
-    assert_nil opened[:session_seq]
-    assert_equal 1, started[:session_seq]
-    assert_equal "session-test-000001", started[:session_id]
+    started, *later = client.calls
+    assert_equal [ "started", "session-test-000001", "tiny-demo-workspace" ],
+                 started.values_at(:event, :session_id, :workspace_key)
+    refute_empty later
+    later.each do |call|
+      assert_equal [ "session-test-000001", nil ], call.values_at(:session_id, :workspace_key), call[:event]
+    end
   end
 
-  # A loop whose Platform was unreachable at startup has no session to beat for. Beating anyway
-  # would be answered `superseded` and would stop a perfectly healthy loop, so the establish is
-  # retried instead.
-  def test_a_session_that_could_not_be_established_is_retried_rather_than_heartbeated
-    client = FakePresenceClient.new(fail_on: "open", fail_times: 1, heartbeat_seconds: 10)
-    status = run_loop(client: client, poll_seconds: 60, max_iterations: 3)
+  # An uncertain start is not an admission. A loop whose Platform was unreachable at startup holds
+  # no slot, so it stops before any claim rather than polling without one.
+  def test_a_session_that_could_not_be_admitted_does_no_work
+    claims = 0
+    client = FakePresenceClient.new(fail_on: "started", fail_times: 1)
+    status = run_loop(client: client, claim: -> { claims += 1; not_claimed }, max_iterations: 3)
 
-    assert_equal Loop::OK, status, "an unreachable Platform at startup must not end the session"
-    assert_equal 2, client.events.count("open"), "the handshake is retried"
-    assert_includes client.events, "started"
-    refute_operator client.events.index("heartbeat") || Float::INFINITY, :<,
-                    client.events.index("started"),
-                    "no beat may be sent for a session Platform never recorded"
+    assert_equal Loop::FAILED, status
+    assert_equal 0, claims
+    assert_includes output, "presence paused"
+  end
+
+  # A start the registration has no room for is permanent for this invocation and names Platform's
+  # own count and maximum.
+  def test_a_full_registration_stops_the_loop_before_any_claim
+    claims = 0
+    client = FakePresenceClient.new(outcome: Presence::FULL)
+    status = run_loop(client: client, claim: -> { claims += 1; not_claimed }, max_iterations: 3)
+
+    assert_equal Loop::FAILED, status
+    assert_equal 0, claims
+    assert_includes output, "this runner already has 2 of 2 sessions running"
+  end
+
+  def test_an_admitted_session_is_not_admitted_twice
+    client = FakePresenceClient.new
+    presence = Presence.new(client: client, workspace_key: "tiny-demo-workspace", interval_seconds: 10,
+                            session_id: "session-test-000001", clock: FakeClock.new)
+
+    2.times { assert_predicate presence.started, :ok? }
+
+    assert_equal [ "started" ], client.events
   end
 
   def test_the_cadence_platform_advertises_drives_the_idle_heartbeat
@@ -97,7 +114,7 @@ class LoopPresenceTest < Minitest::Test
     run_loop(client: client, claim: -> { claims.shift }, execute: execute,
              poll_seconds: 60, max_iterations: 2)
 
-    assert_equal %w[open started], during, "no idle beat may be sent while a claim is executing"
+    assert_equal %w[started], during, "no idle beat may be sent while a claim is executing"
     # The resume is a heartbeat on the SAME session, never a second `started`.
     assert_equal 1, client.events.count("started"), "a completed run must not open a new session"
     assert_operator client.events.count("heartbeat"), :>=, 1
@@ -145,9 +162,9 @@ class LoopPresenceTest < Minitest::Test
     status = run_loop(client: client, poll_seconds: 60, max_iterations: 5)
 
     assert_equal Loop::FAILED, status
-    assert_includes output, "another loop session is now watching this workspace"
+    assert_includes output, "Platform no longer holds this terminal's session"
     assert_includes output, "remedy:"
-    assert_equal 1, output.scan("another loop session").size, "the reason is stated once"
+    assert_equal 1, output.scan("no longer holds").size, "the reason is stated once"
   end
 
   def test_a_rejected_credential_stops_the_loop_rather_than_spinning
@@ -180,10 +197,11 @@ class LoopPresenceTest < Minitest::Test
 
   # ---- what presence is NOT ------------------------------------------------
 
-  def test_a_loop_without_a_workspace_connection_reports_no_presence_at_all
-    # The advanced `--config` path has no connection record to attach a session to.
+  def test_a_development_token_invocation_reports_no_session_at_all
+    # The development token identifies no registration, so there is nothing to admit it against.
     refute_predicate Presence::NONE, :enabled?
     assert_predicate Presence::NONE.started, :ok?
+    assert_nil Presence::NONE.session_id
   end
 
   def test_a_session_id_satisfies_the_bounded_shape_platform_accepts
@@ -246,15 +264,14 @@ class LoopPresenceTest < Minitest::Test
       @fail_on = fail_on
       @fail_times = fail_times
       @failures = 0
-      @issued = 0
       @raise_on_started = raise_on_started
       @raise_on_stopped = raise_on_stopped
       @on_call = on_call
     end
 
-    def report_presence(workspace_key:, event:, session_id: nil, session_seq: nil)
+    def report_presence(event:, session_id:, workspace_key: nil)
       @events << event
-      @calls << { event: event, session_id: session_id, session_seq: session_seq }
+      @calls << { event: event, session_id: session_id, workspace_key: workspace_key }
       @on_call&.call(event)
       raise @raise_on_started if @raise_on_started && event == SpecrelayRunner::Presence::STARTED
       raise @raise_on_stopped if @raise_on_stopped && event == SpecrelayRunner::Presence::STOPPED
@@ -264,19 +281,20 @@ class LoopPresenceTest < Minitest::Test
         raise SpecrelayRunner::PlatformClient::Error, "could not reach Platform at http://127.0.0.1:3200"
       end
 
-      { "contract_version" => "mvp-0031", "presence" => presence_body(workspace_key, event) }
+      { "presence" => presence_body(event) }
     end
 
     private
 
-    # Platform never answers `superseded` to an opening call — that call only allocates a place
-    # in line. Ordering is decided when the `started` presenting it arrives.
-    def presence_body(workspace_key, event)
-      body = { "outcome" => @outcome, "workspace_key" => workspace_key,
-               "heartbeat_seconds" => @heartbeat_seconds, "recent_for_seconds" => 90 }
-      return body unless event == SpecrelayRunner::Presence::OPEN
+    # Only a start can be answered `full`, and it carries Platform's count and maximum. Every
+    # other answer is the scripted outcome.
+    def presence_body(event)
+      body = { "outcome" => @outcome, "heartbeat_seconds" => @heartbeat_seconds, "recent_for_seconds" => 90 }
+      if @outcome == SpecrelayRunner::Presence::FULL
+        return event == SpecrelayRunner::Presence::STARTED ? body.merge("active_sessions" => 2, "maximum_sessions" => 2) : body
+      end
 
-      body.merge("outcome" => SpecrelayRunner::Presence::ACCEPTED, "session_seq" => (@issued += 1))
+      event == SpecrelayRunner::Presence::STARTED ? body.merge("slot_number" => 1) : body
     end
   end
 

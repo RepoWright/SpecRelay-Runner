@@ -178,9 +178,10 @@ class ProjectSwitchingTest < Minitest::Test
     run_walk([ alpha_selector, :loop, :back, beta_selector, :loop, :back, :quit ])
 
     [ @alpha, @beta ].each do |platform|
-      keys = platform.requests_to("/api/runner/presence").map { |r| r.dig(:body, "workspace_key") }
+      starts = platform.requests_to("/api/runner/presence").select { |r| r.dig(:body, "event") == "started" }
+      keys = starts.map { |r| r.dig(:body, "workspace_key") }
 
-      refute_empty keys, "a running session reported no presence"
+      refute_empty keys, "a running session was never admitted"
       assert_equal [ SHARED_KEY ], keys.uniq, "the raw workspace key, not the local selector"
     end
   end

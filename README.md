@@ -166,22 +166,26 @@ bin/specrelay-runner claim-once --workspace <selector>
 ```
 
 **Which sessions may run together.** Each terminal works on one ticket at a time.
-Terminals using saved connections of different projects may run side by side. A
-second session for the same project's registration — through another of its
-workspaces, or after a reconnect — is refused, and a session started from a
-hand-written `--config` runs only alone. A refused command stops at once, before it
-probes a provider, reports presence, starts a connector or claims anything:
+Platform admits every `loop` and `claim-once` terminal against its registration's
+maximum concurrent sessions — chosen when the connection command was issued, `1`
+unless chosen otherwise — before it probes a provider, starts a connector or claims
+anything. A start beyond the maximum stops at once:
 
 ```text
-another SpecRelay runner session for this Runner registration is already running on
-this machine. Stop it first (Ctrl-C in its terminal), then start this one.
+Not started: tiny-demo (tiny-demo-workspace) — this runner already has 2 of 2 sessions running
+Remedy: Stop one of its other terminals, then start this one again.
 ```
 
-Stopping a session releases it: a clean finish, a startup failure and `Ctrl-C` all do,
-with nothing to clean up by hand. It is a same-user, same-machine guard, and every
-installation in concurrent use must be updated — an older binary does not follow
-these rules. `connect`, the dashboard, listings and the readiness test are not
-sessions and stay usable while one runs.
+Terminals of saved connections need nothing else from each other on this machine. A
+session started from a hand-written `--config` runs only alone here, and a registered
+credential's `--config` session still counts against its registration's maximum.
+
+Stopping a session releases its place: a clean finish, a startup failure and `Ctrl-C`
+all do, with nothing to clean up by hand. A terminal that dies silently holds its
+place for 120 seconds, or until the lease of a run it holds expires. Every
+installation in concurrent use must be updated — an older binary does not ask for
+admission and is refused at its first claim. `connect`, the dashboard, listings and
+the readiness test are not sessions and stay usable while sessions run.
 
 Neither needs a config file, an exported credential, a workspace-root environment
 variable, or a reviewer-provider environment variable: the credential is read from
