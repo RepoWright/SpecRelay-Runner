@@ -13,7 +13,7 @@ module SpecrelayRunner
     #       command: claude               # optional; defaults to the profile's executable
     #       args: [--print, --output-format, stream-json, --verbose,
     #              --dangerously-skip-permissions]
-    #       timeout_seconds: 1800
+    #       timeout_seconds: 7200
     #
     # Two things live here and they are deliberately different shapes:
     #
@@ -35,7 +35,7 @@ module SpecrelayRunner
       PROVIDER_FAKE = "fake"
       PROVIDERS = [ PROVIDER_CLAUDE, PROVIDER_FAKE ].freeze
       DEFAULT_NAME = "Local Reviewer"
-      DEFAULT_TIMEOUT_SECONDS = 1800
+      DEFAULT_TIMEOUT_SECONDS = 7200
 
       # Environment overrides, so the demo and the automated tests can select the
       # deterministic provider without editing an operator's YAML.
