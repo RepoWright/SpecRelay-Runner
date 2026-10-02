@@ -29,6 +29,9 @@ module SpecrelayRunner
       def ticket_id = payload.dig("ticket", "external_id").to_s
       def task_id = payload.dig("ticket", "task_id").to_s
       def run_url = payload.dig("implementation", "run_url").to_s
+      # The run the reviewed implementation belongs to. Platform already sends it, and it is
+      # what the live event envelope addresses, so this reads a field rather than deriving one.
+      def run_id = payload.dig("implementation", "run_id").to_s
       def report_url = payload.dig("execution_evidence", "report_url").to_s
 
       # The pinned repositories the runner must verify before reviewing anything.

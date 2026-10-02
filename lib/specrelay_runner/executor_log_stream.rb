@@ -379,7 +379,10 @@ module SpecrelayRunner
       end
       return if elapsed.nil?
 
-      message = "#{provider} executor running for #{elapsed}s on #{task_id} (no new output yet)"
+      # The noun is the PROVIDER, never the lane: this stream now also carries an automated
+      # review, and a quiet-period row that called the reviewer an executor would name the
+      # wrong activity.
+      message = "#{provider} running for #{elapsed}s on #{task_id} (no new output yet)"
       # RUNNER-0001 scope 5: elapsed liveness is true only NOW, so in a terminal it
       # replaces the status row instead of appending a line every interval — and the
       # next real provider line clears it before printing. With no row to redraw it

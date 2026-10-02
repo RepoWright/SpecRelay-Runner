@@ -299,6 +299,20 @@ class LiveLogTest < Minitest::Test
     stream.finish
   end
 
+  # This stream also carries an automated review, so a quiet-period row names the PROVIDER and
+  # never the lane: "reviewer executor running" would name an activity that is not happening.
+  def test_a_quiet_period_report_names_the_provider_rather_than_a_lane
+    clock = FakeClock.new
+    stream, io, emitter = build_stream(clock: clock, heartbeat_interval: 10, provider: "reviewer",
+                                       delivering: false)
+    clock.advance(11)
+    stream.send(:heartbeat_if_quiet)
+
+    assert_includes emitter.events_of("core.progress").first[:summary], "reviewer running for 11s"
+    refute_includes io.string, "executor"
+    stream.finish
+  end
+
   # ---- RUNNER-0001 scope 5: the quiet executor in a terminal ---------------
 
   # Scenario 13. Elapsed liveness is true only NOW, so in a terminal it replaces one row
@@ -728,10 +742,11 @@ class LiveLogTest < Minitest::Test
   # `delivering: false` is for the tests that drive the heartbeat schedule by hand against a
   # frozen clock and assert an exact beat or row count: a timer racing those assertions could
   # emit the same beat a microsecond before the test asks for it.
-  def build_stream(clock: FakeClock.new, heartbeat_interval: 15, io: StringIO.new, delivering: true)
+  def build_stream(clock: FakeClock.new, heartbeat_interval: 15, io: StringIO.new, delivering: true,
+                   provider: "fake")
     emitter = RecordingEmitter.new
     stream = SpecrelayRunner::ExecutorLogStream.new(
-      emitter: emitter, io: io, provider: "fake", task_id: "DEMO-0018",
+      emitter: emitter, io: io, provider: provider, task_id: "DEMO-0018",
       clock: clock, heartbeat_interval: heartbeat_interval
     )
     [ delivering ? stream.start : stream, io, emitter ]

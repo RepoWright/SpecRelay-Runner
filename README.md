@@ -241,11 +241,12 @@ no per-invocation configuration:
 - **A real Claude review streams.** The reviewer runs in the same supported
   structured mode the executor does, so its safe public activity — narration, tool calls,
   commands, file reads and edits, tests, delegated tasks — appears in this terminal as it
-  happens, and the verdict comes from the same decoder's terminal result. That stream is local
-  only: nothing of it is sent to Platform or persisted. An `args:` list you write yourself must
-  therefore request `--print`, `--output-format stream-json` and `--verbose`; a list that does not
-  is refused before the provider is launched, and writing no `args:` at all gets the supported
-  default.
+  happens, and the verdict comes from the same decoder's terminal result. That same activity also
+  reaches the run's live log, so an operator away from this machine can watch the review, and is
+  kept for the review attempt under the run's existing log retention. An `args:` list you write
+  yourself must therefore request `--print`, `--output-format stream-json` and `--verbose`; a list
+  that does not is refused before the provider is launched, and writing no `args:` at all gets the
+  supported default.
 - **The reviewed repository is resolved from three anchored places:** the connected workspace
   root, its direct child named by the repository segment of the pinned `owner/repository` key,
   or `repositories/<repository>` under that root. Exactly one must be a Git repository at its
@@ -759,7 +760,7 @@ live log events, so a working run never looks like a hung one:
   [claude:status] Provider started
   [claude:status] Reading demo-app/index.html
   [claude:status] Running test command: bundle exec rspec
-  [claude:status] claude executor running for 15s on YOUR-1234 (no new output yet)
+  [claude:status] claude running for 15s on YOUR-1234 (no new output yet)
   [claude:status] Provider completed
 [verification.started] Verifying 1 changed repository(ies) for YOUR-1234
 ```
