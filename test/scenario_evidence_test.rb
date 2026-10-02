@@ -9,6 +9,7 @@ require "yaml"
 # a stated limitation in the round README rather than a silent omission.
 class ScenarioEvidenceTest < Minitest::Test
   TASK = "DEMO-0001"
+  SCENARIO_DIR = "/tmp/specrelay-attempt/scenario-evidence"
   PNG = Base64.decode64("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==")
   SCENARIO = <<~MD
     # Sign-in validation
@@ -162,6 +163,37 @@ class ScenarioEvidenceTest < Minitest::Test
     assert_empty uploaded(report).keys.grep(%r{\A(scenarios|screenshots)/})
   end
 
+  # ---- the instructions an executor actually receives ------------------------------------------
+
+  # The prompt is the only control over where an executor writes. The scenario directory lies
+  # outside the task workspace, so the rules must name that one directory and keep every other
+  # write closed: a permission phrased about "outside the workspace" would authorize the host.
+  def test_the_prompt_permits_evidence_writes_in_the_named_directory_and_nowhere_else
+    rules = prompt[/^Rules:\n.*?(?=\n\n)/m]
+
+    assert rules, "the generated prompt states no rules block"
+    assert_includes rules, "Change ONLY files inside the task workspace"
+    assert_includes rules, "`#{SCENARIO_DIR}`"
+    assert_includes rules, "Write nowhere else outside the task workspace"
+    refute_includes rules, "`#{File.dirname(SCENARIO_DIR)}`"
+    assert_includes rules, "write to Platform"
+  end
+
+  # The authoring half: an image belongs beside the step it illustrates, and the prohibition that
+  # made that impossible is gone rather than softened.
+  def test_the_prompt_asks_for_images_at_their_narrative_position
+    text = prompt
+
+    refute_includes text, "Do not link images from the Markdown"
+    assert_includes text, "![Validation error](screenshots/validation.png)"
+    assert_includes text, "with a blank line above and below"
+    assert_includes text, "immediately after the action or observation"
+    # The authoring rules it must keep.
+    assert_includes text, "`PASS`, `FAIL` or `BLOCKED`"
+    assert_includes text, "Never invent a screenshot or a pass"
+    assert_includes text, "Never include credentials, tokens or private reasoning"
+  end
+
   # ---- through the real runner ----------------------------------------------------------------
 
   def test_an_executor_authored_scenario_and_screenshot_reach_the_uploaded_report
@@ -178,9 +210,21 @@ class ScenarioEvidenceTest < Minitest::Test
     files = platform.last_report[:body].dig("report", "files")
                     .to_h { |file| [ file["relative_path"], Base64.strict_decode64(file["content_base64"]) ] }
     manifest = YAML.safe_load(files.fetch("manifest.yml"))
-    assert_includes files.fetch("scenarios/01-heading.md"), "Result: PASS"
+    document = files.fetch("scenarios/01-heading.md")
+    assert_includes document, "Result: PASS"
+    # Each image reference survives collection at the narrative position the executor authored it
+    # in: between the two actions, not gathered at the end of the document.
+    assert_equal [ "![Heading before the change](screenshots/01-heading-before.png)",
+                   "![Heading after the change](screenshots/01-heading-success.png)" ],
+                 document.scan(/^!\[.*\]\(.*\)$/)
+    assert_operator document.index("1. Opened"), :<, document.index("01-heading-before.png")
+    assert_operator document.index("01-heading-before.png"), :<, document.index("2. Applied")
+    assert_operator document.index("2. Applied"), :<, document.index("01-heading-success.png")
+    assert_equal PNG, files.fetch("screenshots/01-heading-before.png")
     assert_equal PNG, files.fetch("screenshots/01-heading-success.png")
-    assert_equal [ { "path" => "screenshots/01-heading-success.png", "viewport" => "1440x900",
+    assert_equal [ { "path" => "screenshots/01-heading-before.png", "viewport" => "1440x900",
+                     "scenario" => "01-heading", "result" => "Old heading" },
+                   { "path" => "screenshots/01-heading-success.png", "viewport" => "1440x900",
                      "scenario" => "01-heading", "result" => "Success" } ], manifest["screenshots"]
     assert_includes manifest["evidence_files"],
                     { "path" => "scenarios/01-heading.md", "kind" => "markdown", "description" => "Heading text" }
@@ -193,6 +237,14 @@ class ScenarioEvidenceTest < Minitest::Test
   end
 
   private
+
+  # The real generated prompt, built by the one method that builds it for every executor.
+  def prompt
+    execution = SpecrelayRunner::Execution.new(config: nil, client: nil,
+                                               payload: claim_payload_for(task_id: TASK))
+    execution.send(:prompt_text, "/work/#{TASK}", "/tmp/specrelay-attempt/question-bridge",
+                   "/tmp/specrelay-attempt/changed-repositories.json", SCENARIO_DIR)
+  end
 
   def write(relative, bytes)
     path = File.join(@dir, relative)
@@ -245,8 +297,10 @@ class ScenarioEvidenceTest < Minitest::Test
     path
   end
 
-  # A fake executor that does the demo edit, then records one checked scenario and one screenshot
-  # exactly where the prompt names the scenario evidence directory, as a real executor must.
+  # A fake executor that does the demo edit, then records one checked scenario with two screenshots
+  # referenced at the positions they were captured, exactly where the prompt names the scenario
+  # evidence directory. It proves transport and ordering only; a fixture cannot prove that a real
+  # provider obeys the instruction, which is what the real-provider probe is for.
   def write_scenario_executor(root)
     path = File.join(root, "bin", "scenario-executor")
     File.write(path, <<~RUBY)
@@ -264,11 +318,27 @@ class ScenarioEvidenceTest < Minitest::Test
       File.write(file, content.gsub("Hello Demo", "Hello SpecRelay Demo")) if changed
       FileUtils.mkdir_p(File.join(dir, "scenarios"))
       FileUtils.mkdir_p(File.join(dir, "screenshots"))
-      File.write(File.join(dir, "scenarios", "01-heading.md"), "# Heading\\n\\n- Result: PASS\\n")
-      File.binwrite(File.join(dir, "screenshots", "01-heading-success.png"), Base64.decode64(#{Base64.strict_encode64(PNG).inspect}))
+      File.write(File.join(dir, "scenarios", "01-heading.md"), <<~DOC)
+        # Heading
+
+        - Result: PASS
+
+        1. Opened the page before the change. Observed the old heading.
+
+        ![Heading before the change](screenshots/01-heading-before.png)
+
+        2. Applied the change and reloaded. Observed the new heading.
+
+        ![Heading after the change](screenshots/01-heading-success.png)
+      DOC
+      pixel = Base64.decode64(#{Base64.strict_encode64(PNG).inspect})
+      File.binwrite(File.join(dir, "screenshots", "01-heading-before.png"), pixel)
+      File.binwrite(File.join(dir, "screenshots", "01-heading-success.png"), pixel)
       File.write(File.join(dir, "index.json"), JSON.generate(
         "evidence_files" => [ { "path" => "scenarios/01-heading.md", "description" => "Heading text" } ],
-        "screenshots" => [ { "path" => "screenshots/01-heading-success.png", "viewport" => "1440x900",
+        "screenshots" => [ { "path" => "screenshots/01-heading-before.png", "viewport" => "1440x900",
+                             "scenario" => "01-heading", "result" => "Old heading" },
+                           { "path" => "screenshots/01-heading-success.png", "viewport" => "1440x900",
                              "scenario" => "01-heading", "result" => "Success" } ]
       ))
       #{DemoWorkspace.selection_snippet(changed: 'changed')}
