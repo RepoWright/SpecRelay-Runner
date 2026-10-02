@@ -122,7 +122,7 @@ module SpecrelayRunner
         refusal = duplicate_refusal(repository, seen) || verify(repository, root, observed, placing, git)
         return refusal if refusal
 
-        placement = placing ? local_placement(repository, root) : :reset
+        placement = placing ? placement_plan(repository, root) : :reset
         return placement if placement.is_a?(Result)
 
         seen << Review::Checkout.identity(repository["clone_url"])
@@ -291,28 +291,30 @@ module SpecrelayRunner
       refuse("#{subject} is at #{observed['headRefOid'].to_s[0, 12]}, not the #{noun} head #{head[0, 12]}")
     end
 
-    # HOW a checkout being placed gets the recorded branch, without moving any existing ref: the
-    # branch may already exist in the clone this checkout shares with other environments. Absent,
-    # it is created at the recorded head; present, it is selected only when it is exactly there and
-    # no other worktree has it checked out. Read after {#fetch_head}, so that head is local.
-    def local_placement(repository, root)
-      key = repository["repository_key"]
-      branch = repository["branch"].to_s
-      worktrees = run(root, %w[worktree list --porcelain])
-      # Exit 1 from a lookup that COMPLETED is "no such branch"; a timeout or any other status is
-      # git failing to answer, which refuses.
-      local = run(root, [ "rev-parse", "--verify", "--quiet", "refs/heads/#{branch}^{commit}" ])
-      absent = !local.nil? && !local.timed_out? && local.exit_code == 1
-      return refuse("could not read the local branch '#{branch}' of '#{key}'; refusing to place it") unless
-        succeeded?(worktrees) && (absent || succeeded?(local))
-      return :create if absent
-      return refuse("the branch '#{branch}' of '#{key}' is checked out in another worktree; " \
-                    "release that worktree before retrying") if
-        worktrees.stdout.to_s.lines.include?("branch refs/heads/#{branch}\n")
-      return :select if local.stdout.to_s.strip.casecmp?(repository["head_commit"].to_s)
+    # HOW a checkout being placed gets the recorded branch, without moving any existing ref.
+    # {BranchPlacement} owns that rule; the answered-question restore establishes the same branch
+    # at a recorded BASE through the same owner, so the two continuations cannot disagree about
+    # which existing branch is safe to select. Read after {#fetch_head}, so the head is local.
+    def placement_plan(repository, root)
+      planned = BranchPlacement.new(root: root, branch: repository["branch"].to_s,
+                                    commit: repository["head_commit"].to_s,
+                                    subject: "'#{repository['repository_key']}'",
+                                    noun: noun, target: "#{noun} head").plan
+      planned.is_a?(BranchPlacement::Refusal) ? refuse(planned.reason) : planned
+    end
 
-      refuse("the local branch '#{branch}' of '#{key}' is not at the #{noun} head; it is never moved, " \
-             "so align or delete it before retrying")
+    # The one mutation, once the whole set has passed. A failure names the repository that failed
+    # and refuses the whole continuation, so a partially materialized workspace never reaches a
+    # provider. Returns nil on success, because the only thing a caller needs from it is the
+    # refusal.
+    #
+    # A checkout being placed is detached, where `reset --hard` would move no branch at all, so
+    # it is the planned {BranchPlacement} that performs and confirms its own mutation.
+    def put(repository, root, placement)
+      return reset(repository, root) if placement == :reset
+
+      refusal = placement.put
+      refusal && refuse(refusal.reason)
     end
 
     # `reset --hard` onto the canonical task branch, so the branch each checkout is on — and that
@@ -321,28 +323,16 @@ module SpecrelayRunner
     # nobody reviewed. Guarded by the cleanliness proof above: this only ever discards committed
     # state the remote does not have, never an operator's uncommitted work.
     #
-    # A failure here names the repository that failed and refuses the whole continuation, so a
-    # partially materialized workspace never reaches a provider. Returns nil on success, because
-    # the only thing a caller needs from it is the refusal.
-    #
     # A `nil` result — git could not be spawned at all — is a refusal, not a pass. The predecessor
     # of this line read `result&.exit_code.to_i.zero?`, which evaluates `nil.to_i.zero?` and
     # reported an unrun reset as a successful one; `clean?` above has always answered the same
     # question the closed way, and now so does this.
-    #
-    # A checkout being placed is detached, where `reset --hard` would move no branch at all. Its
-    # branch is created with `-b`, which refuses if one appeared since the proof, or selected
-    # without moving it. Either way the checkout is then CONFIRMED on the recorded branch at the
-    # recorded head, so a branch that changed after it was proved never reaches the provider.
-    def put(repository, root, placement)
+    def reset(repository, root)
       key = repository["repository_key"]
       head = repository["head_commit"].to_s
       branch = repository["branch"].to_s
-      args = { reset: [ "reset", "--hard", head ], create: [ "checkout", "--quiet", "-b", branch, head ],
-               select: [ "checkout", "--quiet", branch ] }.fetch(placement)
-      result = run(root, args)
       return refuse("could not check out the #{noun} head of '#{key}' in this task workspace") unless
-        succeeded?(result)
+        succeeded?(run(root, [ "reset", "--hard", head ]))
       return nil if placed?(root, branch, head)
 
       refuse("'#{key}' is not on the #{noun} branch at the #{noun} head after placement; nothing was started")

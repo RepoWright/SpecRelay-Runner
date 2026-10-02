@@ -110,6 +110,10 @@ require_relative "specrelay_runner/preview_session"
 # MAPIAI-97: releasing the task environment a finished run leaves behind, through the same
 # project-owned authority the preview lane uses.
 require_relative "specrelay_runner/task_environment"
+# The one rule for putting a detached, run-owned checkout on a recorded branch without moving an
+# existing ref. Before both continuations that need it, and after `review`, whose read-only git
+# seam supplies its timeout.
+require_relative "specrelay_runner/branch_placement"
 require_relative "specrelay_runner/continued_target"
 require_relative "specrelay_runner/rework"
 # MVP-0036 Stage 2a: the offline resume round — continuing from this machine's own uncommitted

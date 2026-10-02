@@ -100,10 +100,17 @@ module SpecrelayRunner
     # This machine has never seen the work. The task workspace is built by the PROJECT's own
     # command — the same one an ordinary first execution uses — and the recorded repositories are
     # restored into it, each proven clean at its recorded base first.
+    #
+    # Whether that command really BUILT the environment travels with the restore, because it is
+    # the only thing that says a checkout it left detached is this claim's own and holds nothing:
+    # a project whose task environment is several independent repositories prepares its components
+    # that way, and without this the continuation would refuse the environment it had just created.
+    # `create` can also return an existing clean worktree, which this claim did not build and which
+    # is therefore never placed.
     def restore(payload, creating:, measuring:)
       created = creating.create
       restored = Checkpoint.restore(checkpoint, payload: payload, task_root: created.path,
-                                                workspace: measuring)
+                                                workspace: measuring, created: created.created?)
       restored.ok? ? Prepared.new(worktree: created) : Prepared.new(reason: restored.reason)
     end
 
