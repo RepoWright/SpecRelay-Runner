@@ -759,7 +759,7 @@ live log events, so a working run never looks like a hung one:
   [claude:status] Provider started
   [claude:status] Reading demo-app/index.html
   [claude:status] Running test command: bundle exec rspec
-  [claude:status] claude executor running for 15s on YOUR-1234 (no new output yet)
+  [claude:status] claude running for 15s on YOUR-1234 (no new output yet)
   [claude:status] Provider completed
 [verification.started] Verifying 1 changed repository(ies) for YOUR-1234
 ```

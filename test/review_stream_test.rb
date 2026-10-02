@@ -25,6 +25,10 @@ class ReviewStreamTest < Minitest::Test
   OUTSIDE_PATH = "/Users/someone-else/private-project/notes.md"
   STDERR_BYTES = "operator@example.com used /Users/operator/Library/Caches/claude"
   VERDICT_MARKER = "VERDICT-BODY-MARKER"
+  # The two identities every live review envelope must carry: the run the reviewed implementation
+  # belongs to, and the review claim this attempt holds.
+  RUN_ID = "run_fake"
+  CLAIM_ID = "rex_fake"
   VERDICT_BODY = %({"outcome":"ACCEPT","summary":"#{VERDICT_MARKER}"})
 
   # A recording terminal that is also a SIGNAL: it creates `sentinel` the instant `marker` is
@@ -41,30 +45,6 @@ class ReviewStreamTest < Minitest::Test
       super
       File.write(@sentinel, "seen") if bytes.include?(@marker)
     end
-  end
-
-  # Every Platform call this review makes, recorded WITH its arguments at the injected client
-  # boundary. Live review progress reaching Platform would show up here as a call or as progress
-  # text inside one — neither can be argued away from the implementation's shape.
-  class RecordingClient
-    attr_reader :calls
-
-    def initialize(inner)
-      @inner = inner
-      @calls = []
-    end
-
-    def method_missing(name, *args, **kwargs, &block)
-      @calls << [ name, args, kwargs ]
-      @inner.public_send(name, *args, **kwargs, &block)
-    end
-
-    def respond_to_missing?(name, include_private = false)
-      @inner.respond_to?(name, include_private) || super
-    end
-
-    def method_names = calls.map(&:first)
-    def recorded_payloads = calls.map { |name, args, kwargs| [ name, args, kwargs ].inspect }.join("\n")
   end
 
   def setup
@@ -232,24 +212,95 @@ class ReviewStreamTest < Minitest::Test
     assert result.success?, result.message
     assert_equal "ACCEPT", @platform.last_review["outcome"]
     refute_includes @terminal.string, "[reviewer:", "the fake provider emits no structured frames"
+    assert_empty @platform.protocol_events, "a lane with no decoder has no public activity to report"
   end
 
-  # --- S08: no live review byte is submitted to Platform --------------------
+  # --- S08: the same public activity is reported on the review claim --------
 
-  def test_a_recording_client_observes_no_protocol_or_log_submission_from_review_progress
-    client = RecordingClient.new(platform_client)
+  def test_public_review_activity_is_submitted_as_ordered_log_events_on_the_review_claim
     script = reviewer_stream([ ClaudeStreamJson.init,
                                ClaudeStreamJson.narration("Reading the approved specification"),
                                ClaudeStreamJson.bash_call("bin/test"),
                                ClaudeStreamJson.terminal(VERDICT_BODY) ])
 
-    result = run_review(command: script, client: client)
+    result = run_review(command: script)
 
     assert result.success?, result.message
-    assert_equal [ :submit_review_result ], client.method_names
-    [ "Provider started", "Reading the approved specification", "bin/test" ].each do |progress|
-      refute_includes client.recorded_payloads, progress
+    events = @platform.protocol_events
+    refute_empty events, "the review lane must report the activity it already decodes"
+    assert_equal [ RUN_ID ], events.map { |event| event["run_id"] }.uniq
+    assert_equal [ CLAIM_ID ], events.map { |event| event["attempt_id"] }.uniq
+    sequences = events.map { |event| event["sequence"] }
+    assert_equal sequences.uniq.sort, sequences, "one monotonic sequence inside the attempt"
+    assert_includes chunk_text, "Reading the approved specification"
+    assert_includes chunk_text, "> Bash bin/test"
+  end
+
+  # The live view closes WITH the provider, so the operator can never be shown activity that
+  # arrived after the verdict it was meant to precede.
+  def test_every_log_event_reaches_platform_before_the_review_result
+    script = reviewer_stream([ ClaudeStreamJson.init, ClaudeStreamJson.narration("Reviewing the diff"),
+                               ClaudeStreamJson.terminal(VERDICT_BODY) ])
+
+    result = run_review(command: script)
+
+    assert result.success?, result.message
+    paths = @platform.requests.map { |request| request[:path] }
+    assert_operator paths.rindex("/api/runner/events"), :<, paths.index("/api/runner/review_results")
+  end
+
+  # Causality, not timing: the reviewer BLOCKS before its terminal result until Platform has
+  # already accepted a chunk carrying its narration, so a runner that only reported at the end
+  # would drive the child into its own abort.
+  def test_a_log_chunk_reaches_platform_while_the_reviewer_is_still_running
+    sentinel = File.join(@root, "delivered.txt")
+    restart_platform(SignallingPlatform.new(sentinel: sentinel, marker: "Reading the approved specification",
+                                            claim_payload: { "claimed" => false }))
+    script = reviewer_stream([ ClaudeStreamJson.init,
+                               ClaudeStreamJson.narration("Reading the approved specification"),
+                               ClaudeStreamJson.terminal(VERDICT_BODY) ], await: sentinel)
+
+    result = run_review(command: script)
+
+    assert result.success?, result.message
+    assert_path_exists sentinel
+  end
+
+  # The wider audience is protected by the SAME boundary the terminal already had: what the
+  # decoder withholds is withheld from every request this attempt makes.
+  def test_no_withheld_category_appears_in_any_submitted_envelope
+    script = reviewer_stream([ ClaudeStreamJson.init,
+                               ClaudeStreamJson.thinking(PRIVATE_REASONING),
+                               ClaudeStreamJson.narration("Authenticating with #{CREDENTIAL}"),
+                               ClaudeStreamJson.read_call(OUTSIDE_PATH),
+                               ClaudeStreamJson.read_call(File.join(@repo, "README.md"), id: "toolu_inside"),
+                               ClaudeStreamJson.terminal(VERDICT_BODY) ],
+                             stderr: "#{STDERR_BYTES}\n")
+
+    result = run_review(command: script)
+
+    assert result.success?, result.message
+    [ PRIVATE_REASONING, CREDENTIAL, "/Users/someone-else", STDERR_BYTES, "operator@example.com" ].each do |secret|
+      refute_includes submitted_bodies, secret
     end
+    refute_match(/"type"\s*=>\s*"assistant"/, submitted_bodies, "a raw provider frame is never submitted")
+    assert_includes chunk_text, "> Read [LOCAL_PATH]"
+    assert_includes chunk_text, "> Read specrelay-platform/README.md"
+  end
+
+  # A progress channel must never decide a review. Platform refusing every live event leaves the
+  # verdict, the attempt outcome and the local record exactly as they were, and says so once.
+  def test_a_platform_outage_on_the_live_stream_changes_neither_the_verdict_nor_the_outcome
+    restart_platform(OfflineEventsPlatform.new(claim_payload: { "claimed" => false }))
+    script = reviewer_stream([ ClaudeStreamJson.init, ClaudeStreamJson.narration("Reviewing the diff"),
+                               ClaudeStreamJson.terminal(VERDICT_BODY) ])
+
+    result = run_review(command: script)
+
+    assert result.success?, result.message
+    assert_equal "ACCEPT", @platform.last_review["outcome"]
+    assert_includes lines, "  [reviewer:status] Reviewing the diff"
+    assert_equal 1, lines.count { |line| line.include?("were not acknowledged by Platform") }
   end
 
   # --- S09: a head that moves during the streamed review still refuses ------
@@ -299,17 +350,53 @@ class ReviewStreamTest < Minitest::Test
 
     assert result.success?, result.message
     refute_empty @platform.requests_to("/api/runner/heartbeat"), "the lease must still be renewed"
+    refute_empty @platform.protocol_events, "the same activity still reaches Platform"
     assert_includes lines, "  [reviewer:status] Reviewing the diff"
     assert(lines.none? { |line| line.include?("[reviewer:") && !line.start_with?("  [reviewer:") },
            "a concurrent heartbeat must not split a streamed line: #{lines.inspect}")
   end
 
+  # A Platform that SIGNALS: it creates `sentinel` the instant it accepts a live log chunk
+  # carrying `marker`, which is what turns "delivered while the reviewer ran" into causality.
+  class SignallingPlatform < FakePlatform
+    def initialize(sentinel:, marker:, **kwargs)
+      super(**kwargs)
+      @sentinel = sentinel
+      @marker = marker
+    end
+
+    def events(request)
+      File.write(@sentinel, "seen") if request.dig(:body, "event", "sanitized_log_chunk").to_s.include?(@marker)
+      super
+    end
+  end
+
+  # A Platform that answers every live event with a fault — not a refusal, so the runner cannot
+  # know the request's fate and must report what it is still owed rather than claim a loss.
+  class OfflineEventsPlatform < FakePlatform
+    def events(_request) = [ 503, { error: "unavailable" } ]
+  end
+
   private
+
+  def restart_platform(replacement)
+    @platform.stop
+    @platform = replacement
+    @platform.start
+  end
 
   # --- assertions over the terminal ----------------------------------------
 
   def lines = @terminal.durable_lines
   def index(fragment) = lines.index { |line| line.include?(fragment) } || -1
+
+  # --- assertions over the wire --------------------------------------------
+
+  def chunk_text
+    @platform.protocol_events.filter_map { |event| event["sanitized_log_chunk"] }.join("\n")
+  end
+
+  def submitted_bodies = @platform.requests.map { |request| request[:body].inspect }.join("\n")
 
   # --- the reviewer stand-ins ----------------------------------------------
 
@@ -377,13 +464,12 @@ class ReviewStreamTest < Minitest::Test
 
   # --- the review itself ---------------------------------------------------
 
-  def run_review(command:, provider: "claude", args: nil, io: nil, timeout_seconds: nil, client: nil,
-                 payload: nil)
+  def run_review(command:, provider: "claude", args: nil, io: nil, timeout_seconds: nil, payload: nil)
     document = { "provider" => provider, "command" => command }
     document["args"] = args if args
     document["timeout_seconds"] = timeout_seconds if timeout_seconds
     SpecrelayRunner::Review::Execution.call(
-      config: config, client: client || platform_client, payload: payload || review_payload,
+      config: config, client: platform_client, payload: payload || review_payload,
       settings: SpecrelayRunner::Review::Settings.new(document, env: {}),
       env: { "PATH" => ENV["PATH"].to_s, "HOME" => @root }, io: io || presenter
     )
@@ -433,7 +519,7 @@ class ReviewStreamTest < Minitest::Test
       "ticket" => { "external_id" => "DEMO-1", "task_id" => "DEMO-1" },
       "workspace" => { "key" => "tiny-demo-workspace" },
       "specification" => { "digest" => "specdigest", "documents" => [] },
-      "implementation" => { "run_url" => "#{@platform.base_url}/runs/run_fake" },
+      "implementation" => { "run_id" => RUN_ID, "run_url" => "#{@platform.base_url}/runs/#{RUN_ID}" },
       "repositories" => [ { "repository_key" => "specrelay-platform", "slug" => "SpecRelay/tiny-demo-workspace",
                             "clone_url" => @remote, "base_commit" => BASE, "branch" => BRANCH,
                             "head_commit" => @pinned_head,

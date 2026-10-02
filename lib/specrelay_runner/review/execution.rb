@@ -12,8 +12,8 @@ module SpecrelayRunner
     #      from this runner's implementation work — no resumed session, no shared context
     #      (S24);
     #   3. decode its structured output as it arrives — safe public activity to this machine's
-    #      own terminal and nowhere else — then parse the ONE terminal result strictly and redact
-    #      it (MAPIAI-103);
+    #      own terminal and to the run's live log, so an operator who is not at this machine can
+    #      watch the review — then parse the ONE terminal result strictly and redact it;
     #   4. submit exactly one structured outcome;
     #   5. if Platform answers an ACCEPT with a retirement plan instead of a verdict, close exactly
     #      the pull requests it authorized and deliver the identical result again (MAPIAI-88).
@@ -92,8 +92,13 @@ module SpecrelayRunner
       def review
         log "Reviewing #{assignment.ticket_id} at the pinned head (attempt #{assignment.attempt_ordinal})"
         heartbeater = start_heartbeater
+        @log_stream = start_log_stream
         @stream = claude_stream
         launched = launch
+        # The live view closes WITH the provider, so every public line this attempt produced is
+        # delivered before the verdict below is submitted — and the result channel never waits on
+        # the progress channel.
+        @log_stream&.finish
         # A timeout and a non-zero exit are provider FAILURES, not results: whatever the process
         # printed before dying is not a verdict, so it is never parsed for one.
         return failure(PROVIDER_EXECUTION_FAILURE, "the reviewer timed out") if launched.timed_out?
@@ -112,6 +117,8 @@ module SpecrelayRunner
         verdict(parsed.review)
       ensure
         heartbeater&.stop
+        # Idempotent, so an exception on any path still stops the delivery thread.
+        @log_stream&.finish
       end
 
       # The ONE document a verdict may be parsed from: the decoder's terminal result for the real
@@ -121,15 +128,33 @@ module SpecrelayRunner
 
       # MAPIAI-103 — the decoder for the real Claude reviewer, or nil for the deterministic fake.
       #
-      # Its safe public progress goes to the terminal this run already writes to, and NOWHERE
-      # else: no Platform event, no persistence, no buffer of this class's own. `repository_path`
-      # is the verified workspace root, so a public path inside it is shown repository-relative
-      # while every other absolute path is withheld by the decoder's existing projection rule.
+      # Its safe public progress is handed to the live log stream, which is the one fan-out owner
+      # for this machine's terminal and for Platform. `repository_path` is the verified workspace
+      # root, so a public path inside it is shown repository-relative while every other absolute
+      # path is withheld by the decoder's existing projection rule.
       def claude_stream
         return nil unless settings.claude?
 
-        ClaudeStream.new(sink: ->(source, text) { log("  [reviewer:#{source}] #{text}") },
-                         repository_path: workspace_root)
+        ClaudeStream.new(sink: @log_stream.sink, repository_path: workspace_root)
+      end
+
+      # The live public view of this review, for the operator who is not sitting at this machine.
+      #
+      # It is the SAME pipeline the implementation and specification lanes use — redact, clip,
+      # batch, cut, deliver on one thread — addressed at this run and at this review claim, so the
+      # review stream has no event vocabulary, endpoint, bound or retention of its own. The
+      # terminal text is unchanged: the stream prints `  [reviewer:<source>] <line>`, which is
+      # exactly what the decoder's sink used to write directly.
+      #
+      # Only the real structured reviewer produces activity to show; the deterministic fake has no
+      # decoder, so it starts no stream and submits nothing.
+      def start_log_stream
+        return nil unless settings.claude?
+
+        emitter = EventEmitter.new(client: client, run_id: assignment.run_id,
+                                   attempt_id: assignment.claim_token)
+        ExecutorLogStream.start(emitter: emitter, io: io, provider: "reviewer",
+                                task_id: assignment.task_id)
       end
 
       # The head can move WHILE the reviewer works — a review takes minutes and a push takes
