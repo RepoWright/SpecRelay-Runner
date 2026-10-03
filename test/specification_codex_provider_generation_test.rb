@@ -163,13 +163,21 @@ class SpecificationCodexProviderGenerationTest < Minitest::Test
     claude_runner = FakeCommandRunner.new(result: ok, lines: [
       event("type" => "system", "subtype" => "init"),
       event("type" => "result", "subtype" => "success", "is_error" => false,
-            "result" => JSON.generate(VALID_DOCUMENTS))
+            "result" => JSON.generate(VALID_DOCUMENTS),
+            "structured_output" => SpecificationWorkspace.structured_output(VALID_DOCUMENTS))
     ])
-    Provider::Claude.new(profile: SpecrelayRunner::ClaudeProfile.new(SpecrelayRunner::ClaudeProfile::CANONICAL),
-                         env: {}, working_directory: working_directory,
-                         command_runner: claude_runner).generate(packet)
+    claude = Provider::Claude.new(profile: SpecrelayRunner::ClaudeProfile.new(SpecrelayRunner::ClaudeProfile::CANONICAL),
+                                  env: {}, working_directory: working_directory, command_runner: claude_runner)
+    claude.generate(packet)
+    codex = Provider::Codex.new(profile: SpecrelayRunner::CodexProfile.new(SpecrelayRunner::CodexProfile::CANONICAL),
+                                env: {}, working_directory: working_directory, command_runner: codex_runner)
 
-    assert_equal claude_runner.calls.fetch(0).argv.last, codex_runner.calls.fetch(0).stdin_data
+    # Only how the answer is SUBMITTED differs: Claude's run accepts the structured output alone.
+    claude_instruction = claude.send(:output_instruction)
+    codex_instruction = codex.send(:output_instruction)
+    refute_equal claude_instruction, codex_instruction
+    assert_equal codex_runner.calls.fetch(0).stdin_data,
+                 claude_runner.calls.fetch(0).argv.last.sub(claude_instruction, codex_instruction)
   end
 
   def test_a_response_wrapped_in_prose_with_unrelated_braces_still_parses

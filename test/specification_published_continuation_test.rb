@@ -249,7 +249,8 @@ class SpecificationPublishedContinuationTest < Minitest::Test
 
       puts JSON.generate("type" => "system", "subtype" => "init")
       puts JSON.generate("type" => "result", "subtype" => "success", "is_error" => false,
-                         "result" => JSON.generate(#{SpecificationWorkspace.valid_documents(ISSUE).to_json}))
+                         "result" => JSON.generate(#{SpecificationWorkspace.valid_documents(ISSUE).to_json}),
+                         "structured_output" => #{SpecificationWorkspace.structured_output(SpecificationWorkspace.valid_documents(ISSUE)).to_json})
     RUBY
     dir
   end

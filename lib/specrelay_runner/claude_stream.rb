@@ -12,7 +12,8 @@ module SpecrelayRunner
   #
   #   1. safe public progress, handed to the caller's sink AS IT ARRIVES, so an operator sees
   #      the provider working instead of a silent terminal; and
-  #   2. the terminal `result` text, handed to the EXISTING result/package parsers unchanged.
+  #   2. the terminal `result` text, handed to the EXISTING result/package parsers unchanged —
+  #      and, for the lane that requests one, the result's schema-constrained `structured_output`.
   #
   # They never mix. A displayed event can never become specification input or a report, and the
   # final result is never duplicated into the live view.
@@ -25,10 +26,10 @@ module SpecrelayRunner
   #
   # Exactly two things are withheld: `thinking` blocks, which are the model's private reasoning
   # and are not public text even though the transport carries them, and the JSONL wrappers
-  # themselves. Credentials are NOT filtered here — {Redaction} is the single boundary that
-  # removes them, and it runs over every line on the way to both surfaces. A message type this
-  # decoder does not recognize renders nothing rather than its object, so a future CLI cannot
-  # leak by being new.
+  # themselves — plus, in a lane that withholds documents, everything free-form (see
+  # {#identities_only}). Credentials are NOT filtered here — {Redaction} is the single boundary that removes them, and it runs over every
+  # line on the way to both surfaces. A message type this decoder does not recognize renders
+  # nothing rather than its object, so a future CLI cannot leak by being new.
   #
   # MAPIAI-77 — an absolute LOCAL path is withheld too, and the decision belongs here because
   # this is the only place that holds the complete public content together with the verified
@@ -84,6 +85,7 @@ module SpecrelayRunner
 
     FAILURE_UNREADABLE = "the provider's structured output could not be read"
     FAILURE_INCOMPLETE = "the provider's structured output ended mid-message"
+    FAILURE_MALFORMED = "the provider's structured output is malformed"
     FAILURE_NO_RESULT = "the provider produced no terminal result"
     FAILURE_TWO_RESULTS = "the provider reported more than one terminal result"
     FAILURE_RESULT_TOO_LARGE = "the provider's terminal result exceeded #{MAX_RESULT_BYTES} bytes"
@@ -99,12 +101,16 @@ module SpecrelayRunner
     # `refusals`, when given, is the attempt's question bridge counting the question turns it has
     # refused back to this same provider process. A lane without a bridge passes nothing and keeps
     # the strict one-result rule.
-    def initialize(sink: nil, repository_path: nil, refusals: nil)
+    # `withhold_documents: true` is the specification lane's; see {#identities_only}.
+    def initialize(sink: nil, repository_path: nil, refusals: nil, withhold_documents: false)
       @sink = sink
       @refusals = refusals
+      @withhold_documents = withhold_documents
       @text = PublicProgress.new(repository_path: repository_path)
       @pending = +""
       @result = nil
+      @structured = nil
+      @result_succeeded = false
       @result_seen = false
       @result_refusals = 0
       @superseded = 0
@@ -144,7 +150,7 @@ module SpecrelayRunner
     def close
       return self if @failure
 
-      return fail!(FAILURE_INCOMPLETE) unless @pending.empty?
+      return fail!(unfinished_failure) unless @pending.empty?
       # A session that visibly continued made its held result provisional; ending before the
       # continued session reports its own result leaves no final result at all.
       return fail!(FAILURE_NO_RESULT) unless @result_seen && !@session_restarted
@@ -158,6 +164,13 @@ module SpecrelayRunner
     # The terminal result, for the existing report/package parsers. Empty when the stream failed,
     # because a stream this object refused must not hand anything to a parser.
     def final_text = @failure ? "" : @result.to_s
+
+    # The authoritative terminal result reported success, and the stream itself is usable.
+    def succeeded? = @failure.nil? && @result_succeeded
+
+    # That result's schema-constrained value, or nil. It is held with the result it arrived in, so
+    # a superseding result replaces it and a refused stream clears it.
+    def structured_output = succeeded? ? @structured : nil
 
     private
 
@@ -183,12 +196,50 @@ module SpecrelayRunner
       nil
     end
 
+    # Why the buffer still held at the end never became a message. Mid-stream it was provisional;
+    # now the installed parser's own numeric position decides — never its message, which can quote
+    # provider bytes. Stopped exactly at the buffer's end (columns are 1-based bytes), the frame was
+    # cut off; stopped inside it, the frame is malformed. With no position, only the end is certain.
+    def unfinished_failure
+      JSON.parse(@pending)
+      FAILURE_INCOMPLETE
+    rescue JSON::ParserError => e
+      line = e.line if e.respond_to?(:line)
+      column = e.column if e.respond_to?(:column)
+      return FAILURE_INCOMPLETE unless line.is_a?(Integer) && column.is_a?(Integer)
+
+      lines = @pending.split("\n", -1)
+      return FAILURE_INCOMPLETE if line == lines.length && column == lines.last.bytesize + 1
+
+      "#{FAILURE_MALFORMED} at line #{line}, column #{column}"
+    end
+
     def handle(message)
       capture_result(message) if message["type"].to_s == "result"
       note_session_restart(message)
       return if @failure
 
-      statuses(message).each { |text| forward(STATUS, text) }
+      statuses(@withhold_documents ? identities_only(message) : message).each { |text| forward(STATUS, text) }
+    end
+
+    # The specification lane's ONE presentation boundary. Its answer is the final documents, and a
+    # model can carry them through any free-form channel — narration, any tool's input, any tool's
+    # result, split across turns — where the same string may equally be source it read. No rule
+    # about content, path or tool can tell the two apart, so before the shared renderers run, a
+    # model message is reduced to what is not free-form: each tool's name and each result's
+    # disposition. Terminal, rate-limit and session messages carry no document and pass unchanged.
+    def identities_only(message)
+      return message unless %w[assistant user].include?(message["type"].to_s)
+
+      content = blocks(message).filter_map do |block|
+        case block["type"].to_s
+        when "tool_use" then { "type" => "tool_use", "name" => block["name"] }
+        when "tool_result" then { "type" => "tool_result", "is_error" => block["is_error"] }
+        end
+      end
+      detail = message["tool_use_result"]
+      { "type" => message["type"], "message" => { "content" => content },
+        "tool_use_result" => (detail.slice("interrupted") if detail.is_a?(Hash)) }
     end
 
     # ---- the public transcript ----------------------------------------------
@@ -341,9 +392,10 @@ module SpecrelayRunner
     end
 
     def terminal_status(message)
-      outcome = message["is_error"] || message["subtype"].to_s != "success" ? FAILED : COMPLETED
-      "#{outcome}#{timing(message)}"
+      "#{successful?(message) ? COMPLETED : FAILED}#{timing(message)}"
     end
+
+    def successful?(message) = !message["is_error"] && message["subtype"].to_s == "success"
 
     # The provider's own public timing, when it reports it.
     def timing(message)
@@ -386,6 +438,8 @@ module SpecrelayRunner
 
       @result_seen = true
       @result = text
+      @structured = message["structured_output"]
+      @result_succeeded = successful?(message)
       @result_refusals = refusals_observed
       @result_session = message["session_id"]
       @result_index = message["result_index"]
@@ -434,6 +488,7 @@ module SpecrelayRunner
     def fail!(reason)
       @failure ||= reason
       @pending = +""
+      @structured = nil
       self
     end
   end

@@ -310,6 +310,134 @@ end
     end
   end
 
+  # ---- unfinished frames at the end of the stream ----------------------------
+
+  # A frame delivered in pieces is provisional until it completes, then decodes normally.
+  def test_a_frame_split_across_deliveries_still_decodes
+    stream = build_stream
+    frame = JSON.generate(result_message("whole"))
+    stream.accept("stdout", frame[0, 20])
+    stream.accept("stdout", frame[20..])
+
+    assert_nil stream.close.failure
+    assert_equal "whole", stream.final_text
+  end
+
+  def test_a_frame_cut_off_at_the_end_is_reported_as_incomplete
+    stream = build_stream
+    stream.accept("stdout", JSON.generate(result_message("TRUNCATED-MARKER"))[0...-3])
+
+    assert_equal SpecrelayRunner::ClaudeStream::FAILURE_INCOMPLETE, stream.close.failure
+  end
+
+  # Malformed is not truncated: the parser stopped INSIDE the buffer, and its numeric location is
+  # reported. Neither the parser's message nor any frame byte is.
+  def test_a_malformed_frame_is_reported_as_malformed_with_its_numeric_location
+    { %({"type":"result","result":"LF-MARKER\nrest"}) => "line 2, column 0",
+      %({"type":"result","result":"JUNK-MARKER"}x) => "line 1, column 41" }.each do |frame, location|
+      stream = build_stream
+      stream.accept("stdout", frame)
+
+      failure = stream.close.failure
+      assert_equal "#{SpecrelayRunner::ClaudeStream::FAILURE_MALFORMED} at #{location}", failure
+      refute_match(/MARKER|unexpected|character/, failure)
+      assert_nil stream.structured_output
+      refute_includes texts.join(" "), "MARKER"
+    end
+  end
+
+  # Every other lane keeps the transcript it had: narration, subjects, input bodies and result
+  # bodies are all shown.
+  def test_the_default_lane_still_shows_the_full_transcript
+    stream = feed(init, assistant_text("NARRATION-MARKER"),
+                  tool_use("Write", { "file_path" => File.join(@tmp, "a.md"), "content" => "WRITE-MARKER" }, "w1"),
+                  tool_use("Bash", { "command" => "echo COMMAND-MARKER", "description" => "DESCRIPTION-MARKER" }, "b1"),
+                  tool_result(id: "b1", content: "RESULT-MARKER"),
+                  tool_use("Grep", { "pattern" => "INPUT-MARKER" }, "g1"), result_message)
+
+    assert_nil stream.close.failure
+    shown = texts.join("\n")
+    %w[NARRATION WRITE COMMAND DESCRIPTION RESULT INPUT].each { |kind| assert_includes shown, "#{kind}-MARKER" }
+    assert_includes texts, "> Write a.md"
+  end
+
+  # A lane that withholds documents shows tool identities, dispositions and status — including a
+  # failed terminal and a rate limit — and nothing free-form.
+  def test_a_lane_withholding_documents_shows_only_identities_dispositions_and_status
+    stream = build_stream(withhold_documents: true)
+    [ init, assistant_text("NARRATION-MARKER"),
+      tool_use("Grep", { "pattern" => "INPUT-MARKER" }, "g1"), tool_result(id: "g1", content: "RESULT-MARKER"),
+      tool_use("Bash", { "command" => "COMMAND-MARKER" }, "b1"), tool_result(id: "b1", error: true, content: "ERROR-MARKER"),
+      { "type" => "rate_limit_event", "rate_limit_info" => { "status" => "allowed", "rateLimitType" => "five_hour" } },
+      result_message.merge("is_error" => true, "duration_ms" => 1500) ].each { |message| stream.accept("stdout", JSON.generate(message)) }
+
+    assert_nil stream.close.failure
+    assert_equal [ "Provider started", "> Grep", "< step completed", "> Bash", "! step failed",
+                   "Rate limit: allowed (five_hour)", "Provider failed in 1.5s" ], texts
+  end
+
+  # ---- the schema-constrained terminal value --------------------------------
+
+  def test_a_successful_terminal_result_exposes_its_structured_value
+    map = { "spec.md" => "# Spec\nShe said \"hi\" \\ Grüße" }
+    stream = feed(init, result_message("not json at all").merge("structured_output" => map))
+
+    assert_nil stream.close.failure
+    assert stream.succeeded?
+    assert_equal map, stream.structured_output
+    refute_includes texts.join(" "), "Grüße"
+  end
+
+  def test_an_error_flagged_or_unsuccessful_result_exposes_no_structured_value
+    [ { "is_error" => true }, { "subtype" => "error_max_turns" } ].each do |terminal|
+      stream = feed(init, result_message.merge("structured_output" => { "spec.md" => "x" }).merge(terminal))
+
+      assert_nil stream.close.failure, "the stream itself is readable; the result reported failure"
+      refute stream.succeeded?
+      assert_nil stream.structured_output
+    end
+  end
+
+  def test_a_refused_stream_leaves_no_structured_value
+    stream = feed(init, result_message.merge("structured_output" => { "spec.md" => "x" }),
+                  result_message.merge("structured_output" => { "spec.md" => "y" }))
+
+    assert_equal SpecrelayRunner::ClaudeStream::FAILURE_TWO_RESULTS, stream.close.failure
+    refute stream.succeeded?
+    assert_nil stream.structured_output
+  end
+
+  # The framing bound already covers the frame the structured value arrives in.
+  def test_a_structured_value_beyond_the_framing_bound_is_refused_and_not_exposed
+    big = { "spec.md" => "x" * SpecrelayRunner::ClaudeStream::MAX_PENDING_BYTES }
+    stream = feed(init, result_message.merge("structured_output" => big))
+
+    assert_equal SpecrelayRunner::ClaudeStream::FAILURE_UNREADABLE, stream.close.failure
+    assert_nil stream.structured_output
+  end
+
+  # A permitted continuation supersedes the held result, and the stale structured value with it.
+  def test_a_continued_session_drops_the_superseded_structured_value
+    stream = feed(session_init, numbered_result("first", 0).merge("structured_output" => { "spec.md" => "stale" }),
+                  session_init, numbered_result("second", 1))
+
+    assert_nil stream.close.failure
+    assert stream.succeeded?
+    assert_nil stream.structured_output
+  end
+
+  # The StructuredOutput call carries the final documents as its input. Only the lane that
+  # requests one sees it, and that lane shows the call and never its input.
+  def test_the_structured_output_tool_input_is_withheld
+    stream = build_stream(withhold_documents: true)
+    [ init, tool_use("StructuredOutput", { "spec.md" => "# Spec\nconfidential draft" }, "t1"),
+      result_message ].each { |message| stream.accept("stdout", JSON.generate(message)) }
+
+    assert_nil stream.close.failure
+    assert_includes texts, "> StructuredOutput"
+    refute_includes texts.join(" "), "confidential draft"
+  end
+
   private
 
   def monotonic = Process.clock_gettime(Process::CLOCK_MONOTONIC)

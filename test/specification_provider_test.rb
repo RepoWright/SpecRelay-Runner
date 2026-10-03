@@ -217,7 +217,8 @@ class SpecificationProviderTest < Minitest::Test
   end
 
   # A provider must not be able to choose its own output paths: that is how a package escapes
-  # its folder. The allowlist rejects the file rather than sanitizing the name.
+  # its folder. A name outside the fixed document set has no path to map to, so it is refused
+  # rather than sanitized or dropped.
   def test_a_provider_that_returns_an_unexpected_file_is_rejected
     documents = valid_documents.merge("../../escaped.md" => "x" * 500)
     provider = provider_stub(files: documents)
@@ -225,15 +226,16 @@ class SpecificationProviderTest < Minitest::Test
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_with(provider), @io.string
     assert_no_package
     refute File.exist?(File.join(@temp, "escaped.md"))
-    assert_includes @io.string, "unexpected files"
+    assert_includes @io.string, "unrecognized document"
+    refute_includes @io.string, "escaped.md"
   end
 
-  def test_non_json_provider_output_is_rejected
+  def test_provider_output_without_a_structured_document_map_is_rejected
     provider = provider_stub(answer: "<html>not json</html>")
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_with(provider), @io.string
     assert_equal "generation_provider_failed", @platform.last_specification_generation["failure_class"]
-    assert_includes @io.string, "returned no JSON object"
+    assert_includes @io.string, "returned no structured document map"
   end
 
   # A provider CAN return a secret — it may have quoted its own configuration, or echoed an

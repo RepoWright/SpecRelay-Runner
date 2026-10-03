@@ -630,13 +630,24 @@ no operator-configured executable, no registry and no discovery — a lane that 
 plausible substitute by configuration is a lane whose output an operator cannot attribute.
 
 Both are the operator's own already-validated profile writing the specification directly,
-requiring no separate configuration. They share one prompt and one file-map parser (reviewable in
-full in `provider.rb`), which state the document contract below and the required synthesis
-discipline: describe the requested product behaviour rather than Jira labels, resolve a vague
-ticket reference (e.g. "the text") from the title and the evidence, avoid raw input-bundle or
-transcript dumps, and never claim a current publication or Jira state a later reader could find
-false. They differ only in what genuinely differs: Claude takes its prompt as one argv element and
-is decoded by `ClaudeStream`; Codex takes it on stdin and is decoded by `CodexStream`.
+requiring no separate configuration. They share one prompt (reviewable in full in `provider.rb`),
+which states the document contract below and the required synthesis discipline: describe the
+requested product behaviour rather than Jira labels, resolve a vague ticket reference (e.g. "the
+text") from the title and the evidence, avoid raw input-bundle or transcript dumps, and never claim
+a current publication or Jira state a later reader could find false. They differ only in what
+genuinely differs: Claude takes its prompt as one argv element and is decoded by `ClaudeStream`;
+Codex takes it on stdin and is decoded by `CodexStream`; and each is told how to submit its answer.
+
+- **Codex** returns a JSON file map as text, extracted and parsed by the one file-map parser.
+- **Claude** is launched with the profile's fixed specification invocation: the canonical argv
+  plus `--json-schema` carrying a runner-owned document schema. Its properties are the document
+  paths with `/` written as `_` (`spec.md`, `analysis_input-evidence.md`, `analysis_business.md`,
+  `analysis_technical.md`, optional `analysis_open-questions.md`), all strings, four required,
+  nothing else admitted. Only the successful terminal result's `structured_output` is accepted;
+  its textual result is never read, so malformed text cannot cost a package and plausible text
+  cannot replace a missing map. An unknown property or non-string value is refused, never coerced.
+  No claim or setting can supply the schema or extra arguments, and the logged provider
+  description shows the effective invocation, schema included.
 
 The selection is the machine's one AI provider, read through `ImplementationProfile`: an explicit
 local `runner.executor:` selection wins, otherwise the profile Platform's Project Setup sent with
@@ -779,17 +790,20 @@ wrappers, session identity and raw diagnostic bytes are not. Before any rendered
 text is clipped or fanned out, absolute local paths are sanitized. A path proven
 inside the assigned implementation worktree is shown repository-relative; every
 other absolute path becomes `[LOCAL_PATH]`. Specification creation has no approved
-root, so all of its absolute paths use the placeholder. An unquoted path followed
+root, and its answer is the documents themselves, which a model may also emit through narration
+or any tool's input or output — so that lane shows each tool's name and outcome (`> Bash`,
+`< step completed`, `! step failed`, `! step interrupted`) and status lines, and nothing free-form. An unquoted path followed
 by ambiguous prose is conservatively withheld through the next strong shell
 boundary or line end; privacy takes precedence over retaining that suffix. Quoted
 paths and explicit adjacent shell operators retain their deterministic boundaries.
-The attempt fails closed without displaying the frame for malformed output, a
+The attempt fails closed without displaying the frame for malformed output (reported with the
+JSON parser's numeric line and column when it stopped inside the frame, never its message), a
 missing terminal result, or a second terminal result without a matching refused
 question turn or a proven continuation. A continuation is the same Claude session
 re-announcing itself with `system/init` after a result and then reporting the next
 `result_index`; only its final result is evidence, and a stream that ends before
-it, or announces another session, fails closed. Both workflows use this one decoder and this one stream; there is
-no lane-specific path rule.
+it, or announces another session, fails closed. Every workflow uses this one decoder and this one
+stream; the specification lane's narrower projection above is its only lane-specific rule.
 
 A `core.progress` **heartbeat** still names the elapsed time after 15s of genuine
 silence. It is a fallback, never a substitute: real output, when available, is what
@@ -1057,7 +1071,9 @@ runner:
 ```
 
 A block that says anything more is refused: the command, arguments, prompt delivery, timeout and
-environment belong to the profile, not to this file.
+environment belong to the profile, not to this file. Specification generation with `claude` adds
+the profile's own fixed `--json-schema` document schema to that invocation (see the generation
+provider boundary); every other launch uses the table's arguments unchanged.
 
 `SpecrelayRunner::ImplementationProfile`
 ([lib](lib/specrelay_runner/implementation_profile.rb)) is the one place that decides what may run.

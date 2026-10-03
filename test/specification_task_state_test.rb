@@ -448,7 +448,8 @@ class SpecificationTaskStateTest < Minitest::Test
       }))
       puts JSON.generate("type" => "system", "subtype" => "init")
       puts JSON.generate("type" => "result", "subtype" => "success", "is_error" => false,
-                         "result" => JSON.generate(#{generated_package.to_json}))
+                         "result" => JSON.generate(#{generated_package.to_json}),
+                         "structured_output" => #{SpecificationWorkspace.structured_output(generated_package).to_json})
     RUBY
     dir
   end

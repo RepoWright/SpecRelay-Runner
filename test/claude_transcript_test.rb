@@ -194,20 +194,18 @@ class ClaudeTranscriptTest < Minitest::Test
                  "one renderer means one transcript on both surfaces"
   end
 
-  # The specification lane passes a bare sink and no repository. It must get the same transcript.
-  def test_the_specification_lane_receives_the_same_transcript
+  # The specification lane passes a bare sink, no repository and withholds documents: any free-form
+  # text may be one. It sees every tool of the same transcript by identity and disposition.
+  def test_the_specification_lane_receives_the_same_transcript_as_identities_and_dispositions
     lane = []
-    decoder = SpecrelayRunner::ClaudeStream.new(sink: ->(_source, text) { lane << text })
+    decoder = SpecrelayRunner::ClaudeStream.new(sink: ->(_source, text) { lane << text }, withhold_documents: true)
     [ J.narration("Writing the specification."),
       J.bash_call("bin/graph-check", description: "Check the graph"),
       J.bash_result("toolu_bash", stdout: "freshness: FRESH\n") ].each do |message|
       decoder.accept("stdout", JSON.generate(message))
     end
 
-    text = lane.join("\n")
-    assert_includes text, "Writing the specification."
-    assert_includes text, "bin/graph-check"
-    assert_includes text, "freshness: FRESH"
+    assert_equal [ "> Bash", "< step completed" ], lane
   end
 
   # ---- CR-006 F1: a multiline credential must not survive line splitting ----

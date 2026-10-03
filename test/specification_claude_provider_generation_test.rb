@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require_relative "test_helper"
+require_relative "support/claude_stream_json"
 
 # MVP-0028 remediation slice 1, review-004 finding F1 — the new real-provider EXECUTION path.
 #
@@ -15,6 +16,7 @@ require_relative "test_helper"
 # failure handling, and JSON extraction) is proven directly and fast.
 class SpecificationClaudeProviderGenerationTest < Minitest::Test
   Provider = SpecrelayRunner::Specification::Provider
+  J = ClaudeStreamJson
   Result = SpecrelayRunner::CommandRunner::Result
 
   # Records every call it receives and returns a pre-baked Result, so a test can assert on
@@ -56,27 +58,35 @@ class SpecificationClaudeProviderGenerationTest < Minitest::Test
 
   # A provider that worked and then answered: one `init`, one PUBLIC narration line the operator
   # must now read (CR-005), one `thinking` block that must never surface whatever else changes,
-  # and one terminal result carrying `answer` — which is what the package parser, and only the
-  # package parser, is given.
-  def answering(answer, duration_seconds: 1.2)
+  # and one terminal result. The document map is the result's schema-constrained
+  # `structured_output`; its textual `result` is what the model also wrote and is never read.
+  def answering(structured = VALID_STRUCTURED, text: "", is_error: false, subtype: "success", duration_seconds: 1.2)
+    terminal = { "type" => "result", "subtype" => subtype, "is_error" => is_error, "result" => text }
+    terminal["structured_output"] = structured unless structured == :absent
     lines = [ JSON.generate("type" => "system", "subtype" => "init"),
               JSON.generate("type" => "assistant", "message" => { "content" => [
                 { "type" => "text", "text" => "Composing the package." },
                 { "type" => "thinking", "thinking" => "private reasoning that must never be shown",
                   "signature" => "sig-1" } ] }),
-              JSON.generate("type" => "result", "subtype" => "success", "is_error" => false,
-                            "result" => answer) ]
+              JSON.generate(terminal) ]
     [ Result.new(exit_code: 0, stdout: "", stderr: "", duration_seconds: duration_seconds, timed_out: false),
       lines ]
   end
 
-  # Drives `generate` for a provider that answers `answer`; returns [documents, runner, progress].
-  def generate(packet, answer: JSON.generate(VALID_DOCUMENTS), profile: build_profile, env: {})
-    result, lines = answering(answer)
+  # Drives `generate` for a provider whose terminal result carries `structured`; returns
+  # [documents, runner, progress].
+  def generate(packet, structured: VALID_STRUCTURED, text: "", profile: build_profile, env: {})
+    result, lines = answering(structured, text: text)
     provider, runner = provider_for(result: result, lines: lines, profile: profile, env: env)
     progress = []
     documents = provider.generate(packet, on_output: ->(source, text) { progress << [ source, text ] })
     [ documents, runner, progress ]
+  end
+
+  def refusal(structured = VALID_STRUCTURED, **terminal)
+    result, lines = answering(structured, **terminal)
+    provider, = provider_for(result: result, lines: lines)
+    assert_raises(Provider::Failed) { provider.generate({}) }
   end
 
   def failure(exit_code:, stdout: "", stderr: "")
@@ -85,6 +95,12 @@ class SpecificationClaudeProviderGenerationTest < Minitest::Test
 
   VALID_DOCUMENTS = { "spec.md" => "# Spec\n", "analysis/business.md" => "business case",
                      "analysis/technical.md" => "technical detail" }.freeze
+  # The same documents under the property names the requested schema declares.
+  VALID_STRUCTURED = { "spec.md" => "# Spec\n", "analysis_business.md" => "business case",
+                       "analysis_technical.md" => "technical detail" }.freeze
+  # A textual answer that is plausible but not valid JSON: a literal line feed inside a quoted
+  # document, the shape that used to lose a whole package at the parser.
+  BROKEN_TEXT = %({"spec.md": "# Spec\nline two", "analysis/business.md": "ok"})
 
   # ------------------------------------------------------------------ a valid response
 
@@ -95,13 +111,13 @@ class SpecificationClaudeProviderGenerationTest < Minitest::Test
   end
 
   # MAPIAI-60 — the two products of one stream, proven together: the package comes ONLY from the
-  # terminal result, and what the operator saw is normalized status, never the model's prose.
+  # terminal result, and what the operator saw is status, never the model's prose. This lane
+  # withholds assistant text entirely, because the documents themselves may arrive that way.
   def test_progress_reaches_the_caller_while_the_package_comes_only_from_the_terminal_result
     documents, _runner, progress = generate({ "issue_key" => "SR-700" })
 
     assert_equal VALID_DOCUMENTS, documents
-    assert_equal [ [ "status", "Provider started" ], [ "status", "Composing the package." ],
-                   [ "status", "Provider completed" ] ], progress
+    assert_equal [ [ "status", "Provider started" ], [ "status", "Provider completed" ] ], progress
     refute_includes progress.flatten.join(" "), "private reasoning"
     refute_includes progress.flatten.join(" "), "spec.md"
   end
@@ -118,21 +134,206 @@ class SpecificationClaudeProviderGenerationTest < Minitest::Test
     assert_includes error.message, "could not be read"
   end
 
-  # The prompt may arrive with a sentence or a fence around it despite the instruction not to,
-  # and that surrounding text may itself contain braces (an aside, a code fragment). Only
-  # genuine object nesting inside the JSON may move the match — this is the case review-004
-  # flagged as unproven by the "first `{` to last `}`" implementation.
-  def test_a_response_wrapped_in_prose_with_unrelated_braces_still_parses
-    wrapped = <<~TEXT
-      Sure, here is the package:
-      #{JSON.generate({ "spec.md" => "See {note} below.", "analysis/business.md" => "ok",
-                       "analysis/technical.md" => "ok" })}
-      (based on config{key: value} if that helps)
-    TEXT
-    documents, = generate({ "issue_key" => "SR-700" }, answer: wrapped)
+  # The textual answer reproduces the original rejection, and it no longer matters: the documents
+  # come from the structured value, byte for byte, including real line feeds, quotes,
+  # backslashes and non-ASCII text.
+  def test_structured_documents_survive_byte_for_byte_whatever_the_textual_answer_was
+    assert_raises(JSON::ParserError) { JSON.parse(BROKEN_TEXT) }
+    content = "# Spec\n\nShe said \"hi\" \\ C:\\path\nGrüße — ✓\n"
+    documents, = generate({ "issue_key" => "SR-700" },
+                          structured: VALID_STRUCTURED.merge("spec.md" => content), text: BROKEN_TEXT)
 
-    assert_equal "See {note} below.", documents["spec.md"]
-    assert_equal "ok", documents["analysis/business.md"]
+    assert_equal content, documents["spec.md"]
+    assert_equal VALID_DOCUMENTS.keys.sort, documents.keys.sort
+  end
+
+  def test_the_optional_open_questions_alias_maps_to_its_exact_path_when_present
+    documents, = generate({}, structured: VALID_STRUCTURED.merge("analysis_open-questions.md" => "# Open questions\n",
+                                                                 "analysis_input-evidence.md" => "# Input evidence\n"))
+
+    assert_equal "# Open questions\n", documents["analysis/open-questions.md"]
+    assert_equal "# Input evidence\n", documents["analysis/input-evidence.md"]
+    refute documents.key?("analysis_open-questions.md")
+  end
+
+  # A missing required document is not this provider's rule: it passes the map through and the
+  # one owner of that rule, DocumentSet, refuses it before anything is written.
+  def test_a_missing_required_alias_is_refused_by_the_document_set_not_coerced
+    documents, = generate({}, structured: VALID_STRUCTURED.except("analysis_business.md"))
+
+    refute documents.key?("analysis/business.md")
+    error = assert_raises(SpecrelayRunner::Specification::DocumentSet::Invalid) do
+      SpecrelayRunner::Specification::DocumentSet.validate!(documents, issue_key: "SR-700")
+    end
+    assert_includes error.message, "analysis/business.md"
+  end
+
+  def test_an_unknown_or_respelled_alias_is_refused_without_naming_its_content
+    [ "notes", " spec.md", "analysis/business.md" ].each do |key|
+      error = refusal(VALID_STRUCTURED.merge(key => "secret-ish content"))
+
+      assert_includes error.message, "unrecognized document"
+      assert_match(/entry \d+/, error.message)
+      refute_includes error.message, "secret-ish content"
+    end
+  end
+
+  def test_a_non_string_document_is_refused_rather_than_coerced
+    [ 42, nil, [ "# Spec" ], { "text" => "# Spec" } ].each do |value|
+      error = refusal(VALID_STRUCTURED.merge("spec.md" => value))
+
+      assert_includes error.message, "spec.md is not text"
+    end
+  end
+
+  # No structured map means no package, however plausible the text beside it.
+  def test_a_missing_null_or_non_object_structured_value_is_refused_despite_a_plausible_text_result
+    [ :absent, nil, [ VALID_STRUCTURED ], "{}", 1 ].each do |structured|
+      error = refusal(structured, text: JSON.generate(VALID_DOCUMENTS))
+
+      assert_includes error.message, "returned no structured document map"
+    end
+  end
+
+  def test_an_error_flagged_or_unsuccessful_terminal_result_is_refused_despite_a_valid_map_and_exit_zero
+    [ { is_error: true }, { subtype: "error_max_turns" } ].each do |terminal|
+      error = refusal(VALID_STRUCTURED, text: JSON.generate(VALID_DOCUMENTS), **terminal)
+
+      assert_includes error.message, "did not finish successfully"
+    end
+  end
+
+  # A structured value inside a frame the decoder refused is never handed over.
+  def test_a_truncated_transport_with_a_structured_value_is_refused_as_unreadable
+    result, lines = answering
+    provider, = provider_for(result: result, lines: [ *lines[0..1], lines.last[0...-2] ])
+
+    error = assert_raises(Provider::Failed) { provider.generate({}) }
+
+    assert_includes error.message, "could not be read"
+  end
+
+  # The content rules stay DocumentSet's: a structured map that passes this provider still fails
+  # there when its documents are not a specification.
+  def test_structured_documents_with_invalid_content_still_fail_the_document_set
+    documents, = generate({}, structured: { "spec.md" => "no title", "analysis_input-evidence.md" => "x",
+                                            "analysis_business.md" => "x", "analysis_technical.md" => "x" })
+
+    assert_raises(SpecrelayRunner::Specification::DocumentSet::Invalid) do
+      SpecrelayRunner::Specification::DocumentSet.validate!(documents, issue_key: "SR-700")
+    end
+  end
+
+  # A model may ALSO write the documents as ordinary text, and may split them across turns. No
+  # fragment of them reaches progress, while tool identities, dispositions and status still do.
+  def test_documents_written_as_assistant_text_never_reach_progress_even_when_split
+    result, lines = answering
+    copy = JSON.generate(VALID_DOCUMENTS.merge("spec.md" => "# Spec\nASSISTANT-COPY-MARKER line"))
+    half = copy.length / 2
+    text = ->(fragment) { JSON.generate("type" => "assistant", "message" => { "content" => [ { "type" => "text", "text" => fragment } ] }) }
+    read = JSON.generate("type" => "assistant", "message" => { "content" => [
+      { "type" => "tool_use", "id" => "t1", "name" => "Grep", "input" => { "pattern" => "export" } } ] })
+    read_result = JSON.generate("type" => "user", "message" => { "content" => [
+      { "type" => "tool_result", "tool_use_id" => "t1", "content" => "app/export.rb" } ] })
+    provider, = provider_for(result: result,
+                             lines: [ lines[0], read, read_result, text.(copy[0, half]), text.(copy[half..]), lines.last ])
+    progress = []
+
+    documents = provider.generate({}, on_output: ->(source, line) { progress << [ source, line ] })
+
+    assert_equal VALID_DOCUMENTS, documents
+    shown = progress.map(&:last).join("\n")
+    [ "ASSISTANT-COPY-MARKER", "business case", "technical detail", copy[0, 20], copy[half, 20] ].each do |fragment|
+      refute_includes shown, fragment
+    end
+    assert_equal [ "Provider started", "> Grep", "< step completed", "Provider completed" ], progress.map(&:last)
+  end
+
+  # Every supported free-form route at once: the same string could be source the model read or
+  # a fragment of the documents, so this lane shows each tool's identity and disposition and none
+  # of their text. The package still comes whole from the structured terminal map.
+  def test_no_free_form_route_carries_document_text_into_progress
+    marker = "DOC-MARKER"
+    path = "specs/SR-700-sample/spec.md"
+    messages = [
+      J.narration("# Spec #{marker}"),
+      J.tool_call("Write", { "file_path" => path, "content" => "# Spec #{marker}" }, "w1"),
+      J.result("w1", "File created successfully at #{path}"),
+      J.tool_call("Write", { "file_path" => path, "contents" => "# Spec #{marker}" }, "w2"),
+      J.result("w2", "File created successfully at #{path}"),
+      J.edit_call(path, "old", "#{marker} new"),
+      J.edit_result("toolu_edit", path, "old", "#{marker} new"),
+      J.read_call(path),
+      J.read_result("toolu_read", path, "# Spec #{marker}\n"),
+      J.bash_call("printf '#{marker}'", description: "Print #{marker}"),
+      J.bash_result("toolu_bash", stdout: "#{marker} out", stderr: "#{marker} err"),
+      J.task_call("Draft #{marker}", "Write #{marker}"),
+      J.task_output_result("toolu_task", "t1", "#{marker} task output"),
+      J.tool_call("TaskOutput", { "task_id" => "t1", "note" => marker }, "o1"),
+      J.result("o1", "#{marker} fallback body"),
+      J.bash_call("false", id: "b2"),
+      J.failed_result("b2", "#{marker} failure text"),
+      J.bash_call("sleep 9", id: "b3"),
+      J.result("b3", "#{marker} interrupted", detail: { "interrupted" => true, "stdout" => marker }),
+      J.tool_call("StructuredOutput", VALID_STRUCTURED.merge("spec.md" => "# Spec #{marker}"), "s1")
+    ]
+    result, lines = answering
+    provider, = provider_for(result: result, lines: [ lines[0], *messages.map { |m| JSON.generate(m) }, lines.last ])
+    progress = []
+
+    documents = provider.generate({}, on_output: ->(source, line) { progress << [ source, line ] })
+
+    assert_equal VALID_DOCUMENTS, documents
+    shown = progress.map(&:last)
+    refute_includes shown.join("\n"), marker
+    assert_equal [ "Provider started", "> Write", "< step completed", "> Write", "< step completed",
+                   "> Edit", "< step completed", "> Read", "< step completed", "> Bash", "< step completed",
+                   "> Task", "< step completed", "> TaskOutput", "< step completed", "> Bash", "! step failed",
+                   "> Bash", "! step interrupted", "> StructuredOutput", "Provider completed" ], shown
+  end
+
+  # The instruction names what this run actually accepts: the schema's property names, submitted
+  # as structured output, never as text.
+  def test_the_prompt_asks_for_the_schema_properties_through_structured_output_only
+    _documents, runner = generate({ "issue_key" => "SR-700" })
+
+    prompt = runner.calls.fetch(0).argv.last
+    %w[spec.md analysis_input-evidence.md analysis_business.md analysis_technical.md analysis_open-questions.md].each do |name|
+      assert_includes prompt, %("#{name}")
+    end
+    assert_includes prompt, "structured output"
+    assert_includes prompt, "Never write any document, or any part of one, as ordinary text."
+    refute_includes prompt, "Return ONLY a JSON object mapping file paths"
+  end
+
+  # A malformed frame is reported by its stage, category and the parser's numeric location —
+  # never by the parser's message or any of the frame's bytes.
+  def test_a_malformed_terminal_frame_reports_a_safe_located_failure
+    result, lines = answering
+    malformed = %({"type":"result","subtype":"success","is_error":false,"result":"FRAME-MARKER\nsecond line"})
+    provider, = provider_for(result: result, lines: [ lines[0], malformed ])
+
+    error = assert_raises(Provider::Failed) { provider.generate({}) }
+
+    assert_equal "the Claude specification provider's output could not be read: " \
+                 "the provider's structured output is malformed at line 2, column 0", error.message
+    refute_includes error.message, "FRAME-MARKER"
+  end
+
+  # The documents arrive as the StructuredOutput tool's input; they are the answer, not progress.
+  def test_the_structured_output_tool_payload_never_reaches_progress
+    result, lines = answering
+    payload = JSON.generate("type" => "assistant", "message" => { "content" => [
+      { "type" => "tool_use", "id" => "t1", "name" => "StructuredOutput",
+        "input" => VALID_STRUCTURED.merge("spec.md" => "# Spec\nconfidential draft line") } ] })
+    provider, = provider_for(result: result, lines: [ *lines[0..1], payload, lines.last ])
+    progress = []
+
+    provider.generate({}, on_output: ->(source, text) { progress << [ source, text ] })
+
+    assert_includes progress, [ "status", "> StructuredOutput" ]
+    refute_includes progress.flatten.join(" "), "confidential draft line"
+    refute_includes progress.flatten.join(" "), "technical detail"
   end
 
   # ------------------------------------------------------------------ the launch itself
@@ -146,12 +347,13 @@ class SpecificationClaudeProviderGenerationTest < Minitest::Test
                                         "UNRELATED_SECRET" => "must-not-travel" })
 
     call = runner.calls.fetch(0)
-    argv = [ "claude", "--print", "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions" ]
+    argv = [ "claude", "--print", "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions",
+             "--json-schema", JSON.generate(SpecrelayRunner::Specification::PackagePath::PROVIDER_SCHEMA) ]
     assert_equal argv, call.argv[0, argv.length]
     assert_equal 1, call.argv.length - argv.length, "the packet-derived prompt is exactly one argv element"
     assert_includes call.argv.last, "SR-700"
     assert_includes call.argv.last, "Add an export button"
-    assert_includes call.argv.last, "Return ONLY a JSON object"
+    assert_includes call.argv.last, "Submit the package ONLY through the structured output"
     assert_equal 42, call.timeout_seconds
     assert_equal({ "PATH" => "/usr/bin:/bin", "HOME" => "/home/operator", "CLAUDE_EXTRA" => "yes" }, call.env,
                 "only PATH, HOME and the profile's own extra_env travel — never an unrelated variable")
@@ -159,6 +361,28 @@ class SpecificationClaudeProviderGenerationTest < Minitest::Test
 
   # The specification writer shares the exact implementation profile, and with it the approved
   # 18,000-second process limit.
+  # The operator reads the invocation that actually ran, not the base argv it extends.
+  def test_the_description_names_the_effective_schema_invocation
+    provider, = provider_for(result: failure(exit_code: 0))
+
+    assert_includes provider.describe, "--dangerously-skip-permissions --json-schema {"
+    assert_includes provider.describe, '"additionalProperties":false'
+  end
+
+  # The fixed schema is the whole contract with the provider: four required string documents, one
+  # optional, nothing else admitted, each property a path spelled without "/".
+  def test_the_requested_schema_is_the_fixed_document_contract
+    assert_equal({ "type" => "object",
+                   "properties" => { "spec.md" => { "type" => "string" },
+                                     "analysis_input-evidence.md" => { "type" => "string" },
+                                     "analysis_business.md" => { "type" => "string" },
+                                     "analysis_technical.md" => { "type" => "string" },
+                                     "analysis_open-questions.md" => { "type" => "string" } },
+                   "required" => %w[spec.md analysis_input-evidence.md analysis_business.md analysis_technical.md],
+                   "additionalProperties" => false },
+                 SpecrelayRunner::Specification::PackagePath::PROVIDER_SCHEMA)
+  end
+
   def test_the_approved_profile_bounds_the_specification_writer_at_18000_seconds
     profile = SpecrelayRunner::ImplementationProfile.for(SpecrelayRunner::ImplementationProfile.canonical("claude"))
 
@@ -243,31 +467,11 @@ class SpecificationClaudeProviderGenerationTest < Minitest::Test
     assert_includes error.message, "timed out"
   end
 
-  def test_output_with_no_json_object_at_all_is_a_generation_failure
-    result, lines = answering("I could not complete this request.")
-    provider, = provider_for(result: result, lines: lines)
-
-    error = assert_raises(Provider::Failed) { provider.generate({}) }
-
-    assert_includes error.message, "returned no JSON object"
-  end
-
-  # A brace is present, but what it encloses is not valid JSON (a trailing comma) — distinct
-  # from "no object found" and from the oversized-output boundary below.
-  def test_malformed_json_inside_a_found_object_is_a_generation_failure
-    result, lines = answering('{"spec.md": "ok",}')
-    provider, = provider_for(result: result, lines: lines)
-
-    error = assert_raises(Provider::Failed) { provider.generate({}) }
-
-    assert_includes error.message, "did not return valid JSON"
-  end
-
   # The size bound moved to the decoder with the bytes it guards, so an oversized answer is
   # refused as an unreadable stream rather than parsed and then rejected.
   def test_an_oversized_terminal_result_is_a_generation_failure_before_any_parsing_is_attempted
     oversized = "x" * (SpecrelayRunner::ClaudeStream::MAX_RESULT_BYTES + 1)
-    result, lines = answering(oversized)
+    result, lines = answering(VALID_STRUCTURED.merge("spec.md" => oversized))
     provider, = provider_for(result: result, lines: lines)
 
     error = assert_raises(Provider::Failed) { provider.generate({}) }

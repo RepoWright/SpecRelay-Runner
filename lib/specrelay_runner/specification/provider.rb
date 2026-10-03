@@ -74,12 +74,13 @@ module SpecrelayRunner
         "on this runner."
 
       # The ONE content contract both real providers answer to: the same specification prompt, the
-      # same balanced JSON file map, and the same sentences when a provider does not deliver one.
+      # same file map, and the same sentences when a provider does not deliver one.
       #
       # It is shared rather than copied because it is one rule, not two: a Codex package and a
       # Claude package are the same artifact, validated by the same {DocumentSet}, and a second
       # prompt or a second parser could only ever drift from the first. What is NOT shared is what
-      # genuinely differs — how each provider is launched, and which decoder reads its output.
+      # genuinely differs — how each provider is launched, which decoder reads its output, and how
+      # the file map is taken from that decoder.
       module PackageContract
         # PATH to find the executable and HOME to find the operator's own provider credentials —
         # the same two the implementation lane forwards, and nothing else. The profile's own
@@ -110,8 +111,11 @@ module SpecrelayRunner
           failure = stream.close.failure
           raise Failed, "#{failure_prefix}'s output could not be read: #{failure}" if failure
 
-          parse(stream.final_text)
+          package_from(stream)
         end
+
+        # The textual answer, parsed. Claude replaces this with its structured value.
+        def package_from(stream) = parse(stream.final_text)
 
         def failure_prefix = "the #{kind.capitalize} specification provider"
 
@@ -158,12 +162,7 @@ module SpecrelayRunner
             edit, format, stage, commit, or clean anything outside it. You still return the
             package as JSON below; writing the documents yourself is neither required nor useful.
 
-            Return ONLY a JSON object mapping file paths to file contents, with no prose before or
-            after it and no code fence. The keys must be exactly "spec.md", "#{PackagePath::INPUT_EVIDENCE_MD}",
-            "#{PackagePath::BUSINESS_MD}", "#{PackagePath::TECHNICAL_MD}" — plus
-            "#{PackagePath::OPEN_QUESTIONS_MD}" ONLY when at least one open question below is
-            genuinely material (a decision that changes scope, behavior, or acceptance). Omit that
-            key entirely otherwise; never include it as an empty string.
+            #{output_instruction}
 
             TITLES — every document begins with its own `#` title on the first line, naming what
             the document is. "spec.md" is titled for the ticket (its key and summary);
@@ -293,6 +292,17 @@ module SpecrelayRunner
           PROMPT
         end
 
+        # How the answer is submitted: the one part of the prompt the adapters do not share. The
+        # textual file map, read by {#parse}; Claude replaces it with its structured submission.
+        def output_instruction = <<~TEXT.chomp
+          Return ONLY a JSON object mapping file paths to file contents, with no prose before or
+          after it and no code fence. The keys must be exactly "spec.md", "#{PackagePath::INPUT_EVIDENCE_MD}",
+          "#{PackagePath::BUSINESS_MD}", "#{PackagePath::TECHNICAL_MD}" — plus
+          "#{PackagePath::OPEN_QUESTIONS_MD}" ONLY when at least one open question below is
+          genuinely material (a decision that changes scope, behavior, or acceptance). Omit that
+          key entirely otherwise; never include it as an empty string.
+        TEXT
+
         # A model may wrap JSON in a fence or add a sentence despite being asked not to, so the
         # first balanced object is extracted rather than the whole answer parsed. Anything else is
         # a failure the run records — never a partial package.
@@ -339,6 +349,9 @@ module SpecrelayRunner
 
         def kind = KIND
 
+        # The invocation that actually runs, schema included.
+        def describe = "#{kind.capitalize} profile — #{profile.describe(profile.specification_args)}"
+
         # The profile is structured-output-only, so the process is read through the
         # SAME {ClaudeStream} the implementation lane uses. Progress reaches `on_output` while the
         # model works; the document map still comes only from the terminal result, and still goes
@@ -346,23 +359,59 @@ module SpecrelayRunner
         def generate(packet, on_output: nil)
           # No repository is assigned to this lane, so containment can never be proven and the
           # decoder shows no path at all — the same projection rule, applied to a lane with no root.
-          generate_package(packet, ClaudeStream.new(sink: on_output))
+          # Nor anything free-form: the documents may arrive through any of it.
+          generate_package(packet, ClaudeStream.new(sink: on_output, withhold_documents: true))
         end
 
         private
 
         # The packet reaches the model as ONE argv element, exactly as the implementation lane
-        # delivers this profile's prompt.
+        # delivers this profile's prompt, after the profile's specification invocation — the base
+        # argv plus the fixed document schema.
         #
         # In the prepared task workspace, not a throwaway directory. That is the whole of
         # workspace-grounded generation at this boundary: the model's own tools resolve the
         # ticket's real multi-repository source state, and what it may WRITE there is bounded
         # afterwards by the change-boundary check rather than by giving it nothing to read.
         def launch(prompt, stream)
-          command_runner.run([ profile.command, *profile.args, prompt ], chdir: working_directory,
-                                                                        env: child_env,
-                                                                        timeout_seconds: profile.timeout_seconds,
-                                                                        on_output: stream.sink)
+          command_runner.run([ profile.command, *profile.specification_args, prompt ],
+                             chdir: working_directory, env: child_env,
+                             timeout_seconds: profile.timeout_seconds, on_output: stream.sink)
+        end
+
+        # The schema's own property names, from the one owner of document membership, and the one
+        # submission this run accepts.
+        def output_instruction
+          required = PackagePath::PROVIDER_SCHEMA["required"].map { |name| %("#{name}") }.join(", ")
+          optional = PackagePath::PROVIDER_DOCUMENTS.key(PackagePath::OPEN_QUESTIONS_MD)
+          <<~TEXT.chomp
+            Submit the package ONLY through the structured output this run provides: one object
+            whose properties are the documents, named by their paths with "/" written as "_" —
+            exactly #{required} — plus "#{optional}" ONLY when at least one open question below is
+            genuinely material (a decision that changes scope, behavior, or acceptance). Omit that
+            property entirely otherwise; never include it as an empty string.
+            Never write any document, or any part of one, as ordinary text.
+          TEXT
+        end
+
+        # The schema-constrained document map from a successful terminal result, and nothing else:
+        # the textual answer beside it is never read, so malformed text cannot cost a package and
+        # plausible text cannot stand in for a missing map. Each property maps back to its exact
+        # document path; one that does not, or a value that is not text, is refused rather than
+        # dropped or coerced. Which documents are required is {DocumentSet}'s rule, not this one's.
+        def package_from(stream)
+          raise Failed, "#{failure_prefix} did not finish successfully" unless stream.succeeded?
+
+          map = stream.structured_output
+          raise Failed, "#{failure_prefix} returned no structured document map" unless map.is_a?(Hash)
+
+          map.each_with_index.to_h do |(key, content), index|
+            path = PackagePath::PROVIDER_DOCUMENTS[key] or
+              raise Failed, "#{failure_prefix} returned an unrecognized document (entry #{index + 1})"
+            raise Failed, "#{failure_prefix}'s #{path} is not text" unless content.is_a?(String)
+
+            [ path, content ]
+          end
         end
       end
 
