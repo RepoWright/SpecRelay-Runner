@@ -17,16 +17,40 @@ module SpecrelayRunner
   # heartbeating after N seconds to reproduce the "runner crashed / lost the
   # network" case: the lease then lapses and Platform reclaims the run. It is the
   # deterministic stand-in for killing the process.
+  #
+  # A lane that runs a provider also passes `lease_seconds`, and then this object is the one
+  # local answer to "may this claim still do work". Authority exists only inside a window that an
+  # ACKNOWLEDGED renewal opens: Platform renewed at or after the instant the request was sent, so
+  # the lease it granted lasts at least `lease_seconds` from that instant — measured on this
+  # machine's monotonic clock, with no wall-clock comparison. The claim response itself is never
+  # an anchor, because Platform granted that lease before an unbounded response delay. No window,
+  # or a passed one, is a stop; so is anything Platform says that is not a live, renewed lease.
+  # Other renewals Platform accepts (live-log events) are deliberately not counted: they can only
+  # make this stop earlier, never later. Without `lease_seconds` nothing here changes.
   class Heartbeater
-    def initialize(client:, claim:, interval_seconds:, io:, stop_after_seconds: nil)
+    # The stop a lane records when this machine can no longer show the claim is its own. Not
+    # something Platform said, so a caller must not describe it as one.
+    UNCONFIRMED = "renewal unconfirmed"
+
+    # Platform's documented default, for a claim that does not state its own.
+    DEFAULT_LEASE_SECONDS = 120
+
+    # The lease duration a claim's `execution_policy` advertises.
+    def self.lease_seconds(execution_policy)
+      execution_policy.to_h["lease_duration_seconds"].to_i.then { |n| n.positive? ? n : DEFAULT_LEASE_SECONDS }
+    end
+
+    def initialize(client:, claim:, interval_seconds:, io:, stop_after_seconds: nil, lease_seconds: nil)
       @client = client
       @claim = claim
       @interval = [ interval_seconds.to_i, 1 ].max
       @io = io
       @stop_after_seconds = stop_after_seconds
+      @lease_seconds = lease_seconds
       @mutex = Mutex.new
       @stop_reason = nil
       @should_stop = false
+      @renewed_until = nil
       @thread = nil
       @started_at = nil
     end
@@ -37,10 +61,26 @@ module SpecrelayRunner
       self
     end
 
-    # The reason Platform told this runner to stop, or nil while the lease is live.
+    # Why this claim must stop, or nil while it may continue: what Platform said, or — for a lane
+    # with a lease window — that no acknowledged renewal covers this instant. Evaluated on every
+    # read, so a renewal request that is still blocked cannot postpone it, and recorded once, so
+    # nothing that arrives later can clear it. It never writes output: the provider's stop check
+    # reads it on the thread that must then end the process group, and the lane's aborted outcome
+    # is where the operator is told why.
     def stop_reason
-      @mutex.synchronize { @stop_reason }
+      @mutex.synchronize do
+        if @stop_reason.nil? && window_closed?
+          @stop_reason = UNCONFIRMED
+          @should_stop = true
+        end
+        @stop_reason
+      end
     end
+
+    # One renewal now, on the caller's thread, read exactly as a background beat is: the lanes'
+    # own phase-boundary heartbeats go through here so that there is one reading of what a
+    # heartbeat response means. A transport error reaches the caller.
+    def renew = beat_once
 
     # Ask the beater to stop and wait for the thread to finish.
     def stop
@@ -83,15 +123,36 @@ module SpecrelayRunner
       end
     end
 
+    # HTTP 200 alone is not renewal. Only `acknowledged: true` on a live lease opens or extends the
+    # window; `acknowledged: false` or a lease that is not live is a stop; anything else is neither.
     def beat_once
+      sent_at = monotonic
       body = client.heartbeat(claim: claim)
-      lease = body.is_a?(Hash) ? body["lease"].to_h : {}
+      body = {} unless body.is_a?(Hash)
+      lease = body["lease"].to_h
       state = lease["state"].to_s
       cancel = lease["cancel_requested"]
-      return if state == "active" && !cancel
+      live = state == "active" && !cancel
+      return confirm(sent_at) if live && body["acknowledged"] == true
+      return unless !live || body["acknowledged"] == false
 
-      reason = cancel ? "cancelled" : (state.empty? ? "expired" : state)
-      record_stop(reason)
+      record_stop(cancel ? "cancelled" : (live || state.empty? ? "expired" : state))
+    end
+
+    # Only ever moves the window forward, and never once a stop is recorded.
+    def confirm(sent_at)
+      return if @lease_seconds.nil?
+
+      @mutex.synchronize do
+        @renewed_until = [ @renewed_until, sent_at + @lease_seconds ].compact.max unless @stop_reason
+      end
+    end
+
+    # Called under the mutex.
+    def window_closed?
+      return false if @lease_seconds.nil?
+
+      @renewed_until.nil? || monotonic >= @renewed_until
     end
 
     def simulated_loss?

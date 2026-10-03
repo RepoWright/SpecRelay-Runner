@@ -32,7 +32,7 @@ class SpecificationCodexProviderGenerationTest < Minitest::Test
 
     attr_reader :calls
 
-    def run(argv, chdir:, env:, timeout_seconds:, stdin_data: nil, on_output: nil)
+    def run(argv, chdir:, env:, timeout_seconds:, stdin_data: nil, on_output: nil, stop_check: nil)
       @calls << Call.new(argv: argv, chdir: chdir, env: env, timeout_seconds: timeout_seconds,
                          stdin_data: stdin_data)
       @stderr_lines.each { |line| on_output&.call("stderr", line) }
