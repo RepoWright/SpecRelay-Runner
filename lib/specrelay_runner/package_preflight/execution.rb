@@ -92,9 +92,10 @@ module SpecrelayRunner
         response = client.submit_specification_package(claim: assignment.claim_token, package: body(documents))
         authorized?(response) ? authorized(response) : platform_refusal(response)
       rescue PlatformClient::Error => e
-        # A refusal Platform stated, or a transport failure. Either way nothing was pinned that
-        # this runner may act on, so it launches nothing and leaves the claim for release.
-        local_failure("Platform did not accept the specification package: #{Redaction.redact(e.message)}")
+        # No answer this runner may act on: whatever Platform did with the submission is unknown
+        # here, so it launches nothing and claims no outcome.
+        local_failure("the specification package result could not be confirmed with Platform: " \
+                      "#{Redaction.redact(e.message)}")
       end
 
       # Paths and bytes only. No digest this runner computed is sent: Platform recomputes every
@@ -150,13 +151,16 @@ module SpecrelayRunner
                    message: "Runner outcome: preflight_refused (#{classification}); " \
                             "nothing was executed and Jira was not advanced.")
       rescue PlatformClient::Error => e
-        local_failure("could not report the refusal to Platform: #{Redaction.redact(e.message)}")
+        local_failure("the refusal could not be confirmed with Platform: #{Redaction.redact(e.message)}")
       end
 
+      # States only what this runner knows. A submission may have been recorded — and its claim
+      # ended — before its response was lost, and an error status does not prove otherwise, so the
+      # claim's state on Platform is never asserted and no release is demanded.
       def local_failure(message)
         log("Preflight failed for #{assignment.ticket_key}: #{message}")
-        log("Nothing was executed and Jira was not advanced. The run is still CLAIMED on Platform;")
-        log("release it there so another attempt can take it.")
+        log("Nothing was executed and Jira was not advanced. This runner cannot confirm what Platform " \
+            "recorded for this claim; check the run on Platform and release the claim only if it is still held.")
         Result.new(outcome: :failed,
                    message: "Runner outcome: preflight_failed (#{message}); nothing was executed.")
       end

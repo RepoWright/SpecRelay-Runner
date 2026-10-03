@@ -444,6 +444,107 @@ class LoopModeTest < Minitest::Test
   end
 
 
+  # ---- a stale specification package, refused before any provider ----
+  #
+  # Through the REAL Execution -> CLI -> LoopRunner path. A REPORTED refusal is recorded by
+  # Platform, which also ends this claim, so the session is free for other work at once and the
+  # failure policy alone decides whether it polls again. A refusal Platform never recorded is a
+  # local failure and says so. Neither may claim a terminal result was submitted.
+  def test_a_reported_package_refusal_keeps_a_continue_loop_claiming_other_work
+    code, output, platform = run_preflight_loop(on_failure: "continue")
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, code, output
+    assert_equal 3, platform.requests_to("/api/runner/claim").size,
+                 "it polls again straight after each refusal, with no lease to wait out"
+    assert_equal 2, platform.requests_to("/api/runner/specification_packages").size
+    assert_empty platform.requests_to("/api/runner/claim_releases"), "Platform ended the claim itself"
+    assert_empty platform.requests_to("/api/runner/reports"), "nothing was executed to report"
+    assert_includes output, "Runner outcome: preflight_refused (package_stale); nothing was executed " \
+                            "and Jira was not advanced."
+    assert_includes output, "continuing to poll (--on-failure continue)"
+    assert_includes output, "session totals — 2 run(s) executed"
+    refute_includes output, "still CLAIMED"
+    refute_includes output, "terminal-result"
+  end
+
+  def test_the_stop_policy_ends_the_session_after_a_reported_package_refusal
+    code, output, platform = run_preflight_loop(on_failure: "stop")
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, code, output
+    assert_equal 1, platform.requests_to("/api/runner/claim").size
+    assert_includes output, "stopping after a failed run (--on-failure stop)"
+    refute_includes output, "terminal-result"
+  end
+
+  # An error answer does not prove Platform recorded nothing, so the runner states only that it
+  # could not confirm the outcome — never that the claim is still held or must be released.
+  def test_an_unconfirmed_package_refusal_asserts_no_claim_state
+    code, output, platform = run_preflight_loop(on_failure: "stop", package_answer: [ 500, { error: "boom" } ])
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, code, output
+    assert_equal 1, platform.requests_to("/api/runner/specification_packages").size
+    assert_match(/cannot confirm/i, output)
+    assert_match(/check the run on Platform/i, output)
+    refute_includes output, "still CLAIMED"
+    refute_match(/release it there/i, output)
+    refute_includes output, "preflight_refused"
+    assert_includes output, "stopping after a failed run (--on-failure stop)"
+    refute_includes output, "terminal-result"
+  end
+
+  PREFLIGHT_HEAD = ("a" * 40).freeze
+
+  # Two stale preflight assignments, then the fake's fatal bound, so a session that keeps polling
+  # still returns. The `gh` answers only the pull-request view, at a head that is not the
+  # published one — which is all a stale refusal reads.
+  def run_preflight_loop(on_failure:, package_answer: nil)
+    @loop_root = Dir.mktmpdir("preflight-loop")
+    gh = File.join(@loop_root, "gh")
+    File.write(gh, <<~RUBY)
+      #!/usr/bin/env ruby
+      require "json"
+      exit 1 unless ARGV[0] == "pr" && ARGV[1] == "view"
+      puts({ "url" => ARGV[2], "state" => "OPEN", "headRefName" => "spec-branch", "headRefOid" => "#{'f' * 40}",
+             "baseRefName" => "main", "isDraft" => true, "isCrossRepository" => false }.to_json)
+    RUBY
+    File.chmod(0o755, gh)
+
+    @loop_platform = FakePlatform.new(claim_payload: {}, claim_limit: 2).start
+    @loop_platform.queue_claims(%w[SR-42 SR-43].map { |key| preflight_payload(key) })
+    @loop_platform.package_answer = package_answer
+    path = File.join(@loop_root, "runner.yml")
+    File.write(path, <<~YAML)
+      platform:
+        base_url: #{@loop_platform.base_url}
+        token_env: TEST_TOKEN
+      runner:
+        id: loop-runner
+        display_name: Loop Runner
+        claim_policy:
+          mode: all_eligible
+    YAML
+
+    io = StringIO.new
+    code = SpecrelayRunner::CLI.run(%W[loop --config #{path} --on-failure #{on_failure}], out: io, err: io,
+                                    env: { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN,
+                                           "PATH" => "#{@loop_root}:#{ENV['PATH']}", "HOME" => @loop_root })
+    [ code, io.string, @loop_platform ]
+  end
+
+  def preflight_payload(ticket_key)
+    {
+      "assignment_kind" => SpecrelayRunner::PackagePreflight::Assignment::KIND,
+      "claim" => { "runner_execution_id" => "rex_#{ticket_key}" },
+      "run" => { "id" => "run_#{ticket_key}", "state" => "AWAITING_SPECIFICATION_PACKAGE_PREFLIGHT" },
+      "specification_package_preflight" => {
+        "ticket_key" => ticket_key, "spec_pull_request_url" => "https://github.com/SpecRelay/specs/pull/7",
+        "repository_slug" => "SpecRelay/specs", "pull_request_number" => 7, "base_branch" => "main",
+        "head_sha" => PREFLIGHT_HEAD, "package_path" => "specs/#{ticket_key}",
+        "documents" => [ { "role" => "specification", "path" => "spec.md", "digest" => "0" * 64 } ]
+      }
+    }
+  end
+
   def setup
     @pending_signal = nil
   end

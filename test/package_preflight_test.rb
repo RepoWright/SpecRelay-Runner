@@ -109,9 +109,11 @@ class PackagePreflightTest < Minitest::Test
     bin = fake_gh(**gh)
     SpecrelayRunner::PackagePreflight::Execution.call(
       config: nil, client: client, payload: payload,
-      env: { "PATH" => "#{bin}:#{ENV['PATH']}", "HOME" => @dir }, io: StringIO.new
+      env: { "PATH" => "#{bin}:#{ENV['PATH']}", "HOME" => @dir }, io: (@output = StringIO.new)
     )
   end
+
+  def output = @output.string
 
   # A Platform that records what the runner sent and answers with a scripted verdict.
   class RecordingPlatform
@@ -301,5 +303,38 @@ class PackagePreflightTest < Minitest::Test
 
     refute result.authorized?
     assert_match(/preflight_failed/, result.message)
+  end
+
+  # A submission can be recorded — the refusal stored and its claim ended — and its response then
+  # lost; or it can fail before Platform records anything. The runner cannot tell which, so it
+  # states neither, and never tells the operator to release a claim that may already have ended.
+  def test_a_refusal_whose_response_was_lost_states_only_what_the_runner_knows
+    platform = RecordingPlatform.new(:error)
+
+    result = run_preflight(client: platform, pr_head: MOVED)
+
+    assert_equal "package_stale", only_submission(platform)[:refusal], "Platform may have recorded it"
+    assert_equal :failed, result.outcome
+    assert_unconfirmed_claim_state
+    refute_includes output, "could not report the refusal"
+  end
+
+  def test_a_package_whose_response_was_lost_states_only_what_the_runner_knows
+    platform = RecordingPlatform.new(:error)
+
+    result = run_preflight(client: platform)
+
+    assert_equal 1, platform.submissions.length
+    assert_equal :failed, result.outcome
+    refute result.authorized?
+    assert_unconfirmed_claim_state
+    refute_includes output, "did not accept"
+  end
+
+  def assert_unconfirmed_claim_state
+    refute_includes output, "still CLAIMED"
+    refute_match(/release it there/i, output)
+    assert_match(/cannot confirm/i, output)
+    assert_match(/check the run on Platform/i, output)
   end
 end
