@@ -265,7 +265,7 @@ module SpecrelayRunner
       presence.pause
       disposition = watching_for_stop { execute.call(payload) }
       # Remembered separately: an operator who interrupts DURING an execution needs to be told
-      # the run finished reporting first, which is a materially different situation from an
+      # the run was allowed to finish, which is a materially different situation from an
       # interrupt while idle. Read from the OPERATOR's flag rather than the general one, because
       # only an interrupt the operator sent can be answered with what their interrupt did.
       @stopped_during_execution ||= @operator_stop
@@ -301,8 +301,7 @@ module SpecrelayRunner
       sleep(STOP_NOTICE_SECONDS) while @execution_active && !@stop_requested
       return unless @stop_requested
 
-      line "stop requested — nothing further will be claimed; the run in progress finishes " \
-           "its report first"
+      line "stop requested — nothing further will be claimed; the run in progress finishes first"
     rescue StandardError
       # An acknowledgement is a courtesy. It must never take an execution down.
       nil
@@ -527,7 +526,7 @@ module SpecrelayRunner
 
     def announce_start
       line "started — polling every #{poll_seconds}s, one run at a time, --on-failure #{on_failure}"
-      line "press Ctrl-C to stop; an in-progress execution finishes its report first"
+      line "press Ctrl-C to stop; an in-progress execution finishes first"
     end
 
     # Names WHO stopped the runner and what it was doing, so an operator who hits Ctrl-C knows
@@ -551,14 +550,14 @@ module SpecrelayRunner
 
     def operator_stop_description
       if @stopped_during_execution
-        # "reported its result first" is the ordinary case and not a universal one. A run whose
-        # report could not be built finished without submitting anything, and answering an
-        # operator's Ctrl-C with the reassurance that it reported would describe a delivery that
-        # did not happen.
+        # A signal changes why the session stops, not what reached Platform. Only a run whose
+        # report could not be built is known here to have submitted nothing; for every other
+        # outcome the execution's own result line above is the one authority on delivery.
         return "stopped by signal DURING an execution — the run finished; its result was NOT " \
                "submitted to Platform" if @unreported_failure
 
-        return "stopped by signal DURING an execution — the run finished and reported its result first"
+        return "stopped by signal DURING an execution — the run finished; its result line above " \
+               "says what reached Platform"
       end
       # "nothing was claimed" is true of a session interrupted before it ever took work, and
       # false of one interrupted between runs.

@@ -704,7 +704,7 @@ claimed` is dropped once the session has executed a run:
 
 ```text
 [loop] stopped by signal while IDLE — no execution was in progress and nothing was claimed
-[loop] stopped by signal DURING an execution — the run finished and reported its result first
+[loop] stopped by signal DURING an execution — the run finished; its result line above says what reached Platform
 ```
 
 A stop the terminal decided for itself — a session Platform no longer holds, a rejected
@@ -720,7 +720,7 @@ An interrupt DURING an execution is acknowledged while the run is still finishin
 so a Ctrl-C in the middle of a long provider run does not look ignored:
 
 ```text
-[loop] stop requested — nothing further will be claimed; the run in progress finishes its report first
+[loop] stop requested — nothing further will be claimed; the run in progress finishes first
 ```
 
 Foreground only, deliberately: no LaunchAgent, no daemonization, no supervisor.
@@ -734,7 +734,7 @@ Foreground only, deliberately: no LaunchAgent, no daemonization, no supervisor.
 
 ```text
 [loop] started — polling every 10s, one run at a time, --on-failure continue
-[loop] press Ctrl-C to stop; an in-progress execution finishes its report first
+[loop] press Ctrl-C to stop; an in-progress execution finishes first
 | tiny-demo (tiny-demo-workspace) — no eligible work; next check in 7s
 ```
 

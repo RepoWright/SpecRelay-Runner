@@ -270,7 +270,7 @@ class LoopModeTest < Minitest::Test
     refute_includes output, "nothing was claimed"
   end
 
-  def test_a_signal_during_an_execution_says_the_run_finished_reporting_first
+  def test_a_signal_during_an_execution_says_the_run_finished
     execute = lambda do |_payload|
       Process.kill("INT", Process.pid)
       sleep 0.05 # let the trap run
@@ -280,8 +280,31 @@ class LoopModeTest < Minitest::Test
                       max_iterations: 10, install_signals: true)
 
     assert_equal Loop::OK, status
-    assert_includes output, "stopped by signal DURING an execution"
-    assert_includes output, "reported its result first"
+    assert_includes output, "stopped by signal DURING an execution — the run finished; " \
+                            "its result line above says what reached Platform"
+  end
+
+  # A signal changes WHY the session stops, not what reached Platform. An ordinary failed outcome
+  # may never have been submitted at all, and the execution's own result line is the only voice
+  # that knows — so neither the acknowledgement nor the closing line may promise a report.
+  def test_a_signal_during_an_unsubmitted_failed_run_promises_no_report
+    claims = 0
+    execute = lambda do |_payload|
+      @io.puts "No generation result was submitted"
+      Process.kill("INT", Process.pid)
+      sleep 0.3 # long enough for the acknowledgement to be written
+      false
+    end
+    status = run_loop(claim: -> { claims += 1; claimed("DEMO-1") }, execute: execute,
+                      max_iterations: 10, install_signals: true)
+
+    assert_equal Loop::FAILED, status
+    assert_equal 1, claims, "nothing further may be claimed after the interrupt"
+    assert_includes output, "stop requested — nothing further will be claimed; " \
+                            "the run in progress finishes first"
+    assert_includes output, "stopped by signal DURING an execution — the run finished; " \
+                            "its result line above says what reached Platform"
+    refute_match(/report(ed)? (its result )?first/, output)
   end
 
   def test_it_restores_the_previous_signal_handlers

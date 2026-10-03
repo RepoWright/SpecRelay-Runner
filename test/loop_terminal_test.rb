@@ -247,7 +247,7 @@ class LoopTerminalTest < Minitest::Test
   # The signal handler may only set a flag, so the acknowledgement has to come from a normal
   # execution path. Without it an operator who interrupts a long Claude run sees nothing at
   # all until the run ends, and presses Ctrl-C again.
-  def test_ctrl_c_during_an_execution_says_so_while_the_run_finishes_reporting
+  def test_ctrl_c_during_an_execution_says_so_while_the_run_finishes
     execute = lambda do |_payload|
       Process.kill("INT", Process.pid)
       sleep 0.3
@@ -259,7 +259,7 @@ class LoopTerminalTest < Minitest::Test
     assert_equal Loop::OK, status
     durable = @terminal.durable_lines
     assert_equal 1, durable.count { |line| line.include?("stop requested") }, durable.inspect
-    assert(durable.any? { |line| line.include?("the run in progress finishes its report first") })
+    assert(durable.any? { |line| line.include?("the run in progress finishes first") })
     assert(durable.any? { |line| line.include?("stopped by signal DURING an execution") })
     assert(durable.any? { |line| line.include?("run completed — stopping as requested") },
            "claiming it would poll again would be untrue: #{durable.inspect}")
