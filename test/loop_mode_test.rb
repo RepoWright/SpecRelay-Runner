@@ -476,14 +476,19 @@ class LoopModeTest < Minitest::Test
     refute_includes output, "terminal-result"
   end
 
-  def test_a_package_refusal_platform_never_recorded_says_the_claim_is_still_held
+  # An error answer does not prove Platform recorded nothing, so the runner states only that it
+  # could not confirm the outcome — never that the claim is still held or must be released.
+  def test_an_unconfirmed_package_refusal_asserts_no_claim_state
     code, output, platform = run_preflight_loop(on_failure: "stop", package_answer: [ 500, { error: "boom" } ])
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, code, output
     assert_equal 1, platform.requests_to("/api/runner/specification_packages").size
-    assert_includes output, "could not report the refusal to Platform"
-    assert_includes output, "The run is still CLAIMED on Platform"
+    assert_match(/cannot confirm/i, output)
+    assert_match(/check the run on Platform/i, output)
+    refute_includes output, "still CLAIMED"
+    refute_match(/release it there/i, output)
     refute_includes output, "preflight_refused"
+    assert_includes output, "stopping after a failed run (--on-failure stop)"
     refute_includes output, "terminal-result"
   end
 
