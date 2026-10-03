@@ -331,9 +331,11 @@ module SpecrelayRunner
     #
     # Only a connected loop asks; a `--config` loop has no runner identity for Platform to prove
     # the paused attempt against. Nothing unproved lets a claim through: an unreadable project
-    # list, an unanswered, refused or unreadable Platform read, a target this machine did not list
-    # and an incomplete release all raise {CleanupRequired}, which stops the session. Only the
-    # claim itself keeps the loop's ordinary transport backoff.
+    # list, a refused or unreadable Platform read, a target this machine did not list and an
+    # incomplete release all raise {CleanupRequired}, which stops the session. A read Platform
+    # never answered, or could not process, proves nothing either and claims nothing either — but
+    # its fate is unknown, so it keeps the loop's ordinary transport backoff alongside the claim
+    # and is asked again on the next poll.
     def claim_after_cancellation_cleanup(config, client, session_id)
       release_cancelled_environment(config, client, session_id) if config.connection
       client.claim(config.claim_runner_params, session_id: session_id)
@@ -359,11 +361,26 @@ module SpecrelayRunner
     end
 
     # A rejected credential stays the loop's own stop, with its reconnect remedy.
+    #
+    # A failure whose FATE is unknown — Platform never answered, or answered that it could not
+    # process the request — is re-raised as the transport failure it is, in the same class and
+    # with the same status, so the loop waits on its ordinary backoff and asks again rather than
+    # ending the session over an outage it can survive. Nothing here proves a cancellation, so the
+    # message states only what could not be confirmed and that the environments were kept; a
+    # remedy telling an operator to release one by hand would name work no answer authorized.
+    #
+    # Everything Platform did answer deterministically — a refusal, or an answer this runner could
+    # not read — stays fail-closed: the same answer would arrive again, so the session stops.
     def confirmed_cleanup_target(client, workspace_key, listed, session_id)
       client.cancellation_cleanup_target(workspace_key: workspace_key, candidates: listed, session_id: session_id)
     rescue PlatformClient::Unauthorized
       raise
     rescue PlatformClient::Error => e
+      if e.transient?
+        raise e.class.new("whether any task environment belongs to a cancelled run could not be confirmed " \
+                          "(#{e.message}); they were kept", status: e.status)
+      end
+
       raise CleanupRequired, "the task environments of cancelled runs could not be confirmed with Platform " \
                              "(#{e.message}); they were kept"
     end
