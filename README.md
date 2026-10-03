@@ -24,7 +24,9 @@ application:
 
 Claim eligibility, claim policy, approved-spec authority, lease and cancellation
 authority, event ordering, terminal-result validation, report import, and Jira
-finalization are all **Platform's** decisions. This client never makes them.
+finalization are all **Platform's** decisions. This client never makes them. It only
+stops its own provider when it can no longer show the claim is still its own: Platform
+said so, or no heartbeat Platform acknowledged has covered the last lease duration.
 
 ### Closed-source posture
 

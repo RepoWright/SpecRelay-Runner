@@ -572,4 +572,79 @@ end
     platform&.stop
     FileUtils.remove_entry(root) if root && File.directory?(root)
   end
+
+  # ------------------------------------------------------------ claim authority while asking
+
+  # Platform releases the answer window, which ends the execution: the lease reads `terminal`
+  # before the bridge's next poll reads the release. The lost claim stops the provider at once, and
+  # Platform — not the order in which this machine noticed — still classifies the ending as the
+  # pause it is.
+  def test_a_release_that_ends_the_lease_before_the_bridge_reads_it_is_still_a_pause
+    use_recorded_question_provider(lease_seconds: 60)
+    platform = @platform
+    @platform.release_question!(after_polls: 3)
+    @platform.question_poll_hold = -> { platform.set_signal("state" => "terminal", "cancel_requested" => false) }
+    io = StringIO.new
+
+    exit_code = run_cli(io)
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, exit_code, io.string
+    assert_equal 1, @platform.capture_failures.size, "the lost claim, not the bridge, stopped the provider"
+    assert_match(/awaiting_input/, io.string)
+    assert question_provider_gone?
+    assert_empty @platform.requests_to("/api/runner/reports")
+  end
+
+  # The bridge is waiting on Platform's answer and that request does not return; renewal is stuck
+  # behind the same outage. The authority window still closes and the provider is stopped while
+  # the poll is in flight. The ending stays the one Platform classifies.
+  def test_a_window_that_closes_while_the_question_poll_is_blocked_still_stops_the_provider
+    use_recorded_question_provider(lease_seconds: 3)
+    observed = []
+    gone = -> { question_provider_gone? }
+    @platform.question_poll_hold = lambda do
+      next unless observed.empty?
+
+      observed << (wait_for(10) { gone.call } ? :stopped_while_poll_held : :still_running_while_poll_held)
+    end
+    io = StringIO.new
+
+    exit_code = run_cli(io)
+
+    assert_equal [ :stopped_while_poll_held ], observed, io.string
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, exit_code, io.string
+    assert_equal 1, @platform.capture_failures.size
+    assert_empty @platform.requests_to("/api/runner/reports")
+  end
+
+  private
+
+  def question_pid_file = File.join(@root, "question-provider.pid")
+
+  # The question-asking double behind the approved fixture name, with its process id written down,
+  # on a claim whose lease is short and renewed every second.
+  def use_recorded_question_provider(lease_seconds:)
+    recorded = File.join(@root, "recorded-question-executor")
+    File.write(recorded, <<~SH)
+      #!/bin/sh
+      echo $$ > #{Shellwords.escape(question_pid_file)}
+      exec #{Shellwords.escape(File.expand_path(@executor))} "$@"
+    SH
+    FileUtils.chmod(0o755, recorded)
+    @platform.claim_payload = payload(executor: recorded).merge(
+      "execution_policy" => { "lease_duration_seconds" => lease_seconds, "lease_renewal_seconds" => 1 }
+    )
+  end
+
+  def question_provider_gone?
+    return false unless File.exist?(question_pid_file)
+
+    Process.kill(0, -File.read(question_pid_file).to_i)
+    false
+  rescue Errno::ESRCH
+    true
+  rescue Errno::EPERM
+    # Members not yet reaped answer EPERM on this platform: not yet shown gone.
+    false
+  end
 end

@@ -103,8 +103,8 @@ module SpecrelayRunner
         # when it cannot be started at all is not: Claude's accepted behaviour is that the
         # operating system's own error escapes, and this slice may not change it. Each adapter
         # therefore owns its own `launch`, and only Codex's classifies a failure to start.
-        def generate_package(packet, stream)
-          result = launch(prompt_for(packet), stream)
+        def generate_package(packet, stream, stop_check)
+          result = launch(prompt_for(packet), stream, stop_check)
           raise Failed, "#{failure_prefix} timed out" if result.timed_out?
           raise Failed, "#{failure_prefix} exited #{result.exit_code}" unless result.success?
 
@@ -356,11 +356,13 @@ module SpecrelayRunner
         # SAME {ClaudeStream} the implementation lane uses. Progress reaches `on_output` while the
         # model works; the document map still comes only from the terminal result, and still goes
         # only to {DocumentSet}. One decoder per provider, two lanes, no second normalization rule.
-        def generate(packet, on_output: nil)
+        # `stop_check` is polled while the process runs; when it answers true, `CommandRunner` ends
+        # the whole process group through its one bounded TERM-then-KILL shutdown.
+        def generate(packet, on_output: nil, stop_check: nil)
           # No repository is assigned to this lane, so containment can never be proven and the
           # decoder shows no path at all — the same projection rule, applied to a lane with no root.
           # Nor anything free-form: the documents may arrive through any of it.
-          generate_package(packet, ClaudeStream.new(sink: on_output, withhold_documents: true))
+          generate_package(packet, ClaudeStream.new(sink: on_output, withhold_documents: true), stop_check)
         end
 
         private
@@ -373,10 +375,11 @@ module SpecrelayRunner
         # workspace-grounded generation at this boundary: the model's own tools resolve the
         # ticket's real multi-repository source state, and what it may WRITE there is bounded
         # afterwards by the change-boundary check rather than by giving it nothing to read.
-        def launch(prompt, stream)
+        def launch(prompt, stream, stop_check)
           command_runner.run([ profile.command, *profile.specification_args, prompt ],
                              chdir: working_directory, env: child_env,
-                             timeout_seconds: profile.timeout_seconds, on_output: stream.sink)
+                             timeout_seconds: profile.timeout_seconds, on_output: stream.sink,
+                             stop_check: stop_check)
         end
 
         # The schema's own property names, from the one owner of document membership, and the one
@@ -436,8 +439,8 @@ module SpecrelayRunner
 
         def kind = KIND
 
-        def generate(packet, on_output: nil)
-          generate_package(packet, CodexStream.new(sink: on_output))
+        def generate(packet, on_output: nil, stop_check: nil)
+          generate_package(packet, CodexStream.new(sink: on_output), stop_check)
         end
 
         private
@@ -447,12 +450,13 @@ module SpecrelayRunner
         # state would not be comparable, and the boundary on what may be WRITTEN there is the
         # change-boundary check rather than the absence of anything to read. The prompt goes on
         # stdin because that is this profile's approved delivery.
-        def launch(prompt, stream)
+        def launch(prompt, stream, stop_check)
           command_runner.run([ profile.command, *profile.args ], chdir: working_directory,
                                                                  env: child_env,
                                                                  timeout_seconds: profile.timeout_seconds,
                                                                  stdin_data: prompt,
-                                                                 on_output: stream.sink)
+                                                                 on_output: stream.sink,
+                                                                 stop_check: stop_check)
         rescue SystemCallError => e
           # A Codex CLI that cannot be started is a bounded generation failure rather than an
           # exception escaping the lane, which would leave the claim held with no recorded reason
