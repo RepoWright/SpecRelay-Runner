@@ -111,6 +111,21 @@ class DeferredCancellationCleanupTest < Minitest::Test
 
   # ------------------------------------------------------------------- retention
 
+  # A rejected credential is the one confirmation failure with a remedy of its own: it is never
+  # waited on, and it asks the operator to reconnect rather than to release anything.
+  def test_a_rejected_credential_stops_the_loop_before_a_claim_with_its_reconnect_remedy
+    allocate(TASK, RUN)
+    @platform.script_cleanup_targets([ 401, { error: "invalid_credential" } ], [ 200, { target: nil } ])
+
+    refute_equal SpecrelayRunner::LoopRunner::OK, run_loop(iterations: 2), @io.string
+
+    assert_equal %w[target], exchanges
+    assert File.directory?(worktree(TASK))
+    assert_equal RUN, ProjectCommand.recorded_owner(@root, TASK)
+    assert_includes @io.string, "credential was rejected by Platform"
+    assert_includes @io.string, "Reconnect this machine"
+  end
+
   # Scenario 4 and 7. Every answer that proves nothing keeps the environment and stops the
   # session, so no later poll claims either. Each session is given a second poll whose lookup
   # would answer "no target", which a session that only backed off would go on to claim after.
@@ -120,8 +135,7 @@ class DeferredCancellationCleanupTest < Minitest::Test
       "extra field" => [ 200, { target: { run_id: RUN, task_id: TASK, state: "CANCELLED" } } ],
       "oversized identity" => [ 200, { target: { run_id: "run_#{'x' * 300}", task_id: TASK } } ],
       "no target field" => [ 200, {} ],
-      "refused" => [ 422, { error: "at most 90 candidates may be offered" } ],
-      "failed" => [ 500, { error: "internal" } ] }.each do |name, answer|
+      "refused" => [ 422, { error: "at most 90 candidates may be offered" } ] }.each do |name, answer|
       restart_platform
       allocate(TASK, RUN)
       @platform.script_cleanup_targets(answer, [ 200, { target: nil } ])
@@ -135,17 +149,88 @@ class DeferredCancellationCleanupTest < Minitest::Test
     end
   end
 
-  def test_an_unreachable_platform_keeps_the_environment_and_stops_before_any_claim
+  # ------------------------------------------------------------------- waiting
+
+  # A failure that proves nothing AND leaves the read's fate unknown — Platform never answered, or
+  # answered that it could not process the request — keeps the environment like every other
+  # unproved answer, but waits on the loop's own backoff instead of ending the session. The poll
+  # after the wait asks again, and a valid answer lets the claim through with no operator action.
+  def test_a_server_failure_keeps_the_environment_and_claims_after_a_later_poll_confirms
+    allocate(TASK, RUN)
+    @platform.script_cleanup_targets([ 502, {} ], [ 200, { target: nil } ])
+
+    assert_equal SpecrelayRunner::LoopRunner::OK, run_loop(iterations: 2), @io.string
+
+    assert_equal %w[target target claim], exchanges
+    assert File.directory?(worktree(TASK)), "the unconfirmed environment was released"
+    assert_equal RUN, ProjectCommand.recorded_owner(@root, TASK)
+    assert_includes @io.string, "polling failed — whether any task environment belongs to a cancelled run " \
+                                "could not be confirmed (Platform request failed (502)); they were kept"
+    assert_includes @io.string, "recovered — Platform answered again after 1 failed poll(s)"
+    refute_includes @io.string, "Release it by hand"
+  end
+
+  # The release the confirmation authorizes is only delayed, not lost: it still precedes the claim
+  # that follows it.
+  def test_a_server_failure_delays_an_authorized_release_until_a_later_poll_confirms_it
+    allocate(TASK, RUN)
+    @platform.script_cleanup_targets([ 502, {} ], target(RUN, TASK))
+
+    assert_equal SpecrelayRunner::LoopRunner::OK, run_loop(iterations: 2), @io.string
+
+    assert_equal %w[target target claim], exchanges
+    refute File.directory?(worktree(TASK))
+    assert_nil ProjectCommand.recorded_owner(@root, TASK)
+  end
+
+  # A Platform that is unreachable leaves the request's fate just as unknown as one that answered
+  # it could not process it, so it waits on the same path rather than ending the session.
+  def test_an_unreachable_platform_keeps_the_environment_and_waits_instead_of_claiming
     allocate(TASK, RUN)
     base_url = @platform.base_url
     @platform.stop
 
-    refute_equal SpecrelayRunner::LoopRunner::OK, run_loop(iterations: 2, base_url: base_url), @io.string
+    assert_equal SpecrelayRunner::LoopRunner::OK, run_loop(iterations: 2, base_url: base_url), @io.string
 
     assert File.directory?(worktree(TASK))
     assert_equal RUN, ProjectCommand.recorded_owner(@root, TASK)
-    assert_includes @io.string, "cancelled runs could not be confirmed"
-    refute_includes @io.string, "polling failed"
+    assert_includes @io.string, "could not be confirmed"
+    assert_includes @io.string, "polling failed"
+    refute_includes @io.string, "Release it by hand"
+  end
+
+  # The gate stays closed for as long as confirmation is unavailable: every poll asks again and
+  # none of them claims, releases or stops, and the backoff grows rather than spinning.
+  def test_a_server_failure_on_every_poll_claims_nothing_and_keeps_the_environment
+    allocate(TASK, RUN)
+    @platform.script_cleanup_targets(*Array.new(3) { [ 502, {} ] })
+
+    assert_equal SpecrelayRunner::LoopRunner::OK, run_loop(iterations: 3), @io.string
+
+    assert_equal %w[target target target], exchanges
+    assert File.directory?(worktree(TASK))
+    assert_equal RUN, ProjectCommand.recorded_owner(@root, TASK)
+    assert_includes @io.string, "until retry #3"
+  end
+
+  # An operator's interrupt during the wait ends the session from the wait itself, so the poll it
+  # was waiting for never happens and nothing is claimed while confirmation is still pending.
+  def test_a_stop_during_the_wait_ends_the_session_without_claiming
+    allocate(TASK, RUN)
+    @platform.script_cleanup_targets([ 502, {} ], [ 200, { target: nil } ])
+    pending_interrupt = -> { Process.kill("INT", Process.pid) }
+
+    status = run_loop(iterations: 2, poll_seconds: 1, install_signals: true,
+                      sleeper: lambda { |_slice|
+                        interrupt = pending_interrupt
+                        pending_interrupt = nil
+                        interrupt&.call
+                      })
+
+    assert_equal SpecrelayRunner::LoopRunner::OK, status, @io.string
+    assert_equal %w[target], exchanges
+    assert File.directory?(worktree(TASK))
+    assert_includes @io.string, "nothing was claimed"
   end
 
   # The ordinary claim keeps its transport backoff: a failed claim after a completed lookup is
@@ -252,13 +337,15 @@ class DeferredCancellationCleanupTest < Minitest::Test
 
   private
 
-  def run_loop(iterations:, connected: true, base_url: @platform.base_url)
+  def run_loop(iterations:, connected: true, base_url: @platform.base_url, poll_seconds: 0,
+               install_signals: false, sleeper: ->(_seconds) { })
     config = connected ? connected_config(base_url) : legacy_config(base_url)
     client = SpecrelayRunner::PlatformClient.new(base_url: base_url, token: CREDENTIAL)
     cli = SpecrelayRunner::CLI.new(out: @io, err: @io, env: { "PATH" => ENV.fetch("PATH", "") })
     SpecrelayRunner::LoopRunner.call(
-      out: @io, err: @io, install_signals: false, max_iterations: iterations, poll_seconds: 0,
-      sleeper: ->(_seconds) { }, on_failure: SpecrelayRunner::LoopRunner::ON_FAILURE_CONTINUE,
+      out: @io, err: @io, install_signals: install_signals, max_iterations: iterations,
+      poll_seconds: poll_seconds,
+      sleeper: sleeper, on_failure: SpecrelayRunner::LoopRunner::ON_FAILURE_CONTINUE,
       claim: -> { cli.send(:claim_after_cancellation_cleanup, config, client, SESSION_ID) },
       execute: ->(_payload) { true }
     )

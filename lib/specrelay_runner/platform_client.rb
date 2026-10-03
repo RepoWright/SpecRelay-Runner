@@ -32,6 +32,16 @@ module SpecrelayRunner
       # failing to process a request it accepted is closer to a transport fault than to a
       # refusal, and the same body may well be accepted on the next attempt.
       def refused? = (400..499).cover?(status.to_i)
+
+      # The request's fate is unknown: Platform never answered at all, or answered that it could
+      # not process a request it had accepted. Asking again may still succeed, so a caller that
+      # would otherwise stop on an unproved answer may wait and ask again instead.
+      #
+      # Deliberately NOT the inverse of #refused?. A failure raised with the status of an answer
+      # this client could read but could not UNDERSTAND (see #cleanup_target) is neither refused
+      # nor transient: Platform did answer, the same answer would arrive again, and a caller must
+      # stay fail-closed rather than retry it forever.
+      def transient? = status.nil? || (500..599).cover?(status.to_i)
     end
 
     Unauthorized = Class.new(Error)
