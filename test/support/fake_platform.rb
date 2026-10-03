@@ -115,6 +115,10 @@ class FakePlatform
   # one registration can each be given their own ticket.
   def queue_claims(payloads) = @mutex.synchronize { @queued_claims = payloads.dup }
 
+  # The `[status, body]` a package-preflight result receives. Unset, it is Platform's recorded
+  # refusal: the run is blocked and the claim that reported it has ended.
+  attr_writer :package_answer
+
   # `token` is the shared development token (fallback mode). A guided connection issues
   # ISSUED_CREDENTIAL, which the fake then accepts as a registered bearer for the remaining
   # endpoints (registered mode).
@@ -439,6 +443,7 @@ class FakePlatform
     # what Platform answers, because the runner PRINTS the run state back and a constant would
     # let a released claim and an unreleased one look identical in the operator's output.
     when "/api/runner/claim_releases" then claim_release
+    when "/api/runner/specification_packages" then specification_package
     when "/api/runner/specification_generations" then specification_generation(request)
     when "/api/runner/specification_publications" then specification_publication(request)
     when "/api/runner/review_results" then review_result(request)
@@ -810,6 +815,13 @@ class FakePlatform
   # `release_status` models the release Platform did NOT accept. The run then stays
   # CLAIMED here, because that is what actually happens: nothing was released, and the lease has
   # to expire before any machine sees the run again.
+  def specification_package
+    @package_answer || [ 201, { outcome: "refused", run_state: "BLOCKED_NEEDS_SPECIFICATION_PACKAGE",
+                                authorized: false,
+                                blocker: { classification: "package_stale", retryable: false,
+                                           detail: "The Spec PR head has moved since the specification was published." } } ]
+  end
+
   def claim_release
     return [ @release_status, { error: "release_rejected" } ] unless @release_status == 201
 
