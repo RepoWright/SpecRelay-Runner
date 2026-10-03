@@ -40,6 +40,21 @@ module SpecrelayRunner
       REQUIRED_FILES = [ SPEC_MD, INPUT_EVIDENCE_MD, BUSINESS_MD, TECHNICAL_MD ].freeze
       ALL_FILES = (REQUIRED_FILES + [ OPEN_QUESTIONS_MD, MANIFEST_JSON ]).freeze
 
+      # The documents a provider may return, keyed by the property name its structured output
+      # carries them under. A provider schema property may not contain "/", so each path is spelled
+      # with "_" in its place: one derivation over this closed set, read back by exact lookup and
+      # never applied to any other name.
+      PROVIDER_DOCUMENTS = (REQUIRED_FILES + [ OPEN_QUESTIONS_MD ]).to_h { |path| [ path.tr("/", "_"), path ] }.freeze
+
+      # The fixed schema a Claude specification invocation requests: every document a string, the
+      # required ones required, and nothing else admitted. Content rules stay {DocumentSet}'s.
+      PROVIDER_SCHEMA = {
+        "type" => "object",
+        "properties" => PROVIDER_DOCUMENTS.keys.to_h { |key| [ key, { "type" => "string" }.freeze ] }.freeze,
+        "required" => PROVIDER_DOCUMENTS.filter_map { |key, path| key if REQUIRED_FILES.include?(path) }.freeze,
+        "additionalProperties" => false
+      }.freeze
+
       # A Jira issue key is a closed shape (PROJECT-123). Validating it as such is what
       # lets the folder name be trusted as a path segment without escaping: anything that
       # is not this shape is refused, so no traversal or metacharacter can arrive inside

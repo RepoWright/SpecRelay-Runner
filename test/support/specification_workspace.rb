@@ -342,6 +342,10 @@ module SpecificationWorkspace
     }
   end
 
+  # `documents` as a schema-constrained Claude result reports them: keyed by the requested schema's
+  # property names, for the hand-written doubles that bake their own terminal frame.
+  def structured_output(documents) = documents.transform_keys { |path| path.tr("/", "_") }
+
   # `analyzer_answer` is what the SAME double replies with when it is asked the OTHER question
   # this profile answers — the optional external-reference analysis. One bare name, two questions,
   # exactly as a real host resolves them.
@@ -362,11 +366,18 @@ module SpecificationWorkspace
   # line, and one terminal result carrying the answer. The tool it reports names a path OUTSIDE any
   # repository, because this lane is assigned none — so a local path reaching the operator at all
   # is a defect this double is able to expose.
+  #
+  # When the launch requested a schema, the result also carries the answer as the real CLI reports
+  # it: `structured_output`, keyed by the schema's property names. An answer that is not a JSON
+  # object yields none, which is how a boundary test asks for a missing structured value.
   CLAUDE_FRAMES = <<~RUBY
     say("type" => "system", "subtype" => "init")
     say("type" => "assistant", "message" => { "content" => [
       { "type" => "tool_use", "name" => "Read", "input" => { "file_path" => "/elsewhere/notes.md" } } ] })
-    say("type" => "result", "subtype" => "success", "is_error" => false, "result" => answer)
+    terminal = { "type" => "result", "subtype" => "success", "is_error" => false, "result" => answer }
+    documents = ARGV.include?("--json-schema") ? (JSON.parse(answer) rescue nil) : nil
+    terminal["structured_output"] = documents.transform_keys { |path| path.tr("/", "_") } if documents.is_a?(Hash)
+    say(terminal)
   RUBY
 
   # The observed Codex thread shape: a started thread and turn, private reasoning the decoder must

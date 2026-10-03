@@ -151,6 +151,26 @@ class ClaudeProfileTest < Minitest::Test
     assert_equal PROFILE.fetch("args"), built.args
   end
 
+  # The specification lane's effective invocation: the exact base argv, then the fixed schema.
+  def test_the_specification_invocation_appends_only_the_fixed_schema_to_the_base_args
+    schema = JSON.generate(SpecrelayRunner::Specification::PackagePath::PROVIDER_SCHEMA)
+
+    assert_equal [ *PROFILE["args"], "--json-schema", schema ], profile.specification_args
+    assert_equal PROFILE["args"], profile.args
+    assert_includes profile.describe(profile.specification_args), "--verbose --dangerously-skip-permissions --json-schema {"
+    refute_includes profile.describe, "--json-schema"
+  end
+
+  # The schema is the runner's own, never the claim's: a canonical profile carrying one is not
+  # the canonical profile, and the claimed identity is still compared exactly.
+  def test_a_claim_carrying_a_schema_is_not_the_canonical_profile
+    canonical = SpecrelayRunner::ImplementationProfile.canonical("claude")
+    claimed = canonical.merge("args" => [ *canonical["args"], "--json-schema", "{}" ])
+
+    assert_raises(SpecrelayRunner::ImplementationProfile::Error) { SpecrelayRunner::ImplementationProfile.for(claimed) }
+    assert_equal canonical["args"], SpecrelayRunner::ImplementationProfile.for(canonical).args
+  end
+
   def test_describe_is_a_single_safe_line
     assert_equal "claude claude --print --output-format stream-json --verbose " \
                  "--dangerously-skip-permissions (prompt via argument)", profile.describe

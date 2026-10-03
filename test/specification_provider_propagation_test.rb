@@ -96,10 +96,10 @@ class SpecificationProviderPropagationTest < Minitest::Test
 
     assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
 
-    # MAPIAI-77: the specification lane has no approved root — its provider works in a private
-    # temporary directory — so containment can never be proven and every absolute local path
-    # renders as the placeholder. The lane still shares one renderer and one fan-out.
-    expected = [ "Provider started", "> Read [LOCAL_PATH]", "Provider completed" ]
+    # The specification lane withholds every free-form value — any of them could carry the
+    # documents — so a tool appears by identity alone, with no path at all. The lane still shares
+    # one renderer and one fan-out.
+    expected = [ "Provider started", "> Read", "Provider completed" ]
     expected.each { |status| assert_includes @io.string, "[claude:status] #{status}" }
 
     chunks = @platform.protocol_events.select { |event| event["event_type"] == "log.chunk" }

@@ -426,7 +426,8 @@ class SpecificationTaskWorkspaceTest < Minitest::Test
       system("/bin/sh", "-c", sabotage) if sabotage
       puts JSON.generate("type" => "system", "subtype" => "init")
       puts JSON.generate("type" => "result", "subtype" => "success", "is_error" => false,
-                         "result" => JSON.generate(#{files.to_json}))
+                         "result" => JSON.generate(#{files.to_json}),
+                         "structured_output" => #{SpecificationWorkspace.structured_output(files).to_json})
     RUBY
     dir
   end

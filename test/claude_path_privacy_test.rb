@@ -222,7 +222,7 @@ class ClaudePathPrivacyTest < Minitest::Test
   # The specification lane has NO approved root, so every absolute path is unprovable.
   def test_s10_the_specification_lane_has_no_approved_root_and_shows_no_absolute_path
     lane = []
-    decoder = SpecrelayRunner::ClaudeStream.new(sink: ->(_source, text) { lane << text })
+    decoder = SpecrelayRunner::ClaudeStream.new(sink: ->(_source, text) { lane << text }, withhold_documents: true)
     [ J.narration("Reading the packet at /private/var/folders/q7/T/claude-1/packet.json."),
       J.bash_call("cat #{MAC_ROOT}/spec.md"),
       J.bash_result("toolu_bash", stdout: "freshness: FRESH\n") ].each do |message|
@@ -230,8 +230,7 @@ class ClaudePathPrivacyTest < Minitest::Test
     end
 
     text = lane.join("\n")
-    assert_equal 2, text.scan(PLACEHOLDER).length
-    assert_includes text, "freshness: FRESH", "useful progress must remain"
+    assert_equal [ "> Bash", "< step completed" ], lane, "the lane shows tools and dispositions, never a path"
     assert_private_absent text
     refute_includes text, "packet.json"
   end

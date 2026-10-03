@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require "json"
+
 module SpecrelayRunner
   # The ONE supported real provider profile (MVP-0016): Claude Code, launched
   # non-interactively by the runner in the task worktree Platform assigned.
@@ -250,8 +252,18 @@ module SpecrelayRunner
         args, prompt_delivery, timeout_seconds, extra_env ]
     end
 
-    # A one-line, redacted description safe for a console line or a report field.
-    def describe = Redaction.redact("#{PROVIDER} #{command} #{args.join(' ')} (prompt via #{prompt_delivery})")
+    # The specification lane's EFFECTIVE invocation: the validated base argv, unchanged, then the
+    # fixed document schema. It lives here, beside the argv it extends, so the launch and the
+    # description an operator reads come from one list. No claim can supply or alter it — the base
+    # argv had to equal the canonical profile exactly, and the schema is a constant — so `identity`
+    # keeps comparing exactly what was claimed.
+    SCHEMA_FLAG = "--json-schema"
+
+    def specification_args = [ *args, SCHEMA_FLAG, JSON.generate(Specification::PackagePath::PROVIDER_SCHEMA) ]
+
+    # A one-line, redacted description safe for a console line or a report field. `argv` is the
+    # invocation actually launched when it is not the base one.
+    def describe(argv = args) = Redaction.redact("#{PROVIDER} #{command} #{argv.join(' ')} (prompt via #{prompt_delivery})")
 
     # The local, no-edit readiness check the runner performs BEFORE it asks
     # Platform for work: is the CLI installed, and is the operator logged in? It
