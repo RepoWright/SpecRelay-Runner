@@ -242,9 +242,11 @@ end
 # round, exactly as Platform does for a claim that follows a CHANGES_REQUESTED review. Omit it
 # to model a first execution, which carries no rework block at all.
 def claim_payload_for(task_id:, publication: nil, rework: nil, restart: nil,
-                      worktree_create_command: nil, root: nil, specification_repository: nil)
+                      worktree_create_command: nil, root: nil, specification_repository: nil,
+                      issue_key: nil)
   payload = base_claim_payload(task_id: task_id, worktree_create_command: worktree_create_command,
-                               root: root, specification_repository: specification_repository)
+                               root: root, specification_repository: specification_repository,
+                               issue_key: issue_key)
   payload = payload.merge("rework" => rework_block(rework), "report_contract" => rework_round(task_id)) if rework
   # MVP-0036 Stage 2b — a REPLACEMENT run's recorded target. Its report round stays the first
   # one, because the replacement is a new run rather than another round of the old one.
@@ -347,13 +349,18 @@ def rework_round(task_id)
 end
 
 def base_claim_payload(task_id:, worktree_create_command: nil, root: nil,
-                      specification_repository: nil)
+                      specification_repository: nil, issue_key: nil)
   {
     "contract_version" => "mvp-0010",
     "claim" => { "runner_execution_id" => "rex_test123", "claim_policy_mode" => "all_eligible" },
     # MVP-0025 names the LANE on every assignment, and Platform's RunPayload always sends it.
     "run" => { "id" => IMPL_RUN, "type" => "implementation", "task_id" => task_id,
                "canonical_branch" => task_id },
+    # The ticket this run implements, exactly as Runner::Api::RunPayload states it. A task id
+    # OPENS with the key but is not one, so a case that reasons about the key states it; the
+    # rest default to nothing stated, which is the shape every assertion on output already
+    # assumes.
+    "work_item" => { "issue_key" => issue_key },
     "workspace" => {
       "project_key" => "tiny-demo", "workspace_key" => "tiny-demo-workspace",
       "display_name" => "Tiny Demo Workspace", "repository_url" => "https://github.com/SpecRelay/tiny-demo-workspace",

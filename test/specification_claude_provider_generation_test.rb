@@ -478,4 +478,13 @@ class SpecificationClaudeProviderGenerationTest < Minitest::Test
 
     assert_includes error.message, "could not be read"
   end
+
+  # The fixed schema adapter rejects an unknown alias before DocumentSet; the text-map
+  # adapter still sends file names to that existing validation gate unchanged.
+  def test_a_leading_space_schema_alias_is_rejected_before_the_document_gate
+    error = refusal(VALID_STRUCTURED.merge(" analysis_business.md" => "business case"))
+
+    assert_includes error.message, "unrecognized document"
+    refute_includes error.message, "business case"
+  end
 end

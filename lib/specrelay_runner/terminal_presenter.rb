@@ -29,14 +29,26 @@ module SpecrelayRunner
   # gets the same facts as plain lines with no cursor control at all: erasing a row
   # that a log file will keep forever produces garbage, not animation.
   #
-  # Rendering is CR-and-spaces only — no ANSI, no colour. A `\e[K` would be shorter
-  # but assumes the sink understands it; returning the cursor and overwriting with
-  # spaces is true of every terminal, and keeps a captured transcript readable.
+  # Erasing is CR-and-spaces only — no `\e[K`. That would be shorter but assumes the sink
+  # understands it; returning the cursor and overwriting with spaces is true of every
+  # terminal, and keeps a captured transcript readable.
+  #
+  # WHICH WORK A LINE BELONGS TO is the one fact the output could not answer. A machine left
+  # in `loop` mode writes one run after another into the same scrollback, so the presenter
+  # carries the ticket key of the run that is active and puts it in front of every logical
+  # line and the transient row. It is SET from outside rather than derived here: nothing in
+  # this class parses a key out of a message, and a presenter holding none writes exactly
+  # what it wrote before.
   #
   # It owns rendering and nothing else. Claim, eligibility, execution, upload, and
   # report decisions stay with their own objects.
   class TerminalPresenter
     DEFAULT_COLUMNS = 96
+    # Colour for the ticket key and nothing else, in the one style TerminalMenu already uses
+    # for emphasis. Applied only to a terminal, and never carrying information on its own:
+    # the key is bracketed plain text first, so a pipe, a CI log, and a screenshot all still
+    # name the ticket.
+    KEY_STYLE = "36"
     # A floor for the CLIP only, so a degenerate width cannot ask for a negative slice. The
     # reported width is never rounded UP the way TerminalMenu rounds a menu frame: a menu that
     # overflows a very narrow terminal is ugly, but a transient row that overflows becomes a
@@ -74,9 +86,21 @@ module SpecrelayRunner
       @rendered = nil
       @frame = -1
       @finished = false
+      @ticket_key = nil
     end
 
     def transient? = @transient
+
+    # The ticket whose run is producing output right now, or nil between runs.
+    #
+    # Under the same mutex as every write, so a heartbeat timer or an executor reader thread
+    # cannot observe half a change — and so a line can only ever carry the key of the run that
+    # was active when it was written. Blank is the same as nothing: an assignment that states
+    # no key prefixes nothing rather than printing an empty pair of brackets.
+    def ticket_key=(key)
+      stated = key.to_s.strip
+      @mutex.synchronize { @ticket_key = stated.empty? ? nil : stated }
+    end
 
     # The terminal's own width, read on every draw so a resized window is respected. Only an
     # UNREPORTED width falls back to a default.
@@ -140,11 +164,15 @@ module SpecrelayRunner
     #
     # Guarded: the row is decoration, and a terminal that refuses it must not take
     # a run down. Transient rendering switches itself off rather than retrying.
+    #
+    # The row is MEASURED as the plain text it occupies and RENDERED with the key painted.
+    # Escape sequences have length but occupy no columns, so clipping or padding a painted
+    # string would turn one row into two and leave debris behind a shorter replacement.
     def draw(message)
-      text = clip("#{glyph} #{message}")
+      text = clip(prefixed("#{glyph} #{message}"))
       padding = " " * [ @rendered.to_s.length - text.length, 0 ].max
       @rendered = text
-      push_text(@out, "\r#{text}#{padding}\r")
+      push_text(@out, "\r#{paint_key(text, @out)}#{padding}\r")
       nil
     rescue IOError, SystemCallError
       @transient = false
@@ -168,10 +196,42 @@ module SpecrelayRunner
     # Durable writes are deliberately NOT guarded: a broken stdout is a real
     # failure for a record the operator is relying on, and swallowing it here
     # would change the failure semantics every existing writer has today.
+    #
+    # LOGICAL lines, not visual ones. A message carrying embedded newlines already became
+    # several rows from one call, so each of them is prefixed; a row the terminal wraps
+    # because it is wider than the window is not, because the prefix is attached when the
+    # line is written and not when it is displayed. Still ONE write, so a concurrent status
+    # frame cannot land in the middle of a multiline message.
     def write_line(message, sink: out)
       erase
-      push_text(sink, "#{message}\n")
+      push_text(sink, logical_rows(message).map { |row| "#{paint_key(prefixed(row), sink)}\n" }.join)
       nil
+    end
+
+    # The logical lines of a message. `split` answers an EMPTY message with no lines at all,
+    # which would silently drop the blank separator line `puts`/`line("")` has always written;
+    # an empty message is one empty line, exactly as it was before.
+    def logical_rows(message)
+      rows = message.split("\n", -1)
+      rows.empty? ? [ "" ] : rows
+    end
+
+    # The key as it is MEASURED: plain text, no escape sequences.
+    def key_token = @ticket_key && "[#{@ticket_key}]"
+
+    def prefixed(text)
+      token = key_token
+      token.nil? ? text : "#{token} #{text}"
+    end
+
+    # Painted only on a terminal, and only over a string that still opens with the whole
+    # plain token — a row clipped to a very narrow width keeps its text rather than being
+    # handed half an escape sequence.
+    def paint_key(text, sink)
+      token = key_token
+      return text if token.nil? || !text.start_with?(token) || !self.class.terminal?(sink)
+
+      "\e[#{KEY_STYLE}m#{token}\e[0m#{text[token.length..]}"
     end
 
     def push_text(sink, bytes)

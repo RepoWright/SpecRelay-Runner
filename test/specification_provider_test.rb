@@ -230,6 +230,42 @@ class SpecificationProviderTest < Minitest::Test
     refute_includes @io.string, "escaped.md"
   end
 
+  # Through the text-map adapter (the schema adapter rejects unknown aliases): a valid map in which one document also arrives, with equal content, under
+  # a name carrying a single leading space completes, and the package on disk holds canonical names
+  # only.
+  def test_a_duplicate_document_name_with_a_leading_space_still_produces_a_canonical_package
+    documents = valid_documents
+    documents[" analysis/business.md"] = documents["analysis/business.md"]
+    restart_platform(spec_creation_payload_for(issue_key: ISSUE, specification_provider:
+      { "profile" => SpecrelayRunner::CodexProfile::PROVIDER,
+        "executor" => SpecrelayRunner::CodexProfile::CANONICAL }))
+    provider = SpecificationWorkspace.codex_stub(@temp, files: documents)
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, run_with(provider), @io.string
+    assert_equal [ "analysis", "analysis/business.md", "analysis/input-evidence.md",
+                   "analysis/technical.md", "generation-manifest.json", "spec.md" ],
+                 Dir.glob("**/*", base: package_root).sort
+  end
+
+  # The same two names carrying DIFFERENT documents has no safe resolution, so the run refuses
+  # rather than publishing one of them under a name the provider did not pair it with — and, like
+  # every other rejected document set, it refuses before anything reaches disk.
+  def test_a_leading_space_duplicate_with_different_content_is_rejected_before_anything_is_written
+    documents = valid_documents
+    documents[" analysis/business.md"] =
+      documents["analysis/business.md"].sub("# Business analysis", "# Revised business analysis")
+    restart_platform(spec_creation_payload_for(issue_key: ISSUE, specification_provider:
+      { "profile" => SpecrelayRunner::CodexProfile::PROVIDER,
+        "executor" => SpecrelayRunner::CodexProfile::CANONICAL }))
+    provider = SpecificationWorkspace.codex_stub(@temp, files: documents)
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_with(provider), @io.string
+    assert_no_package
+    assert_equal "generated_output_invalid", @platform.last_specification_generation["failure_class"]
+    assert_includes @io.string, "leading space"
+    refute_includes @io.string, "Revised business analysis"
+  end
+
   def test_provider_output_without_a_structured_document_map_is_rejected
     provider = provider_stub(answer: "<html>not json</html>")
 
