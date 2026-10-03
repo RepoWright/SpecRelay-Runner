@@ -228,9 +228,9 @@ class SpecificationProviderTest < Minitest::Test
     assert_includes @io.string, "unexpected files"
   end
 
-  # The observed defect, at the real boundary: a complete, valid map in which one document also
-  # arrives under a name carrying a single leading space. The run used to be discarded whole after
-  # a full provider turn; it now completes, and the package on disk holds canonical names only.
+  # At the real boundary: a valid map in which one document also arrives, with equal content, under
+  # a name carrying a single leading space completes, and the package on disk holds canonical names
+  # only.
   def test_a_duplicate_document_name_with_a_leading_space_still_produces_a_canonical_package
     documents = valid_documents
     documents[" analysis/business.md"] = documents["analysis/business.md"]

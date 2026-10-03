@@ -500,8 +500,8 @@ class SpecificationDocumentSetTest < Minitest::Test
     MD
   end
 
-  # The observed failure: a complete, valid map in which the business analysis arrives a SECOND
-  # time under a name carrying one leading space. The whole package used to be discarded for it.
+  # A valid map in which the business analysis arrives a SECOND time, with equal content, under a
+  # name carrying one leading space.
   #
   # Asserted on the resolved file set rather than only on acceptance — a key that were merely
   # tolerated would pass `validate!` and then never be written, because `#each_file` yields the

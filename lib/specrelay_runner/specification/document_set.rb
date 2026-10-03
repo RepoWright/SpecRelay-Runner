@@ -143,22 +143,14 @@ module SpecrelayRunner
       NO_BULLET_YET = :no_bullet_yet
       private_constant :NO_BULLET_YET
 
-      # The ONE provider misspelling this gate resolves instead of rejecting: a document name
-      # carrying exactly one leading ASCII space. A real generation run spent a full provider turn
-      # writing a complete, valid package and was then discarded whole because one key in the
-      # returned map read " analysis/business.md" — a duplicate of a document the same map already
-      # carried under its correct name. The turn is the expensive thing here; the space is not.
+      # The ONE provider misspelling this gate resolves instead of rejecting: a Markdown document
+      # name carrying exactly one leading ASCII space. It is a fixed MAP of the exact aliases, not a
+      # strip rule, so every other spelling — two spaces, a trailing space, a tab, a non-breaking
+      # space, a case variant, an absolute or traversing path — still reaches the unexpected-files
+      # rejection, and widening it is a deliberate edit to a visible list.
       #
-      # It is a fixed MAP of the exact aliases, not a strip-and-retry rule, because the containment
-      # IS the point. Every other spelling — two spaces, a trailing space, a tab, a non-breaking
-      # space, a case variant, an absolute or traversing path — still falls through to the
-      # unexpected-files rejection untouched, and widening this is a deliberate edit to a visible
-      # list rather than a change to one character class.
-      #
-      # {PackagePath::MANIFEST_JSON} is deliberately absent. That file is this runner's own output,
-      # written by the package writer after validation; a provider that returns it under ANY
-      # spelling is returning something it does not author, and tolerance there would be tolerance
-      # of the wrong thing.
+      # Only the manifest's ALIAS is excluded. The canonical {PackagePath::MANIFEST_JSON} name is in
+      # {PackagePath::ALL_FILES} and keeps its existing handling.
       DOCUMENT_ALIASES = (PackagePath::ALL_FILES - [ PackagePath::MANIFEST_JSON ])
                          .to_h { |name| [ " #{name}", name ] }.freeze
 
@@ -251,11 +243,9 @@ module SpecrelayRunner
 
       private
 
-      # One canonical name, one document. Reached twice with byte-identical content — the observed
-      # case, where the provider returned the same document under both spellings — the two are the
-      # same document and collapse to one. Reached twice with DIFFERENT content, there is no honest
-      # answer: either body would be published under a name the provider did not pair it with, and
-      # which one survived would depend on nothing but map order. So it refuses, in both orders.
+      # One canonical name, one document. Reached twice with equal content, the two collapse to one.
+      # Reached twice with DIFFERENT content, it refuses in both orders: keeping either body would
+      # publish it under a name the provider did not pair it with, chosen by map order alone.
       #
       # Compared as the provider wrote them, before the writer's redaction runs: two documents that
       # differ only inside a secret-shaped value genuinely differ, and comparing redacted forms
