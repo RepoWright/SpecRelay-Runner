@@ -360,8 +360,8 @@ class ClaudeProfileTest < Minitest::Test
   end
 
   # The reviewer is configured on its own and keeps its own limit when the Claude profile's limit changes.
-  def test_the_reviewer_keeps_its_own_1800_second_limit
-    assert_equal 1800, SpecrelayRunner::Review::Settings.new({ "provider" => "claude" }, env: {}).timeout_seconds
+  def test_the_reviewer_keeps_its_own_7200_second_limit
+    assert_equal 7200, SpecrelayRunner::Review::Settings.new({ "provider" => "claude" }, env: {}).timeout_seconds
   end
 
   # The identity is what the guard compares; it must carry every launch-deciding

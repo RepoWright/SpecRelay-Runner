@@ -288,6 +288,9 @@ class FakePlatform
   # waiting on, and a scripted answer for the acknowledgement itself. The hold is called on this
   # fake's accept thread before the poll is answered.
   attr_accessor :question_poll_hold, :delivery_response
+  # Called before the claim is answered, so a test can delay the response the way a slow network
+  # or proxy does — after Platform has already granted the lease.
+  attr_accessor :claim_hold
 
   # The recorded portable checkpoint this fake hands back on the claim-bound download path, and
   # a scripted response so a test can put a transfer failure in front of a runner that has not
@@ -437,7 +440,7 @@ class FakePlatform
     when "/api/runner/presence" then presence(request)
     when "/api/runner/cancellation_cleanup_target" then cancellation_cleanup_target
     when "/api/runner/events" then events(request)
-    when "/api/runner/heartbeat" then [ 200, { acknowledged: true, state: "EXECUTING", lease: lease_signal } ]
+    when "/api/runner/heartbeat" then heartbeat
     when "/api/runner/reports" then report(request)
     # A runner abandoning its own claim before it executed anything. The fake answers
     # what Platform answers, because the runner PRINTS the run state back and a constant would
@@ -750,7 +753,15 @@ class FakePlatform
     @mutex.synchronize { @cleanup_targets.shift } || [ 200, { target: nil } ]
   end
 
+  # Platform acknowledges a heartbeat exactly when it renewed the lease: a live, uncancelled one.
+  def heartbeat
+    signal = lease_signal
+    renewed = signal["state"] == "active" && !signal["cancel_requested"]
+    [ 200, { acknowledged: renewed, state: "EXECUTING", lease: signal } ]
+  end
+
   def claim
+    claim_hold&.call
     return [ 401, { error: "claim_limit_reached" } ] if claim_limit_reached?
     return queued_claim unless @queued_claims.nil?
     if @claimed

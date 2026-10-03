@@ -197,7 +197,8 @@ module SpecrelayRunner
     def start_heartbeater
       @heartbeater = Heartbeater.new(
         client: client, claim: claim, interval_seconds: renewal_seconds,
-        io: io, stop_after_seconds: stop_heartbeat_after
+        io: io, stop_after_seconds: stop_heartbeat_after,
+        lease_seconds: Heartbeater.lease_seconds(payload["execution_policy"])
       ).start
     end
 
@@ -210,8 +211,13 @@ module SpecrelayRunner
       value.positive? ? value : nil
     end
 
+    # Every reason this claim must stop, from every observer of the lease. The provider's stop
+    # check reads it too, so a claim lost while the provider runs ends that provider instead of
+    # waiting for it to finish.
+    def stop_reason = @heartbeater&.stop_reason || @log_stream&.stop_reason || @lease_stop_reason
+
     def check_stop!
-      reason = @heartbeater&.stop_reason || @log_stream&.stop_reason || @lease_stop_reason
+      reason = stop_reason
       raise Aborted, reason if reason
     end
 
@@ -219,12 +225,24 @@ module SpecrelayRunner
     # the Run's environment goes back. Any other stop keeps it: this process cannot show the Run ended.
     def aborted_result(error)
       reason = error.message.to_s.empty? ? "the lease is no longer live" : error.message
+      return unconfirmed_result if reason == Heartbeater::UNCONFIRMED
+
       cancelled = reason == CANCELLED
       log("Stopping #{run['task_id']}: Platform reports #{reason}. No report was uploaded.")
       log(cancelled ? "The run is cancelled on Platform; its task environment is handed back." :
                       "Platform owns the outcome; this run's task environment is kept.")
       Result.new(outcome: :aborted, run_ended: cancelled,
                  message: "Runner outcome: aborted (#{reason}); claim released to Platform, no report uploaded.")
+    end
+
+    # This machine stopped on its own: it could not show the claim was still its own, which is not
+    # something Platform said, and nothing was handed back.
+    def unconfirmed_result
+      log("Stopping #{run['task_id']}: no renewal of this claim was confirmed within the lease. " \
+          "No report was uploaded.")
+      log("This run's task environment is kept.")
+      Result.new(outcome: :aborted,
+                 message: "Runner outcome: aborted (#{Heartbeater::UNCONFIRMED}); no report uploaded.")
     end
 
     def preflight_failure(error)
@@ -754,7 +772,7 @@ module SpecrelayRunner
                                         @scenario_evidence_dir),
                             on_output: (@provider_stream || @log_stream).sink,
                             on_start: -> { @bridge.confirm_resume },
-                            stop_check: -> { @bridge.stop_provider? })
+                            stop_check: -> { @bridge.stop_provider? || !stop_reason.nil? })
       decoded(result)
     ensure
       @log_stream&.finish
@@ -1235,12 +1253,14 @@ module SpecrelayRunner
 
     # Emit ONE ordered v1 protocol event, then heartbeat. Both responses carry the
     # lease/cancellation liveness signal (MVP-0012); observe it so a
-    # cancellation/expiry that lands at a phase boundary is noticed immediately.
+    # cancellation/expiry that lands at a phase boundary is noticed immediately. The heartbeat is
+    # read by the heartbeater, the one owner of what a renewal means, so the check that follows —
+    # including the last one before the provider launches — also requires a confirmed renewal.
     # Console output is redacted defensively.
     def emit(event_type, summary, **attributes)
       log("[#{event_type}] #{summary}")
       observe_lease(emitter.emit(event_type, summary, **attributes))
-      observe_lease(client.heartbeat(claim: claim))
+      @heartbeater.renew
       check_stop!
     end
 

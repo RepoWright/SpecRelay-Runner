@@ -113,12 +113,92 @@ class SpecificationLeaseLifecycleTest < Minitest::Test
     assert_includes @io.string, "No generation result was submitted"
   end
 
-  # A transport failure reaching Platform is a reporting problem, not a lost claim: the run goes
-  # on and still records its result.
-  def test_an_unreachable_heartbeat_does_not_stop_the_run
-    with_failing_heartbeats { assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string }
+  # A claim no renewal was ever confirmed for has no authority to start a model run: the claim
+  # response proves nothing about how long ago Platform granted the lease. Nothing is launched,
+  # nothing is submitted, the workspace is kept, and the ending says what this machine saw.
+  def test_a_claim_no_renewal_was_ever_confirmed_for_launches_no_provider
+    with_failing_heartbeats { assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string }
 
-    assert_equal "generated", @platform.last_specification_generation["outcome"]
+    refute provider_generated?, "the provider was launched without a confirmed renewal"
+    assert_empty @platform.specification_generations
+    assert_includes @io.string, "no renewal of this claim was confirmed within the lease"
+    refute_empty SpecificationWorkspace.isolated_workspaces(@temp)
+  end
+
+  # ---------------------------------------------------- a claim lost while the provider runs
+
+  # Platform cancels the run while the model works. The provider's process group ends at once,
+  # the ending is the cancellation rather than a provider failure, and the cancelled run's
+  # workspace goes with it, exactly as a cancellation noticed at a phase boundary does.
+  def test_a_cancellation_while_the_provider_runs_ends_the_provider
+    use_held_provider
+
+    latency = stop_latency { @platform.signal_cancelled! }
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, @exit_code, @io.string
+    assert_operator latency, :<, HOLD_SECONDS - 8, "the provider was allowed to finish:\n#{@io.string}"
+    assert held_provider_gone?
+    assert_empty @platform.specification_generations, "a stopped provider is not a generation failure to report"
+    assert_includes @io.string, "Platform reports cancelled"
+    assert_empty SpecificationWorkspace.isolated_workspaces(@temp)
+  end
+
+  # A provider that ignores TERM is still ended: the shutdown escalates to KILL and the group is
+  # shown to be gone before the run ends.
+  def test_a_provider_that_ignores_term_is_killed_when_the_claim_is_lost
+    use_held_provider(ignore_term: true)
+
+    latency = stop_latency { @platform.signal_expired! }
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, @exit_code, @io.string
+    assert_operator latency, :<, HOLD_SECONDS - 4, "the provider was allowed to finish:\n#{@io.string}"
+    assert_operator latency, :>=, SpecrelayRunner::CommandRunner::TERM_GRACE_SECONDS,
+                    "a TERM-ignoring provider can only end through KILL, after the grace"
+    assert held_provider_gone?
+    assert_empty @platform.specification_generations
+  end
+
+  # A provider group that cannot be shown to have ended ends the terminal session: no next claim
+  # is taken on a machine where it may still be running.
+  def test_a_provider_group_not_shown_gone_takes_no_next_claim
+    use_held_provider
+    restart_platform(claim_limit: 2) { |platform| platform.queue_claims([ claim_payload, claim_payload ]) }
+    platform = @platform
+    cancel = Thread.new do
+      sleep 0.05 until File.exist?(held_pid_file)
+      platform.signal_expired!
+    end
+
+    with_provider_group_surviving_kill do
+      Timeout.timeout(120) { @exit_code = run_cli(command: %w[loop --poll-interval 5 --on-failure continue]) }
+    end
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, @exit_code, @io.string
+    assert_includes @io.string, "a supervised command could not be shown to have ended"
+    assert_equal 1, @platform.requests_to("/api/runner/claim").length, @io.string
+  ensure
+    cancel&.kill
+  end
+
+  # Renewal stops being confirmed while the model works. This machine stops on its own and says
+  # so: it is not something Platform reported. The workspace is kept, as for any ending that is
+  # not Platform's own cancellation.
+  def test_unconfirmed_renewal_while_the_provider_runs_stops_it_and_says_why
+    @platform.claim_payload = claim_payload.tap do |payload|
+      payload["execution_policy"] = payload["execution_policy"].merge("lease_duration_seconds" => 3)
+    end
+    use_held_provider
+
+    marker = held_pid_file
+    latency = with_failing_heartbeats(when_file: marker) { stop_latency }
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, @exit_code, @io.string
+    assert_operator latency, :<, HOLD_SECONDS - 8, "the provider was allowed to finish:\n#{@io.string}"
+    assert held_provider_gone?
+    assert_empty @platform.specification_generations
+    assert_includes @io.string, "no renewal of this claim was confirmed within the lease"
+    refute_match(/Platform reports/, @io.string)
+    refute_empty SpecificationWorkspace.isolated_workspaces(@temp)
   end
 
   # ---------------------------------------------------- one worker, one ensured stop
@@ -200,15 +280,87 @@ class SpecificationLeaseLifecycleTest < Minitest::Test
     SpecrelayRunner::PlatformClient.define_method(:heartbeat, original)
   end
 
-  # Platform unreachable for renewal only, so the claim and the result still travel.
-  def with_failing_heartbeats
+  # Platform unreachable for renewal only, so the claim and the result still travel. With
+  # `when_file`, only once that file exists.
+  def with_failing_heartbeats(when_file: nil)
     original = SpecrelayRunner::PlatformClient.instance_method(:heartbeat)
     SpecrelayRunner::PlatformClient.define_method(:heartbeat) do |claim:|
-      raise SpecrelayRunner::PlatformClient::Error, "Platform is unreachable (#{claim})"
+      raise SpecrelayRunner::PlatformClient::Error, "Platform is unreachable (#{claim})" if when_file.nil? || File.exist?(when_file)
+
+      original.bind(self).call(claim: claim)
     end
     yield
   ensure
     SpecrelayRunner::PlatformClient.define_method(:heartbeat, original)
+  end
+
+  # How long the model would work if nothing stopped it. Long enough that finishing on its own and
+  # being stopped are unmistakable apart.
+  HOLD_SECONDS = 20
+
+  def held_pid_file = File.join(@temp, "held-provider.pid")
+
+  # The approved provider's bare name, holding the GENERATION call open with its process id written
+  # down; the reference analysis and the readiness probes pass straight through.
+  def use_held_provider(ignore_term: false)
+    original = File.join(provider_stub, "claude")
+    dir = Dir.mktmpdir("held-claude", @temp)
+    SpecificationWorkspace.write_executable(File.join(dir, "claude"), <<~RUBY)
+      #!/usr/bin/env ruby
+      probe = ARGV.first == "--version" || %w[auth login].include?(ARGV.first)
+      if !probe && ARGV.last.to_s.include?(#{SpecificationWorkspace::GENERATION_MARKER.inspect})
+        File.write(#{held_pid_file.inspect}, Process.pid.to_s)
+        trap("TERM", "IGNORE") if #{ignore_term}
+        sleep #{HOLD_SECONDS}
+      end
+      exec(#{original.inspect}, *ARGV)
+    RUBY
+    @provider_stub = dir
+  end
+
+  # Runs one claim, calling `on_provider` once the provider is running, and returns how long the
+  # session went on after that moment.
+  def stop_latency(&on_provider)
+    started = nil
+    watcher = Thread.new do
+      sleep 0.05 until File.exist?(held_pid_file)
+      started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      on_provider&.call
+    end
+    @exit_code = run_cli
+    flunk("the provider was never launched:\n#{@io.string}") if started.nil?
+    Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+  ensure
+    watcher&.kill
+  end
+
+  def held_provider_gone?
+    Process.kill(0, -File.read(held_pid_file).to_i)
+    false
+  rescue Errno::ESRCH
+    true
+  rescue Errno::EPERM
+    # Members not yet reaped answer EPERM on this platform: not yet shown gone.
+    false
+  end
+
+  # The provider's group is really ended, but the shutdown cannot show it: the boundary a group
+  # that survives KILL reaches. Only a stop the runner requested is affected; every other command
+  # finishes as it always does.
+  def with_provider_group_surviving_kill
+    original = SpecrelayRunner::CommandRunner.instance_method(:terminate_group)
+    SpecrelayRunner::CommandRunner.define_method(:terminate_group) do |pid, reaped = false, status = nil|
+      next original.bind(self).call(pid, reaped, status) if reaped || !send(:stop_requested?)
+
+      Process.kill("KILL", -pid) rescue nil
+      raise SpecrelayRunner::CommandRunner::TerminationFailed,
+            "process group #{pid} (claude) did not end within 10s of TERM and KILL"
+    end
+    SpecrelayRunner::CommandRunner.send(:private, :terminate_group)
+    yield
+  ensure
+    SpecrelayRunner::CommandRunner.define_method(:terminate_group, original)
+    SpecrelayRunner::CommandRunner.send(:private, :terminate_group)
   end
 
   # Flip Platform's liveness answer the moment the provider has produced its documents, so the

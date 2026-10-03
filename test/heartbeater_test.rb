@@ -125,6 +125,160 @@ class HeartbeaterTest < Minitest::Test
     assert_nil @beater.stop_reason, "a lapsed lease is Platform's call, not the runner's"
   end
 
+  # ------------------------------------------------------------ authority window
+
+  # What Platform answers when it renewed: an explicit acknowledgement on a live lease.
+  RENEWED = { "acknowledged" => true, "lease" => { "state" => "active", "cancel_requested" => false } }.freeze
+
+  # A heartbeat whose answer the test releases, so "a request is still in flight" is a state the
+  # test holds rather than a race it hopes for. Every other call answers from the script.
+  class HeldClient < ScriptedClient
+    def initialize(*script)
+      super
+      @held = Queue.new
+      @holding = false
+    end
+
+    def hold_next! = @mutex.synchronize { @holding = true }
+    def release!(answer) = @held << answer
+    def in_flight? = @mutex.synchronize { @in_flight }
+
+    def heartbeat(claim:)
+      held = @mutex.synchronize { @holding.tap { @holding = false } }
+      return super unless held
+
+      @mutex.synchronize { @in_flight = true }
+      answer = @held.pop
+      @mutex.synchronize { @in_flight = false }
+      answer
+    end
+  end
+
+  def build_with_window(client, lease_seconds:)
+    @beater = SpecrelayRunner::Heartbeater.new(client: client, claim: "rex_test", interval_seconds: 1,
+                                               io: @io, lease_seconds: lease_seconds)
+  end
+
+  # An output sink that blocks every write until the test releases it, and counts the writes.
+  class BlockingSink
+    def initialize
+      @gate = Queue.new
+      @writes = 0
+      @mutex = Mutex.new
+    end
+
+    def writes = @mutex.synchronize { @writes }
+    def release! = @gate << :open
+
+    def puts(*)
+      @mutex.synchronize { @writes += 1 }
+      @gate.pop
+    end
+  end
+
+  # The provider's stop check reads the stop reason on the thread that must then send TERM/KILL,
+  # so the read may not wait on anything — not even a terminal that has stopped draining. The
+  # operator copy for this stop belongs to the lane's aborted outcome, after the shutdown.
+  def test_reading_an_elapsed_window_returns_at_once_without_writing_output
+    sink = BlockingSink.new
+    @beater = SpecrelayRunner::Heartbeater.new(client: ScriptedClient.new(RENEWED), claim: "rex_test",
+                                               interval_seconds: 1, io: sink, lease_seconds: 60)
+
+    reader = Thread.new { @beater.stop_reason }
+
+    assert reader.join(0.5), "reading the stop reason did not return while output was blocked"
+    assert_equal SpecrelayRunner::Heartbeater::UNCONFIRMED, reader.value
+    assert_equal 0, sink.writes, "the stop reason read must not write output"
+  ensure
+    sink&.release!
+    reader&.join(1)
+  end
+
+  # Platform granted the claim's lease before its response left, after an unbounded delay, so the
+  # claim alone gives this machine no authority to start work: only an acknowledged renewal does.
+  def test_a_claim_has_no_authority_until_a_renewal_is_acknowledged
+    build_with_window(ScriptedClient.new(RENEWED), lease_seconds: 60)
+
+    assert_equal SpecrelayRunner::Heartbeater::UNCONFIRMED, @beater.stop_reason
+  end
+
+  # The delayed claim response: by the time the first renewal reaches Platform the lease has
+  # lapsed, and Platform declines to renew it.
+  def test_a_renewal_platform_declines_is_a_stop_not_authority
+    declined = { "acknowledged" => false, "lease" => { "state" => "expired", "cancel_requested" => false } }
+    build_with_window(ScriptedClient.new(declined), lease_seconds: 60)
+
+    @beater.renew
+
+    assert_equal "expired", @beater.stop_reason
+  end
+
+  # HTTP 200 alone is not renewal: an answer that does not acknowledge the renewal stops the claim
+  # even when the lease it describes still reads active, and a terminal lease stops it too.
+  def test_an_unacknowledged_or_terminal_answer_is_a_stop
+    unacknowledged = { "acknowledged" => false, "lease" => { "state" => "active", "cancel_requested" => false } }
+    terminal = { "acknowledged" => false, "lease" => { "state" => "terminal", "cancel_requested" => false } }
+    { unacknowledged => "expired", terminal => "terminal" }.each do |answer, reason|
+      build_with_window(ScriptedClient.new(answer), lease_seconds: 60)
+      @beater.renew
+
+      assert_equal reason, @beater.stop_reason, answer.inspect
+    end
+  end
+
+  # Transport failures inside a confirmed window cost nothing: the next acknowledged renewal
+  # extends the window and the claim never stops.
+  def test_transient_failures_inside_the_window_do_not_stop_the_claim
+    client = ScriptedClient.new(RENEWED, timeout_error, timeout_error, RENEWED)
+    build_with_window(client, lease_seconds: 4)
+    @beater.renew
+    @beater.start
+
+    observed = []
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 5.5
+    while Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
+      observed << @beater.stop_reason
+      sleep 0.1
+    end
+
+    assert_operator client.attempts.length, :>=, 4, "the window must have been renewed after the failures"
+    assert_equal [ nil ], observed.uniq, @io.string
+  end
+
+  # A renewal request that never returns cannot postpone the stop: the window is read on every
+  # check, not when the beat thread next gets a chance.
+  def test_a_blocked_renewal_request_cannot_postpone_the_stop
+    client = HeldClient.new(RENEWED)
+    build_with_window(client, lease_seconds: 2)
+    @beater.renew
+    client.hold_next!
+    @beater.start
+
+    wait_until("the window to close while a renewal is still in flight", timeout: 6) { @beater.stop_reason }
+
+    assert client.in_flight?, "the renewal request must still be blocked when the claim stops"
+    assert_equal SpecrelayRunner::Heartbeater::UNCONFIRMED, @beater.stop_reason
+  ensure
+    client&.release!(RENEWED)
+  end
+
+  # A stop is final: an acknowledgement that arrives after it was recorded — the late answer to the
+  # request that was blocked — never revives the claim.
+  def test_a_late_acknowledgement_never_revives_a_stopped_claim
+    client = HeldClient.new(RENEWED)
+    build_with_window(client, lease_seconds: 2)
+    @beater.renew
+    client.hold_next!
+    @beater.start
+    wait_until("the window to close", timeout: 6) { @beater.stop_reason }
+
+    client.release!(RENEWED)
+    wait_until("the late acknowledgement to be read") { !client.in_flight? }
+    @beater.renew
+
+    assert_equal SpecrelayRunner::Heartbeater::UNCONFIRMED, @beater.stop_reason
+  end
+
   private
 
   def timeout_error = Net::OpenTimeout.new("execution expired connecting to #{SYNTHETIC_USERINFO_URL}")

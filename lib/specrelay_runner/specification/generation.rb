@@ -206,8 +206,10 @@ module SpecrelayRunner
       # provider call only: it is a record of the generation, not of the whole claim.
       #
       # A stop signal Platform returns on one of those events is treated exactly as the
-      # heartbeater's is — the next {#checkpoint!} raises on it — so live delivery cannot become
-      # a second way to decide whether this claim is still live.
+      # heartbeater's is, so live delivery cannot become a second way to decide whether this claim
+      # is still live. Both are read WHILE the provider runs: a claim lost mid-generation ends the
+      # provider's process group, and the provider failure that follows is that stop, not a
+      # generation failure to report.
       #
       # EVERY provider gets one, because every provider this lane can resolve is a real model
       # whose work takes long enough to watch. The stream is labelled with the kind that actually
@@ -215,7 +217,12 @@ module SpecrelayRunner
       def generated(ready, packet)
         stream = start_log_stream(ready.provider.kind)
         begin
-          ready.provider.generate(packet, on_output: stream.sink)
+          ready.provider.generate(packet, on_output: stream.sink, stop_check: -> { !stop_reason(stream).nil? })
+        rescue Provider::Failed
+          reason = stop_reason(stream)
+          raise Aborted, reason if reason
+
+          raise
         ensure
           stream.finish
           @lease_stop_reason ||= stream.stop_reason
@@ -352,7 +359,8 @@ module SpecrelayRunner
       def aborted(error, ready)
         reason = error.message.to_s.empty? ? "the lease is no longer live" : error.message
         log("")
-        log("Stopping: Platform reports #{reason}. No generation result was submitted.")
+        cause = reason == Heartbeater::UNCONFIRMED ? "no renewal of this claim was confirmed within the lease" : "Platform reports #{reason}"
+        log("Stopping: #{cause}. No generation result was submitted.")
         if reason == Execution::CANCELLED
           discard(ready.workspace)
         else
@@ -543,7 +551,8 @@ module SpecrelayRunner
       def start_heartbeater(assignment)
         @heartbeater = Heartbeater.new(
           client: client, claim: assignment.runner_execution_id, interval_seconds: renewal_seconds(assignment),
-          io: io, stop_after_seconds: stop_heartbeat_after
+          io: io, stop_after_seconds: stop_heartbeat_after,
+          lease_seconds: Heartbeater.lease_seconds(payload["execution_policy"])
         ).start
       end
 
@@ -570,26 +579,22 @@ module SpecrelayRunner
       # would never look at the signal at all. It would then report success for a run an
       # operator had already cancelled, which is exactly what criterion 10 forbids.
       #
-      # A heartbeat that fails in transport is NOT treated as a stop: an unreachable Platform
-      # is a reporting problem, and killing a generation over one would turn a network blip
-      # into a lost package. The lease expiring is Platform's own remedy for that case.
+      # The heartbeater reads the response, as it reads every renewal. A heartbeat that fails in
+      # transport is not by itself a stop: the claim continues while an earlier acknowledged
+      # renewal still covers it. A claim no renewal has ever covered, or whose cover has run out,
+      # stops here — before the provider is launched, before the write and before the report.
       def checkpoint!
-        observe_lease(client.heartbeat(claim: assignment.runner_execution_id))
+        @heartbeater.renew
         check_stop!
       rescue PlatformClient::Error
         check_stop!
       end
 
-      def observe_lease(response)
-        lease = response.is_a?(Hash) ? response["lease"].to_h : {}
-        state = lease["state"].to_s
-        return if state.empty? || (state == "active" && !lease["cancel_requested"])
-
-        @lease_stop_reason ||= lease["cancel_requested"] ? "cancelled" : state
-      end
+      # Every reason this claim must stop, including the live log stream's while it is open.
+      def stop_reason(stream = nil) = @heartbeater&.stop_reason || stream&.stop_reason || @lease_stop_reason
 
       def check_stop!
-        reason = @heartbeater&.stop_reason || @lease_stop_reason
+        reason = stop_reason
         raise Aborted, reason if reason
       end
 

@@ -36,7 +36,7 @@ class SpecificationClaudeProviderGenerationTest < Minitest::Test
 
     attr_reader :calls
 
-    def run(argv, chdir:, env:, timeout_seconds:, on_output: nil)
+    def run(argv, chdir:, env:, timeout_seconds:, on_output: nil, stop_check: nil)
       @calls << Call.new(argv: argv, chdir: chdir, env: env, timeout_seconds: timeout_seconds)
       @lines.each { |line| on_output&.call("stdout", line) }
       @result
