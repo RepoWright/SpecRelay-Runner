@@ -274,4 +274,15 @@ class SpecificationClaudeProviderGenerationTest < Minitest::Test
 
     assert_includes error.message, "could not be read"
   end
+
+  # The decoder is not where a misspelled document name is repaired. A key carrying a leading
+  # space arrives byte for byte, so the one gate that judges file names sees what the provider
+  # actually wrote — and both adapters are judged by it rather than each normalizing its own way.
+  def test_a_document_name_with_a_leading_space_reaches_the_gate_unchanged
+    answer = JSON.generate(VALID_DOCUMENTS.merge(" analysis/business.md" => "business case"))
+
+    documents, = generate({ "issue_key" => "SR-700" }, answer: answer)
+
+    assert_equal "business case", documents.fetch(" analysis/business.md")
+  end
 end

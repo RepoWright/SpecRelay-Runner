@@ -304,6 +304,17 @@ class SpecificationCodexProviderGenerationTest < Minitest::Test
     assert_includes unusable(lines), SpecrelayRunner::CodexStream::FAILURE_INCOMPLETE
   end
 
+  # The same question the Claude adapter answers: a key carrying a leading space is delivered
+  # verbatim rather than repaired here, so one gate — not two decoders — decides what a document
+  # name may be.
+  def test_a_document_name_with_a_leading_space_reaches_the_gate_unchanged
+    answer = JSON.generate(VALID_DOCUMENTS.merge(" analysis/business.md" => "business case"))
+
+    documents, = generate({ "issue_key" => "SR-700" }, answer: answer)
+
+    assert_equal "business case", documents.fetch(" analysis/business.md")
+  end
+
   # The prepared task environment a real run hands the provider. These examples are about the
   # stream and the file map, so an ordinary directory is enough; what matters is that the
   # boundary requires one at all.

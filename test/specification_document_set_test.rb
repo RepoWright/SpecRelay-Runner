@@ -484,4 +484,172 @@ class SpecificationDocumentSetTest < Minitest::Test
 
     assert_includes error.message, "level-1 title"
   end
+
+  # ------------------------------------------------------------ the single leading-space alias
+
+  # A valid open-questions document, for the tests that alias the OPTIONAL file.
+  def open_questions_document
+    <<~MD
+      # Open questions — #{ISSUE}
+
+      ## OQ-001
+
+      - Why it blocks: the recorded inputs do not decide this.
+      - Decision required: what happens on a second identical request?
+      - Consequence: an implementer must guess.
+    MD
+  end
+
+  # A valid map in which the business analysis arrives a SECOND time, with equal content, under a
+  # name carrying one leading space.
+  #
+  # Asserted on the resolved file set rather than only on acceptance — a key that were merely
+  # tolerated would pass `validate!` and then never be written, because `#each_file` yields the
+  # canonical names and nothing else.
+  def test_validate_resolves_a_leading_space_alias_that_duplicates_a_canonical_document
+    files = base_files.merge(" #{PackagePath::BUSINESS_MD}" => base_files.fetch(PackagePath::BUSINESS_MD))
+
+    documents = DocumentSet.validate!(files, issue_key: ISSUE)
+
+    assert_equal PackagePath::REQUIRED_FILES.sort, documents.files.keys.sort
+    assert_equal PackagePath::REQUIRED_FILES, documents.each_file.to_a
+    assert_equal base_files.fetch(PackagePath::BUSINESS_MD), documents.files.fetch(PackagePath::BUSINESS_MD)
+  end
+
+  # The same map built the other way round. Order independence is the specific guard against the
+  # natural implementation — rewriting the key inside a `to_h` — which keeps whichever entry was
+  # written last and makes the surviving document a matter of provider ordering.
+  def test_validate_resolves_a_duplicate_alias_written_before_its_canonical_name
+    business = base_files.fetch(PackagePath::BUSINESS_MD)
+    files = { " #{PackagePath::BUSINESS_MD}" => business }.merge(base_files)
+
+    documents = DocumentSet.validate!(files, issue_key: ISSUE)
+
+    assert_equal PackagePath::REQUIRED_FILES.sort, documents.files.keys.sort
+    assert_equal business, documents.files.fetch(PackagePath::BUSINESS_MD)
+  end
+
+  # Two different documents under one name have no honest resolution, so neither is published and
+  # neither is dropped. Checked in BOTH orders, because the failure mode is that one order happens
+  # to overwrite the other quietly.
+  def test_validate_rejects_an_alias_whose_content_differs_from_its_canonical_document
+    business = base_files.fetch(PackagePath::BUSINESS_MD)
+    conflicting = business.sub("Business analysis", "Business analysis (second)")
+
+    [ base_files.merge(" #{PackagePath::BUSINESS_MD}" => conflicting),
+      { " #{PackagePath::BUSINESS_MD}" => conflicting }.merge(base_files) ].each do |files|
+      error = assert_raises(DocumentSet::Invalid) { DocumentSet.validate!(files, issue_key: ISSUE) }
+
+      assert_includes error.message, PackagePath::BUSINESS_MD
+      assert_includes error.message, "leading space"
+      refute_includes error.message, "second"
+    end
+  end
+
+  # The diagnostic names the document and the problem. Quoting either body would put generated
+  # content into the run page and the operator's log.
+  def test_the_collision_diagnostic_carries_neither_document_body
+    conflicting = base_files.fetch(PackagePath::TECHNICAL_MD).sub("Technical analysis", "Technical analysis of")
+    files = base_files.merge(" #{PackagePath::TECHNICAL_MD}" => conflicting)
+
+    error = assert_raises(DocumentSet::Invalid) { DocumentSet.validate!(files, issue_key: ISSUE) }
+
+    refute_includes error.message, "## Source entry points inspected"
+    refute_includes error.message, "x" * 50
+  end
+
+  # Each required name in turn arrives ONLY as an alias. The content assertion is the point: the
+  # document must survive under its canonical name, not merely be counted as present.
+  def test_validate_accepts_an_alias_standing_in_for_each_required_document
+    PackagePath::REQUIRED_FILES.each do |name|
+      content = base_files.fetch(name)
+      files = base_files.except(name).merge(" #{name}" => content)
+
+      documents = DocumentSet.validate!(files, issue_key: ISSUE)
+
+      assert_equal content, documents.files.fetch(name), "expected the alias of #{name} to keep its content"
+      assert_equal PackagePath::REQUIRED_FILES.sort, documents.files.keys.sort
+    end
+  end
+
+  # The OPTIONAL document resolves the same way, and is then held to its own existing rules —
+  # read back through `#open_questions`, which only ever looks at the canonical name.
+  def test_validate_resolves_an_open_questions_alias_and_still_parses_it
+    files = base_files.merge(" #{PackagePath::OPEN_QUESTIONS_MD}" => open_questions_document)
+
+    documents = DocumentSet.validate!(files, issue_key: ISSUE)
+
+    assert_equal [ "OQ-001: what happens on a second identical request?" ], documents.open_questions
+  end
+
+  # Resolution changes which keys are recognized, never what a valid document must contain.
+  def test_validate_rejects_an_aliased_open_questions_document_with_a_malformed_question
+    malformed = open_questions_document.sub("- Decision required: what happens on a second identical request?\n", "")
+    files = base_files.merge(" #{PackagePath::OPEN_QUESTIONS_MD}" => malformed)
+
+    error = assert_raises(DocumentSet::Invalid) { DocumentSet.validate!(files, issue_key: ISSUE) }
+
+    assert_includes error.message, PackagePath::OPEN_QUESTIONS_MD
+    assert_includes error.message, "missing required field(s): decision required"
+  end
+
+  # Content validation runs on the resolved document, and reports it under the CANONICAL name —
+  # which is also how this proves the key was rewritten rather than tolerated.
+  def test_validate_rejects_an_alias_whose_content_is_an_invalid_document
+    files = base_files.except(PackagePath::TECHNICAL_MD).merge(" #{PackagePath::TECHNICAL_MD}" => "# too short")
+
+    error = assert_raises(DocumentSet::Invalid) { DocumentSet.validate!(files, issue_key: ISSUE) }
+
+    assert_includes error.message, PackagePath::TECHNICAL_MD
+    assert_includes error.message, "too short"
+  end
+
+  # An alias is not a substitute for a document that is simply absent.
+  def test_validate_still_rejects_a_missing_required_document
+    error = assert_raises(DocumentSet::Invalid) do
+      DocumentSet.validate!(base_files.except(PackagePath::BUSINESS_MD), issue_key: ISSUE)
+    end
+
+    assert_includes error.message, "returned no #{PackagePath::BUSINESS_MD}"
+  end
+
+  # The containment. Every one of these is one character away from a recognized alias and none of
+  # them is recognized — which is what keeps this a fixed exception rather than a whitespace policy.
+  def test_validate_rejects_every_spelling_that_is_not_the_single_leading_space
+    [
+      "  #{PackagePath::BUSINESS_MD}",
+      "#{PackagePath::BUSINESS_MD} ",
+      "\t#{PackagePath::BUSINESS_MD}",
+      " #{PackagePath::BUSINESS_MD}",
+      " Analysis/Business.md",
+      " analysis/notes.md",
+      " #{PackagePath::MANIFEST_JSON}"
+    ].each do |name|
+      error = assert_raises(DocumentSet::Invalid) do
+        DocumentSet.validate!(base_files.merge(name => "x" * 500), issue_key: ISSUE)
+      end
+
+      assert_includes error.message, "unexpected files", "expected #{name.inspect} to stay rejected"
+    end
+  end
+
+  # Unsafe shapes are rejected exactly as before, aliased or not: nothing here rewrites a path.
+  def test_validate_rejects_absolute_traversing_and_backslash_names
+    [ "/#{PackagePath::SPEC_MD}", " /#{PackagePath::SPEC_MD}", "../#{PackagePath::SPEC_MD}",
+      " ../#{PackagePath::SPEC_MD}", "analysis\\business.md", " analysis\\business.md" ].each do |name|
+      error = assert_raises(DocumentSet::Invalid) do
+        DocumentSet.validate!(base_files.merge(name => "x" * 500), issue_key: ISSUE)
+      end
+
+      assert_includes error.message, "unexpected files", "expected #{name.inspect} to stay rejected"
+    end
+  end
+
+  # A package with no alias in it behaves exactly as it always did.
+  def test_a_canonical_package_is_unaffected
+    documents = DocumentSet.validate!(base_files, issue_key: ISSUE)
+
+    assert_equal PackagePath::REQUIRED_FILES, documents.each_file.to_a
+    assert_empty documents.open_questions
+  end
 end
