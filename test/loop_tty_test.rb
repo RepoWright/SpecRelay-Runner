@@ -72,7 +72,7 @@ class LoopTtyTest < Minitest::Test
   def test_the_waiting_row_is_one_row_that_replaces_itself
     output = drive_direct_loop(polls: 3)
 
-    body = output[/finishes its report first\r?\n(.*?)\[loop\] stopped/m, 1]
+    body = output[/execution finishes first\r?\n(.*?)\[loop\] stopped/m, 1]
     refute_nil body, output.inspect
     assert_operator body.count("\r"), :>=, 3, "the row must be redrawn in place"
     assert_equal 0, body.count("\n"),
@@ -184,7 +184,7 @@ class LoopTtyTest < Minitest::Test
 
     claims_at_interrupt = 1
     assert_includes output, "stop requested"
-    assert_includes output, "the run in progress finishes its report first"
+    assert_includes output, "the run in progress finishes first"
     assert_includes output, "[verification.completed]", "the run really finished its own phases"
     assert_includes output, "stopped by signal DURING an execution"
     assert_equal claims_at_interrupt, claims, "no further claim may be sent after the interrupt"

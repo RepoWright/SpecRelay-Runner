@@ -13,10 +13,11 @@ module SpecrelayRunner
   #   - ONE RUN AT A TIME falls out of the design. The loop body is synchronous:
   #     `Execution#call` must return before the next poll is even attempted, so
   #     there is no code path that can start a second executor.
-  #   - A FAILED RUN IS NEVER IDLE. The failure has already travelled the normal
-  #     terminal-result/report contract by the time `execute` returns; this records
-  #     it, says so on the terminal, and exits non-zero at the end of the session
-  #     even if it kept polling afterwards.
+  #   - A FAILED RUN IS NEVER IDLE. This records the failure, says so on the
+  #     terminal, and exits non-zero at the end of the session even if it kept
+  #     polling afterwards. WHAT REACHED PLATFORM is not this session's to state:
+  #     `execute` hands back a disposition, not a delivery, and the execution has
+  #     already printed its own answer immediately above.
   #   - AN EXPECTED FAILURE KEEPS THE RUNNER ALIVE, an unexpected one does not. A
   #     transport error (Platform restarting, laptop off the network) backs off and
   #     retries. A `401` does NOT: a revoked or rotated credential will never start
@@ -110,6 +111,11 @@ module SpecrelayRunner
       @presenter = presenter || TerminalPresenter.for(out: out, err: err)
       @sleeper = sleeper || ->(seconds) { sleep seconds }
       @stop_requested = false
+      # WHO stopped the session, kept apart from the flag that stops it. One flag is enough to
+      # end the loop and cannot describe the ending: the operator's signal, a session this
+      # terminal ended on its own, and a bounded iteration count all set the same one.
+      @operator_stop = false
+      @session_stop = false
       @stopped_during_execution = false
       @unreported_failure = false
       @execution_active = false
@@ -169,10 +175,24 @@ module SpecrelayRunner
       iterations = 0
       until stop?(iterations)
         iterations += 1
-        break unless one_iteration == :continue
+        next if one_iteration == :continue
+
+        stopped_by_session
+        break
       end
       @failures.positive? ? FAILED : OK
     end
+
+    # An ending this terminal chose for itself rather than one the operator asked for. Recorded
+    # at the two places the decision is MADE — every permanent refusal, which all pass through
+    # {#fatal}, and every run disposition that ends the loop — rather than at each cause, because
+    # the closing line needs to know that the terminal decided and not which of the reasons
+    # already printed above it applied.
+    #
+    # Recording it at the cause is also what keeps one superseded session from getting two
+    # different endings: a session lost at admission and the same session lost when presence
+    # resumes after a run are the same fact, and they reach {#fatal} from different places.
+    def stopped_by_session = @session_stop = true
 
     def stop?(iterations)
       return true if @stop_requested
@@ -244,14 +264,11 @@ module SpecrelayRunner
       # look like it owned the run rather than being the process executing it.
       presence.pause
       disposition = watching_for_stop { execute.call(payload) }
-      # Remembered separately from @stop_requested: an operator who interrupts
-      # DURING an execution needs to be told the run finished reporting first, which
-      # is a materially different situation from an interrupt while idle.
-      #
-      # Read BEFORE presence resumes, because a superseded presence session also sets
-      # @stop_requested — and reporting that as "interrupted by signal during an execution"
-      # would describe something the operator did not do.
-      @stopped_during_execution ||= @stop_requested
+      # Remembered separately: an operator who interrupts DURING an execution needs to be told
+      # the run was allowed to finish, which is a materially different situation from an
+      # interrupt while idle. Read from the OPERATOR's flag rather than the general one, because
+      # only an interrupt the operator sent can be answered with what their interrupt did.
+      @stopped_during_execution ||= @operator_stop
       resume_presence
       @executed += 1
       # Read before the Boolean, because neither is a degree of failure: each is an outcome whose
@@ -284,24 +301,38 @@ module SpecrelayRunner
       sleep(STOP_NOTICE_SECONDS) while @execution_active && !@stop_requested
       return unless @stop_requested
 
-      line "stop requested — nothing further will be claimed; the run in progress finishes " \
-           "its report first"
+      line "stop requested — nothing further will be claimed; the run in progress finishes first"
     rescue StandardError
       # An acknowledgement is a courtesy. It must never take an execution down.
       nil
     end
 
     def run_succeeded
-      line(@stop_requested ? "run completed — stopping as requested" : "run completed — polling again immediately")
+      line(completion_notice)
       :continue
     end
 
-    # The failure has already been reported to Platform through the terminal-result
-    # contract by this point. What matters here is that the loop never presents it
-    # as a quiet idle, and that the session's exit code remembers it.
+    # "as requested" belongs to the operator alone. A session that lost its presence slot while
+    # this run was executing also stops here, and answering that with the operator's own wording
+    # would credit them with a decision they did not make — the reason is on the line above.
+    def completion_notice
+      return "run completed — polling again immediately" unless @stop_requested
+      return "run completed — stopping as requested" if @operator_stop
+
+      "run completed — nothing further will be claimed"
+    end
+
+    # What matters here is that the loop never presents a failed run as a quiet idle, and that
+    # the session's exit code remembers it.
+    #
+    # It says NOTHING about what reached Platform. `execute` hands this session a disposition,
+    # not a delivery, and a failure can end with its result recorded, refused, superseded or
+    # never sent — a claim that expired mid-run reports nothing at all. The execution's own
+    # result line, printed immediately above, is the one authority on which of those happened,
+    # and a second voice restating it was guessing.
     def run_failed
       @failures += 1
-      line "run FAILED — the failure was reported to Platform through the terminal-result contract"
+      line "run FAILED — the result line above says what reached Platform"
       unless continue_on_failure?
         line "stopping after a failed run (--on-failure #{ON_FAILURE_STOP})"
         return :stop
@@ -330,9 +361,9 @@ module SpecrelayRunner
 
     # A failed run whose result never reached Platform.
     #
-    # {#run_failed} says the failure travelled the terminal-result contract. That is true of every
-    # ordinary failure and is exactly what this one could not do: the report could not be built,
-    # so nothing was submitted. The session stops for the reason a pre-provider refusal does —
+    # Named on the session's own line rather than left to the execution's, because this is the
+    # one failure whose consequence is a STOPPING RULE: the report could not be built, so nothing
+    # was submitted. The session stops for the reason a pre-provider refusal does —
     # the next claim meets the same broken reporting dependency on this same machine — and the
     # failure policy is not consulted, because `continue` means "a REPORTED failure does not end
     # the session".
@@ -380,6 +411,7 @@ module SpecrelayRunner
 
     def fatal(reason, remedy)
       @failures += 1
+      stopped_by_session
       presenter.error "[loop] stopping — #{reason}"
       presenter.error "[loop] remedy: #{remedy}"
       :stop
@@ -456,14 +488,16 @@ module SpecrelayRunner
     def format_seconds(seconds) = seconds == seconds.to_i ? "#{seconds.to_i}s" : format("%.1fs", seconds)
     def monotonic = clock.clock_gettime(Process::CLOCK_MONOTONIC)
 
-    # Only an assignment happens in the handler — nothing that allocates, logs, or
+    # Only assignments happen in the handler — nothing that allocates, logs, or
     # takes a lock, because a trap can interrupt any of those mid-operation. The
     # loop prints and unwinds on the main thread; the watcher above is what turns
     # the flag into an operator-visible line.
     def trap_signals
       return unless @install_signals
 
-      %w[INT TERM].each { |name| @previous_traps[name] = Signal.trap(name) { @stop_requested = true } }
+      %w[INT TERM].each do |name|
+        @previous_traps[name] = Signal.trap(name) { @operator_stop = @stop_requested = true }
+      end
     end
 
     def restore_signals
@@ -492,28 +526,42 @@ module SpecrelayRunner
 
     def announce_start
       line "started — polling every #{poll_seconds}s, one run at a time, --on-failure #{on_failure}"
-      line "press Ctrl-C to stop; an in-progress execution finishes its report first"
+      line "press Ctrl-C to stop; an in-progress execution finishes first"
     end
 
-    # Names what the runner was doing when it stopped, so an operator who hits
-    # Ctrl-C knows whether a run is mid-flight.
+    # Names WHO stopped the runner and what it was doing, so an operator who hits Ctrl-C knows
+    # whether a run is mid-flight and an operator who did not is not told that they did.
     def announce_stop
       line(stop_description)
       line "session totals — #{@executed} run(s) executed, #{@failures} failed"
     end
 
+    # The operator's own interrupt is answered first and takes precedence: a signal that lands
+    # while the session was already ending itself is still the thing the operator is waiting to
+    # hear about.
     def stop_description
-      return "stopped — no further iterations requested" unless @stop_requested
+      return operator_stop_description if @operator_stop
+      # Every cause already printed its own reason and remedy above, so naming the cause again
+      # here would be a second copy of a line the operator has just read.
+      return "stopped by this runner — the reason is above" if @session_stop
+
+      "stopped — no further iterations requested"
+    end
+
+    def operator_stop_description
       if @stopped_during_execution
-        # "reported its result first" is the ordinary case and not a universal one. A run whose
-        # report could not be built finished without submitting anything, and answering an
-        # operator's Ctrl-C with the reassurance that it reported would describe a delivery that
-        # did not happen.
+        # A signal changes why the session stops, not what reached Platform. Only a run whose
+        # report could not be built is known here to have submitted nothing; for every other
+        # outcome the execution's own result line above is the one authority on delivery.
         return "stopped by signal DURING an execution — the run finished; its result was NOT " \
                "submitted to Platform" if @unreported_failure
 
-        return "stopped by signal DURING an execution — the run finished and reported its result first"
+        return "stopped by signal DURING an execution — the run finished; its result line above " \
+               "says what reached Platform"
       end
+      # "nothing was claimed" is true of a session interrupted before it ever took work, and
+      # false of one interrupted between runs.
+      return "stopped by signal while IDLE — no execution was in progress" if @executed.positive?
 
       "stopped by signal while IDLE — no execution was in progress and nothing was claimed"
     end

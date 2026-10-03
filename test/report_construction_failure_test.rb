@@ -266,8 +266,8 @@ class ReportConstructionFailureTest < Minitest::Test
     refute_includes output, "the failure was reported to Platform through the terminal-result contract"
   end
 
-  # An operator's Ctrl-C during an execution that could not report must not be answered with the
-  # ordinary reassurance that the run reported its result first.
+  # An operator's Ctrl-C during an execution that could not report keeps its precise closing line:
+  # this is the one outcome where the session itself knows nothing was submitted.
   def test_a_stop_signal_during_an_unreported_run_never_claims_a_result_was_sent
     execute = lambda do |_payload|
       Process.kill("INT", Process.pid)
