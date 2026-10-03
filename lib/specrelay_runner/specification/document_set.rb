@@ -223,25 +223,53 @@ module SpecrelayRunner
       # already settled is history, not a live blocker. Its heading and body still exist in the
       # file itself, unabridged — only this summary omits it.
       def open_questions
+        # `validate!` has already proven every unresolved body carries exactly one nonblank
+        # "Decision required" field before this is ever reached (see Generation, which validates
+        # before reading these back out) — so there is no fallback branch here. A body that does
+        # not have one is a bug in validation, not a shape this method is asked to survive.
+        unresolved_questions.map { |id, fields| "#{id}: #{fields.fetch('decision required').first}" }
+      end
+
+      # The same unresolved questions as `#open_questions`, carrying each one's WHOLE body
+      # instead of a one-line label.
+      #
+      # The two exist for two different readers. `#open_questions` is what a person scanning a
+      # run page needs in order to recognise a question; this is what the person who must ANSWER
+      # it needs — the question is asked outside the repository, in the ticket's own comment
+      # thread, and "why it blocks, the decision required, the consequence" is the whole of what
+      # the document contract gives a reader to answer from. A label alone sends them back to the
+      # file, which is the round trip this exists to remove.
+      #
+      # The fields are the entry's own, verbatim and unmerged. Laying them out for a reader is
+      # the control plane's job, because the control plane is what knows where the text is going.
+      def open_question_details
+        unresolved_questions.map do |id, fields|
+          { "id" => id,
+            "why_it_blocks" => fields.fetch("why it blocks").first,
+            "decision_required" => fields.fetch("decision required").first,
+            "consequence" => fields.fetch("consequence").first }
+        end
+      end
+
+      private
+
+      # The unresolved questions in document order, as `[id, parsed fields]`.
+      #
+      # ONE selection, read by both public readers above, so the summary and the bodies can never
+      # describe different question sets — which would show a reader one list and ask them to
+      # answer another.
+      def unresolved_questions
         content = files[PackagePath::OPEN_QUESTIONS_MD]
         return [] if content.nil?
 
         headings = open_question_headings(content)
         headings.each_with_index.filter_map do |(line, number), index|
-          id = line.chomp[OPEN_QUESTION_HEADING, 1]
-          body = question_body(content, number, headings[index + 1]&.last)
-          fields = question_fields(body)
+          fields = question_fields(question_body(content, number, headings[index + 1]&.last))
           next if resolved?(fields)
 
-          # `validate!` has already proven this body carries exactly one nonblank "Decision
-          # required" field before this is ever reached (see Generation, which validates before
-          # reading `#open_questions` back out) — so there is no fallback branch here. A body that
-          # does not have one is a bug in validation, not a shape this method is asked to survive.
-          "#{id}: #{fields.fetch('decision required').first}"
+          [ line.chomp[OPEN_QUESTION_HEADING, 1], fields ]
         end
       end
-
-      private
 
       # One canonical name, one document. Reached twice with equal content, the two collapse to one.
       # Reached twice with DIFFERENT content, it refuses in both orders: keeping either body would

@@ -284,6 +284,66 @@ class SpecificationDocumentSetTest < Minitest::Test
     assert_equal [ "OQ-002: what does the user see on failure?" ], documents.open_questions
   end
 
+  # ------------------------------------------------------- open_question_details
+
+  # The bodies Platform asks the decision WITH, in the ticket's own comment thread. A label alone
+  # tells a reader a question exists; these three fields are what they answer from.
+  def test_open_question_details_carries_every_field_of_each_unresolved_question
+    open_questions_md = <<~MD
+      # Open questions — SR-700
+
+      ## OQ-001
+
+      - Why it blocks: the ticket names no retention period.
+      - Decision required: how long is an export kept?
+      - Consequence: choosing wrongly deletes a customer's data or keeps it too long.
+    MD
+    documents = DocumentSet.new(base_files.merge(PackagePath::OPEN_QUESTIONS_MD => open_questions_md))
+
+    assert_equal [ { "id" => "OQ-001",
+                     "why_it_blocks" => "the ticket names no retention period.",
+                     "decision_required" => "how long is an export kept?",
+                     "consequence" => "choosing wrongly deletes a customer's data or keeps it too long." } ],
+                 documents.open_question_details
+  end
+
+  # Criterion 3 — a question the current ticket already settled is history. Its decision and its
+  # source stay in the file and must not be republished as something still to answer.
+  def test_open_question_details_omits_a_resolved_entry_and_its_decision
+    open_questions_md = <<~MD
+      # Open questions — SR-700
+
+      ## OQ-001
+
+      - Status: resolved
+      - Decision: cache the result.
+      - Source: Jira comment.
+
+      ## OQ-002
+
+      - Why it blocks: the recorded inputs do not decide this.
+      - Decision required: what does the user see on failure?
+      - Consequence: an implementer must guess.
+    MD
+    documents = DocumentSet.new(base_files.merge(PackagePath::OPEN_QUESTIONS_MD => open_questions_md))
+
+    assert_equal %w[OQ-002], documents.open_question_details.map { |question| question["id"] }
+    refute_includes documents.open_question_details.to_s, "cache the result"
+  end
+
+  # The summary and the bodies answer from one selection, so a reader can never be shown one list
+  # and asked to answer another.
+  def test_open_question_details_describes_the_same_questions_as_the_summary
+    documents = DocumentSet.new(base_files.merge(PackagePath::OPEN_QUESTIONS_MD => open_questions_document))
+
+    assert_equal documents.open_questions.map { |label| label.split(":").first },
+                 documents.open_question_details.map { |question| question["id"] }
+  end
+
+  def test_open_question_details_is_empty_when_the_file_is_absent
+    assert_empty DocumentSet.new(base_files).open_question_details
+  end
+
   def test_a_resolved_question_missing_its_own_required_field_is_rejected
     open_questions_md = <<~MD
       # Open questions — SR-700

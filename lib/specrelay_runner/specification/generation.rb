@@ -362,9 +362,16 @@ module SpecrelayRunner
           # one grounded in a ticket, and Platform has to be able to show it.
           "warnings" => (ready.inputs.warnings + ready.source.warnings + written.warnings)
             .map { |text| Redaction.redact(text) },
-          "open_questions" => documents.open_questions.map { |text| Redaction.redact(text) }
+          "open_questions" => documents.open_questions.map { |text| Redaction.redact(text) },
+          # The same questions' full bodies. Platform asks for the decision in the ticket's own
+          # comment thread and cannot read this package — only a runner reaches the repository —
+          # so the text has to travel here or not at all. Redacted field by field, like every
+          # other generated string that leaves this process.
+          "open_question_details" => documents.open_question_details.map { |question| redacted_question(question) }
         )
       end
+
+      def redacted_question(question) = question.transform_values { |value| Redaction.redact(value) }
 
       def refusal_payload(refusal, outcome:, zero_files:, workspace: nil)
         base = base_payload(assignment, outcome).merge(
