@@ -699,11 +699,21 @@ Only **one run at a time**, structurally: the loop body is synchronous, so
 `Execution#call` must return before the next poll is even attempted. There is no
 code path that starts a second executor.
 
-`SIGINT`/`SIGTERM` stop it cleanly and name the situation it stopped in:
+`SIGINT`/`SIGTERM` stop it cleanly and name the situation it stopped in. `and nothing was
+claimed` is dropped once the session has executed a run:
 
 ```text
 [loop] stopped by signal while IDLE — no execution was in progress and nothing was claimed
 [loop] stopped by signal DURING an execution — the run finished and reported its result first
+```
+
+A stop the terminal decided for itself — a session Platform no longer holds, a rejected
+credential, a refused claim, a run outcome the next poll would only meet again — is named as
+its own ending rather than as an interrupt nobody sent. The cause and its remedy are printed
+immediately above it:
+
+```text
+[loop] stopped by this runner — the reason is above
 ```
 
 An interrupt DURING an execution is acknowledged while the run is still finishing,
@@ -1189,7 +1199,10 @@ Platform cannot know where you checked this repository out.
 
 While a claim is held, the runner keeps a background **heartbeater** that beats on
 the cadence Platform advertises (`execution_policy.lease_renewal_seconds`), so a
-long executor/test run keeps its lease alive. The runner carries **no** lease or
+long executor/test run keeps its lease alive. Renewal belongs to the **claim**, not to a
+phase: a lane starts it as soon as the assignment parses and before it prepares
+anything, so preparation that takes longer than one lease window does not lose the
+claim it is preparing for. The runner carries **no** lease or
 cancellation authority: it reports liveness and **obeys the signal** Platform
 returns on each heartbeat/event. If Platform reports the claim is no longer live
 (`cancelled` / `expired` / `terminal`), the runner stops at the next safe

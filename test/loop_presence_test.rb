@@ -167,6 +167,35 @@ class LoopPresenceTest < Minitest::Test
     assert_equal 1, output.scan("no longer holds").size, "the reason is stated once"
   end
 
+  # The ending this terminal chose for itself is not the operator's interrupt. Describing it as
+  # one sends an operator looking for a key nobody pressed, and tells them nothing was claimed
+  # in a session that never got as far as claiming for a different reason entirely.
+  def test_a_superseded_session_is_not_described_as_an_operator_signal
+    client = FakePresenceClient.new(outcome: Presence::SUPERSEDED)
+    run_loop(client: client, poll_seconds: 60, max_iterations: 5)
+
+    refute_includes output, "stopped by signal"
+    refute_includes output, "nothing was claimed"
+  end
+
+  # The same lost session, discovered when presence resumes after a run rather than at admission.
+  # One cause must not produce two different endings depending on when it was noticed.
+  def test_a_session_superseded_during_a_run_is_not_described_as_an_operator_signal
+    client = FakePresenceClient.new
+    execute = lambda do |_payload|
+      client.outcome = Presence::SUPERSEDED
+      true
+    end
+    status = run_loop(client: client, claim: -> { claimed("DEMO-1") }, execute: execute,
+                      max_iterations: 5)
+
+    assert_equal Loop::FAILED, status
+    assert_includes output, "Platform no longer holds this terminal's session"
+    refute_includes output, "stopped by signal"
+    refute_includes output, "no further iterations requested"
+    refute_includes output, "as requested"
+  end
+
   def test_a_rejected_credential_stops_the_loop_rather_than_spinning
     client = FakePresenceClient.new(raise_on_started: SpecrelayRunner::PlatformClient::Unauthorized.new(
       "Platform rejected the runner token (401)", status: 401
@@ -253,6 +282,9 @@ class LoopPresenceTest < Minitest::Test
   # line an `open` hands back (CR-001 F1).
   class FakePresenceClient
     attr_reader :events, :calls
+    # Settable, so a test can supersede a session Platform admitted — which is what actually
+    # happens — rather than only one it refused from the start.
+    attr_writer :outcome
 
     def initialize(outcome: SpecrelayRunner::Presence::ACCEPTED, heartbeat_seconds: 30,
                    fail_on: nil, fail_times: Float::INFINITY, raise_on_started: nil,

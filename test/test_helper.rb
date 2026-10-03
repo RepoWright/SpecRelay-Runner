@@ -88,7 +88,8 @@ end
 def spec_creation_payload_for(issue_key:, title: "Add an export button", inputs: nil,
                               specification_root: "specs", complete: true, content: nil,
                               existing_pull_request_url: nil, specification_provider: nil,
-                              worktree_create_command: nil, canonical_branch: nil)
+                              worktree_create_command: nil, canonical_branch: nil,
+                              lease_renewal_seconds: 30)
   {
     "contract_version" => "mvp-0025",
     "claim" => { "runner_execution_id" => "rex_spec123", "runner_id" => "test-runner",
@@ -144,7 +145,10 @@ def spec_creation_payload_for(issue_key:, title: "Add an export button", inputs:
                        worktree_create_command || "./bin/worktree create #{issue_key}" },
     "links" => { "run_url" => "http://127.0.0.1:3200/runs/run_spec123",
                  "work_item_url" => "https://example.atlassian.net/browse/#{issue_key}" },
-    "execution_policy" => { "timeout_seconds" => 120, "lease_renewal_seconds" => 30,
+    # The advertised renewal cadence, overridable so a test can make the window a run spends
+    # between renewals short enough to observe without waiting out a production-shaped lease.
+    "execution_policy" => { "timeout_seconds" => 120,
+                            "lease_renewal_seconds" => lease_renewal_seconds,
                             "lease_expires_at" => "2026-07-31T12:05:00Z" },
     "assignment_boundary" => { "generation" => "runner_generates_package",
                                "expected_runner_action" => "generate_specification_package",

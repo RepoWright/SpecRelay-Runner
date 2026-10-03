@@ -143,7 +143,9 @@ class LoopModeTest < Minitest::Test
 
     assert_equal Loop::FAILED, status
     assert_includes output, "run FAILED"
-    assert_includes output, "reported to Platform through the terminal-result contract"
+    # The session sees a Boolean, never a delivery. What reached Platform is the execution's
+    # own report, printed immediately above, and a second voice restating it can only be a guess.
+    refute_includes output, "reported to Platform through the terminal-result contract"
     refute_includes output, "idle —"
   end
 
@@ -248,6 +250,24 @@ class LoopModeTest < Minitest::Test
     assert_equal Loop::OK, status
     assert_includes output, "stopped by signal while IDLE"
     assert_includes output, "nothing was claimed"
+  end
+
+  # The idle wording claims two things, and only one of them survives a session that did work:
+  # no execution was in progress, and nothing was claimed. A terminal that completed a run and
+  # was then interrupted while waiting for the next one claimed something.
+  def test_an_interrupt_while_idle_after_a_run_does_not_say_nothing_was_claimed
+    claims = 0
+    claim = lambda do
+      claims += 1
+      claims == 1 ? claimed("DEMO-1") : not_claimed("nothing eligible")
+    end
+    signal_on_first_sleep!
+    status = run_loop(claim: claim, execute: ->(_p) { true }, max_iterations: 10,
+                      install_signals: true)
+
+    assert_equal Loop::OK, status
+    assert_includes output, "stopped by signal while IDLE"
+    refute_includes output, "nothing was claimed"
   end
 
   def test_a_signal_during_an_execution_says_the_run_finished_reporting_first

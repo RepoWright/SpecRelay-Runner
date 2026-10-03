@@ -27,11 +27,12 @@ module SpecrelayRunner
     # path after it either produces a complete package or leaves the destination untouched,
     # because PackageWriter stages and then performs a single rename.
     #
-    # A claim is real work, so the lease is real too: a heartbeater runs for the duration, and
-    # the liveness signal is checked before the write and again before the report. A run
-    # Platform has cancelled or reclaimed must never be reported as generated — the files may
-    # already be on the operator's disk, but claiming the run produced them would let a
-    # superseded attempt overwrite a newer one's result.
+    # A claim is real work, so the lease is real too: a heartbeater runs from the moment the
+    # claim parses — preparation is the longest phase here, and a lease nobody renewed lapses
+    # inside it — and the liveness signal is checked before the provider launches, before the
+    # write, and again before the report. A run Platform has cancelled or reclaimed must never be
+    # reported as generated — the files may already be on the operator's disk, but claiming the
+    # run produced them would let a superseded attempt overwrite a newer one's result.
     class Generation
       # Raised internally when Platform signals the claim is no longer live. Handled here;
       # never escapes.
@@ -67,10 +68,21 @@ module SpecrelayRunner
         @lease_stop_reason = nil
       end
 
+      # Renewal is owned by the CLAIM, not by the phase that happens to be running, so it starts
+      # as soon as there is a claim identity to renew and before anything slow. Preparation is
+      # the longest phase in this lane — it builds or reuses the ticket's whole task environment,
+      # may place a previously accepted implementation into it, and prepares the analysis tooling
+      # against the final tree — and a lease nobody renewed lapses inside it, which throws away
+      # the provider run that follows. The other two lanes already start here; this one used to
+      # wait until preparation had finished.
+      #
+      # ONE construction site and ONE ensured stop, so no exit can leave a worker running and no
+      # path can start a second one.
       def call
         assignment = Assignment.parse(payload)
         @assignment = assignment
         announce(assignment)
+        start_heartbeater(assignment)
         ready = Preflight.call(assignment: assignment, settings: settings, config: config, env: env)
         return refuse(ready) if ready.refused?
 
@@ -78,8 +90,11 @@ module SpecrelayRunner
       rescue Assignment::Malformed => e
         # A malformed assignment cannot be reported against a claim identity the runner could
         # not parse, so this is the one refusal that may have nowhere to send itself. It is
-        # still reported when the claim token survived parsing, and always printed.
+        # still reported when the claim token survived parsing, and always printed. Nothing is
+        # renewed either: there is no parsed claim to renew.
         refuse(Preflight::Refusal.new(failure_class: Preflight::ASSIGNMENT_MALFORMED, message: e.message))
+      ensure
+        @heartbeater&.stop
       end
 
       private
@@ -99,8 +114,12 @@ module SpecrelayRunner
       # The generating half. Everything before `write_package` is reversible by doing nothing;
       # `write_package` writes into the Runner-owned isolated worktree preflight created, and
       # nothing in this method can reach the operator's checkout at all.
+      #
+      # It OPENS with a liveness read, because the phase it follows is the long one. A claim
+      # Platform has already ended must cost no provider run at all: the model is the expensive
+      # thing here, and its output could only be discarded.
       def generate(assignment, ready)
-        start_heartbeater(assignment)
+        checkpoint!
         log("Preflight passed. Generating with #{ready.provider.describe}.")
         documents = produce(ready)
         check_change_boundary!(ready)
@@ -113,8 +132,6 @@ module SpecrelayRunner
       rescue Provider::Failed, DocumentSet::Invalid, PackageWriter::Error,
              PackagePath::Unsafe, PackageWorkspace::Error => e
         fail_generation(ready, e)
-      ensure
-        @heartbeater&.stop
       end
 
       # WHAT THE PROVIDER CHANGED in the prepared task workspace, and the refusal when it changed
