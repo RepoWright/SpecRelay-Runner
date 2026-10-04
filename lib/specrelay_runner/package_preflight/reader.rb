@@ -75,13 +75,15 @@ module SpecrelayRunner
 
       # The package folder as GitHub has it at the pinned commit, flattened to package-relative
       # paths. `analysis` is the one subdirectory a package may contain; any other directory makes
-      # the listing not-the-package rather than something to walk into.
+      # the listing not-the-package rather than something to walk into. `execution-reports` holds
+      # earlier implementation rounds' output, never specification input, so it is skipped unread.
       def listing
         entries = contents(assignment.package_path)
         return entries if entries.is_a?(Failure)
 
         files = entries.select { |entry| entry["type"] == "file" }.map { |entry| entry["name"].to_s }
         directories = entries.select { |entry| entry["type"] == "dir" }.map { |entry| entry["name"].to_s }
+        directories -= [ EXECUTION_REPORTS ]
         return files if directories.empty?
         return Failure.new(classification: FILE_SET_MISMATCH,
                            message: "the package folder at #{short_sha} contains an unexpected " \
@@ -94,6 +96,7 @@ module SpecrelayRunner
       end
 
       ANALYSIS = "analysis"
+      EXECUTION_REPORTS = "execution-reports"
 
       def fetch(paths)
         total = 0
