@@ -54,9 +54,10 @@ class PackagePreflightTest < Minitest::Test
 
   # A `gh` that answers the three calls preflight makes. `pr_state`/`pr_base`/`pr_head` script the
   # PR view; `final_head` scripts the SECOND view only, which is how a head that moves mid-read is
-  # modelled. `fail_api` makes every contents read fail.
+  # modelled. `fail_api` makes every contents read fail. `directories` lists extra top-level folder
+  # entries whose contents this `gh` never serves, so any read into one fails.
   def fake_gh(pr_state: "OPEN", pr_base: "main", pr_head: HEAD, final_head: nil,
-              contents: DOCUMENTS, fail_api: false, fail_view: false)
+              contents: DOCUMENTS, directories: [], fail_api: false, fail_view: false)
     tree = contents.keys.group_by { |path| path.include?("/") ? "analysis" : "root" }
     payloads = contents.to_h { |path, body| [ path, Base64.strict_encode64(body) ] }
     path = File.join(@dir, "gh")
@@ -84,6 +85,7 @@ class PackagePreflightTest < Minitest::Test
         if target == #{FOLDER.inspect}
           entries = root.map { |n| { "name" => n, "type" => "file" } }
           entries << { "name" => "analysis", "type" => "dir" } unless nested.empty?
+          entries += #{directories.inspect}.map { |n| { "name" => n, "type" => "dir" } }
           puts entries.to_json
           exit 0
         end
@@ -258,6 +260,57 @@ class PackagePreflightTest < Minitest::Test
     platform = RecordingPlatform.new({ "authorized" => false })
 
     result = run_preflight(client: platform, contents: DOCUMENTS.merge("notes.md" => "# extra\n"))
+
+    assert result.refused?
+    assert_equal "package_file_set_mismatch", only_submission(platform)[:refusal]
+  end
+
+  def test_refuses_an_unknown_directory_beside_the_recorded_files
+    platform = RecordingPlatform.new({ "authorized" => false })
+
+    result = run_preflight(client: platform, directories: [ "reviews" ])
+
+    assert result.refused?
+    submitted = only_submission(platform)
+    assert_equal "package_file_set_mismatch", submitted[:refusal]
+    refute submitted.key?(:documents)
+  end
+
+  # ---------------------------------------------------------------- prior execution reports
+
+  def test_submits_only_the_recorded_files_beside_prior_execution_reports
+    platform = RecordingPlatform.new({ "authorized" => true, "manifest_digest" => "d" * 64,
+                                       "assignment" => { "run" => { "id" => "run_1" } } })
+
+    result = run_preflight(client: platform, directories: [ "execution-reports" ])
+
+    assert result.authorized?, result.message
+    assert_equal DOCUMENTS.keys.sort, only_submission(platform)[:documents].map { |d| d[:path] }.sort
+  end
+
+  def test_never_reads_inside_prior_execution_reports
+    run_preflight(client: RecordingPlatform.new({ "authorized" => true }), directories: [ "execution-reports" ])
+
+    content_calls = gh_calls.select { |line| line.start_with?("api") }
+    DOCUMENTS.each_key { |path| assert content_calls.any? { |line| line.include?("#{FOLDER}/#{path} ") }, path }
+    content_calls.each { |line| refute_includes line, "execution-reports" }
+  end
+
+  def test_prior_execution_reports_do_not_excuse_an_unrecorded_file
+    platform = RecordingPlatform.new({ "authorized" => false })
+
+    result = run_preflight(client: platform, directories: [ "execution-reports" ],
+                          contents: DOCUMENTS.merge("notes.md" => "# extra\n"))
+
+    assert result.refused?
+    assert_equal "package_file_set_mismatch", only_submission(platform)[:refusal]
+  end
+
+  def test_prior_execution_reports_do_not_excuse_a_missing_recorded_file
+    platform = RecordingPlatform.new({ "authorized" => false })
+
+    result = run_preflight(client: platform, directories: [ "execution-reports" ],
+                          contents: DOCUMENTS.except("analysis/business.md"))
 
     assert result.refused?
     assert_equal "package_file_set_mismatch", only_submission(platform)[:refusal]
