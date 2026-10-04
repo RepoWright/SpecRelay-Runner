@@ -161,6 +161,40 @@ class PackagePreflightTest < Minitest::Test
     assert_equal HEAD, submitted[:head_sha]
   end
 
+  # A manually approved revision: Platform knows the exact commit and file set but not the bytes,
+  # so every expected digest is null. The runner checks the same pull request, head and file set,
+  # reads at that commit only, and submits the bytes for Platform to recompute.
+  def test_an_approved_revision_with_unknown_digests_is_read_at_its_exact_commit
+    revised = DOCUMENTS.merge("spec.md" => "# SR-42\n\nRevised by hand.\n")
+    payload = assignment_payload(documents: revised)
+    payload["specification_package_preflight"]["documents"].each { |document| document["digest"] = nil }
+    platform = RecordingPlatform.new({ "authorized" => true, "manifest_digest" => "d" * 64,
+                                       "assignment" => { "run" => { "id" => "run_1" } } })
+
+    result = run_preflight(client: platform, payload: payload, contents: revised)
+
+    assert result.authorized?, result.message
+    submitted = only_submission(platform)
+    assert_equal HEAD, submitted[:head_sha]
+    assert_equal revised["spec.md"],
+                 Base64.strict_decode64(submitted[:documents].find { |d| d[:path] == "spec.md" }[:content_base64])
+    gh_calls.select { |line| line.start_with?("api") }.each { |line| assert_includes line, "ref=#{HEAD}" }
+  end
+
+  def test_an_approved_revision_still_refuses_a_moved_head_and_a_changed_file_set
+    payload = assignment_payload
+    payload["specification_package_preflight"]["documents"].each { |document| document["digest"] = nil }
+
+    moved = RecordingPlatform.new({ "authorized" => false })
+    assert run_preflight(client: moved, payload: payload, pr_head: MOVED).refused?
+    assert_equal "package_stale", only_submission(moved)[:refusal]
+
+    setup
+    changed = RecordingPlatform.new({ "authorized" => false })
+    assert run_preflight(client: changed, payload: payload, contents: DOCUMENTS.merge("notes.md" => "# extra\n")).refused?
+    assert_equal "package_file_set_mismatch", only_submission(changed)[:refusal]
+  end
+
   def test_reads_content_by_commit_sha_and_never_by_the_branch_name
     run_preflight(client: RecordingPlatform.new({ "authorized" => true }))
 
