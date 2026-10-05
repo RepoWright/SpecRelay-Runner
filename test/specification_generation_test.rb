@@ -490,7 +490,7 @@ class SpecificationGenerationTest < Minitest::Test
       assert_equal owner, ProjectCommand.recorded_owner(@source, ISSUE)
       refute_nil task_worktree
       refute_includes project_verbs(log), "release", "a protected environment was asked to be released"
-      refute_includes @io.string, "Release it by hand"
+      refute_includes @io.string, "Resolve the reason above"
     end
   end
 
@@ -504,7 +504,7 @@ class SpecificationGenerationTest < Minitest::Test
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
 
     assert_includes project_lines(log), "release #{ISSUE} --run-id #{SPEC_RUN} --json", @io.string
-    refute_includes @io.string, "Release it by hand"
+    refute_includes @io.string, "Resolve the reason above"
   end
 
   # A status the Runner cannot read does not stand for absence: the release is asked, and the
@@ -520,7 +520,7 @@ class SpecificationGenerationTest < Minitest::Test
       assert_equal "refused", @platform.last_specification_generation["outcome"], name
       assert_nil ProjectCommand.recorded_owner(@source, ISSUE), "#{name}: the owned environment was kept"
       assert_nil task_worktree, name
-      refute_includes @io.string, "Release it by hand", name
+      refute_includes @io.string, "Resolve the reason above", name
     end
   end
 
@@ -537,7 +537,7 @@ class SpecificationGenerationTest < Minitest::Test
 
       assert_equal owner, ProjectCommand.recorded_owner(@source, ISSUE)
       refute_nil task_worktree
-      assert_includes @io.string, "Release it by hand"
+      assert_includes @io.string, "Resolve the reason above"
     end
   end
 
@@ -549,7 +549,7 @@ class SpecificationGenerationTest < Minitest::Test
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
 
     assert_equal "refused", @platform.last_specification_generation["outcome"]
-    assert_includes @io.string, "Release it by hand"
+    assert_includes @io.string, "Resolve the reason above"
   end
 
   # An unmapped workspace root is not proof of absence: an earlier attempt may have allocated the
@@ -560,7 +560,7 @@ class SpecificationGenerationTest < Minitest::Test
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
 
     assert_equal "refused", @platform.last_specification_generation["outcome"]
-    assert_includes @io.string, "Release it by hand"
+    assert_includes @io.string, "Resolve the reason above"
     refute_includes @io.string, @temp, "the cleanup reason exposed a local path"
   end
 
