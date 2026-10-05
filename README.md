@@ -316,7 +316,8 @@ connected `loop` or `claim-once` offers the Run-owned environments its project l
 releases every one Platform confirms belongs to a run that has ended for this machine and that
 no live execution, review or preview still needs, then claims. It does the same after a restart.
 An unreadable list, an unconfirmed answer or an incomplete release stops before the claim; a
-`--config` runner does not ask. Manual and other-run environments are never offered or released.
+`--config` runner does not ask. Manual environments are never offered. Another run's environment
+can be offered, but only the one Platform names as an ended run's is released.
 Everything unpublished in it is that run's own by then and goes with it,
 including edits you made there by hand; the runner removes none of it itself. Only an explicit
 `released` naming that run, or your project's own proof that there is nothing left, is
