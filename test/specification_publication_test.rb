@@ -617,6 +617,44 @@ class SpecificationPublicationTest < Minitest::Test
   end
 
 
+  # ------------------------------------------- the lease at a publication checkpoint
+
+  # The checkpoint reads each renewal through the shared heartbeat rule, so a refusal is a stop
+  # that leaves nothing published or reported.
+  def test_a_refused_renewal_aborts_the_publication_before_anything_is_pushed
+    start_platform
+
+    with_heartbeat_answers(rest: 403) { assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string }
+
+    assert_empty @platform.specification_publications
+    assert_nil FakeGithub.remote_branches(@bare)[BRANCH]
+    assert_includes @io.string, "Platform reports #{SpecrelayRunner::Heartbeater::REJECTED}"
+  end
+
+  # HTTP 200 alone is not renewal here either: an unacknowledged answer is a stop.
+  def test_an_unacknowledged_renewal_stops_the_publication
+    start_platform
+    unacknowledged = { "acknowledged" => false, "lease" => { "state" => "active", "cancel_requested" => false } }
+
+    with_heartbeat_answers(rest: unacknowledged) do
+      assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
+    end
+
+    assert_empty @platform.specification_publications
+    assert_includes @io.string, "Platform reports expired"
+  end
+
+  # An unreachable Platform at a checkpoint is a reporting problem, not a stop: the publication
+  # still completes.
+  def test_an_unreachable_renewal_does_not_stop_the_publication
+    start_platform
+
+    with_heartbeat_answers(rest: :transport) { assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string }
+
+    assert_equal "published", @platform.last_specification_publication["outcome"], @io.string
+  end
+
+
   # ------------------------------------------- MAPIAI-62 design 3: resuming the workspace
 
   # S10 — a fresh process resolves the SAME workspace from the opaque id alone. Nothing about

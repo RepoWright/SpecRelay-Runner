@@ -451,7 +451,9 @@ class ReportConstructionFailureTest < Minitest::Test
 
   # Call the REAL `Execution#submit` with a failed verification and a builder that cannot load,
   # and return what the operator sees. Everything but the builder is genuine: the payload, the
-  # client, the emitter and the failure narrative are the production ones.
+  # client, the emitter and the failure narrative are the production ones. The execution's own
+  # heartbeater runs around `submit` as it does inside `Execution#call`, so every event `submit`
+  # emits passes the same confirmed-renewal check a real attempt does.
   def submit_with_verification(one_attempt, verification: nil, &on_build)
     start
     verification ||= failed_verification(one_attempt)
@@ -462,9 +464,14 @@ class ReportConstructionFailureTest < Minitest::Test
                                                   token: FakePlatform::EXPECTED_TOKEN),
       payload: claim_payload_for(task_id: TASK, publication: {}), env: child_env, io: io
     )
-    result = with_failing_builder(LoadError.new("cannot load such file -- psych"), on_build) do
-      execution.send(:submit, worktree_info, executor_result, [ verification ], changes,
-                     SpecrelayRunner::ReportBundle::STATUS_FAILED, [], nil)
+    execution.send(:start_heartbeater)
+    result = begin
+      with_failing_builder(LoadError.new("cannot load such file -- psych"), on_build) do
+        execution.send(:submit, worktree_info, executor_result, [ verification ], changes,
+                       SpecrelayRunner::ReportBundle::STATUS_FAILED, [], nil)
+      end
+    ensure
+      execution.instance_variable_get(:@heartbeater).stop
     end
     refute_predicate result, :success?, "a construction failure is never a successful attempt"
     assert_predicate result, :report_unsubmitted?

@@ -120,6 +120,84 @@ class LeaseTest < Minitest::Test
     refute_match(/claim released/, io.string)
   end
 
+  # ------------------------------------------------------------ a failed renewal while the lease holds
+
+  # One server error on a phase-boundary renewal, after an acknowledged renewal opened the window:
+  # the attempt continues, the provider runs and the report is submitted.
+  def test_a_server_error_on_a_phase_boundary_renewal_does_not_stop_the_attempt
+    io = StringIO.new
+
+    exit_code = with_heartbeat_answers(:platform, 503) { run_full_cli(io) }
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, exit_code, io.string
+    assert_equal 1, @platform.requests_to("/api/runner/reports").size
+    assert_includes io.string, "Platform could not be reached"
+  end
+
+  # Event delivery is the first request of the same boundary. A transport failure there is
+  # tolerated the same way, and the terminal result is still accepted despite the missing event.
+  def test_a_transport_failure_delivering_a_phase_event_does_not_stop_the_attempt
+    io = StringIO.new
+
+    exit_code = with_event_delivery_failing_on(2) { run_full_cli(io) }
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, exit_code, io.string
+    assert_equal 1, @platform.requests_to("/api/runner/reports").size
+    assert_includes io.string, "Platform could not be reached"
+  end
+
+  # Tolerance needs an earlier acknowledged renewal. A boundary that fails while one still covers
+  # the claim continues; the same failure once that cover has run out stops it, as this machine's
+  # own finding rather than something Platform said.
+  def test_a_phase_boundary_tolerates_failures_only_while_an_acknowledged_renewal_covers_it
+    execution = direct_execution("lease_duration_seconds" => 2)
+    execution.send(:start_heartbeater)
+    with_heartbeat_answers(:platform, 503, :transport, rest: :transport) do
+      execution.send(:emit, "attempt.started", "acknowledged renewal", phase: "attempt")
+      execution.send(:emit, "workspace.preparing", "inside the window", phase: "workspace")
+      sleep 2.2
+
+      error = assert_raises(SpecrelayRunner::Execution::Aborted) do
+        execution.send(:emit, "workspace.ready", "past the window", phase: "workspace")
+      end
+      assert_equal SpecrelayRunner::Heartbeater::UNCONFIRMED, error.message
+    end
+  ensure
+    execution&.instance_variable_get(:@heartbeater)&.stop
+  end
+
+  # Without an acknowledged renewal there is no window to tolerate anything in: the attempt stops
+  # before its provider is launched.
+  def test_a_transient_failure_before_any_acknowledged_renewal_stops_the_attempt
+    use_held_provider
+    io = StringIO.new
+
+    exit_code = with_heartbeat_answers(rest: :transport) { run_held_cli(io) }
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, exit_code, io.string
+    refute_path_exists provider_pid_file, "a provider was launched without a confirmed renewal"
+    assert_empty @platform.requests_to("/api/runner/reports")
+    assert_includes io.string, "no renewal of this claim was confirmed within the lease"
+  end
+
+  # A heartbeat Platform refuses is a stop the moment it is read, even inside an open window. It
+  # ends this attempt as aborted rather than escaping as an error: nothing is reported, and the
+  # task environment is kept because nothing here shows the Run ended.
+  def test_a_refused_heartbeat_ends_the_attempt_aborted_with_no_report
+    [ 401, 403, 404, 422 ].each do |status|
+      reset_platform
+      io = StringIO.new
+
+      exit_code = with_heartbeat_answers(:platform, status) { run_full_cli(io) }
+
+      assert_equal SpecrelayRunner::CLI::RUN_FAILED, exit_code, io.string
+      assert_empty @platform.requests_to("/api/runner/reports"), "HTTP #{status}"
+      assert_includes io.string, "Runner outcome: aborted (#{SpecrelayRunner::Heartbeater::REJECTED})", io.string
+      assert_includes io.string, "this run's task environment is kept"
+      refute_match(/Runner failed/, io.string)
+    end
+  end
+
   private
 
   def fixture_dir = @fixture_dir ||= fixture_bin
@@ -172,6 +250,46 @@ class LeaseTest < Minitest::Test
   rescue Errno::EPERM
     # Members not yet reaped answer EPERM on this platform: not yet shown gone.
     false
+  end
+
+  # A claim whose workspace root is mapped and whose provider is the demo executor, so the attempt
+  # really reaches a report when nothing stops it.
+  def run_full_cli(io)
+    @platform.claim_payload = claim_payload_for(task_id: TASK, root: @root)
+    SpecrelayRunner::CLI.run(%W[claim-once --config #{@config.source_path}],
+                             out: io, err: io,
+                             env: { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN,
+                                    "PATH" => fixture_path(@executor) })
+  end
+
+  def reset_platform
+    teardown
+    setup
+  end
+
+  # The real `Execution` behind the CLI, for driving one phase boundary at a time.
+  def direct_execution(execution_policy)
+    SpecrelayRunner::Execution.new(
+      config: @config,
+      client: SpecrelayRunner::PlatformClient.new(base_url: @platform.base_url, token: FakePlatform::EXPECTED_TOKEN),
+      payload: claim_payload_for(task_id: TASK, root: @root).merge("execution_policy" => execution_policy),
+      env: {}, io: StringIO.new
+    )
+  end
+
+  # The `nth` protocol event this process sends fails in transport; every other one travels.
+  def with_event_delivery_failing_on(nth)
+    original = SpecrelayRunner::PlatformClient.instance_method(:submit_protocol_event)
+    sent = 0
+    mutex = Mutex.new
+    SpecrelayRunner::PlatformClient.define_method(:submit_protocol_event) do |**arguments|
+      raise SpecrelayRunner::PlatformClient::Error, "Platform is unreachable" if mutex.synchronize { (sent += 1) == nth }
+
+      original.bind(self).call(**arguments)
+    end
+    yield
+  ensure
+    SpecrelayRunner::PlatformClient.define_method(:submit_protocol_event, original)
   end
 
   # Platform unreachable for renewal from the moment the provider is running; every other request

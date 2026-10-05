@@ -1260,10 +1260,17 @@ module SpecrelayRunner
     # read by the heartbeater, the one owner of what a renewal means, so the check that follows —
     # including the last one before the provider launches — also requires a confirmed renewal.
     # Console output is redacted defensively.
+    # A phase boundary. Platform being unreachable here, for the event or the renewal, is not by
+    # itself a stop: the attempt continues while an earlier acknowledged renewal still covers it.
     def emit(event_type, summary, **attributes)
       log("[#{event_type}] #{summary}")
       observe_lease(emitter.emit(event_type, summary, **attributes))
       @heartbeater.renew
+      check_stop!
+    rescue PlatformClient::Error => e
+      raise unless e.transient?
+
+      log("[#{event_type}] Platform could not be reached: #{Redaction.redact(e.message)}")
       check_stop!
     end
 

@@ -125,6 +125,25 @@ class SpecificationLeaseLifecycleTest < Minitest::Test
     refute_empty SpecificationWorkspace.isolated_workspaces(@temp)
   end
 
+  # ---------------------------------------------------- a renewal that fails while the lease holds
+
+  # The checkpoint reads a refusal through the shared heartbeat rule: Platform's answer about this
+  # claim, so the lane stops and submits nothing even while an earlier renewal still covers it.
+  def test_a_refused_renewal_aborts_the_generation_with_nothing_submitted
+    with_heartbeat_answers(:platform, 403) { assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string }
+
+    assert_empty @platform.specification_generations
+    assert_includes @io.string, "Platform reports #{SpecrelayRunner::Heartbeater::REJECTED}"
+  end
+
+  # A renewal Platform could not answer is tolerated while an acknowledged one still covers the
+  # claim, and the generation completes.
+  def test_a_server_error_at_a_checkpoint_inside_the_window_lets_the_generation_finish
+    with_heartbeat_answers(:platform, 503) { assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string }
+
+    assert_equal %w[generated], recorded_outcomes, @io.string
+  end
+
   # ---------------------------------------------------- a claim lost while the provider runs
 
   # Platform cancels the run while the model works. The provider's process group ends at once,
