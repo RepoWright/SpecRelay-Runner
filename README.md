@@ -1073,9 +1073,16 @@ is no plugin registry, no auto-detection and no fallback from one provider to an
 
 | Provider | Command | Invocation | Prompt | Timeout |
 | --- | --- | --- | --- | --- |
-| `claude` | `claude` | `--print --output-format stream-json --verbose --dangerously-skip-permissions` | one argv element | 18000s |
+| `claude` | `claude` | `--print --output-format stream-json --verbose --dangerously-skip-permissions --disallowedTools=ScheduleWakeup` | one argv element | 18000s |
 | `codex` | `codex` | `exec --json --ephemeral --dangerously-bypass-approvals-and-sandbox` | stdin | 1800s |
 | `fake` | `specrelay-fake-executor` | none | prompt file path | 120s |
+
+The `claude` profile also sets `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`, `CLAUDE_CODE_DISABLE_CRON=1`
+and `BASH_MAX_TIMEOUT_MS=3600000`. The handoff is read after the process exits, so verification
+must finish, fail or time out in the foreground: no background command, no scheduled wakeup, and
+at most one hour per command. The wakeup flag is one `=` element; the two-element form would take
+the trailing prompt as its value. A workspace that saved the earlier Claude profile is refused until
+an operator re-saves it with Project Setup's **Save AI provider**.
 
 Select one in your own runner config by naming the provider — and only the provider:
 

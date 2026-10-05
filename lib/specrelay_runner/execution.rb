@@ -1164,6 +1164,9 @@ module SpecrelayRunner
           report the command that fails; never fall back to another interpreter or omit it.
         - Run what you select, diagnose any failure, fix it, and rerun it before you exit. If you
           cannot fix it, still report the final commands so SpecRelay records the real failure.
+        - Run every command in the foreground and wait for it; never end your final answer while one
+          is still running. This process ends with that answer, so nothing finishes later: no
+          background job and no scheduled wakeup. Write the file above before that answer.
         - Write `"commands": []` when a repository has no applicable verification. That is a valid
           answer; do not invent a command or a passing result.
         - SpecRelay verifies every entry, re-runs every command you report against your final files,

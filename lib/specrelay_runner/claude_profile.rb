@@ -15,10 +15,12 @@ module SpecrelayRunner
   #   executor:
   #     provider: claude
   #     command: claude
-  #     args: [--print, --output-format, stream-json, --verbose, --dangerously-skip-permissions]
+  #     args: [--print, --output-format, stream-json, --verbose, --dangerously-skip-permissions,
+  #            --disallowedTools=ScheduleWakeup]
   #     prompt_delivery: argument
-  #     timeout_seconds: 900
-  #     env: {}
+  #     timeout_seconds: 18000
+  #     env: {CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: "1", CLAUDE_CODE_DISABLE_CRON: "1",
+  #           BASH_MAX_TIMEOUT_MS: "3600000"}
   #
   # Secret posture: this class NEVER reads, stores, returns, logs, or uploads a
   # provider credential, login token, or account identity. Claude authenticates
@@ -208,10 +210,21 @@ module SpecrelayRunner
     # canonical identity and the validation rules below cannot describe different things. It is the
     # exact hash Platform stores and serves; {ImplementationProfile} compares a claimed payload
     # against it before a worktree exists.
-    CANONICAL_ARGS = [ PRINT_FLAGS.first, "--output-format", STREAM_FORMAT, "--verbose", PERMISSION_FLAG ].freeze
+    #
+    # The provider must finish its work inside this one process: the handoff is read only after it
+    # exits, and a print session neither keeps a background shell alive past its final result nor
+    # lives on to fire a scheduled wakeup. Background tasks and the scheduler are therefore off, a
+    # foreground command may run for up to an hour, and the self-paced wakeup tool, which the
+    # scheduler switch leaves exposed, is removed. That flag is ONE `=` element because the CLI reads
+    # a separate value list up to and including the trailing prompt.
+    NO_WAKEUP_FLAG = "--disallowedTools=ScheduleWakeup"
+    FOREGROUND_ENV = { "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS" => "1", "CLAUDE_CODE_DISABLE_CRON" => "1",
+                       "BASH_MAX_TIMEOUT_MS" => "3600000" }.freeze
+    CANONICAL_ARGS = [ PRINT_FLAGS.first, "--output-format", STREAM_FORMAT, "--verbose", PERMISSION_FLAG,
+                       NO_WAKEUP_FLAG ].freeze
     CANONICAL = {
       "provider" => PROVIDER, "command" => EXECUTABLE, "mode" => MODE, "args" => CANONICAL_ARGS,
-      "prompt_delivery" => PROMPT_DELIVERY, "timeout_seconds" => APPROVED_TIMEOUT_SECONDS, "env" => {}
+      "prompt_delivery" => PROMPT_DELIVERY, "timeout_seconds" => APPROVED_TIMEOUT_SECONDS, "env" => FOREGROUND_ENV
     }.freeze
 
     # Labels for the identity tuple, so a mismatch names the dimension that differed
