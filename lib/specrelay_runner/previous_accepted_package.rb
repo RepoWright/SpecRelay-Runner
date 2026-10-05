@@ -461,7 +461,16 @@ module SpecrelayRunner
     # `checkout -B` onto the canonical task branch, so the branch the executor works on — and that
     # publication pushes from — IS the accepted head. A detached checkout would leave publication
     # unable to find the branch, and a merge would invent a commit nobody accepted.
+    #
+    # All-or-nothing like {#plan}: a canonical branch holding commits that neither the decided head
+    # nor any other branch, remote branch or tag contains refuses before anything moves. Placing
+    # over it would discard committed work, and such work exists only where a commit was made in
+    # the environment itself — a project command builds it from heads its primary checkouts hold.
     def place(plans)
+      plans.each do |plan|
+        refusal = unplaced_work_refusal(plan)
+        return refuse(refusal) if refusal
+      end
       plans.each do |plan|
         result = run(plan[:path], [ "checkout", "-B", canonical_branch, plan[:head] ])
         return refuse("could not place #{quoted(plan[:repository])} on #{quoted(canonical_branch)} " \
@@ -469,6 +478,20 @@ module SpecrelayRunner
           result&.exit_code.to_i.zero?
       end
       Result.new(ok: true, repositories: plans.map { |plan| plan[:repository] })
+    end
+
+    def unplaced_work_refusal(plan)
+      return nil unless value(plan[:path], %w[symbolic-ref --quiet --short HEAD]) == canonical_branch
+
+      # Full ref names through `--glob`: `--exclude` before `--branches` matches short names.
+      only_here = value(plan[:path], [ "rev-list", "-n", "1", "HEAD", "--not", plan[:head],
+                                       "--exclude=refs/heads/#{canonical_branch}", "--glob=refs/heads/*",
+                                       "--glob=refs/remotes/*", "--glob=refs/tags/*" ])
+      return nil if only_here&.empty?
+
+      "the checkout of #{quoted(plan[:repository])} holds commits on #{quoted(canonical_branch)} that " \
+        "#{plan[:head_is]} #{plan[:head][0, 12]} does not contain; preserve or release the task " \
+        "workspace before retrying"
     end
 
     # A reused workspace proved to CONTAIN the accepted head, and moved forward only when that
