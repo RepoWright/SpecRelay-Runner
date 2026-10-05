@@ -165,7 +165,7 @@ class AcknowledgedTerminalCleanupTest < Minitest::Test
 
     assert_equal 1, @platform.requests_to("/api/runner/reports").size
     assert_includes @io.string, "still allocated"
-    assert_includes @io.string, "Release it by hand"
+    assert_includes @io.string, "Resolve the reason above"
     refute_includes @io.string, "Released the task environment"
     assert File.directory?(worktree)
     assert_equal RUN, File.read(owner_file(TASK))

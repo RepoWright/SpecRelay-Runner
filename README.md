@@ -310,19 +310,22 @@ A run hands its environment back once Platform has RECORDED how it ended, and no
 implementation report (success or failure), a specification publication or publication
 failure, or a generation failure or refusal. An explicit cancellation this runner observes
 while the run is active is an ending too: it ends the run's process group, sends no late
-result and hands the environment back. A question pause ends the provider session, so a
-cancellation after it reaches no process: before each claim, a connected `loop` offers the
-Run-owned environments its project lists and releases the one Platform names as cancelled
-after this machine's pause, then claims. It does the same after a restart. An unreadable list,
-an unconfirmed answer or an incomplete release stops the loop before it claims. `claim-once`
-and a `--config` loop do not ask, and any other late cancellation releases nothing yet.
+result and hands the environment back. Some endings reach no process — a cancellation after a
+question pause, or a release that failed after the result was recorded — so before each claim a
+connected `loop` or `claim-once` offers the Run-owned environments its project lists and
+releases every one Platform confirms belongs to a run that has ended for this machine and that
+no live execution, review or preview still needs, then claims. It does the same after a restart.
+An unreadable list, an unconfirmed answer or an incomplete release stops before the claim; a
+`--config` runner does not ask. Manual environments are never offered. Another run's environment
+can be offered, but only the one Platform names as an ended run's is released.
 Everything unpublished in it is that run's own by then and goes with it,
 including edits you made there by hand; the runner removes none of it itself. Only an explicit
 `released` naming that run, or your project's own proof that there is nothing left, is
 completion. A timeout, a non-zero exit, an unreadable answer or a partial teardown is reported
-as still allocated — without guessing which files survived, because your project is what
-knows — and this machine stops: a single run exits non-zero and a `loop` session ends before
-another claim, until you release it by hand.
+as still allocated, with your project's own reason when it printed one — without guessing which
+files survived, because your project is what knows — and this machine stops: a single run exits
+non-zero and a `loop` session ends before another claim. The next start retries the release of
+an environment Platform confirms has ended.
 
 Two endings keep something back. After a recorded publication failure the runner keeps its
 package snapshot, so a publication retry republishes the same files. After a recorded

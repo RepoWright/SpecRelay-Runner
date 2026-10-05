@@ -39,6 +39,11 @@ module SpecrelayRunner
     RELEASED = "released"
     ABSENT = "absent"
 
+    # The most of a project's own failure reason one message carries.
+    REASON_LIMIT = 500
+    # The fields in which a failed command's document states why, in the project's own words.
+    REASON_FIELDS = %w[failures refusals remaining_resources error].freeze
+
     Result = Struct.new(:released, :reason, keyword_init: true) do
       def released? = released ? true : false
     end
@@ -216,16 +221,44 @@ module SpecrelayRunner
       end
     end
 
-    # What the command did, in the operator's terms. Deliberately silent about which files or
-    # resources survived: only the project knows that, it has recorded it, and a runner guessing
-    # at it is how an incomplete teardown comes to be described as a partial success.
+    # What the command did, in the operator's terms. Which files or resources survived is said
+    # only in the project's own words: it is the one that knows, it has recorded it, and a runner
+    # guessing at it is how an incomplete teardown comes to be described as a partial success.
     def detail(result, verb, task_id)
       command = "`#{Workspace::PROJECT_COMMAND} #{verb} #{task_id}`"
       return "#{command} could not be started" if result.nil?
       return "#{command} timed out" if result.timed_out?
-      return "#{command} exited #{result.exit_code}" unless result.success?
+
+      unless result.success?
+        reason = failure_reason(result)
+        return reason ? "#{command} failed: #{reason}" : "#{command} exited #{result.exit_code}"
+      end
 
       "#{command} returned output this runner could not read"
+    end
+
+    # Why a failed command failed, as the document it printed on stdout states it, or nil when it
+    # printed none. It is a description, never an answer: {document_of} still reads no document
+    # from a failed command. Host paths and secrets are removed before it is bounded, so a cut can
+    # never leave half a secret behind.
+    def failure_reason(result)
+      document = JSON.parse(result.stdout.to_s)
+      return nil unless document.is_a?(Hash)
+
+      reasons = document.values_at(*REASON_FIELDS).flatten.compact.map(&:to_s).reject(&:empty?)
+      reasons << refused_owner(document) if reasons.empty? && document["outcome"] == "refused"
+      text = reasons.compact.join("; ")
+      text.empty? ? nil : Redaction.redact(PrivatePaths.sanitize(text))[0, REASON_LIMIT]
+    rescue JSON::ParserError
+      nil
+    end
+
+    # The project refuses another identity's release without a reason field: a manual environment
+    # states its owner as null, and another run's omits the owner altogether.
+    def refused_owner(document)
+      return "it is owned by a different run" unless document.key?("owner_run_id")
+
+      "it is a manual environment with no run owner" if document["owner_run_id"].nil?
     end
 
     def invoke(root, arguments, timeout)

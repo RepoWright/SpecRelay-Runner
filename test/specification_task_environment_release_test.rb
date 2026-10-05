@@ -77,7 +77,7 @@ class SpecificationTaskEnvironmentReleaseTest < Minitest::Test
     assert_path_exists File.join(task_workspace, "README.md")
     assert_path_exists File.join(task_workspace, "component-a", "app", "services", "export_report.rb")
     assert_includes @io.string, "still allocated"
-    assert_includes @io.string, "Release it by hand"
+    assert_includes @io.string, "Resolve the reason above"
   end
 
   # No claim about which files were cleared or retained. Only the project knows what is left.
