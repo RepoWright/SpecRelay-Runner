@@ -122,14 +122,50 @@ module SpecrelayRunner
     end
     private_class_method :default_branch_tip, :relative
 
+    # The record, in the task root's own git directory, that the run owning this environment has
+    # placed it. The provider only ever starts after placement, so only a placed environment can
+    # hold work of its run: a reused one WITH the record is reconciled and its newer work kept,
+    # and one WITHOUT it — a first attempt refused before placement — is placed like a new one
+    # rather than trusted for whatever the local checkouts held when it was built. Being in the
+    # git directory, it never appears in the tree and goes with the environment when it is
+    # released.
+    PLACED = "specrelay-placed"
+
+    def self.placed?(task_root, git: Review::Checkout::Git)
+      record = placement_record(task_root, git)
+      !record.nil? && File.file?(record)
+    end
+
+    def self.record_placement(task_root, git: Review::Checkout::Git)
+      record = placement_record(task_root, git)
+      !record.nil? && File.write(record, "") && true
+    rescue SystemCallError
+      false
+    end
+
+    def self.placement_record(task_root, git)
+      result = git.run(task_root.to_s, [ "rev-parse", "--git-path", PLACED ])
+      return nil unless result&.exit_code.to_i&.zero?
+
+      File.expand_path(result.stdout.to_s.strip, task_root.to_s)
+    end
+    private_class_method :placement_record
+
     # Put every accepted repository of the task workspace on the canonical branch at its verified
     # head, or refuse. A package that changed nothing succeeds without touching git.
     #
     # `initial_bases` is the implementation lane's stored set: with it, EVERY contained repository
     # is decided and placed — the accepted head, else the approved specification head, else the
-    # repository's stored base. Without it (the specification lane) only the first two are.
+    # repository's stored base, and the environment is recorded as placed ({placed?}). Without it
+    # (the specification lane) only the first two are.
     def materialize(task_root:, specification: nil, initial_bases: nil)
-      act(task_root, specification: specification, initial_bases: initial_bases) { |plans| place(plans) }
+      act(task_root, specification: specification, initial_bases: initial_bases) do |plans|
+        placed = place(plans)
+        next placed unless placed.ok? && initial_bases
+        next placed if self.class.record_placement(task_root, git: git)
+
+        refuse("SpecRelay could not record that the prepared task workspace was placed")
+      end
     end
 
     # PROVE a workspace this run did not build already contains the accepted implementation,

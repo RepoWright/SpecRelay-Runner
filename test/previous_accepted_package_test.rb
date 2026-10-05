@@ -826,4 +826,67 @@ class PreviousAcceptedPackageTest < Minitest::Test
     assert_equal 1, requests_to("/api/runner/claim_releases").length
     assert_equal diverged, head_of(task_root, ".")
   end
+
+  # Scenario 6 when the first attempt was refused BEFORE placement — what an unreadable origin, an
+  # unconfirmed recording or a missing commit leaves: the environment exists, owned by this run,
+  # holding only what the project command built from the local checkouts and no work of this run.
+  def first_attempt_refused_before_placement
+    task_root = create_task_workspace
+    File.truncate(@built.worktree_log, 0)
+    task_root
+  end
+
+  # `[branch, head]` of each named checkout when the report is made, before the run releases it.
+  def checkouts_at_report(task_root, names)
+    observed = []
+    original = @platform.method(:report)
+    @platform.define_singleton_method(:report) do |request|
+      observed << names.to_h do |name|
+        path = File.join(task_root, name)
+        [ name, [ DemoWorkspace.git(path, "branch", "--show-current").strip,
+                  DemoWorkspace.git(path, "rev-parse", "HEAD").strip ] ]
+      end
+      original.call(request)
+    end
+    observed
+  end
+
+  def test_a_retry_after_a_refusal_before_placement_places_the_stored_set_not_local_commits
+    gh_dir, = gh_bin
+    start(continuation_block: continuation)
+    stored_root = remote_main(".")
+    local = leave_local_commit(".")
+    task_root = first_attempt_refused_before_placement
+    assert_equal local, head_of(task_root, "."), "the project command starts from the local head"
+    observed = checkouts_at_report(task_root, [ "." ])
+
+    code, output = run_cli(gh_dir)
+
+    assert_equal 0, code, output
+    assert_equal "status #{TASK} --json", worktree_invocations.first, "the environment was reused"
+    assert_equal [ { "." => [ TASK, stored_root ] } ], observed, "never the unpublished local commit"
+    assert core_started?
+    assert_match(/Prepared #{TASK} at /, output)
+  end
+
+  def test_a_retry_after_a_refusal_before_placement_places_detached_components
+    gh_dir, = gh_bin
+    start(continuation_block: continuation)
+    FileUtils.mkdir_p(File.join(@root, ".runs"))
+    FileUtils.touch(File.join(@root, ".runs", "detach-components"))
+    task_root = first_attempt_refused_before_placement
+    MultiRepositoryWorkspace::COMPONENTS.each do |name|
+      assert_equal "", DemoWorkspace.git(File.join(task_root, name), "branch", "--show-current").strip
+    end
+    observed = checkouts_at_report(task_root, MultiRepositoryWorkspace::COMPONENTS)
+
+    code, output = run_cli(gh_dir)
+
+    assert_equal 0, code, output
+    assert_equal "status #{TASK} --json", worktree_invocations.first, "the environment was reused"
+    assert_equal 1, observed.length
+    observed.first.each_value { |branch, _head| assert_equal TASK, branch }
+    assert_equal @heads.fetch("component-b"), observed.first.fetch("component-b").last
+    assert core_started?
+  end
 end

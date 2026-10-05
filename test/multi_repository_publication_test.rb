@@ -281,12 +281,14 @@ class MultiRepositoryPublicationTest < Minitest::Test
     end
   end
 
-  # A reused environment is reconciled before the provider starts, so a repository moved off the
-  # canonical branch is refused there: before any provider, selection or external write.
+  # An environment this run already placed is reconciled before the provider starts, so a
+  # repository moved off the canonical branch is refused there: before any provider, selection or
+  # external write.
   def test_a_repository_not_on_the_canonical_task_branch_is_refused
     assert_preparation_refused(/component-a.*not on the canonical branch/i) do
-      FakeGithub.git(File.join(MultiRepositoryWorkspace.task_workspace(@root, TASK), "component-a"),
-                     "checkout", "-q", "--detach", "HEAD")
+      workspace = MultiRepositoryWorkspace.task_workspace(@root, TASK)
+      assert SpecrelayRunner::PreviousAcceptedPackage.record_placement(workspace)
+      FakeGithub.git(File.join(workspace, "component-a"), "checkout", "-q", "--detach", "HEAD")
     end
   end
 

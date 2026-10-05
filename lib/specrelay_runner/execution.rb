@@ -371,9 +371,11 @@ module SpecrelayRunner
       nil
     end
 
-    # A created environment is PLACED at the decided commits and a reused one of this run is
-    # RECONCILED to them, so a retry after a refused attempt is verified too. A resume keeps its
-    # own rule: only an environment it had to create receives the package and the specification.
+    # A created environment, and a reused one this run never placed, are PLACED at the decided
+    # commits; a reused one this run already placed is RECONCILED to them, keeping its newer work.
+    # A retry after any refused attempt is therefore verified, and an environment built from local
+    # checkouts never passes as this run's work. A resume keeps its own rule: only an environment
+    # it had to create receives the package and the specification.
     def place_inputs(worktree)
       placer = @continuation.package ||
                PreviousAcceptedPackage.for_specification(run["canonical_branch"], env: env)
@@ -387,11 +389,15 @@ module SpecrelayRunner
       return PreviousAcceptedPackage::Result.new(ok: false, reason: bases) if bases.is_a?(String)
 
       inputs = { task_root: worktree.path, specification: anchor, initial_bases: bases }
-      worktree.created? ? placer.materialize(**inputs) : placer.reconcile(**inputs)
+      return placer.reconcile(**inputs) if !worktree.created? && PreviousAcceptedPackage.placed?(worktree.path)
+
+      placer.materialize(**inputs)
     end
 
     # The set Platform STORED for this run, never the one this machine just resolved: the first
-    # attempt's offer is recorded and every later attempt is answered with it.
+    # attempt's offer is recorded and every later attempt is answered with it. A retry resolves and
+    # offers too, because the endpoint answers an offer; an origin it cannot read therefore refuses
+    # the retry before anything is compared, which is the intended fail-closed answer.
     def recorded_initial_bases(task_root)
       resolved = PreviousAcceptedPackage.initial_bases(task_root)
       return resolved if resolved.is_a?(String)
