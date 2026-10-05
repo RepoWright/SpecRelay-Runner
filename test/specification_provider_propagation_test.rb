@@ -28,9 +28,12 @@ class SpecificationProviderPropagationTest < Minitest::Test
   # The exact configuration ProjectSetup::ExecutorProfiles stores for each selectable profile.
   CLAUDE_PROFILE = {
     "provider" => "claude", "command" => "claude", "mode" => "print",
-    "args" => [ "--print", "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions" ],
+    "args" => [ "--print", "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions",
+                "--disallowedTools=ScheduleWakeup" ],
     "prompt_delivery" => "argument",
-    "timeout_seconds" => 18_000, "env" => {}
+    "timeout_seconds" => 18_000,
+    "env" => { "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS" => "1", "CLAUDE_CODE_DISABLE_CRON" => "1",
+               "BASH_MAX_TIMEOUT_MS" => "3600000" }
   }.freeze
 
   CODEX_PROFILE = {

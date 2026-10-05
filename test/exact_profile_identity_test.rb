@@ -83,8 +83,11 @@ class ExactProfileIdentityTest < Minitest::Test
 
   CLAUDE = {
     "provider" => "claude", "command" => "claude", "mode" => "print",
-    "args" => %w[--print --output-format stream-json --verbose --dangerously-skip-permissions],
-    "prompt_delivery" => "argument", "timeout_seconds" => 18_000, "env" => {}
+    "args" => %w[--print --output-format stream-json --verbose --dangerously-skip-permissions
+                 --disallowedTools=ScheduleWakeup],
+    "prompt_delivery" => "argument", "timeout_seconds" => 18_000,
+    "env" => { "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS" => "1", "CLAUDE_CODE_DISABLE_CRON" => "1",
+               "BASH_MAX_TIMEOUT_MS" => "3600000" }
   }.freeze
 
   # Every dimension is restated here rather than read from the production constant, so this file is
@@ -194,6 +197,19 @@ class ExactProfileIdentityTest < Minitest::Test
   def test_a_forged_claude_limit_is_refused_before_anything_runs
     marker_executable("claude")
     refuses(CLAUDE.merge("timeout_seconds" => 18_001), path: "#{@scratch}:#{ENV['PATH']}")
+  end
+
+  # The profile that let the provider leave background work and a scheduled wakeup behind is no
+  # longer approved, in either half: an operator must re-save it rather than have both accepted.
+  def test_the_former_claude_profile_without_foreground_execution_is_refused_before_anything_runs
+    marker_executable("claude")
+    refuses(CLAUDE.merge("env" => {}), path: "#{@scratch}:#{ENV['PATH']}")
+  end
+
+  def test_the_former_claude_arguments_that_still_offer_a_scheduled_wakeup_are_refused
+    marker_executable("claude")
+    refuses(CLAUDE.merge("args" => CLAUDE.fetch("args") - %w[--disallowedTools=ScheduleWakeup]),
+            path: "#{@scratch}:#{ENV['PATH']}")
   end
 
   def test_the_claude_limit_written_as_a_string_is_refused

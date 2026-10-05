@@ -53,6 +53,11 @@ module FakeClaudeCli
     [ bin_dir, argv_log ]
   end
 
+  # The environment keys the supported profile sets, recorded beside the argv log by every launch.
+  PROFILE_ENV_KEYS = %w[CLAUDE_CODE_DISABLE_BACKGROUND_TASKS CLAUDE_CODE_DISABLE_CRON BASH_MAX_TIMEOUT_MS].freeze
+
+  def env_log(argv_log) = argv_log.sub(/\.json\z/, "-env.json")
+
   # `hang` sleeps well past every bounded timeout the runner uses, so the runner's
   # own Timeout/process-group kill is what ends it — a real timeout, not a stub.
   HANG_SECONDS = 600
@@ -66,6 +71,8 @@ module FakeClaudeCli
       # Record the exact argv this process was launched with, so a test can prove
       # the prompt arrived as ONE distinct element and no shell was involved.
       File.write(#{argv_log.inspect}, JSON.generate(ARGV))
+      # And the profile environment it received, so a test can prove the launch forwarded it.
+      File.write(#{env_log(argv_log).inspect}, JSON.generate(ENV.to_h.slice(*#{PROFILE_ENV_KEYS.inspect})))
 
       if ARGV.first == "--version"
         #{version_branch(version)}

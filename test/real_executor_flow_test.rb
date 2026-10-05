@@ -27,7 +27,8 @@ class RealExecutorFlowTest < Minitest::Test
 
   # The supported argv, in ONE place: MAPIAI-60 made structured output mandatory, so a fixture
   # that spelled the flags out per test would drift from the profile it is meant to exercise.
-  ARGS = %w[--print --output-format stream-json --verbose --dangerously-skip-permissions].freeze
+  ARGS = %w[--print --output-format stream-json --verbose --dangerously-skip-permissions
+            --disallowedTools=ScheduleWakeup].freeze
 
   # The claim payload Platform returns once it has merged this runner's `executor:`
   # override over the workspace definition — i.e. the real Claude profile.
@@ -313,6 +314,14 @@ class RealExecutorFlowTest < Minitest::Test
     assert_equal ARGS.length + 1, argv.length
     assert_includes argv.last, "Automated execution task — #{TASK}"
     assert_includes argv.last, "Approved spec for #{TASK}"
+    assert_includes argv.last, "Run every command in the foreground and wait for it"
+    assert_includes argv.last, "background job and no scheduled wakeup"
+
+    # The profile's environment reached the child: no background work, no scheduler, and room for
+    # a long verification command to finish in the foreground.
+    assert_equal({ "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS" => "1", "CLAUDE_CODE_DISABLE_CRON" => "1",
+                   "BASH_MAX_TIMEOUT_MS" => "3600000" },
+                 JSON.parse(File.read(FakeClaudeCli.env_log(argv_log))))
 
     terminal = @platform.last_terminal_result
     assert_equal "succeeded", terminal["outcome"]
