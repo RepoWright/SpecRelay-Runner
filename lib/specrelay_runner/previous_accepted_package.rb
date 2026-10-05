@@ -39,8 +39,6 @@ module SpecrelayRunner
       def ok? = ok
     end
 
-    OPEN = "OPEN"
-
     # What a planned head IS, so a refusal about it can say so. Two inputs can decide a head and
     # they are not interchangeable to the operator who has to act on the message: being told the
     # "accepted head" is unreachable when the unreachable commit is the approved specification's
@@ -48,6 +46,7 @@ module SpecrelayRunner
     ACCEPTED_HEAD = "the accepted head"
     SPECIFICATION_HEAD = "the approved specification head"
     BOTH_HEADS = "the head carrying both approved inputs"
+    INITIAL_BASE = "the stored initial base"
 
     # The one authoritative reading of the required, nullable continuation field. Both lanes call
     # it — the implementation lane here, the specification lane through {Input} — so neither can
@@ -84,10 +83,53 @@ module SpecrelayRunner
     # {read} is the only way in: every method below assumes {Input} already proved the shape.
     private_class_method :new
 
+    # Each contained repository's default branch and tip, as `origin` reports them through one
+    # `ls-remote --symref`, or the reason one could not be read. These are what an implementation
+    # run offers Platform at its first claim; only the set Platform returns is ever placed.
+    def self.initial_bases(task_root, git: Review::Checkout::Git)
+      contained = ContainedRepositories.discover(task_root, git: git)
+      return contained.error unless contained.ok?
+
+      contained.roots.each_with_object([]) do |root, bases|
+        repository = GithubRemote.slug(git.remote_url(root))
+        return "#{relative(task_root, root).inspect} in the prepared task workspace has no GitHub " \
+               "identity" if repository.nil?
+
+        base = default_branch_tip(root, git)
+        return "SpecRelay could not read the default branch of #{repository.inspect} from its " \
+               "origin" if base.nil?
+
+        bases << { "repository" => repository, "default_branch" => base[0], "commit" => base[1] }
+      end
+    end
+
+    # `[branch, commit]` from `ls-remote --symref origin HEAD`, or nil when either is absent.
+    def self.default_branch_tip(root, git)
+      result = git.run(root, [ "ls-remote", "--symref", Review::Checkout::Git::REMOTE, "HEAD" ])
+      return nil unless result&.exit_code.to_i&.zero?
+
+      lines = result.stdout.to_s.lines.map(&:strip)
+      branch = lines.filter_map { |line| line[%r{\Aref: refs/heads/(\S+)\s+HEAD\z}, 1] }.first
+      commit = lines.filter_map { |line| line[/\A(\h{40})\s+HEAD\z/, 1] }.first
+      branch && commit ? [ branch, commit.downcase ] : nil
+    end
+
+    def self.relative(task_root, path)
+      root = File.realpath(task_root.to_s)
+      path == root ? "." : path.delete_prefix("#{root}#{File::SEPARATOR}")
+    rescue SystemCallError
+      "."
+    end
+    private_class_method :default_branch_tip, :relative
+
     # Put every accepted repository of the task workspace on the canonical branch at its verified
     # head, or refuse. A package that changed nothing succeeds without touching git.
-    def materialize(task_root:, specification: nil)
-      act(task_root, specification: specification) { |plans| place(plans) }
+    #
+    # `initial_bases` is the implementation lane's stored set: with it, EVERY contained repository
+    # is decided and placed — the accepted head, else the approved specification head, else the
+    # repository's stored base. Without it (the specification lane) only the first two are.
+    def materialize(task_root:, specification: nil, initial_bases: nil)
+      act(task_root, specification: specification, initial_bases: initial_bases) { |plans| place(plans) }
     end
 
     # PROVE a workspace this run did not build already contains the accepted implementation,
@@ -95,8 +137,8 @@ module SpecrelayRunner
     #
     # A reused environment is never re-seeded to satisfy the specification: this run's own work is
     # in it, so an incompatibility is REPORTED rather than repaired.
-    def reconcile(task_root:, specification: nil)
-      act(task_root, specification: specification) { |plans| advance(plans) }
+    def reconcile(task_root:, specification: nil, initial_bases: nil)
+      act(task_root, specification: specification, initial_bases: initial_bases) { |plans| advance(plans) }
     end
 
     private
@@ -108,10 +150,10 @@ module SpecrelayRunner
     # decides what a repository's head must be when it carries both the approved specification and
     # accepted code. An explicit null accepted-code block is still a decision: there is no code to
     # honour, so the specification alone determines that repository's head.
-    def act(task_root, specification: nil)
+    def act(task_root, specification: nil, initial_bases: nil)
       targets = read_targets
       return refuse(targets) if targets.is_a?(String)
-      return Result.new(ok: true, repositories: []) if targets.empty? && specification.nil?
+      return Result.new(ok: true, repositories: []) if targets.empty? && specification.nil? && initial_bases.nil?
 
       contained = ContainedRepositories.discover(task_root, git: git)
       return refuse(contained.error) unless contained.ok?
@@ -120,6 +162,9 @@ module SpecrelayRunner
       return refuse(plans) if plans.is_a?(String)
 
       plans = with_specification(plans, specification, contained)
+      return refuse(plans) if plans.is_a?(String)
+
+      plans = with_initial_bases(plans, initial_bases, contained) unless initial_bases.nil?
       return refuse(plans) if plans.is_a?(String)
       return Result.new(ok: true, repositories: []) if plans.empty?
 
@@ -176,6 +221,48 @@ module SpecrelayRunner
 
       plans.map do |plan|
         plan.equal?(existing) ? plan.merge(head: chosen, head_is: BOTH_HEADS) : plan
+      end
+    end
+
+    # Every contained repository the accepted package and the specification left undecided, at
+    # its stored initial base. All-or-nothing like {#plan}: a stored entry that names no contained
+    # repository, a contained repository without an identity or an entry, and a base that is not
+    # here after an exact fetch each refuse before anything is placed.
+    def with_initial_bases(plans, bases, contained)
+      stored = stored_bases(bases, contained)
+      return stored if stored.is_a?(String)
+      return "a repository in the prepared task workspace has no GitHub identity" unless
+        contained.roots.length == contained.paths_by_identity.values.sum(&:length)
+
+      decided = plans.map { |plan| plan[:repository].to_s.downcase }
+      added = contained.paths_by_identity.filter_map do |identity, paths|
+        next if decided.include?(identity)
+
+        base = stored[identity]
+        return "no initial base is stored for the contained repository #{quoted(identity)}" if base.nil?
+        return "the prepared task workspace holds two checkouts of #{quoted(identity)}" if paths.length > 1
+
+        target = { repository: base["repository"], head: base["commit"] }
+        refusal = fetch_head(target, paths.first, INITIAL_BASE)
+        return refusal if refusal
+
+        target.merge(path: paths.first, head_is: INITIAL_BASE)
+      end
+      plans + added
+    end
+
+    # Platform's stored set keyed by identity, or the reason it cannot be used. An entry for a
+    # repository this environment does not contain is a refusal, never something to skip.
+    def stored_bases(bases, contained)
+      return "Platform returned no usable initial repository bases" unless bases.is_a?(Array) && !bases.empty?
+
+      bases.each_with_object({}) do |base, acc|
+        return "Platform returned an unusable initial repository base" unless base.is_a?(Hash) &&
+          base["repository"].is_a?(String) && Input::COMMIT.match?(base["commit"].to_s)
+        return "the stored initial base #{quoted(base['repository'])} is not a repository of the " \
+               "prepared task workspace" if contained.resolve(base["repository"]) == :missing
+
+        acc[base["repository"].downcase] = base
       end
     end
 
@@ -304,37 +391,35 @@ module SpecrelayRunner
       pull_request_refusal(target, path) || fetch_head(target, path)
     end
 
-    # WHAT GITHUB SAYS NOW. The package records what was accepted; only the live pull request can
-    # say whether that is still the head a new round may build on, so a closed, moved, re-branched
-    # or unreadable one refuses rather than being reconstructed from a stale record.
+    # The pull request must still be readable, belong to this repository and be on the accepted
+    # branch. Its live state and head are NOT authority: the accepted package pinned the exact
+    # commit, so a merged pull request or a branch a later attempt moved still yields that commit
+    # through the exact fetch below, and never the branch's current head.
     def pull_request_refusal(target, path)
       observed = github.pull_request(root: path, slug: target[:repository], url: target[:url], env: env)
       return "SpecRelay could not read the accepted pull request of #{quoted(target[:repository])}; " \
              "refusing to continue from a head it cannot confirm" if observed.nil?
-
-      state = observed["state"].to_s
-      return "the accepted pull request of #{quoted(target[:repository])} is #{state.downcase}, not open" unless
-        state == OPEN
       return "the accepted pull request of #{quoted(target[:repository])} is on branch " \
              "#{quoted(observed['headRefName'].to_s)}, not #{quoted(target[:branch])}" unless
         observed["headRefName"].to_s == target[:branch]
-      return "the accepted head of #{quoted(target[:repository])} moved from " \
-             "#{target[:head][0, 12]} to #{observed['headRefOid'].to_s[0, 12]}" unless
-        observed["headRefOid"].to_s.casecmp?(target[:head])
 
       nil
     end
 
-    # One read-only fetch, then the object itself. The accepted commit legitimately does not exist
-    # in a workspace that was just created, so fetching is the ordinary path rather than a repair.
-    def fetch_head(target, path)
+    # The object itself, fetched when it is not already here: first the remote's branches, then
+    # the exact commit by its SHA, which is how a commit whose branch was deleted or moved is
+    # still reached. A pinned commit legitimately does not exist in a workspace that was just
+    # created, so fetching is the ordinary path rather than a repair.
+    def fetch_head(target, path, head_is = ACCEPTED_HEAD)
       return nil if git.commit?(path, target[:head])
 
       git.fetch(path)
       return nil if git.commit?(path, target[:head])
 
-      "#{quoted(target[:repository])} does not contain the accepted head " \
-        "#{target[:head][0, 12]} after a fetch"
+      run(path, [ "fetch", "--quiet", Review::Checkout::Git::REMOTE, target[:head] ])
+      return nil if git.commit?(path, target[:head])
+
+      "#{quoted(target[:repository])} does not contain #{head_is} #{target[:head][0, 12]} after a fetch"
     end
 
     # `checkout -B` onto the canonical task branch, so the branch the executor works on — and that

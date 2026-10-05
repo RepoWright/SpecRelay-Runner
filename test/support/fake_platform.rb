@@ -119,6 +119,10 @@ class FakePlatform
   # refusal: the run is blocked and the claim that reported it has ended.
   attr_writer :package_answer
 
+  # The initial repository bases the fake has stored for its run, and a scripted `[status, body]`
+  # answer that replaces the ordinary write-once one.
+  attr_accessor :initial_bases, :initial_bases_response
+
   # `token` is the shared development token (fallback mode). A guided connection issues
   # ISSUED_CREDENTIAL, which the fake then accepts as a registered bearer for the remaining
   # endpoints (registered mode).
@@ -446,6 +450,7 @@ class FakePlatform
     # what Platform answers, because the runner PRINTS the run state back and a constant would
     # let a released claim and an unreleased one look identical in the operator's output.
     when "/api/runner/claim_releases" then claim_release
+    when "/api/runner/initial_repository_bases" then initial_repository_bases(request)
     when "/api/runner/specification_packages" then specification_package
     when "/api/runner/specification_generations" then specification_generation(request)
     when "/api/runner/specification_publications" then specification_publication(request)
@@ -831,6 +836,15 @@ class FakePlatform
                                 authorized: false,
                                 blocker: { classification: "package_stale", retryable: false,
                                            detail: "The Spec PR head has moved since the specification was published." } } ]
+  end
+
+  # Write-once, as on Platform: the first offered set is stored and every later call is answered
+  # with it. `initial_bases_response` scripts a refusal or an unconfirmed answer instead.
+  def initial_repository_bases(request)
+    return @initial_bases_response if @initial_bases_response
+
+    @initial_bases ||= request.dig(:body, "repositories")
+    [ 200, { repositories: @initial_bases } ]
   end
 
   def claim_release

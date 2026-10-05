@@ -371,6 +371,37 @@ module SpecrelayRunner
       nil
     end
 
+    # A created environment is PLACED at the decided commits and a reused one of this run is
+    # RECONCILED to them, so a retry after a refused attempt is verified too. A resume keeps its
+    # own rule: only an environment it had to create receives the package and the specification.
+    def place_inputs(worktree)
+      placer = @continuation.package ||
+               PreviousAcceptedPackage.for_specification(run["canonical_branch"], env: env)
+      anchor = @package.anchor
+      if @resume
+        return worktree.created? ? placer.materialize(task_root: worktree.path, specification: anchor) :
+                                   PreviousAcceptedPackage::Result.new(ok: true, repositories: [])
+      end
+
+      bases = recorded_initial_bases(worktree.path)
+      return PreviousAcceptedPackage::Result.new(ok: false, reason: bases) if bases.is_a?(String)
+
+      inputs = { task_root: worktree.path, specification: anchor, initial_bases: bases }
+      worktree.created? ? placer.materialize(**inputs) : placer.reconcile(**inputs)
+    end
+
+    # The set Platform STORED for this run, never the one this machine just resolved: the first
+    # attempt's offer is recorded and every later attempt is answered with it.
+    def recorded_initial_bases(task_root)
+      resolved = PreviousAcceptedPackage.initial_bases(task_root)
+      return resolved if resolved.is_a?(String)
+
+      stored = client.pin_initial_repository_bases(claim: claim, repositories: resolved).to_h["repositories"]
+      stored.is_a?(Array) ? stored : "Platform did not confirm the initial repository bases"
+    rescue PlatformClient::Error => e
+      "Platform did not confirm the initial repository bases (#{e.message})"
+    end
+
     def run_flow(root, staging)
       # MAPIAI-87 CR-001 F1 — the continuation field is authority, so an absent or malformed one
       # is refused HERE: before a worktree is created or reused, before any git or GitHub read,
@@ -416,21 +447,13 @@ module SpecrelayRunner
                                            task_root: worktree.path)
       return package_refused(root, worktree, @package.failure) unless @package.ok?
 
-      if !continued && (@continuation.package || @package.anchor) && worktree.created?
-        # MAPIAI-87 — the ticket's PREVIOUS accepted implementation, and only into a workspace
-        # this attempt just built. Same-run authority wins: a rework or restart target is handled
-        # above and never reaches here, and a resume reuses the worktree its question was asked
-        # from, so `created?` is false for it.
-        #
-        # The verified specification anchor travels with the accepted code, so one authority
-        # chooses a commit that satisfies BOTH inputs — or refuses before placing any of them. A
-        # first run has no accepted code and still needs its approved specification placed, so the
-        # same owner is used with no accepted targets rather than a second placement path here.
-        placer = @continuation.package ||
-                 PreviousAcceptedPackage.for_specification(run["canonical_branch"], env: env)
-        reconstructed = placer.materialize(task_root: worktree.path,
-                                           specification: @package.anchor)
-        return continuation_refused(reconstructed.reason) unless reconstructed.ok?
+      unless continued
+        # The ticket's PREVIOUS accepted implementation, the approved specification and, for every
+        # other repository, the run's stored initial base — one owner decides each repository's
+        # commit. Same-run authority wins: a rework or restart target is handled above and never
+        # reaches here.
+        placed = place_inputs(worktree)
+        return continuation_refused(placed.reason) unless placed.ok?
       end
 
       # THE TREE, not the objects that were verified into it. Everything above proves what each

@@ -187,7 +187,8 @@ class ReportConstructionFailureTest < Minitest::Test
     start
     assert_raises(Interrupt) { with_failing_builder(Interrupt.new) { run_cli } }
 
-    start
+    # A fresh workspace: the interrupted attempt's environment is not this attempt's input.
+    start(expected_heading: "Hello SpecRelay Demo")
     assert_raises(SystemExit) { with_failing_builder(SystemExit.new(9)) { run_cli } }
   end
 
