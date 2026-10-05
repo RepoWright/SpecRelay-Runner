@@ -176,7 +176,7 @@ class SpecificationPublicationTest < Minitest::Test
     assert_equal "published", @platform.last_specification_publication["outcome"]
     assert_includes @io.string, PR_URL
     assert_includes @io.string, "could not be removed"
-    assert_includes @io.string, "Release it by hand"
+    assert_includes @io.string, "Resolve the reason above"
   end
 
   # ------------------------------------------------- the ticket's ONE pull request

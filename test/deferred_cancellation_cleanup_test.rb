@@ -3,15 +3,16 @@
 require_relative "test_helper"
 require "open3"
 
-# A question pause ends the provider session and frees the loop, but the Run's task environment
-# stays with this machine. When Platform cancels that Run later — while the loop runs on, or
-# while this machine is offline — no claim or heartbeat reaches it. So before each claim the
-# connected loop offers its project's Run-owned environments to Platform, and releases the one
-# Platform names through the project's own run-qualified release, before it claims anything.
+# A Run can end while its task environment stays with this machine: Platform cancels it after a
+# question pause had already ended the provider session, or the release after its recorded result
+# failed. No claim or heartbeat reaches that environment again. So before each claim a connected
+# `loop` or `claim-once` offers its project's Run-owned environments to Platform, and releases
+# every one Platform names through the project's own run-qualified release, before it claims
+# anything.
 #
-# Driven through the real loop, the CLI's own pre-claim step and the real HTTP client against
-# the fake Platform, on a real git worktree allocated and released by the project's own
-# `bin/worktree`.
+# Driven through the real loop, the CLI's own pre-claim step and `claim-once` itself, with the
+# real HTTP client against the fake Platform, on a real git worktree allocated and released by the
+# project's own `bin/worktree`.
 class DeferredCancellationCleanupTest < Minitest::Test
   SESSION_ID = "session-deferred-0001"
   CREDENTIAL = "src_deferred-cleanup-credential"
@@ -99,6 +100,99 @@ class DeferredCancellationCleanupTest < Minitest::Test
     assert_equal before, snapshot(%w[DEMO-0402 DEMO-0403], shared)
   end
 
+  # Every environment Platform names is released before the claim, and one already released is not
+  # offered again, so the same target cannot be named twice.
+  def test_every_named_environment_is_released_before_the_claim
+    allocate(TASK, RUN)
+    allocate("DEMO-0402", "run_ended_too")
+    @platform.script_cleanup_targets(target(RUN, TASK), target("run_ended_too", "DEMO-0402"))
+
+    assert_equal SpecrelayRunner::LoopRunner::OK, run_loop(iterations: 1), @io.string
+
+    assert_equal %w[target target claim], exchanges
+    assert_equal [ [ TASK, "DEMO-0402" ], [ "DEMO-0402" ] ],
+                 offered_candidates.map { |pairs| pairs.map { |pair| pair["task_id"] }.sort }
+    refute File.directory?(worktree(TASK))
+    refute File.directory?(worktree("DEMO-0402"))
+  end
+
+  # A release the project could not complete stops the session with the project's own reason and
+  # claims nothing. The next start offers the environment again and, once the project can release
+  # it, releases it and then claims — the unpublished edit in it does not stand in the way.
+  def test_a_failed_release_stops_with_the_projects_reason_and_the_next_start_releases_then_claims
+    allocate(TASK, RUN)
+    working = File.read(File.join(@root, "bin", "worktree"))
+    block_release
+    @platform.script_cleanup_targets(target(RUN, TASK))
+
+    refute_equal SpecrelayRunner::LoopRunner::OK, run_loop(iterations: 2), @io.string
+
+    assert_equal %w[target], exchanges
+    assert File.directory?(worktree(TASK))
+    assert_includes @io.string, "docker is not reachable at [PRIVATE_PATH_REDACTED]"
+    refute_includes @io.string, "/Users/someone"
+
+    File.write(File.join(@root, "bin", "worktree"), working)
+    @platform.script_cleanup_targets(target(RUN, TASK))
+
+    assert_equal SpecrelayRunner::LoopRunner::OK, run_loop(iterations: 1), @io.string
+
+    assert_equal %w[target target claim], exchanges
+    refute File.directory?(worktree(TASK))
+    assert_nil ProjectCommand.recorded_owner(@root, TASK)
+  end
+
+  # ------------------------------------------------------------------- claim-once
+
+  # `claim-once` runs the same recovery before its one claim.
+  def test_claim_once_releases_a_named_environment_before_its_claim
+    allocate(TASK, RUN)
+    @platform.script_cleanup_targets(target(RUN, TASK))
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, claim_once, @io.string
+
+    assert_equal %w[target claim], exchanges
+    refute File.directory?(worktree(TASK))
+  end
+
+  # A release that failed sends no claim and says what to resolve, not to release by hand; the
+  # next `claim-once` releases and then claims.
+  def test_claim_once_stops_on_a_failed_release_and_the_next_one_releases_then_claims
+    allocate(TASK, RUN)
+    working = File.read(File.join(@root, "bin", "worktree"))
+    block_release
+    @platform.script_cleanup_targets(target(RUN, TASK))
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, claim_once, @io.string
+
+    assert_equal %w[target], exchanges
+    assert File.directory?(worktree(TASK))
+    assert_includes @io.string, "docker is not reachable at [PRIVATE_PATH_REDACTED]"
+    assert_includes @io.string, "Resolve the reason above, then run this runner again."
+    refute_includes @io.string, "Release it by hand"
+
+    File.write(File.join(@root, "bin", "worktree"), working)
+    @platform.script_cleanup_targets(target(RUN, TASK))
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, claim_once, @io.string
+    assert_equal %w[target target claim], exchanges
+    refute File.directory?(worktree(TASK))
+  end
+
+  # A confirmation whose fate is unknown keeps the environment and fails the single shot without
+  # a claim.
+  def test_claim_once_keeps_the_environment_and_claims_nothing_when_platform_cannot_confirm
+    allocate(TASK, RUN)
+    @platform.script_cleanup_targets([ 502, {} ])
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, claim_once, @io.string
+
+    assert_equal %w[target], exchanges
+    assert File.directory?(worktree(TASK))
+    assert_equal RUN, ProjectCommand.recorded_owner(@root, TASK)
+    assert_includes @io.string, "could not be confirmed"
+  end
+
   # Scenario 9. A release the project answers with its proof of absence completes too.
   def test_a_project_proved_absence_completes_the_cleanup
     list_also(TASK, RUN)
@@ -145,7 +239,7 @@ class DeferredCancellationCleanupTest < Minitest::Test
       assert_equal %w[target], exchanges, "#{name}: a claim followed an unproved answer"
       assert File.directory?(worktree(TASK)), "#{name}: the environment was released"
       assert_equal RUN, ProjectCommand.recorded_owner(@root, TASK), name
-      assert_includes @io.string, "cancelled runs could not be confirmed", name
+      assert_includes @io.string, "ended runs could not be confirmed", name
     end
   end
 
@@ -164,7 +258,7 @@ class DeferredCancellationCleanupTest < Minitest::Test
     assert_equal %w[target target claim], exchanges
     assert File.directory?(worktree(TASK)), "the unconfirmed environment was released"
     assert_equal RUN, ProjectCommand.recorded_owner(@root, TASK)
-    assert_includes @io.string, "polling failed — whether any task environment belongs to a cancelled run " \
+    assert_includes @io.string, "polling failed — whether any task environment belongs to an ended run " \
                                 "could not be confirmed (Platform request failed (502)); they were kept"
     assert_includes @io.string, "recovered — Platform answered again after 1 failed poll(s)"
     refute_includes @io.string, "Release it by hand"
@@ -346,9 +440,21 @@ class DeferredCancellationCleanupTest < Minitest::Test
       out: @io, err: @io, install_signals: install_signals, max_iterations: iterations,
       poll_seconds: poll_seconds,
       sleeper: sleeper, on_failure: SpecrelayRunner::LoopRunner::ON_FAILURE_CONTINUE,
-      claim: -> { cli.send(:claim_after_cancellation_cleanup, config, client, SESSION_ID) },
+      claim: -> { cli.send(:claim_after_cleanup, config, client, SESSION_ID) },
       execute: ->(_payload) { true }
     )
+  end
+
+  # `claim-once` itself, selecting this machine's saved connection.
+  def claim_once
+    home = Dir.mktmpdir("home", @root)
+    store = SpecrelayRunner::ConnectionStore.new(File.join(home, "connections.json"))
+    store.save(connected_config(@platform.base_url).connection)
+    secrets = FakeSecretStore.new(entries: { SpecrelayRunner::SecretStore.account_for_runner("rnr_deferred") => CREDENTIAL })
+    SpecrelayRunner::CLI.new(out: @io, err: @io, secret_store: secrets,
+                             env: { "PATH" => ENV.fetch("PATH", ""), "HOME" => home,
+                                    "SPECRELAY_RUNNER_STATE_FILE" => store.path })
+                        .run([ "claim-once", "--workspace", KEY ])
   end
 
   def connected_config(base_url)
@@ -418,6 +524,14 @@ class DeferredCancellationCleanupTest < Minitest::Test
   # release answers with a proof of absence.
   def list_also(task, run_id)
     override_verb("list", %(printf '{"environments":[{"task_id":"#{task}","owner_run_id":"#{run_id}"}]}\\n'; exit 0))
+  end
+
+  # The project cannot inspect its runtime, so its owner release stops before removing anything and
+  # says why on stdout, naming a host path.
+  def block_release
+    document = { task_id: TASK, outcome: "blocked", owner_run_id: RUN, recoverable: true,
+                 failures: [ "docker is not reachable at /Users/someone/.docker/run/docker.sock" ] }
+    override_verb("release", "printf '%s\\n' '#{JSON.generate(document)}'; exit 1")
   end
 
   # Replace one verb of the project's command, leaving the others as they are.

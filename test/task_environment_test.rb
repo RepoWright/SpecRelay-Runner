@@ -32,6 +32,14 @@ class TaskEnvironmentTest < Minitest::Test
   def release = SpecrelayRunner::TaskEnvironment.release(root: @workspace.root, task_id: TASK,
                                                          run_id: RUN)
 
+  def release! = SpecrelayRunner::TaskEnvironment.release!(root: @workspace.root, task_id: TASK, run_id: RUN)
+
+  # The project's failure document on stdout and a nonzero exit, as `release --json` reports one.
+  def fail_release_with(document)
+    @workspace.leak!("release", "#{JSON.generate({ 'task_id' => TASK }.merge(document))}\n")
+    @workspace.fail!("release")
+  end
+
   # Once, from the connected root, naming the owning run. The working directory is asserted
   # because a project command run from anywhere else would address a different checkout.
   def test_it_invokes_the_project_owned_release_once_from_the_connected_root
@@ -81,6 +89,66 @@ class TaskEnvironmentTest < Minitest::Test
     end
 
     assert_includes error.message, "still allocated"
+  end
+
+  # ---- the project's own reason for a failed release ---------------------------------------
+
+  # The project prints its failure document on stdout and exits nonzero. Its own words are what
+  # the operator needs, so they are carried into the reason that stops the session.
+  def test_a_failed_release_carries_the_projects_own_reason
+    { "blocked" => [ { "outcome" => "blocked", "owner_run_id" => RUN, "failures" => [ "docker is not reachable" ],
+                       "recoverable" => true }, "docker is not reachable" ],
+      "refused containment" => [ { "outcome" => "refused", "owner_run_id" => RUN,
+                                   "refusals" => [ "component-a is a symlink" ] }, "component-a is a symlink" ],
+      "refused absence" => [ { "outcome" => "refused", "remaining_resources" => [ "registry record for #{TASK}" ] },
+                             "registry record for #{TASK}" ],
+      "degraded" => [ { "state" => "DEGRADED", "owner_run_id" => RUN,
+                        "failures" => [ "compose down failed: exit 1", "volume still present" ] },
+                      "compose down failed: exit 1; volume still present" ],
+      "project error" => [ { "error" => "another release holds the lock" }, "another release holds the lock" ],
+      "manual" => [ { "outcome" => "refused", "owner_run_id" => nil }, "manual environment" ],
+      "foreign" => [ { "outcome" => "refused" }, "owned by a different run" ] }.each do |name, (document, reason)|
+      fail_release_with(document)
+
+      error = assert_raises(SpecrelayRunner::CleanupRequired, name) { release! }
+
+      assert_includes error.message, TASK, name
+      assert_includes error.message, reason, name
+      refute_includes error.message, "exited 1", name
+    end
+  end
+
+  # The reason is the project's text, so it is bounded and passes the same path and secret
+  # redaction as every other line this runner prints.
+  def test_the_projects_reason_is_bounded_and_redacted
+    fail_release_with("outcome" => "blocked",
+                      "failures" => [ "cannot read /Users/someone/secret-checkout/compose.yaml " \
+                                      "with token ghp_#{'a1B2' * 9}; #{'docker said no. ' * 80}" ])
+
+    message = assert_raises(SpecrelayRunner::CleanupRequired) { release! }.message
+
+    refute_includes message, "/Users/someone"
+    refute_includes message, "ghp_"
+    assert_includes message, "[PRIVATE_PATH_REDACTED]"
+    assert_operator message.length, :<=, SpecrelayRunner::TaskEnvironment::REASON_LIMIT + 200
+  end
+
+  # Without a readable document there is no reason to report, and the exit status is what is left.
+  def test_unreadable_failure_output_keeps_the_exit_status
+    @workspace.leak!("release", "Traceback: something broke\n")
+    @workspace.fail!("release")
+
+    assert_includes assert_raises(SpecrelayRunner::CleanupRequired) { release! }.message, "exited 1"
+  end
+
+  # A failed command is never completion, whatever outcome its document names.
+  def test_a_failed_command_that_names_a_release_is_not_completion
+    fail_release_with("outcome" => "released", "owner_run_id" => RUN)
+
+    result = release
+
+    refute_predicate result, :released?
+    assert_includes result.reason, "exited 1"
   end
 
   def test_a_successful_release_says_so_and_lets_the_loop_continue

@@ -216,11 +216,12 @@ module SpecrelayRunner
       err.puts "Invalid executor profile: #{e.message}"
       USAGE_ERROR
     rescue CleanupRequired => e
-      # MAPIAI-97 — the report was accepted; the environment was not released. A single shot has
-      # no loop to stop, so the non-zero exit is what stops the operator's script from claiming
-      # again on a machine holding something unaccounted for.
+      # A task environment was not released, after a report or before the claim. A single shot
+      # has no loop to stop, so the non-zero exit is what stops the operator's script from claiming
+      # again on a machine holding something unaccounted for. The next run offers a leftover Platform
+      # confirms has ended to the same release again, so the remedy is the stated reason.
       presenter.error(Redaction.redact(e.message))
-      err.puts "Release it by hand, then run this runner again."
+      err.puts "Resolve the reason above, then run this runner again."
       RUN_FAILED
     rescue Config::Error => e
       err.puts "Invalid runner config: #{e.message}"
@@ -241,7 +242,7 @@ module SpecrelayRunner
       # stuck; this exits non-zero having sent no claim request at all.
       return RUN_FAILED unless executor_ready?(config)
 
-      result = client.claim(config.claim_runner_params, session_id: presence.session_id)
+      result = claim_after_cleanup(config, client, presence.session_id)
       unless result.claimed?
         out.puts not_claimed_message(result)
         return SUCCESS
@@ -306,7 +307,7 @@ module SpecrelayRunner
         presence: presence,
         connector: loop_connector(config),
         status_reporter: loop_status_reporter(config, client),
-        claim: -> { claim_after_cancellation_cleanup(config, client, presence.session_id) },
+        claim: -> { claim_after_cleanup(config, client, presence.session_id) },
         execute: ->(payload) { loop_disposition(config, client, payload) }
       )
       result == LoopRunner::OK ? SUCCESS : RUN_FAILED
@@ -325,37 +326,43 @@ module SpecrelayRunner
       false
     end
 
-    # Release the task environment of a Run Platform cancelled after its question pause, then
-    # claim. Asked before every loop claim, because that cancellation reaches no process: the Run
-    # is no longer claimable and the paused attempt's claim token ended with its session.
+    # Release every task environment of a Run that Platform confirms has ended and that nothing
+    # still needs, then claim. Asked before every `loop` and `claim-once` claim, because such an
+    # ending may reach no process: a cancellation after a question pause, or a release that failed
+    # after the Run's result was recorded.
     #
-    # Only a connected loop asks; a `--config` loop has no runner identity for Platform to prove
-    # the paused attempt against. Nothing unproved lets a claim through: an unreadable project
-    # list, a refused or unreadable Platform read, a target this machine did not list and an
-    # incomplete release all raise {CleanupRequired}, which stops the session. A read Platform
-    # never answered, or could not process, proves nothing either and claims nothing either — but
-    # its fate is unknown, so it keeps the loop's ordinary transport backoff alongside the claim
-    # and is asked again on the next poll.
-    def claim_after_cancellation_cleanup(config, client, session_id)
-      release_cancelled_environment(config, client, session_id) if config.connection
+    # Only a connected runner asks; a `--config` one has no runner identity for Platform to prove
+    # the attempt against. Nothing unproved lets a claim through: an unreadable project list, a
+    # refused or unreadable Platform read, a target this machine did not list and an incomplete
+    # release all raise {CleanupRequired}, which stops the session. A read Platform never
+    # answered, or could not process, proves nothing either and claims nothing either — but its
+    # fate is unknown, so it keeps the loop's ordinary transport backoff alongside the claim and is
+    # asked again on the next poll.
+    def claim_after_cleanup(config, client, session_id)
+      release_ended_environments(config, client, session_id) if config.connection
       client.claim(config.claim_runner_params, session_id: session_id)
     end
 
-    def release_cancelled_environment(config, client, session_id)
+    # One target per round, and a released environment is not offered again, so there are at most
+    # as many rounds as listed environments. The project's run-qualified release is the only thing
+    # that removes anything, and it discards the environment's unpublished files itself.
+    def release_ended_environments(config, client, session_id)
       workspace_key = config.connection.workspace_key
       root = config.workspace_root(workspace_key, env: env)
       listed, unreadable = TaskEnvironment.run_owned(root: root)
       raise CleanupRequired, unreadable if unreadable
-      return if listed.empty?
 
-      target = confirmed_cleanup_target(client, workspace_key, listed, session_id)
-      return if target.nil?
-      raise CleanupRequired, "Platform named a cancelled run this machine did not list" unless listed.include?(target)
+      until listed.empty?
+        target = confirmed_cleanup_target(client, workspace_key, listed, session_id)
+        return if target.nil?
+        raise CleanupRequired, "Platform named a run this machine did not list" unless listed.include?(target)
 
-      run_id, task_id = target
-      presenter.line("[loop] run #{run_id} was cancelled on Platform; releasing its task environment")
-      TaskEnvironment.release!(root: root, task_id: task_id, run_id: run_id)
-      presenter.line("[loop] released the task environment #{task_id}")
+        run_id, task_id = target
+        presenter.line("run #{run_id} has ended on Platform; releasing its task environment")
+        TaskEnvironment.release!(root: root, task_id: task_id, run_id: run_id)
+        presenter.line("released the task environment #{task_id}")
+        listed -= [ target ]
+      end
     rescue Config::Error => e
       raise CleanupRequired, "the task environments could not be checked: #{PrivatePaths.sanitize(e.message)}"
     end
@@ -365,7 +372,7 @@ module SpecrelayRunner
     # A failure whose FATE is unknown — Platform never answered, or answered that it could not
     # process the request — is re-raised as the transport failure it is, in the same class and
     # with the same status, so the loop waits on its ordinary backoff and asks again rather than
-    # ending the session over an outage it can survive. Nothing here proves a cancellation, so the
+    # ending the session over an outage it can survive. Nothing here proves an ending, so the
     # message states only what could not be confirmed and that the environments were kept; a
     # remedy telling an operator to release one by hand would name work no answer authorized.
     #
@@ -377,11 +384,11 @@ module SpecrelayRunner
       raise
     rescue PlatformClient::Error => e
       if e.transient?
-        raise e.class.new("whether any task environment belongs to a cancelled run could not be confirmed " \
+        raise e.class.new("whether any task environment belongs to an ended run could not be confirmed " \
                           "(#{e.message}); they were kept", status: e.status)
       end
 
-      raise CleanupRequired, "the task environments of cancelled runs could not be confirmed with Platform " \
+      raise CleanupRequired, "the task environments of ended runs could not be confirmed with Platform " \
                              "(#{e.message}); they were kept"
     end
 
