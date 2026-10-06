@@ -69,6 +69,41 @@ class SpecificationLeaseLifecycleTest < Minitest::Test
     assert_equal %w[generated generated], recorded_outcomes, @io.string
   end
 
+  # ---------------------------------------------------- a provider that cannot be launched
+
+  # The operating system refuses to start the provider. Platform receives the lane's ordinary
+  # bounded failure — no package, no host path — and the session goes on to its next claim
+  # instead of ending on the exception.
+  def test_a_provider_that_cannot_be_launched_is_reported_and_the_loop_claims_again
+    restart_platform(claim_limit: 2) { |platform| platform.queue_claims([ claim_payload, claim_payload ]) }
+
+    with_unlaunchable_provider do
+      Timeout.timeout(180) { run_cli(command: %w[loop --poll-interval 5 --on-failure continue]) }
+    end
+
+    assert_equal %w[failed generated], recorded_outcomes, @io.string
+    failure = @platform.specification_generations.first.dig(:body, "generation")
+    assert_equal "generation_provider_failed", failure["failure_class"]
+    assert_equal "the Claude specification provider could not be launched (Errno::ENOENT)", failure["message"]
+    assert_equal true, failure["zero_output_files_written"]
+    refute_includes @io.string, UNLAUNCHABLE_PATH
+  end
+
+  # A launch failure while the claim is already lost is that stop, not a failure to report.
+  def test_a_launch_failure_after_the_claim_was_lost_submits_nothing
+    lose_claim = lambda do |stop_check|
+      @platform.signal_cancelled!
+      Timeout.timeout(15) { sleep 0.05 until stop_check.call }
+    end
+
+    with_unlaunchable_provider(before_failure: lose_claim) do
+      assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
+    end
+
+    assert_empty @platform.specification_generations
+    assert_includes @io.string, "Platform reports cancelled"
+  end
+
   # ---------------------------------------------------- the claim Platform ended
 
   # A claim Platform no longer considers live is discovered BEFORE the provider is launched, so
@@ -327,7 +362,7 @@ class SpecificationLeaseLifecycleTest < Minitest::Test
     SpecificationWorkspace.write_executable(File.join(dir, "claude"), <<~RUBY)
       #!/usr/bin/env ruby
       probe = ARGV.first == "--version" || %w[auth login].include?(ARGV.first)
-      if !probe && ARGV.last.to_s.include?(#{SpecificationWorkspace::GENERATION_MARKER.inspect})
+      if !probe && ARGV.include?("--json-schema")
         File.write(#{held_pid_file.inspect}, Process.pid.to_s)
         trap("TERM", "IGNORE") if #{ignore_term}
         sleep #{HOLD_SECONDS}
@@ -392,6 +427,26 @@ class SpecificationLeaseLifecycleTest < Minitest::Test
       platform.signal_cancelled! if marker.call
       original.call
     end
+  end
+
+  UNLAUNCHABLE_PATH = "/opt/host-only/bin/claude"
+
+  # The first specification launch fails in the spawn itself, as an oversized argv or a missing
+  # CLI does; every other command, and any later launch, runs normally.
+  def with_unlaunchable_provider(before_failure: nil)
+    original = SpecrelayRunner::CommandRunner.method(:run)
+    failed = false
+    SpecrelayRunner::CommandRunner.define_singleton_method(:run) do |argv, **kwargs|
+      if !failed && argv.include?("--json-schema")
+        failed = true
+        before_failure&.call(kwargs[:stop_check])
+        raise Errno::ENOENT, UNLAUNCHABLE_PATH
+      end
+      original.call(argv, **kwargs)
+    end
+    yield
+  ensure
+    SpecrelayRunner::CommandRunner.define_singleton_method(:run, original)
   end
 
   # Every renewal worker one claim built. Instances rather than threads: "exactly one worker" and

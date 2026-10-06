@@ -274,9 +274,16 @@ module SpecrelayRunner
 
     def specification_args = [ *args, SCHEMA_FLAG, JSON.generate(Specification::PackagePath::PROVIDER_SCHEMA) ]
 
-    # A one-line, redacted description safe for a console line or a report field. `argv` is the
-    # invocation actually launched when it is not the base one.
-    def describe(argv = args) = Redaction.redact("#{PROVIDER} #{command} #{argv.join(' ')} (prompt via #{prompt_delivery})")
+    # How the specification lane delivers its prompt. A specification prompt can exceed the
+    # operating system's argument limit, so it goes on stdin; the claimed `prompt_delivery` still
+    # governs the implementation lane and the identity.
+    SPECIFICATION_PROMPT_DELIVERY = "stdin"
+
+    # A one-line, redacted description safe for a console line or a report field. `argv` and
+    # `delivery` describe the invocation actually launched when it is not the base one.
+    def describe(argv = args, delivery: prompt_delivery)
+      Redaction.redact("#{PROVIDER} #{command} #{argv.join(' ')} (prompt via #{delivery})")
+    end
 
     # The local, no-edit readiness check the runner performs BEFORE it asks
     # Platform for work: is the CLI installed, and is the operator logged in? It
