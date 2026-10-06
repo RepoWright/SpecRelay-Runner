@@ -46,10 +46,14 @@ class SpecificationDocumentSetTest < Minitest::Test
     assert_empty documents.open_questions
   end
 
-  # THE regression this slice caught interactively: the id must pair with the DISTINGUISHING
-  # "decision required" text, not the "why it blocks" boilerplate that reads identically for
-  # every question in the file.
-  def test_open_questions_returns_the_decision_required_text_not_the_why_it_blocks_boilerplate
+  # One reported entry per question, carrying all three of its fields in the order the package
+  # contract names them, so a reader of the entry alone can answer the question.
+  def entry(id, why, decision, consequence)
+    "#{id}\nWhy it blocks: #{why}\nDecision required: #{decision}\nConsequence: #{consequence}"
+  end
+
+  # Every field travels, wrapped continuation lines included, rather than the decision alone.
+  def test_open_questions_reports_every_field_of_the_question
     open_questions_md = <<~MD
       # Open questions — SR-700
 
@@ -62,12 +66,14 @@ class SpecificationDocumentSetTest < Minitest::Test
     MD
     documents = DocumentSet.new(base_files.merge(PackagePath::OPEN_QUESTIONS_MD => open_questions_md))
 
-    assert_equal [ "OQ-001: should a repeat request return the cached result or re-run the operation?" ],
-                documents.open_questions
+    assert_equal [ entry("OQ-001", "the recorded inputs do not decide this, and guessing would put an " \
+                                   "unreviewed product decision into the implementation.",
+                         "should a repeat request return the cached result or re-run the operation?",
+                         "without an answer, an implementer must choose arbitrarily.") ],
+                 documents.open_questions
   end
 
-  # Two questions, each with its OWN decision text, correctly paired by id rather than both
-  # collapsing to the same (identical) "why it blocks" sentence.
+  # Two questions, each with its OWN decision text, correctly paired by id and kept in document order.
   def test_open_questions_pairs_each_id_with_its_own_distinct_decision
     open_questions_md = <<~MD
       # Open questions — SR-700
@@ -86,8 +92,11 @@ class SpecificationDocumentSetTest < Minitest::Test
     MD
     documents = DocumentSet.new(base_files.merge(PackagePath::OPEN_QUESTIONS_MD => open_questions_md))
 
-    assert_equal [ "OQ-001: what happens on a second identical request?",
-                  "OQ-002: what does the user see on failure?" ], documents.open_questions
+    assert_equal [ entry("OQ-001", "the recorded inputs do not decide this.",
+                         "what happens on a second identical request?", "an implementer must guess."),
+                   entry("OQ-002", "the recorded inputs do not decide this.",
+                         "what does the user see on failure?", "an implementer must guess.") ],
+                 documents.open_questions
   end
 
   # A "Decision required" bullet whose value soft-wraps onto a continuation line still joins
@@ -105,8 +114,52 @@ class SpecificationDocumentSetTest < Minitest::Test
     MD
     documents = DocumentSet.new(base_files.merge(PackagePath::OPEN_QUESTIONS_MD => open_questions_md))
 
-    assert_equal [ "OQ-001: should a repeat request return the cached result or re-run the " \
-                  "operation end to end?" ], documents.open_questions
+    assert_equal [ entry("OQ-001", "a", "should a repeat request return the cached result or re-run the " \
+                                        "operation end to end?", "an implementer must guess.") ],
+                 documents.open_questions
+  end
+
+  # A long decision whose final answer option sits on a wrapped line keeps that option: no cut at
+  # a character budget and no cut at the wrap point.
+  def test_open_questions_keeps_the_final_option_of_a_long_wrapped_decision
+    options = (1..7).map { |n| "option #{n}: keep the existing behaviour for every customer account in region #{n}" }
+    decision = "which rollout should the export follow? #{options.join('; ')}; or option 8: defer the export until finance confirms the reporting calendar for the next fiscal years."
+    wrapped = decision.scan(/.{1,90}(?:\s|\z)/).map(&:strip)
+    open_questions_md = <<~MD
+      # Open questions — #{ISSUE}
+
+      ## OQ-001
+
+      - Why it blocks: the recorded inputs do not decide this.
+      - Decision required: #{wrapped.join("\n  ")}
+      - Consequence: an implementer must guess.
+    MD
+    documents = DocumentSet.validate!(base_files.merge(PackagePath::OPEN_QUESTIONS_MD => open_questions_md),
+                                      issue_key: ISSUE)
+
+    assert_equal 688, decision.length
+    assert_equal [ entry("OQ-001", "the recorded inputs do not decide this.", decision, "an implementer must guess.") ],
+                 documents.open_questions
+    assert documents.open_questions.first.end_with?("fiscal years.\nConsequence: an implementer must guess.")
+  end
+
+  # The reported entry passes through the same redactor Generation applies before sending it: a
+  # secret-shaped value inside one field is replaced and every other line of the entry survives.
+  def test_a_secret_inside_a_reported_question_is_redacted_and_the_rest_survives
+    open_questions_md = <<~MD
+      # Open questions — #{ISSUE}
+
+      ## OQ-001
+
+      - Why it blocks: the ticket quotes a deploy key ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA in its log.
+      - Decision required: rotate the key now, or after the export ships?
+      - Consequence: an implementer must guess.
+    MD
+    documents = DocumentSet.new(base_files.merge(PackagePath::OPEN_QUESTIONS_MD => open_questions_md))
+
+    assert_equal [ entry("OQ-001", "the ticket quotes a deploy key [REDACTED] in its log.",
+                         "rotate the key now, or after the export ships?", "an implementer must guess.") ],
+                 documents.open_questions.map { |text| SpecrelayRunner::Redaction.redact(text) }
   end
 
   # ------------------------------------------------------------------ validate! on the new files
@@ -281,7 +334,9 @@ class SpecificationDocumentSetTest < Minitest::Test
     MD
     documents = DocumentSet.new(base_files.merge(PackagePath::OPEN_QUESTIONS_MD => open_questions_md))
 
-    assert_equal [ "OQ-002: what does the user see on failure?" ], documents.open_questions
+    assert_equal [ entry("OQ-002", "the recorded inputs do not decide this.",
+                         "what does the user see on failure?", "an implementer must guess.") ],
+                 documents.open_questions
   end
 
   def test_a_resolved_question_missing_its_own_required_field_is_rejected
@@ -579,7 +634,9 @@ class SpecificationDocumentSetTest < Minitest::Test
 
     documents = DocumentSet.validate!(files, issue_key: ISSUE)
 
-    assert_equal [ "OQ-001: what happens on a second identical request?" ], documents.open_questions
+    assert_equal [ entry("OQ-001", "the recorded inputs do not decide this.",
+                         "what happens on a second identical request?", "an implementer must guess.") ],
+                 documents.open_questions
   end
 
   # Resolution changes which keys are recognized, never what a valid document must contain.
