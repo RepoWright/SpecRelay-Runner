@@ -405,7 +405,7 @@ class SpecificationTaskWorkspaceTest < Minitest::Test
       require "specrelay_runner"
       packet = begin
         SpecrelayRunner::Specification::BalancedJson
-          .extract_object(ARGV.last.to_s.split("EVIDENCE (JSON):").last.to_s)
+          .extract_object($stdin.read.to_s.split("EVIDENCE (JSON):").last.to_s)
           .then { |object| JSON.parse(object) }
       rescue StandardError
         nil

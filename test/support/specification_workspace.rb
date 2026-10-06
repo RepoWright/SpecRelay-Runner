@@ -351,7 +351,7 @@ module SpecificationWorkspace
   # exactly as a real host resolves them.
   def claude_stub(root, files: nil, answer: nil, compose: false, exit_code: 0, capture_prompt_to: nil,
                   analyzer_answer: nil)
-    provider_stub(root, "claude", delivery: :argument, exit_code: exit_code,
+    provider_stub(root, "claude", delivery: :schema_stdin, exit_code: exit_code,
                                   capture_prompt_to: capture_prompt_to, analyzer_answer: analyzer_answer,
                                   answer: answer_source(files, answer, compose), emit: CLAUDE_FRAMES)
   end
@@ -413,6 +413,13 @@ module SpecificationWorkspace
   # question it was asked.
   GENERATION_MARKER = "You are writing a software specification package"
 
+  # Where each double reads its prompt. Claude's specification call (the one asking for the
+  # document schema) takes it on stdin; its reference analysis still takes it as the last argument.
+  PROMPT_READERS = {
+    stdin: "$stdin.read.to_s",
+    schema_stdin: '(ARGV.include?("--json-schema") ? $stdin.read : ARGV.last).to_s'
+  }.freeze
+
   def provider_stub(root, name, answer:, emit:, delivery:, exit_code:, capture_prompt_to:, analyzer_answer:)
     dir = Dir.mktmpdir("#{name}-stub", root)
     write_executable(File.join(dir, name), <<~RUBY)
@@ -430,7 +437,7 @@ module SpecificationWorkspace
       CODEX_PRIVATE_REASONING = #{CODEX_PRIVATE_REASONING.inspect}
       def say(event) = puts(JSON.generate(event))
 
-      prompt = #{delivery == :stdin ? '$stdin.read.to_s' : 'ARGV.last.to_s'}
+      prompt = #{PROMPT_READERS.fetch(delivery)}
       #{capture_prompt_to ? "File.write(#{capture_prompt_to.inspect}, prompt)" : ''}
       exit #{exit_code} unless #{exit_code}.zero?
 

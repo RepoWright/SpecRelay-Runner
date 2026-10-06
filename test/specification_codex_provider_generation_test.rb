@@ -177,7 +177,7 @@ class SpecificationCodexProviderGenerationTest < Minitest::Test
     codex_instruction = codex.send(:output_instruction)
     refute_equal claude_instruction, codex_instruction
     assert_equal codex_runner.calls.fetch(0).stdin_data,
-                 claude_runner.calls.fetch(0).argv.last.sub(claude_instruction, codex_instruction)
+                 claude_runner.calls.fetch(0).stdin_data.sub(claude_instruction, codex_instruction)
   end
 
   def test_a_response_wrapped_in_prose_with_unrelated_braces_still_parses

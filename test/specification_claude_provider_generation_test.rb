@@ -2,6 +2,7 @@
 
 require_relative "test_helper"
 require_relative "support/claude_stream_json"
+require "digest"
 
 # MVP-0028 remediation slice 1, review-004 finding F1 — the new real-provider EXECUTION path.
 #
@@ -26,7 +27,7 @@ class SpecificationClaudeProviderGenerationTest < Minitest::Test
   # CommandRunner does for it: each JSONL line is handed to `on_output` WHILE the provider is
   # notionally running, and the Result's stdout is no longer what the adapter reads.
   class FakeCommandRunner
-    Call = Struct.new(:argv, :chdir, :env, :timeout_seconds, keyword_init: true)
+    Call = Struct.new(:argv, :chdir, :env, :timeout_seconds, :stdin_data, keyword_init: true)
 
     def initialize(result:, lines: [])
       @result = result
@@ -36,8 +37,8 @@ class SpecificationClaudeProviderGenerationTest < Minitest::Test
 
     attr_reader :calls
 
-    def run(argv, chdir:, env:, timeout_seconds:, on_output: nil, stop_check: nil)
-      @calls << Call.new(argv: argv, chdir: chdir, env: env, timeout_seconds: timeout_seconds)
+    def run(argv, chdir:, env:, timeout_seconds:, stdin_data: nil, on_output: nil, stop_check: nil)
+      @calls << Call.new(argv: argv, chdir: chdir, env: env, timeout_seconds: timeout_seconds, stdin_data: stdin_data)
       @lines.each { |line| on_output&.call("stdout", line) }
       @result
     end
@@ -297,7 +298,7 @@ class SpecificationClaudeProviderGenerationTest < Minitest::Test
   def test_the_prompt_asks_for_the_schema_properties_through_structured_output_only
     _documents, runner = generate({ "issue_key" => "SR-700" })
 
-    prompt = runner.calls.fetch(0).argv.last
+    prompt = runner.calls.fetch(0).stdin_data
     %w[spec.md analysis_input-evidence.md analysis_business.md analysis_technical.md analysis_open-questions.md].each do |name|
       assert_includes prompt, %("#{name}")
     end
@@ -338,7 +339,7 @@ class SpecificationClaudeProviderGenerationTest < Minitest::Test
 
   # ------------------------------------------------------------------ the launch itself
 
-  def test_the_launch_carries_the_configured_command_arguments_prompt_timeout_and_environment
+  def test_the_launch_carries_the_configured_command_arguments_stdin_prompt_timeout_and_environment
     profile = build_profile(command: "claude", args: [ "--print", "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions" ],
                             timeout_seconds: 42, env: { "CLAUDE_EXTRA" => "yes" })
     _documents, runner = generate({ "issue_key" => "SR-700", "title" => "Add an export button" },
@@ -347,26 +348,59 @@ class SpecificationClaudeProviderGenerationTest < Minitest::Test
                                         "UNRELATED_SECRET" => "must-not-travel" })
 
     call = runner.calls.fetch(0)
-    argv = [ "claude", "--print", "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions",
-             "--json-schema", JSON.generate(SpecrelayRunner::Specification::PackagePath::PROVIDER_SCHEMA) ]
-    assert_equal argv, call.argv[0, argv.length]
-    assert_equal 1, call.argv.length - argv.length, "the packet-derived prompt is exactly one argv element"
-    assert_includes call.argv.last, "SR-700"
-    assert_includes call.argv.last, "Add an export button"
-    assert_includes call.argv.last, "Submit the package ONLY through the structured output"
+    assert_equal [ "claude", *profile.specification_args ], call.argv
+    assert_includes call.stdin_data, "SR-700"
+    assert_includes call.stdin_data, "Add an export button"
+    assert_includes call.stdin_data, "Submit the package ONLY through the structured output"
+    refute call.argv.any? { |argument| argument.include?("Submit the package ONLY") },
+           "the prompt must never become a process argument"
     assert_equal 42, call.timeout_seconds
     assert_equal({ "PATH" => "/usr/bin:/bin", "HOME" => "/home/operator", "CLAUDE_EXTRA" => "yes" }, call.env,
                 "only PATH, HOME and the profile's own extra_env travel — never an unrelated variable")
   end
 
-  # The specification writer shares the exact implementation profile, and with it the approved
-  # 18,000-second process limit.
-  # The operator reads the invocation that actually ran, not the base argv it extends.
-  def test_the_description_names_the_effective_schema_invocation
+  # The incident: a prompt above Linux's 128 KiB per-argument limit and macOS's 1 MiB ARG_MAX made
+  # the spawn itself fail. Through the real CommandRunner the same prompt now reaches the CLI byte
+  # for byte on stdin, while as an argument it still cannot be launched at all.
+  def test_an_oversized_prompt_reaches_the_cli_intact_on_stdin_and_never_through_argv
+    packet = { "issue_key" => "SR-700", "description" => "The export must keep every column in order. " * 30_000 }
+    _documents, fake = generate(packet)
+    prompt = fake.calls.fetch(0).stdin_data
+    assert_operator prompt.bytesize, :>, 1024 * 1024
+
+    dir = Dir.mktmpdir("specrelay-claude-stdin-")
+    capture = File.join(dir, "received.json")
+    SpecificationWorkspace.write_executable(File.join(dir, "claude"), <<~RUBY)
+      #!/usr/bin/env ruby
+      require "json"
+      require "digest"
+      input = $stdin.read
+      File.write(#{capture.inspect}, JSON.generate("sha256" => Digest::SHA256.hexdigest(input), "argv" => ARGV))
+      puts JSON.generate("type" => "result", "subtype" => "success", "is_error" => false, "result" => "",
+                         "structured_output" => #{VALID_STRUCTURED.to_json})
+    RUBY
+    profile = build_profile(command: File.join(dir, "claude"))
+    provider = Provider::Claude.new(profile: profile, env: { "PATH" => ENV["PATH"] }, working_directory: dir)
+
+    assert_equal VALID_DOCUMENTS, provider.generate(packet)
+    received = JSON.parse(File.read(capture))
+    assert_equal Digest::SHA256.hexdigest(prompt), received["sha256"]
+    assert_equal profile.specification_args, received["argv"]
+    assert_raises(Errno::E2BIG) do
+      SpecrelayRunner::CommandRunner.run([ "/bin/echo", prompt ], chdir: dir, env: {}, timeout_seconds: 10)
+    end
+  end
+
+  # The operator reads the invocation that actually ran, not the base argv it extends, and how its
+  # prompt really travels. The profile's own description and identity keep the claimed delivery.
+  def test_the_description_names_the_effective_schema_invocation_and_stdin_delivery
     provider, = provider_for(result: failure(exit_code: 0))
 
     assert_includes provider.describe, "--dangerously-skip-permissions --json-schema {"
     assert_includes provider.describe, '"additionalProperties":false'
+    assert provider.describe.end_with?("(prompt via stdin)"), provider.describe
+    assert build_profile.describe.end_with?("(prompt via argument)")
+    assert_includes build_profile.identity(env: {}), "argument"
   end
 
   # The fixed schema is the whole contract with the provider: four required string documents, one
@@ -397,7 +431,7 @@ class SpecificationClaudeProviderGenerationTest < Minitest::Test
   def test_the_prompt_names_the_new_required_key_and_the_synthesis_rules
     _documents, runner = generate({ "issue_key" => "SR-700" })
 
-    prompt = runner.calls.fetch(0).argv.last
+    prompt = runner.calls.fetch(0).stdin_data
     assert_includes prompt, "analysis/input-evidence.md"
     assert_includes prompt, "analysis/open-questions.md"
     assert_includes prompt, "PRODUCT BEHAVIOR"
@@ -412,7 +446,7 @@ class SpecificationClaudeProviderGenerationTest < Minitest::Test
   def test_the_prompt_requires_genuine_analysis_of_a_linked_issues_own_content
     _documents, runner = generate({ "issue_key" => "SR-700" })
 
-    prompt = runner.calls.fetch(0).argv.last
+    prompt = runner.calls.fetch(0).stdin_data
     assert_includes prompt, "already had its OWN key, title, and description read"
     assert_includes prompt, "its own stated acceptance criteria"
   end
@@ -423,7 +457,7 @@ class SpecificationClaudeProviderGenerationTest < Minitest::Test
     _documents, runner = generate({ "issue_key" => "SR-700",
                                    "revision" => { "previous_files" => { "spec.md" => "# SR-700\n\nprevious text" } } })
 
-    prompt = runner.calls.fetch(0).argv.last
+    prompt = runner.calls.fetch(0).stdin_data
     assert_includes prompt, "reuse the previous package's own"
     assert_includes prompt, "never renumber or reissue it"
     assert_includes prompt, "Status: resolved"
@@ -440,22 +474,20 @@ class SpecificationClaudeProviderGenerationTest < Minitest::Test
     assert_includes error.message, "exited 1"
   end
 
-  # Claude's launch-error behaviour is UNCHANGED, and this test exists to hold it that way.
-  #
-  # An absent or unexecutable CLI raises the operating system's own error out of this adapter,
-  # exactly as it did before the second provider existed. Classifying it as a bounded
-  # `Provider::Failed` would be an improvement to Claude's failure boundary, and this slice is
-  # not allowed to make one: the accepted boundary is that Claude's argv, stream, parser and
-  # FAILURE behaviour are byte-for-byte what they were. The bounded classification is Codex's
-  # own, proven in its own suite, and the asymmetry is deliberate rather than an oversight.
-  def test_a_launch_error_propagates_unchanged_rather_than_being_reclassified
-    runner = Object.new
-    def runner.run(*, **) = raise(Errno::ENOENT, "/usr/local/bin/claude")
-    provider = Provider::Claude.new(profile: build_profile, env: {},
-                                    working_directory: Dir.mktmpdir("specrelay-spec-task-"),
-                                    command_runner: runner)
+  # A CLI that cannot be launched at all is a bounded generation failure rather than an exception
+  # escaping the lane. The operating system's error names a host path, so only its class is kept.
+  def test_a_launch_error_is_a_bounded_generation_failure_without_the_host_path
+    [ Errno::E2BIG, Errno::ENOENT ].each do |launch_error|
+      runner = Object.new
+      runner.define_singleton_method(:run) { |*, **| raise launch_error, "/usr/local/bin/claude" }
+      provider = Provider::Claude.new(profile: build_profile, env: {},
+                                      working_directory: Dir.mktmpdir("specrelay-spec-task-"),
+                                      command_runner: runner)
 
-    assert_raises(Errno::ENOENT) { provider.generate({}) }
+      error = assert_raises(Provider::Failed) { provider.generate({}) }
+
+      assert_equal "the Claude specification provider could not be launched (#{launch_error})", error.message
+    end
   end
 
   def test_a_timeout_is_a_generation_failure_naming_the_timeout

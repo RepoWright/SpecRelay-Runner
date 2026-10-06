@@ -99,12 +99,16 @@ module SpecrelayRunner
 
         # The provider's whole run, from the prompt to a parsed file map. Every rule about what a
         # usable answer IS lives here, once; the adapter supplies only its decoder and its launch.
-        # What happens once the process has STARTED is one rule for both providers. What happens
-        # when it cannot be started at all is not: Claude's accepted behaviour is that the
-        # operating system's own error escapes, and this slice may not change it. Each adapter
-        # therefore owns its own `launch`, and only Codex's classifies a failure to start.
+        # A provider that cannot be started at all is one rule for both too: a bounded generation
+        # failure rather than an exception escaping the lane, which would leave the claim held with
+        # no recorded reason. The operating system's error names a host path, so the message keeps
+        # its CLASS and nothing else.
         def generate_package(packet, stream, stop_check)
-          result = launch(prompt_for(packet), stream, stop_check)
+          result = begin
+            launch(prompt_for(packet), stream, stop_check)
+          rescue SystemCallError => e
+            raise Failed, "#{failure_prefix} could not be launched (#{e.class})"
+          end
           raise Failed, "#{failure_prefix} timed out" if result.timed_out?
           raise Failed, "#{failure_prefix} exited #{result.exit_code}" unless result.success?
 
@@ -349,8 +353,9 @@ module SpecrelayRunner
 
         def kind = KIND
 
-        # The invocation that actually runs, schema included.
-        def describe = "#{kind.capitalize} profile — #{profile.describe(profile.specification_args)}"
+        # The invocation that actually runs, schema and prompt delivery included.
+        def describe = "#{kind.capitalize} profile — " \
+                       "#{profile.describe(profile.specification_args, delivery: ClaudeProfile::SPECIFICATION_PROMPT_DELIVERY)}"
 
         # The profile is structured-output-only, so the process is read through the
         # SAME {ClaudeStream} the implementation lane uses. Progress reaches `on_output` while the
@@ -367,19 +372,19 @@ module SpecrelayRunner
 
         private
 
-        # The packet reaches the model as ONE argv element, exactly as the implementation lane
-        # delivers this profile's prompt, after the profile's specification invocation — the base
-        # argv plus the fixed document schema.
+        # The profile's specification invocation — the base argv plus the fixed document schema —
+        # with the packet on stdin. A specification prompt can exceed the operating system's
+        # argument limit, which would fail the launch before the model started.
         #
         # In the prepared task workspace, not a throwaway directory. That is the whole of
         # workspace-grounded generation at this boundary: the model's own tools resolve the
         # ticket's real multi-repository source state, and what it may WRITE there is bounded
         # afterwards by the change-boundary check rather than by giving it nothing to read.
         def launch(prompt, stream, stop_check)
-          command_runner.run([ profile.command, *profile.specification_args, prompt ],
+          command_runner.run([ profile.command, *profile.specification_args ],
                              chdir: working_directory, env: child_env,
-                             timeout_seconds: profile.timeout_seconds, on_output: stream.sink,
-                             stop_check: stop_check)
+                             timeout_seconds: profile.timeout_seconds, stdin_data: prompt,
+                             on_output: stream.sink, stop_check: stop_check)
         end
 
         # The schema's own property names, from the one owner of document membership, and the one
@@ -421,10 +426,9 @@ module SpecrelayRunner
       # The operator's REAL Codex profile, writing the specification.
       #
       # It is a sibling of {Claude}, not a subclass and not a registry entry: the two share the
-      # prompt and the file-map contract through {PackageContract} and differ only in the two
-      # things that genuinely differ — Codex takes its prompt on STDIN, so the specification never
-      # becomes a process argument, and its turn is read by {CodexStream}, whose terminal contract
-      # is materially different from Claude's single `result` frame.
+      # prompt and the file-map contract through {PackageContract} and differ only in what
+      # genuinely differs — the profile's own argv, and its turn is read by {CodexStream}, whose
+      # terminal contract is materially different from Claude's single `result` frame.
       class Codex
         include PackageContract
 
@@ -457,12 +461,6 @@ module SpecrelayRunner
                                                                  stdin_data: prompt,
                                                                  on_output: stream.sink,
                                                                  stop_check: stop_check)
-        rescue SystemCallError => e
-          # A Codex CLI that cannot be started is a bounded generation failure rather than an
-          # exception escaping the lane, which would leave the claim held with no recorded reason
-          # (S07). The underlying error names a host path, so this names the condition and the
-          # error CLASS and nothing else.
-          raise Failed, "#{failure_prefix} could not be launched (#{e.class})"
         end
       end
     end
