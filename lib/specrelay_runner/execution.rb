@@ -1147,7 +1147,10 @@ module SpecrelayRunner
         #{package_lines.join("\n")}
 
         Rules:
-        - Change ONLY files inside the task workspace above, per the approved specification.
+        - Change ONLY files inside the task workspace above, per the approved specification. The
+          one exception is the scenario evidence described below, which belongs inside
+          `#{scenario_dir}`. Write nowhere else outside the task workspace: not that directory's
+          parent, and no other path.
         - Do NOT edit any `spec.md`/`spec_persian.md`, push, open a PR, or write to Platform.
         - Make the change idempotently.
 
@@ -1239,9 +1242,15 @@ module SpecrelayRunner
           "viewport": "<width>x<height>", "scenario": "NN-short-name", "result": "<captured UI state>" } ] }`.
           Paths are relative to that directory; `scenario` is the scenario file name without `.md`.
           Only declared files are read.
-        - Do not link images from the Markdown, and never include credentials, tokens or private
-          reasoning. A scenario records what you observed; SpecRelay's own verification decides the
-          outcome.
+        - Put each screenshot where it belongs in the narrative: write its reference on a line of
+          its own, with a blank line above and below, immediately after the action or observation
+          it shows — `![Validation error](screenshots/validation.png)`. Write one such line for
+          every material state you captured, at the position where you captured it, so one
+          scenario can carry several. The path is the one you declared for that scenario, relative
+          to this directory and not to the document: never a remote URL, an absolute path, a `..`
+          segment, or a screenshot declared against another scenario.
+        - Never include credentials, tokens or private reasoning. A scenario records what you
+          observed; SpecRelay's own verification decides the outcome.
       MD
     end
 
