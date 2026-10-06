@@ -143,11 +143,23 @@ class RepositorySelectionTest < Minitest::Test
     assert_match(/at most/i, read.error)
   end
 
-  def test_more_argv_elements_than_the_bound_are_refused
-    argv = Array.new(SpecrelayRunner::RepositorySelection::MAX_ARGUMENTS + 1) { "--flag" }
+  # The argv element count is not a bound: a runtime activation, a test command and several test
+  # paths are one ordinary command. The document and per-element bounds still limit its volume.
+  def test_an_argv_of_more_than_twenty_elements_is_accepted_whole
+    argv = [ "bin/test", *Array.new(24) { |index| "test/example_#{index}_test.rb" } ]
+    write(JSON.generate({ "repositories" => [ { "path" => "component-a", "commands" => [ argv ] } ] }))
+
+    result = read
+
+    assert result.ok?, result.error
+    assert_equal [ argv ], result.entries.first.commands
+  end
+
+  def test_a_many_element_argv_that_overflows_the_document_is_refused_on_size
+    argv = Array.new(SpecrelayRunner::RepositorySelection::MAX_BYTES / 10) { "--flag-one" }
     write(JSON.generate({ "repositories" => [ { "path" => "component-a", "commands" => [ argv ] } ] }))
     refute read.ok?
-    assert_match(/at most/i, read.error)
+    assert_match(/too large/i, read.error)
   end
 
   def test_an_oversized_argv_element_is_refused

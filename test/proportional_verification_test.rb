@@ -209,6 +209,21 @@ class ProportionalVerificationTest < Minitest::Test
     assert_empty verification_for("component-b").fetch("commands")
   end
 
+  # A focused command naming many test paths is selected, replayed and reported whole: the argv
+  # element count is not a bound at any step.
+  def test_a_selected_argv_of_more_than_twenty_elements_is_replayed_and_reported_whole
+    argv = [ "bin/verify", *Array.new(24) { |index| "test/example_#{index}_test.rb" } ]
+    start(fixture_env: { "FAKE_EXECUTOR_COMMANDS" => JSON.generate({ "component-a" => [ argv ] }) })
+    code, output = run_cli
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, code, output
+    assert_equal "succeeded", terminal["outcome"]
+    command = verification_for("component-a").fetch("commands").first
+    assert_equal argv, command.fetch("argv")
+    assert_equal 0, command.fetch("exit_status")
+    assert_includes command.fetch("output_summary"), "verify passed"
+  end
+
   # --- S05: the executor repairs before it returns -------------------------
 
   def test_the_executor_repairs_a_failure_and_the_runner_replay_observes_the_final_pass
