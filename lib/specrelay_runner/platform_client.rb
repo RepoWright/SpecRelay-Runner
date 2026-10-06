@@ -385,6 +385,15 @@ module SpecrelayRunner
       status == 201 ? body : raise_for(status, body)
     end
 
+    # POST /api/runner/initial_repository_bases — offer the default-branch commits this machine
+    # resolved, and receive the set Platform STORED for the run. The first offer is recorded and
+    # every later one gets that original set back, so only the returned set may be placed.
+    def pin_initial_repository_bases(claim:, repositories:)
+      status, body = post_json("/api/runner/initial_repository_bases",
+                               { claim: claim, repositories: repositories })
+      status == 200 ? body : raise_for(status, body)
+    end
+
     # POST /api/runner/executor_questions (MVP-0036). Submits ONE bounded question batch from
     # the local bridge, plus the bounded public continuation context, for a claim whose
     # provider session is still alive.

@@ -281,10 +281,14 @@ class MultiRepositoryPublicationTest < Minitest::Test
     end
   end
 
+  # An environment this run already placed is reconciled before the provider starts, so a
+  # repository moved off the canonical branch is refused there: before any provider, selection or
+  # external write.
   def test_a_repository_not_on_the_canonical_task_branch_is_refused
-    assert_selection_refused(%([ { "path" => "component-a" } ]), /canonical branch/i) do
-      FakeGithub.git(File.join(MultiRepositoryWorkspace.task_workspace(@root, TASK), "component-a"),
-                     "checkout", "-q", "--detach", "HEAD")
+    assert_preparation_refused(/component-a.*not on the canonical branch/i) do
+      workspace = MultiRepositoryWorkspace.task_workspace(@root, TASK)
+      assert SpecrelayRunner::PreviousAcceptedPackage.record_placement(workspace)
+      FakeGithub.git(File.join(workspace, "component-a"), "checkout", "-q", "--detach", "HEAD")
     end
   end
 
@@ -300,13 +304,26 @@ class MultiRepositoryPublicationTest < Minitest::Test
   end
 
   def test_two_paths_with_one_normalized_remote_are_refused_as_duplicates
-    # component-b is re-pointed at component-a's GitHub identity in its scp-like spelling: two
-    # different working trees, one repository as far as GitHub is concerned.
-    assert_selection_refused(%([ { "path" => "component-a" }, { "path" => "component-b" } ]),
-                             /same repository|duplicate/i) do
-      FakeGithub.git(File.join(@root, "component-b"), "remote", "set-url", "origin",
-                     "https://github.com/SpecRelay/component-a.git")
+    # component-b is re-pointed at component-a's GitHub identity in its https spelling: two
+    # different working trees, one repository as far as GitHub is concerned. The environment is
+    # refused before the provider, because no single commit can be decided for that repository.
+    assert_preparation_refused(/two checkouts of "specrelay\/component-a"/i) do
+      FakeGithub.https_remote(File.join(@root, "component-b"), @bares.fetch("SpecRelay/component-a"),
+                              "https://github.com/SpecRelay/component-a.git")
     end
+  end
+
+  def assert_preparation_refused(reason_pattern)
+    start
+    prepare_task_workspace
+    yield
+    _code, output = run_cli
+
+    assert_match reason_pattern, output
+    assert_nil @platform.last_terminal_result, "nothing ran, so nothing is reported"
+    assert_equal 1, @platform.requests.count { |r| r[:path] == "/api/runner/claim_releases" }
+    @bares.each_key { |slug| assert_empty branches_of(slug), "#{slug} must not be pushed" }
+    assert_equal 0, FakeGithub.pr_creates(@gh_log)
   end
 
   # Every refusal must happen BEFORE any external write: no branch on any remote, and no `gh`

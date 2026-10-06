@@ -29,18 +29,66 @@ module FakeGithub
     git(root, "remote", "add", "origin", url || "git@github.com:SpecRelay/#{name}.git")
     git(root, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/#{default_branch}")
     serve_locally(root, bare)
+    publish_default_branch(root, bare, default_branch)
     bare
+  end
+
+  # A GitHub repository always has its default branch, and the runner now reads that branch's tip
+  # from `origin` before it places a new task environment. The repository's current commit is
+  # therefore published as the remote default branch, and the bare HEAD names it. What was
+  # published is recorded so {remote_branches} reports only what happened after the fixture.
+  def publish_default_branch(root, bare, default_branch)
+    git(bare, "symbolic-ref", "HEAD", "refs/heads/#{default_branch}")
+    out, status = Open3.capture2e("git", "-C", root, "rev-parse", "--verify", "--quiet", "HEAD")
+    return unless status.success?
+
+    git(root, "push", "--quiet", "origin", "HEAD:refs/heads/#{default_branch}")
+    # The push also wrote a remote-tracking ref this checkout never fetched; dropping it keeps the
+    # checkout's own refs exactly as the fixture built them.
+    git(root, "update-ref", "-d", "refs/remotes/origin/#{default_branch}")
+    git(bare, "config", "fixture.published", "#{default_branch} #{out.strip}")
   end
 
   # MAPIAI-84 — an `origin` whose url carries credential userinfo, as a token-authenticated https
   # remote does. `pushInsteadOf` keeps the push local while `git remote get-url origin` still
   # returns the credential-bearing url the runner actually reads, so the value that must never be
   # transmitted is really present rather than approximated.
-  def credential_remote(root, bare, url)
+  #
+  # Reads travel over https, which no ssh shim can serve and which `insteadOf` would rewrite in the
+  # very `get-url` answer the runner reads. A git exec path whose `git-remote-https` answers this
+  # url from the bare repository keeps the credential-bearing url real and reaches no network;
+  # any other https url falls through to git's own helper.
+  def credential_remote(root, bare, url) = https_remote(root, bare, url)
+
+  # An https `origin` answered from `bare`, for a fixture whose identity must be an https url.
+  def https_remote(root, bare, url)
     git(root, "remote", "set-url", "origin", url)
     git(root, "config", "url.#{bare}.pushInsteadOf", url)
+    File.write(https_map, "#{url}\t#{bare}\n", mode: "a")
+    ENV["GIT_EXEC_PATH"] = https_exec_path
     url
   end
+
+  def https_exec_path
+    @https_exec_path ||= begin
+      real, = Open3.capture2("git", "--exec-path")
+      farm = Dir.mktmpdir("specrelay-runner-exec-path-")
+      Dir.children(real.strip).each { |name| File.symlink(File.join(real.strip, name), File.join(farm, name)) }
+      helper = File.join(farm, "git-remote-https")
+      File.delete(helper)
+      File.write(helper, <<~RUBY)
+        #!/usr/bin/env ruby
+        map = File.readlines(#{https_map.inspect}, chomp: true).to_h { |line| line.split("\t", 2) }
+        bare = map[ARGV[1]]
+        exec(#{File.join(real.strip, 'git-remote-https').inspect}, *ARGV) if bare.nil?
+        exec("git", "-c", "protocol.ext.allow=always", "remote-ext", ARGV[0], "git %s \#{bare}")
+      RUBY
+      FileUtils.chmod(0o755, helper)
+      farm
+    end
+  end
+
+  def https_map = @https_map ||= File.join(Dir.mktmpdir("specrelay-runner-https-"), "map.tsv")
 
   def remote?(root)
     _out, status = Open3.capture2e("git", "-C", root, "remote", "get-url", "origin")
@@ -271,11 +319,15 @@ module FakeGithub
   def invocations(log) = File.exist?(log) ? File.read(log).lines.map(&:strip).reject(&:empty?) : []
   def pr_creates(log) = invocations(log).count { |line| line.start_with?("pr create") }
 
+  # Every branch the remote holds, except the default branch the fixture itself published while
+  # it still points where the fixture left it.
   def remote_branches(bare)
     out, status = Open3.capture2e("git", "-C", bare, "for-each-ref", "--format=%(refname:short) %(objectname)", "refs/heads")
     raise out unless status.success?
 
-    out.lines.map(&:strip).reject(&:empty?).to_h { |line| line.split(" ", 2) }
+    published, = Open3.capture2("git", "-C", bare, "config", "--get", "fixture.published")
+    branches = out.lines.map(&:strip).reject(&:empty?).to_h { |line| line.split(" ", 2) }
+    branches.reject { |name, sha| "#{name} #{sha}" == published.strip }
   end
 
   def git(root, *args)

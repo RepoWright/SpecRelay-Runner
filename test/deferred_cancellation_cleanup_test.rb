@@ -155,6 +155,23 @@ class DeferredCancellationCleanupTest < Minitest::Test
     refute File.directory?(worktree(TASK))
   end
 
+  # A returning machine still holds an ended earlier run's environment of the same task, with an
+  # edit nobody published. It is released before the claim, so the next run of the task is given
+  # a fresh environment of its own instead of being refused by, or starting from, the leftover.
+  def test_a_dirty_ended_leftover_is_released_before_the_claim_and_the_next_run_starts_fresh
+    allocate(TASK, "run_earlier")
+    @platform.script_cleanup_targets(target("run_earlier", TASK))
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, claim_once, @io.string
+
+    assert_equal %w[target claim], exchanges
+    out, status = Open3.capture2e(File.join(@root, "bin", "worktree"), "create", TASK, "--run-id", "run_next",
+                                  chdir: @root)
+    assert status.success?, out
+    assert_equal "run_next", ProjectCommand.recorded_owner(@root, TASK)
+    refute File.exist?(File.join(worktree(TASK), "unpublished.txt")), "the leftover edit reached the next run"
+  end
+
   # A release that failed sends no claim and says what to resolve, not to release by hand; the
   # next `claim-once` releases and then claims.
   def test_claim_once_stops_on_a_failed_release_and_the_next_one_releases_then_claims

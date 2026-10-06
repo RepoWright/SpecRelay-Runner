@@ -123,24 +123,26 @@ class SpecificationTaskStateTest < Minitest::Test
 
   # ------------------------------------------------------------------ S05
 
-  # A pull request GitHub no longer shows as open refuses BEFORE the provider is launched. The
-  # probe file is the proof: it exists only if the provider ran.
-  def test_a_closed_accepted_pull_request_refuses_before_the_provider_launches
+  # The accepted package pins the exact commit, so a pull request that has since merged, or whose
+  # branch a later attempt moved, still yields that commit rather than a refusal or the new head.
+  def test_a_merged_or_moved_accepted_pull_request_still_places_the_accepted_head
     head = publish_accepted_round
     start(previous_accepted_package: accepted_package(head),
-          gh_seed: [ accepted_pull_request(head).merge("state" => "CLOSED") ])
+          gh_seed: [ accepted_pull_request(head).merge("state" => "MERGED", "headRefOid" => "e" * 40) ])
 
-    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
-    assert_refused "is closed, not open"
+    assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
+    assert_equal head, git(File.join(task_workspace, "component-a"), "rev-parse", "HEAD").strip
   end
 
-  def test_a_moved_accepted_head_refuses_before_the_provider_launches
+  # A pinned accepted commit the remote cannot serve refuses BEFORE the provider is launched. The
+  # probe file is the proof: it exists only if the provider ran.
+  def test_an_accepted_head_the_remote_does_not_have_refuses_before_the_provider_launches
     head = publish_accepted_round
     start(previous_accepted_package: accepted_package("f" * 40),
           gh_seed: [ accepted_pull_request(head) ])
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
-    assert_refused "moved from"
+    assert_refused "does not contain the accepted head ffffffffffff"
   end
 
   def test_an_accepted_pull_request_on_another_branch_refuses_before_the_provider_launches
@@ -259,16 +261,16 @@ class SpecificationTaskStateTest < Minitest::Test
     assert_refused "diverged"
   end
 
-  # The live pull-request proof runs on a reused environment too. Without it, a workspace left on
-  # one runner would generate happily from a head GitHub no longer shows as accepted.
-  def test_a_closed_accepted_pull_request_refuses_in_a_reused_environment
+  # The pull-request proof runs on a reused environment too, and there as well a merged accepted
+  # pull request is no refusal: the accepted commit is the authority.
+  def test_a_merged_accepted_pull_request_is_reconciled_in_a_reused_environment
     head = publish_accepted_round
     prepare_task_environment
     start(previous_accepted_package: accepted_package(head),
-          gh_seed: [ accepted_pull_request(head).merge("state" => "CLOSED") ])
+          gh_seed: [ accepted_pull_request(head).merge("state" => "MERGED") ])
 
-    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli, @io.string
-    assert_refused "is closed, not open"
+    assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
+    assert_equal head, git(File.join(task_workspace, "component-a"), "rev-parse", "HEAD").strip
   end
 
   # --- assertions ----------------------------------------------------------

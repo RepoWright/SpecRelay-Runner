@@ -333,12 +333,11 @@ module DemoWorkspace
 
   # MAPIAI-84 — the runner now reads a repository's identity and default branch from the
   # repository itself rather than from an assignment entry, so every fixture repository must
-  # carry both. No network and no bare remote are involved: `origin` is a url and
-  # `refs/remotes/origin/HEAD` is a symbolic ref, and a test that also PUSHES replaces the url
-  # with one FakeGithub serves locally.
+  # carry both. The runner also reads the default branch's tip from `origin` before it places a
+  # task environment, so the GitHub url is served locally from a bare remote and no network is
+  # reached.
   def identify(root, name, default_branch: "main")
-    git(root, "remote", "add", "origin", "git@github.com:SpecRelay/#{name}.git")
-    git(root, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/#{default_branch}")
+    FakeGithub.add_remote(root, name: name, default_branch: default_branch)
   end
 
   def git(root, *args)
