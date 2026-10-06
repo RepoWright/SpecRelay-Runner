@@ -226,10 +226,10 @@ class HeartbeaterTest < Minitest::Test
     end
   end
 
-  # Transport failures inside a confirmed window cost nothing: the next acknowledged renewal
+  # Transport failures and server errors inside a confirmed window cost nothing: the next acknowledged renewal
   # extends the window and the claim never stops.
   def test_transient_failures_inside_the_window_do_not_stop_the_claim
-    client = ScriptedClient.new(RENEWED, timeout_error, timeout_error, RENEWED)
+    client = ScriptedClient.new(RENEWED, timeout_error, server_error, RENEWED)
     build_with_window(client, lease_seconds: 4)
     @beater.renew
     @beater.start
@@ -279,7 +279,73 @@ class HeartbeaterTest < Minitest::Test
     assert_equal SpecrelayRunner::Heartbeater::UNCONFIRMED, @beater.stop_reason
   end
 
+  # A phase-boundary renewal that Platform could not answer reaches the caller as the transient
+  # failure it is, and the window an earlier acknowledgement opened still covers the claim.
+  def test_a_server_error_on_renewal_reaches_the_caller_and_leaves_the_window_open
+    build_with_window(ScriptedClient.new(RENEWED, server_error, RENEWED), lease_seconds: 60)
+    @beater.renew
+
+    error = assert_raises(SpecrelayRunner::PlatformClient::Error) { @beater.renew }
+
+    assert_predicate error, :transient?
+    assert_nil @beater.stop_reason, @io.string
+  end
+
+  # A definitive refusal is Platform's answer about this claim, not an outage: it is a stop the
+  # moment it is read, even inside an open window, and no later acknowledgement clears it.
+  def test_a_refused_renewal_is_a_rejected_stop_a_later_acknowledgement_cannot_clear
+    [ 401, 403, 404, 422 ].each do |status|
+      build_with_window(ScriptedClient.new(RENEWED, refusal(status), RENEWED), lease_seconds: 60)
+      @beater.renew
+      @beater.renew
+
+      assert_equal SpecrelayRunner::Heartbeater::REJECTED, @beater.stop_reason, "HTTP #{status}"
+      @beater.renew
+      assert_equal SpecrelayRunner::Heartbeater::REJECTED, @beater.stop_reason, "HTTP #{status}"
+    end
+  end
+
+  # The periodic beat reads a refusal the same way, and stops beating instead of retrying it.
+  def test_a_refusal_in_the_periodic_loop_stops_at_once_and_ends_the_thread
+    client = ScriptedClient.new(RENEWED, refusal(403), RENEWED)
+    build_with_window(client, lease_seconds: 60)
+    @beater.renew
+    @beater.start
+
+    wait_until("the refusal to be recorded") { @beater.stop_reason }
+    wait_until("the beat thread to end") { !@beater.instance_variable_get(:@thread).alive? }
+
+    assert_equal SpecrelayRunner::Heartbeater::REJECTED, @beater.stop_reason
+    assert_equal 2, client.attempts.length, "a refused renewal must not be retried"
+  end
+
+  # What Platform says about the lease stops the claim inside an open window too, and the stop is
+  # final: the next acknowledged answer does not revive it.
+  def test_platforms_stop_inside_an_open_window_is_immediate_and_final
+    { { "acknowledged" => true, "lease" => CANCELLED["lease"] } => "cancelled",
+      { "acknowledged" => false, "lease" => EXPIRED["lease"] } => "expired",
+      { "acknowledged" => false, "lease" => { "state" => "terminal", "cancel_requested" => false } } => "terminal",
+      { "acknowledged" => false, "lease" => ACTIVE["lease"] } => "expired" }.each do |answer, reason|
+      build_with_window(ScriptedClient.new(RENEWED, answer, RENEWED), lease_seconds: 60)
+      @beater.renew
+      @beater.renew
+
+      assert_equal reason, @beater.stop_reason, answer.inspect
+      @beater.renew
+      assert_equal reason, @beater.stop_reason, answer.inspect
+    end
+  end
+
+  def test_a_claim_that_states_no_lease_uses_the_platform_default
+    assert_equal 180, SpecrelayRunner::Heartbeater.lease_seconds({})
+  end
+
   private
+
+  def server_error = SpecrelayRunner::PlatformClient::RequestFailed.new("Platform request failed (503)", status: 503)
+
+  def refusal(status) = SpecrelayRunner::PlatformClient::RequestFailed.new("Platform request failed (#{status})",
+                                                                            status: status)
 
   def timeout_error = Net::OpenTimeout.new("execution expired connecting to #{SYNTHETIC_USERINFO_URL}")
 

@@ -454,27 +454,19 @@ module SpecrelayRunner
         value.positive? ? value : nil
       end
 
-      # A phase boundary: renew the lease, READ the liveness signal that comes back, and stop if
-      # Platform no longer considers this claim live. A heartbeat that fails in TRANSPORT is not
-      # treated as a stop — an unreachable Platform is a reporting problem, and killing a
-      # publication over one would turn a network blip into a half-published run.
+      # A phase boundary: renew the lease and stop if Platform no longer considers this claim live.
+      # The heartbeater reads the response, as it reads every renewal. A heartbeat that fails in
+      # TRANSPORT is not treated as a stop — an unreachable Platform is a reporting problem, and
+      # killing a publication over one would turn a network blip into a half-published run.
       def checkpoint!
-        observe_lease(client.heartbeat(claim: assignment.runner_execution_id))
+        @heartbeater.renew
         check_stop!
       rescue PlatformClient::Error
         check_stop!
       end
 
-      def observe_lease(response)
-        lease = response.is_a?(Hash) ? response["lease"].to_h : {}
-        state = lease["state"].to_s
-        return if state.empty? || (state == "active" && !lease["cancel_requested"])
-
-        @lease_stop_reason ||= lease["cancel_requested"] ? "cancelled" : state
-      end
-
       def check_stop!
-        reason = @heartbeater&.stop_reason || @lease_stop_reason
+        reason = @heartbeater&.stop_reason
         raise Aborted, reason if reason
       end
 

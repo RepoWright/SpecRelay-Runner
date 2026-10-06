@@ -43,7 +43,10 @@ class PreviewSessionTest < Minitest::Test
 
     def heartbeat(claim:)
       @beats << true
-      { "lease" => @triggered ? @then_lease : ACTIVE }
+      lease = @triggered ? @then_lease : ACTIVE
+      raise lease if lease.is_a?(Exception)
+
+      { "lease" => lease }
     end
 
     def submit_preview_result(claim:, result:)
@@ -226,6 +229,19 @@ class PreviewSessionTest < Minitest::Test
     refute_includes @io.string, "bin/worktree release #{TASK}"
   end
 
+
+  # A refused heartbeat is the shared heartbeat rule's stop, so a preview holding its environment
+  # reads it as an ended claim exactly as it reads a lost lease.
+  def test_a_refused_heartbeat_while_holding_ends_the_claim_like_a_lost_lease
+    refusal = SpecrelayRunner::PlatformClient::RequestFailed.new("Platform request failed (403)", status: 403)
+    client = FakeClient.new(after: "started", then_lease: refusal)
+
+    refute Timeout.timeout(30) { session(client) }
+
+    assert_equal %w[sources started], kinds(client)
+    assert_includes @io.string, "handed back for release"
+    refute_includes @io.string, "bin/worktree release #{TASK}"
+  end
 
   # ---- The release Platform hands back on reconnect -------------------------------------
 

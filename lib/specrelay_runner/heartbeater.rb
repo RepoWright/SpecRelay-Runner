@@ -9,7 +9,7 @@ module SpecrelayRunner
   #
   # It never decides anything: Platform owns expiry and cancellation. The beater
   # only reads the returned `lease` signal and, when Platform says the claim is no
-  # longer live (expired / cancelled / terminal), records a stop reason. The
+  # longer live (expired / cancelled / terminal) or refuses the heartbeat, records a stop reason. The
   # Execution polls that reason at safe boundaries and stops WITHOUT uploading a
   # success report.
   #
@@ -32,8 +32,12 @@ module SpecrelayRunner
     # something Platform said, so a caller must not describe it as one.
     UNCONFIRMED = "renewal unconfirmed"
 
+    # The stop recorded when Platform answered a heartbeat with a definitive refusal: anything but
+    # a transport failure or a server error. Asking again cannot change that answer.
+    REJECTED = "rejected"
+
     # Platform's documented default, for a claim that does not state its own.
-    DEFAULT_LEASE_SECONDS = 120
+    DEFAULT_LEASE_SECONDS = 180
 
     # The lease duration a claim's `execution_policy` advertises.
     def self.lease_seconds(execution_policy)
@@ -79,7 +83,8 @@ module SpecrelayRunner
 
     # One renewal now, on the caller's thread, read exactly as a background beat is: the lanes'
     # own phase-boundary heartbeats go through here so that there is one reading of what a
-    # heartbeat response means. A transport error reaches the caller.
+    # heartbeat response means. A transport failure or a server error reaches the caller; a refusal
+    # is a recorded stop.
     def renew = beat_once
 
     # Ask the beater to stop and wait for the thread to finish.
@@ -124,10 +129,17 @@ module SpecrelayRunner
     end
 
     # HTTP 200 alone is not renewal. Only `acknowledged: true` on a live lease opens or extends the
-    # window; `acknowledged: false` or a lease that is not live is a stop; anything else is neither.
+    # window; `acknowledged: false`, a lease that is not live or a refused heartbeat is a stop; a
+    # transient failure is neither and reaches the caller.
     def beat_once
       sent_at = monotonic
-      body = client.heartbeat(claim: claim)
+      body = begin
+        client.heartbeat(claim: claim)
+      rescue PlatformClient::Error => e
+        raise if e.transient?
+
+        return record_stop(REJECTED)
+      end
       body = {} unless body.is_a?(Hash)
       lease = body["lease"].to_h
       state = lease["state"].to_s

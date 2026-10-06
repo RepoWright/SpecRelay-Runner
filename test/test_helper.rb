@@ -85,6 +85,27 @@ def fixture_path(script, base: ENV["PATH"], env: {})
   [ fixture_bin(script, env: env), base.to_s ].reject(&:empty?).join(File::PATH_SEPARATOR)
 end
 
+# Answers every lease renewal this process sends from `script`, then with `rest`, whichever lane
+# or thread sends it. `:platform` is the fake Platform's own answer, `:transport` an unreachable
+# Platform, a Hash that 200 body, and an Integer that HTTP status read by the client's own
+# classification.
+def with_heartbeat_answers(*script, rest: :platform)
+  original = SpecrelayRunner::PlatformClient.instance_method(:heartbeat)
+  mutex = Mutex.new
+  SpecrelayRunner::PlatformClient.define_method(:heartbeat) do |claim:|
+    answer = mutex.synchronize { script.empty? ? rest : script.shift }
+    case answer
+    when :platform then original.bind(self).call(claim: claim)
+    when :transport then raise SpecrelayRunner::PlatformClient::Error, "Platform is unreachable"
+    when Hash then answer
+    else send(:raise_for, answer, { "error" => "heartbeat answered #{answer}" })
+    end
+  end
+  yield
+ensure
+  SpecrelayRunner::PlatformClient.define_method(:heartbeat, original)
+end
+
 def spec_creation_payload_for(issue_key:, title: "Add an export button", inputs: nil,
                               specification_root: "specs", complete: true, content: nil,
                               existing_pull_request_url: nil, specification_provider: nil,
