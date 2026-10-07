@@ -166,7 +166,8 @@ class ScenarioEvidenceTest < Minitest::Test
 
   def test_an_executor_authored_scenario_and_screenshot_reach_the_uploaded_report
     root, = DemoWorkspace.build
-    executor = write_scenario_executor(root)
+    prompt_path = File.join(@dir, "captured-prompt.md")
+    executor = write_scenario_executor(root, prompt_path)
     platform = FakePlatform.new(claim_payload: claim_payload_for(task_id: TASK, root: root)).start
     io = StringIO.new
 
@@ -179,6 +180,8 @@ class ScenarioEvidenceTest < Minitest::Test
                     .to_h { |file| [ file["relative_path"], Base64.strict_decode64(file["content_base64"]) ] }
     manifest = YAML.safe_load(files.fetch("manifest.yml"))
     assert_includes files.fetch("scenarios/01-heading.md"), "Result: PASS"
+    # The placement line reaches Platform exactly as written; Platform alone decides where it renders.
+    assert_includes files.fetch("scenarios/01-heading.md"), "1. Opened the page.\n![Success](screenshots/01-heading-success.png)\n"
     assert_equal PNG, files.fetch("screenshots/01-heading-success.png")
     assert_equal [ { "path" => "screenshots/01-heading-success.png", "viewport" => "1440x900",
                      "scenario" => "01-heading", "result" => "Success" } ], manifest["screenshots"]
@@ -187,6 +190,29 @@ class ScenarioEvidenceTest < Minitest::Test
     # The evidence lived outside the task workspace, so it is neither a changed file nor in the diff.
     assert_equal [ "demo-app/index.html" ], manifest.dig("git", "changed_files")
     refute_includes files.fetch("evidence/diff.txt"), "scenario"
+  ensure
+    platform&.stop
+    FileUtils.remove_entry(root) if root && File.directory?(root)
+  end
+
+  # A screenshot is placed by a line of its own directly after the step it shows; the instruction
+  # still forbids an invented screenshot or pass, and secrets.
+  def test_the_executor_is_told_to_place_each_screenshot_after_the_step_it_shows
+    root, = DemoWorkspace.build
+    prompt_path = File.join(@dir, "captured-prompt.md")
+    executor = write_scenario_executor(root, prompt_path)
+    platform = FakePlatform.new(claim_payload: claim_payload_for(task_id: TASK, root: root)).start
+    io = StringIO.new
+
+    SpecrelayRunner::CLI.run(%W[claim-once --config #{runner_config(platform, root)}], out: io, err: io,
+                             env: { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN, "PATH" => fixture_path(executor) })
+
+    prompt = File.read(prompt_path).gsub(/\s+/, " ")
+    assert_includes prompt, "a line containing only `![<short state>](screenshots/<name>.png)` directly after the " \
+                            "action or observation it shows"
+    refute_includes prompt, "Do not link images"
+    assert_includes prompt, "Never invent a screenshot or a pass."
+    assert_includes prompt, "Never include credentials, tokens or private reasoning."
   ensure
     platform&.stop
     FileUtils.remove_entry(root) if root && File.directory?(root)
@@ -247,7 +273,7 @@ class ScenarioEvidenceTest < Minitest::Test
 
   # A fake executor that does the demo edit, then records one checked scenario and one screenshot
   # exactly where the prompt names the scenario evidence directory, as a real executor must.
-  def write_scenario_executor(root)
+  def write_scenario_executor(root, prompt_path)
     path = File.join(root, "bin", "scenario-executor")
     File.write(path, <<~RUBY)
       #!/usr/bin/env ruby
@@ -256,6 +282,7 @@ class ScenarioEvidenceTest < Minitest::Test
       require "fileutils"
       require "json"
       prompt = File.read(ARGV.last.to_s)
+      File.write(#{prompt_path.inspect}, prompt)
       dir = prompt[%r{`([^`]*/scenario-evidence)`}, 1]
       abort "the prompt named no scenario evidence directory" if dir.nil?
       file = "demo-app/index.html"
@@ -264,7 +291,7 @@ class ScenarioEvidenceTest < Minitest::Test
       File.write(file, content.gsub("Hello Demo", "Hello SpecRelay Demo")) if changed
       FileUtils.mkdir_p(File.join(dir, "scenarios"))
       FileUtils.mkdir_p(File.join(dir, "screenshots"))
-      File.write(File.join(dir, "scenarios", "01-heading.md"), "# Heading\\n\\n- Result: PASS\\n")
+      File.write(File.join(dir, "scenarios", "01-heading.md"), "# Heading\\n\\n- Result: PASS\\n\\n1. Opened the page.\\n![Success](screenshots/01-heading-success.png)\\n")
       File.binwrite(File.join(dir, "screenshots", "01-heading-success.png"), Base64.decode64(#{Base64.strict_encode64(PNG).inspect}))
       File.write(File.join(dir, "index.json"), JSON.generate(
         "evidence_files" => [ { "path" => "scenarios/01-heading.md", "description" => "Heading text" } ],
