@@ -63,20 +63,38 @@ class LoopTtyTest < Minitest::Test
     # start (2) + stop (2). Everything else the process printed is the announce block, which is
     # not a `[loop]` line, and the transient row, which never terminates a line.
     assert_equal 4, durable.grep(/\[loop\]/).length, durable.inspect
-    assert_includes output, "no eligible work", "the state was visible while it was true"
+    assert_includes output, "WAITING FOR WORK", "the state was visible while it was true"
   end
 
-  # Scenario 6, second half: one CURRENT row. Every frame is written to the same row, so the
-  # pty stream carries many carriage returns and — between the start and stop blocks — no
-  # newline at all.
-  def test_the_waiting_row_is_one_row_that_replaces_itself
+  # Scenario 6, second half: one CURRENT region. Every redraw first erases the previous one from
+  # its top, so once the session has stopped the screen holds the start and stop blocks and
+  # nothing of any of the redraws between them.
+  def test_the_waiting_region_replaces_itself_and_leaves_no_history
     output = drive_direct_loop(polls: 3)
 
     body = output[/execution finishes first\r?\n(.*?)\[loop\] stopped/m, 1]
     refute_nil body, output.inspect
-    assert_operator body.count("\r"), :>=, 3, "the row must be redrawn in place"
-    assert_equal 0, body.count("\n"),
-                 "between the start block and the stop line nothing may terminate a line: #{body.inspect}"
+    assert_operator body.scan("\e[J").length, :>=, 3, "the region must be redrawn in place"
+    shown = screen(output)
+    assert_equal 1, shown.count { |row| row.include?("[loop] started") }
+    refute(shown.any? { |row| row.match?(/WAITING|CHECKING|Ctrl\+C to stop|[┌│└]/) },
+           "a redraw survived into the history: #{shown.inspect}")
+  end
+
+  # Scenario group 11: a terminal narrowed under a drawn region gets the compact row, with the
+  # region erased whole from its top rather than repainted over.
+  def test_a_resize_switches_to_the_compact_row_and_leaves_no_stale_border
+    before, after = resized_loop(from: [ 40, 100 ], to: [ 40, 40 ])
+
+    assert_includes before, "┌", "the full region was drawn at 100 columns"
+    assert_includes before, "WAITING FOR WORK"
+    compact = transient_rows(after)
+    refute_empty compact, after.inspect
+    assert(compact.any? { |row| row.include?("WAITING FOR WORK; next check in") }, compact.inspect)
+    compact.each { |row| assert_operator row.length, :<, 40, "a compact row never wraps: #{row.inspect}" }
+    assert_includes after, "\r\e[J", "the region was erased from its top before the compact row"
+    shown = screen(before + after)
+    refute(shown.any? { |row| row.match?(/WAITING|[┌│└]/) }, "a stale border remained: #{shown.inspect}")
   end
 
   # Scenario 9: at a narrow width the row stays ONE row. The pty itself is resized, so the
@@ -91,7 +109,7 @@ class LoopTtyTest < Minitest::Test
     end
     # A shorter TRUTHFUL message, not a clipped one: the countdown is dropped where it does not
     # fit rather than the row being wrapped or cut mid-word.
-    assert(rows.any? { |row| row.match?(/no eligible work\z/) }, rows.inspect)
+    assert(rows.any? { |row| row.match?(/WAITING FOR WORK\z/) }, rows.inspect)
     refute(rows.any? { |row| row.include?("next check in") },
            "the countdown cannot fit in 30 columns and must not be forced in: #{rows.inspect}")
   end
@@ -104,7 +122,8 @@ class LoopTtyTest < Minitest::Test
     assert_equal 1, output.scan("session totals").length
     assert_includes output, "stopped by signal while IDLE"
     tail = output.split("session totals").last
-    refute_includes tail, "next check in", "a live row was left on screen after the summary"
+    refute_includes tail, "WAITING FOR WORK", "a live region was left on screen after the summary"
+    refute(screen(output).any? { |row| row.match?(/WAITING|Ctrl\+C to stop|[┌│└]/) }, "Ctrl-C cleared the whole region")
     refute_includes output, "Press any key", "a direct command returns to the shell, not to a menu"
   end
 
@@ -130,8 +149,8 @@ class LoopTtyTest < Minitest::Test
 
     assert_includes output, "credential was rejected by Platform"
     assert_includes output, "specrelay-runner connect"
-    refute_includes output, "next check in", "a rejected credential must not be retried on a timer"
-    refute_includes output, "retry #", "and no backoff timer is started either"
+    refute_includes output, "WAITING TO RETRY", "a rejected credential must not be retried on a timer"
+    refute_includes output, "seconds until", "and no backoff timer is started either"
   end
 
   # ---- scenario 25 / 37: Ctrl-C in a MENU-launched loop ------------------
@@ -160,8 +179,7 @@ class LoopTtyTest < Minitest::Test
 
     sessions = output.split("[loop] started —")
     assert_equal 3, sessions.length, "two loops must have started: #{sessions.length - 1}"
-    assert(transient_rows(sessions.last).any? { |row| row.include?("no eligible work") },
-           "the second loop rendered no transient row: #{transient_rows(sessions.last).inspect}")
+    assert_includes sessions.last, "WAITING FOR WORK", "the second loop rendered no waiting region"
     assert_equal 2, output.scan("session totals").length
   end
 
@@ -196,6 +214,13 @@ class LoopTtyTest < Minitest::Test
     assert_operator output.index("Released the task environment"), :<,
                     output.index("stopped by signal"),
                     "the release must happen before the loop winds down, not after"
+    # Scenario groups 1 and 10: the result is framed once, after the run, and every waiting
+    # region drawn before the claim is gone from the history.
+    shown = screen(output)
+    assert_equal 1, shown.count { |row| row.include?("LAST RUN") }
+    # This fixture's payload states no ticket key, so the row names none rather than inventing one.
+    assert(shown.any? { |row| row.start_with?("│ [OK] SUCCESS ") }, shown.inspect)
+    refute(shown.any? { |row| row.match?(/WAITING|CHECKING|Ctrl\+C to stop/) }, shown.inspect)
   end
 
   def test_ctrl_c_during_a_real_execution_still_leaves_the_terminal_cooked
@@ -225,7 +250,7 @@ class LoopTtyTest < Minitest::Test
     second = output.split("SESSION-2").last
     refute_nil second
     assert_includes second, "1 project connected to this runner", "the second dashboard opened normally"
-    refute_includes second, "next check in", "stale transient text survived into the next session"
+    refute_includes second, "WAITING FOR WORK", "stale transient text survived into the next session"
     refute_includes second, "executing —"
   end
 
@@ -264,6 +289,31 @@ class LoopTtyTest < Minitest::Test
   private
 
   def claims = @platform.requests_to("/api/runner/claim").length
+
+  # What a terminal shows once every byte of the session has been applied to it.
+  def screen(output) = RecordingTerminal.new.tap { |terminal| terminal.print(output) }.screen
+
+  # A direct loop drawn at one size, then resized, then stopped with Ctrl-C. Returns the output
+  # before and after the resize.
+  def resized_loop(from:, to:)
+    before = utf8
+    after = utf8
+    PTY.spawn(child_env, *loop_argv) do |reader, writer, pid|
+      resize(reader, *from)
+      before << read_while(reader, polled(1)) << read_for(reader, 1.5)
+      resize(reader, *to)
+      after << read_for(reader, 1.5)
+      write_key(writer, CTRL_C)
+      after << drain(reader)
+      wait(pid)
+    end
+    [ before, after ]
+  end
+
+  def read_for(reader, seconds)
+    deadline = monotonic + seconds
+    read_while(reader, -> { monotonic > deadline })
+  end
 
   # The terminal HISTORY: what survives on screen once the row it was written over is gone.
   #

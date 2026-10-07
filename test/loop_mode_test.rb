@@ -109,7 +109,7 @@ class LoopModeTest < Minitest::Test
     assert_equal 4, io.string.scan("[loop] ").size,
                  "five idle polls may add nothing beyond the 2 start lines and the 2 stop lines"
     refute_includes io.string, "[loop] idle"
-    assert_includes io.string, "no eligible work", "the state is still visible — on the transient row"
+    assert_includes io.string, "WAITING FOR WORK", "the state is still visible — in the transient region"
   end
 
   def test_it_claims_and_executes_exactly_one_run_at_a_time
@@ -544,6 +544,146 @@ class LoopModeTest < Minitest::Test
       }
     }
   end
+
+  # ---- scenario group 4: what a lane's own result carries to the result frame ----
+  #
+  # Through the REAL CLI lane code with only the lane's worker replaced, so the frame label is
+  # proved to come from the lane's existing result rather than from the exit status.
+
+  def test_an_awaiting_input_implementation_is_framed_as_waiting_with_its_title
+    result = SpecrelayRunner::Execution::Result.new(
+      outcome: :awaiting_input, message: "Runner outcome: awaiting_input (question durable; no report uploaded)."
+    )
+    execution = Object.new
+    execution.define_singleton_method(:call) { result }
+    replacing(SpecrelayRunner::Execution, :new, ->(**) { execution }) do
+      code, claims, screen, status = framed_through_cli(implementation_payload)
+
+      assert_equal SpecrelayRunner::CLI::SUCCESS, code, "the exit code is unchanged"
+      assert_equal 2, claims, "the loop keeps polling as before"
+      assert_equal Loop::OK, status
+      assert_includes screen, "[WAIT] DEMO-8 · AWAITING_INPUT"
+      assert_includes screen, "Add a totals row"
+      assert_includes screen, "Runner outcome: awaiting_input"
+      refute_includes screen, "[OK]"
+    end
+  end
+
+  def test_a_stale_review_is_framed_as_stopped_while_still_exiting_zero
+    result = SpecrelayRunner::Review::Execution::Result.new(outcome: :stale, message: "Review stopped: the target moved")
+    replacing(SpecrelayRunner::Review::Execution, :call, ->(**) { result }) do
+      code, claims, screen, status = framed_through_cli(review_payload)
+
+      assert_equal SpecrelayRunner::CLI::SUCCESS, code
+      assert_equal 2, claims
+      assert_equal Loop::OK, status
+      assert_includes screen, "[STOP] DEMO-7 · STALE"
+      assert_includes screen, "Review stopped: the target moved"
+      refute_includes screen, "[OK]"
+    end
+  end
+
+  def test_every_unfinished_preview_is_framed_truthfully_and_returns_what_it_always_did
+    preview = SpecrelayRunner::PreviewExecution
+    {
+      preview::FAILED_CLEAN => [ true, "[FAIL] DEMO-97 · FAILED", SpecrelayRunner::CLI::SUCCESS ],
+      preview::FAILED_CLEANUP => [ true, "[FAIL] DEMO-97 · FAILED", SpecrelayRunner::CLI::SUCCESS ],
+      preview::STOPPED => [ true, "[STOP] DEMO-97 · STOPPED", SpecrelayRunner::CLI::SUCCESS ],
+      preview::RELEASE_FAILED => [ true, "[FAIL] DEMO-97 · FAILED", SpecrelayRunner::CLI::SUCCESS ],
+      preview::AVAILABLE => [ true, "[OK] DEMO-97 · SUCCESS", SpecrelayRunner::CLI::SUCCESS ]
+    }.each do |state, (held, label, exit_code)|
+      outcome = preview::Outcome.new(state: state, reason: ("the preview's own reason" unless state == preview::AVAILABLE))
+      session = preview_session(held, outcome)
+      replacing(SpecrelayRunner::PreviewSession, :new, ->(**) { session }) do
+        code, claims, screen, status = framed_through_cli(preview_payload, config: preview_config)
+
+        assert_equal exit_code, code, "#{state}: the exit code is unchanged"
+        assert_equal 2, claims, "#{state}: the loop keeps polling as before"
+        assert_equal Loop::OK, status, state.to_s
+        assert_includes screen, label, state.to_s
+        assert_includes screen, "the preview's own reason" unless state == preview::AVAILABLE
+      end
+    end
+  end
+
+  def test_a_refused_preview_assignment_is_framed_as_failed
+    session = preview_session(false, nil)
+    replacing(SpecrelayRunner::PreviewSession, :new, ->(**) { session }) do
+      code, claims, screen, status = framed_through_cli(preview_payload("preview" => {}), config: preview_config)
+
+      assert_equal SpecrelayRunner::CLI::RUN_FAILED, code
+      assert_equal 2, claims
+      assert_equal Loop::FAILED, status
+      assert_includes screen, "[FAIL] FAILED"
+      assert_includes screen, "Refusing a preview assignment"
+    end
+  end
+
+  private
+
+  # Replaces one singleton method for the block, then puts the original back.
+  def replacing(target, name, implementation)
+    original = target.method(name)
+    target.define_singleton_method(name, &implementation)
+    yield
+  ensure
+    target.define_singleton_method(name, original)
+  end
+
+  # One claimed assignment through the real `loop_disposition`, then one idle poll. Returns the
+  # lane's exit code, the number of claims the loop made, the loop terminal's screen and status.
+  def framed_through_cli(payload, config: nil)
+    code = SpecrelayRunner::CLI.new(out: StringIO.new, err: StringIO.new).send(:execute, config, nil, payload)
+    cli = SpecrelayRunner::CLI.new(out: StringIO.new, err: StringIO.new)
+    terminal = RecordingTerminal.new
+    @clock = FakeClock.new
+    claims = 0
+    status = Loop.call(
+      out: terminal, err: StringIO.new, presenter: SpecrelayRunner::TerminalPresenter.new(out: terminal, transient: true),
+      claim: -> { (claims += 1) == 1 ? SpecrelayRunner::PlatformClient::ClaimResult.new(claimed: true, payload: payload) : not_claimed("x") },
+      execute: ->(claimed, &report) { cli.send(:loop_disposition, config, nil, claimed, &report) },
+      poll_seconds: 5, max_iterations: 2, install_signals: false, sleeper: sleeper, clock: @clock
+    )
+    [ code, claims, terminal.screen.join("\n"), status ]
+  end
+
+  def implementation_payload
+    { "claim" => { "runner_execution_id" => "rex_8", "claim_policy_mode" => "all_eligible" },
+      "run" => { "id" => "run_8", "task_id" => "DEMO-8" },
+      "work_item" => { "issue_key" => "DEMO-8", "title" => "Add a totals row" } }
+  end
+
+  def review_payload
+    { "assignment_type" => "review", "claim" => { "runner_execution_id" => "rex_7" },
+      "review" => { "attempt_ordinal" => 1 }, "ticket" => { "external_id" => "DEMO-7" } }
+  end
+
+  def preview_payload(**overrides)
+    { "contract_version" => "3", "assignment_kind" => "task_preview",
+      "claim" => { "execution_id" => "rex_abc", "claimed_at" => nil, "lease_expires_at" => nil },
+      "preview" => { "id" => "prv_abc", "ticket_key" => "DEMO-97", "project_slug" => "tiny-demo",
+                     "task_id" => "DEMO-97-session", "canonical_branch" => "DEMO-97-session", "mode" => "start" },
+      "workspace" => { "key" => "multi-demo-workspace", "repository_url" => nil, "default_branch" => "main" },
+      "secure_preview" => { "route_namespace" => "7c1d4a90e3b25f6108ad4c3b2e59f071" },
+      "sources" => [ { "repository" => "SpecRelay/component-a",
+                       "pull_request_url" => "https://github.com/SpecRelay/component-a/pull/21" } ] }
+      .merge(overrides.transform_keys(&:to_s))
+  end
+
+  def preview_config
+    config = Object.new
+    config.define_singleton_method(:workspace_root) { |_key, env:| Dir.tmpdir }
+    config
+  end
+
+  def preview_session(held, outcome)
+    session = Object.new
+    session.define_singleton_method(:call) { held }
+    session.define_singleton_method(:outcome) { outcome }
+    session
+  end
+
+  public
 
   def setup
     @pending_signal = nil

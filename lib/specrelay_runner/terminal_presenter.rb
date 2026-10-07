@@ -40,10 +40,39 @@ module SpecrelayRunner
   # this class parses a key out of a message, and a presenter holding none writes exactly
   # what it wrote before.
   #
+  # A loop session also draws two FRAMES. A run's result is a framed durable block. Its waiting
+  # state is a framed transient REGION of several rows, drawn below that result and redrawn in
+  # place; on a terminal too small to hold it whole, the one-row status stands in for it. Moving
+  # back over several rows needs cursor control, so the region is erased with cursor-up and
+  # erase-below — the same erase-before-every-durable-write rule, under the same mutex. Both are
+  # MEASURED as plain text after redaction and RENDERED with colour, which never carries a state
+  # on its own: every state also has its text label.
+  #
   # It owns rendering and nothing else. Claim, eligibility, execution, upload, and
   # report decisions stay with their own objects.
   class TerminalPresenter
     DEFAULT_COLUMNS = 96
+    DEFAULT_LINES = 24
+    # Every frame shares one left edge and this outer width, so a result and the waiting region
+    # below it line up however wide the window is.
+    FRAME_WIDTH = 60
+    # Inside the borders and their one-character padding.
+    FRAME_INNER = FRAME_WIDTH - 4
+    # Corners, horizontal and vertical edge, and the countdown ink — with an ASCII equivalent for
+    # a terminal whose encoding cannot show box drawing.
+    BOX = { top_left: "┌", top_right: "┐", bottom_left: "└", bottom_right: "┘", across: "─", side: "│",
+            ink: "█" }.freeze
+    PLAIN_BOX = { top_left: "+", top_right: "+", bottom_left: "+", bottom_right: "+", across: "-", side: "|",
+                  ink: "#" }.freeze
+    TONES = { green: "32", amber: "33", red: "31", blue: "34", cyan: "36" }.freeze
+    # Five-row character-cell digits for the countdown.
+    DIGITS = {
+      "0" => [ "###", "# #", "# #", "# #", "###" ], "1" => [ " # ", "## ", " # ", " # ", "###" ],
+      "2" => [ "###", "  #", "###", "#  ", "###" ], "3" => [ "###", "  #", "###", "  #", "###" ],
+      "4" => [ "# #", "# #", "###", "  #", "  #" ], "5" => [ "###", "#  ", "###", "  #", "###" ],
+      "6" => [ "###", "#  ", "###", "# #", "###" ], "7" => [ "###", "  #", "  #", "  #", "  #" ],
+      "8" => [ "###", "# #", "###", "# #", "###" ], "9" => [ "###", "# #", "###", "  #", "###" ]
+    }.freeze
     # Colour for the ticket key and nothing else, in the one style TerminalMenu already uses
     # for emphasis. Applied only to a terminal, and never carrying information on its own:
     # the key is bracketed plain text first, so a pipe, a CI log, and a screenshot all still
@@ -113,6 +142,14 @@ module SpecrelayRunner
       DEFAULT_COLUMNS
     end
 
+    # The terminal's own height, read on every draw like the width.
+    def lines
+      reported = @out.respond_to?(:winsize) ? @out.winsize[0].to_i : 0
+      reported.positive? ? reported : DEFAULT_LINES
+    rescue IOError, SystemCallError, NoMethodError
+      DEFAULT_LINES
+    end
+
     # Show the current state on the reusable row.
     #
     # `fallback: :line` is for progress that still MATTERS with no terminal to
@@ -130,6 +167,35 @@ module SpecrelayRunner
     end
 
     def clear_status = @mutex.synchronize { erase }
+
+    # A framed block that stays in the record. `emphasis` is the index of the row that names the
+    # state. A sink that cannot show the frame whole — no terminal, or one narrower than the
+    # frame — gets the same rows as plain lines.
+    def frame(rows, tone:, emphasis: nil)
+      texts = rows.map { |row| Redaction.redact(row.to_s) }
+      @mutex.synchronize do
+        next write_line(texts.join("\n")) unless @transient && columns > FRAME_WIDTH
+
+        erase
+        push_text(@out, "\n#{framed(texts, tone, emphasis).map { |_, painted| "#{painted}\n" }.join}")
+        nil
+      end
+    end
+
+    # The framed waiting region, redrawn in place. A row given as `[seconds, label]` is the
+    # countdown: large centered digits with their label. `compact` is the one-row status shown
+    # instead when the frame does not fit the terminal. Like `status`, it is dropped when there
+    # is no terminal to redraw.
+    def panel(rows, tone:, compact:, emphasis: nil)
+      texts = rows.map { |row| row.is_a?(Array) ? [ row[0].to_i, Redaction.redact(row[1].to_s) ] : Redaction.redact(row.to_s) }
+      summary = Redaction.redact(compact.to_s)
+      @mutex.synchronize do
+        next nil unless @transient && !@finished
+
+        block = framed(texts, tone, emphasis)
+        block.length < lines - 1 && columns > FRAME_WIDTH ? draw_region(block) : draw(summary)
+      end
+    end
 
     def line(text = "") = @mutex.synchronize { write_line(Redaction.redact(text.to_s)) }
     def error(text = "") = @mutex.synchronize { write_line(Redaction.redact(text.to_s), sink: @err) }
@@ -170,9 +236,28 @@ module SpecrelayRunner
     # string would turn one row into two and leave debris behind a shorter replacement.
     def draw(message)
       text = clip(prefixed("#{glyph} #{message}"))
-      padding = " " * [ @rendered.to_s.length - text.length, 0 ].max
-      @rendered = text
+      erase unless single_row?
+      padding = " " * [ @rendered.to_a.first.to_s.length - text.length, 0 ].max
+      @rendered = [ text ]
       push_text(@out, "\r#{paint_key(text, @out)}#{padding}\r")
+      nil
+    rescue IOError, SystemCallError
+      @transient = false
+      @rendered = nil
+      nil
+    end
+
+    # The region's blank separator row, then the frame, as one write; the cursor is then moved
+    # back to the separator row. Parking it at the TOP is what makes the erase resize-safe: rows a
+    # narrowing terminal reflows grow below the cursor, and erasing everything below it removes
+    # them however many rows they became, without touching the history above.
+    def draw_region(block)
+      visible = [ "", *block.map(&:first) ]
+      return nil if visible == @rendered
+
+      bytes = "#{erase_bytes}\n#{block.map(&:last).join("\n")}\e[#{block.length}A\r"
+      @rendered = visible
+      push_text(@out, bytes)
       nil
     rescue IOError, SystemCallError
       @transient = false
@@ -183,15 +268,73 @@ module SpecrelayRunner
     # `@rendered` is cleared FIRST, so a sink that fails here cannot leave the
     # presenter believing a row is still on screen.
     def erase
-      target = @rendered
-      return nil if target.nil?
-
+      bytes = erase_bytes
       @rendered = nil
-      push_text(@out, "\r#{' ' * target.length}\r")
+      push_text(@out, bytes) unless bytes.empty?
       nil
     rescue IOError, SystemCallError
       nil
     end
+
+    # One row that still fits is overwritten with spaces, as it always was. A region, or a row a
+    # narrowing resize has wrapped, is erased from the cursor — parked at its top — downwards.
+    def erase_bytes
+      return "" if @rendered.nil?
+      return "\r#{' ' * @rendered.first.length}\r" if single_row?
+
+      "\r\e[J"
+    end
+
+    def single_row? = @rendered.nil? || (@rendered.length == 1 && @rendered.first.length < columns)
+
+    # The frame's rows as [measured, painted] pairs: borders in the tone's colour, the emphasised
+    # row bold in it, and every row padded to the same width so the frame never stretches.
+    def framed(texts, tone, emphasis)
+      box = glyphs
+      color = TONES.fetch(tone)
+      edge = paint(box[:side], color)
+      body = texts.each_with_index.flat_map do |text, index|
+        next countdown(*text, box[:ink]).map { |row| [ row, row ] } if text.is_a?(Array)
+
+        wrap(text).map do |row|
+          padded = row.ljust(FRAME_INNER)
+          [ padded, index == emphasis ? "#{paint(row, "1;#{color}")}#{padded[row.length..]}" : padded ]
+        end
+      end
+      top = "#{box[:top_left]}#{box[:across] * (FRAME_WIDTH - 2)}#{box[:top_right]}"
+      bottom = "#{box[:bottom_left]}#{box[:across] * (FRAME_WIDTH - 2)}#{box[:bottom_right]}"
+      [ [ top, paint(top, color) ],
+        *body.map { |row, painted| [ "#{box[:side]} #{row} #{box[:side]}", "#{edge} #{painted} #{edge}" ] },
+        [ bottom, paint(bottom, color) ] ]
+    end
+
+    # Every digit is drawn; the digits and their label are the only centered rows.
+    def countdown(seconds, label, ink)
+      digits = seconds.to_s.chars.map { |char| DIGITS.fetch(char) }
+      rows = Array.new(5) { |row| digits.map { |digit| digit[row] }.join(" ").tr("#", ink) }
+      [ *rows, label ].map { |row| row.center(FRAME_INNER) }
+    end
+
+    # Word-wrapped to the frame's inner width; a word longer than a whole row is split.
+    def wrap(text)
+      rows = []
+      text.split.each do |word|
+        word.scan(/.{1,#{FRAME_INNER}}/) do |piece|
+          next rows.last << " " << piece if rows.last && rows.last.length + piece.length < FRAME_INNER
+
+          rows << piece.dup
+        end
+      end
+      rows.empty? ? [ "" ] : rows
+    end
+
+    # Box drawing is shown only where the sink's encoding can carry it.
+    def glyphs
+      encoding = @out.respond_to?(:external_encoding) && @out.external_encoding || Encoding.default_external
+      encoding == Encoding::UTF_8 ? BOX : PLAIN_BOX
+    end
+
+    def paint(text, style) = "\e[#{style}m#{text}\e[0m"
 
     # Durable writes are deliberately NOT guarded: a broken stdout is a real
     # failure for a record the operator is relying on, and swallowing it here

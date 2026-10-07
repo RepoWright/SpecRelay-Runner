@@ -308,7 +308,7 @@ module SpecrelayRunner
         connector: loop_connector(config),
         status_reporter: loop_status_reporter(config, client),
         claim: -> { claim_after_cleanup(config, client, presence.session_id) },
-        execute: ->(payload) { loop_disposition(config, client, payload) }
+        execute: ->(payload, &report) { loop_disposition(config, client, payload, &report) }
       )
       result == LoopRunner::OK ? SUCCESS : RUN_FAILED
     end
@@ -401,10 +401,26 @@ module SpecrelayRunner
     # and reaches the identical refusal. The fact is yielded by the same {Execution::Result} the
     # exit status is read from, so the two can never disagree, and `claim-once` is untouched — it
     # passes no block and keeps its unchanged nonzero single attempt.
+    #
+    # The facts its result frame shows are yielded beside it: the lane's own result line and
+    # outcome as the lane stated them, never re-derived from the exit status.
     def loop_disposition(config, client, payload)
       disposition = nil
+      @lane_result = {}
       code = execute(config, client, payload) { |signal| disposition = signal }
+      yield(ticket_key: ticket_key_for(payload), title: title_for(payload), **@lane_result) if block_given?
       disposition || code == SUCCESS
+    end
+
+    def title_for(payload)
+      title = payload.dig("work_item", "title") if payload.is_a?(Hash) && payload["work_item"].is_a?(Hash)
+      title.is_a?(String) ? title : nil
+    end
+
+    # A lane's result line, printed, and remembered for the `loop` result frame.
+    def lane_result(message, outcome = nil)
+      @lane_result = { message: message, outcome: outcome }
+      presenter.line message
     end
 
     # This terminal's admitted session, for `loop` and `claim-once` alike.
@@ -555,10 +571,13 @@ module SpecrelayRunner
     def preview(config, client, payload)
       assignment = PreviewAssignment.read(payload)
       root = assignment.ok? ? config.workspace_root(assignment.workspace_key, env: env) : nil
-      presenter.line(assignment.ok? ? "Claimed a live preview of #{assignment.ticket_key}." :
-                       "Refusing a preview assignment: #{assignment.reason}")
-      held = PreviewSession.call(payload: payload, client: client, root: root.to_s, io: presenter,
-                                 env: env)
+      notice = assignment.ok? ? "Claimed a live preview of #{assignment.ticket_key}." :
+                 "Refusing a preview assignment: #{assignment.reason}"
+      presenter.line(notice)
+      session = PreviewSession.new(payload: payload, client: client, root: root.to_s, io: presenter,
+                                   env: env)
+      held = session.call
+      preview_result(session.outcome, assignment.ok? ? nil : notice)
       held ? SUCCESS : RUN_FAILED
     rescue Config::Error => e
       # This machine holds a grant for the workspace but has no local root mapped for it. Nothing
@@ -567,7 +586,14 @@ module SpecrelayRunner
       preview_refused(client, assignment, Redaction.redact(e.message))
     end
 
+    # The state the session computed, and the reason it already printed for it.
+    def preview_result(outcome, notice)
+      reason = outcome&.reason && PrivatePaths.sanitize(outcome.reason.to_s)
+      @lane_result = { message: notice || reason, outcome: outcome&.state }
+    end
+
     def preview_refused(client, assignment, reason)
+      @lane_result = { message: reason }
       presenter.error(reason)
       client.submit_preview_result(
         claim: assignment.execution_id,
@@ -591,7 +617,7 @@ module SpecrelayRunner
                      "(attempt #{assignment.attempt_ordinal}); claim #{assignment.claim_token}."
       result = Review::Execution.call(config: config, client: client, payload: payload,
                                       env: env, io: presenter)
-      presenter.line result.message
+      lane_result(result.message, result.outcome)
       # A STALE target exits zero. The claim did not produce a verdict, but the runner did
       # exactly what it should have — the code it was sent to review moved. Treating that as a
       # machine fault would stop a `loop` session on a healthy runner (CR-001 F3).
@@ -647,7 +673,7 @@ module SpecrelayRunner
                      "claim #{assignment.claim_token}."
       result = PackagePreflight::Execution.call(config: config, client: client, payload: payload,
                                                 env: env, io: presenter)
-      presenter.line result.message
+      lane_result(result.message)
       return RUN_FAILED unless result.authorized?
 
       execute_authorized(config, client, result.assignment_payload, &released)
@@ -671,7 +697,7 @@ module SpecrelayRunner
     def run_execution(config, client, payload)
       result = Execution.new(config: config, client: client, payload: payload, env: env,
                              io: presenter).call
-      presenter.line result.message
+      lane_result(result.message, result.outcome)
       # The facts a `loop` session needs beyond this exit status, reported at the single place
       # both entry points map an execution to one. `claim-once` passes no block, so its
       # behaviour is unchanged.
@@ -721,7 +747,7 @@ module SpecrelayRunner
     def generate_specification(config, client, payload)
       result = Specification::Generation.call(config: config, client: client, payload: payload,
                                               env: env, io: presenter)
-      presenter.line result.message
+      lane_result(result.message)
       result.success? ? SUCCESS : RUN_FAILED
     end
 
@@ -731,7 +757,7 @@ module SpecrelayRunner
     def publish_specification(config, client, payload)
       result = Specification::Publication.call(config: config, client: client, payload: payload,
                                                env: env, io: presenter)
-      presenter.line result.message
+      lane_result(result.message)
       result.success? ? SUCCESS : RUN_FAILED
     end
 
