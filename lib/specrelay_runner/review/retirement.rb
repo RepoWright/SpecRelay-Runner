@@ -70,6 +70,10 @@ module SpecrelayRunner
         Result.new(retired: retired)
       end
 
+      # The same fresh read-back a plan entry gets, for one exact pull request. The ticket-reset lane
+      # classifies with it before it decides whether {#call} should close anything.
+      def state_of(repository:, url:) = view({ repository: repository, url: url })
+
       private
 
       attr_reader :plan, :chdir, :env, :timeout_seconds, :io

@@ -123,6 +123,9 @@ class FakePlatform
   # answer that replaces the ordinary write-once one.
   attr_accessor :initial_bases, :initial_bases_response
 
+  # The `[status, body]` a ticket-reset result receives. Unset, Platform accepted it as completed.
+  attr_writer :reset_answer
+
   # `token` is the shared development token (fallback mode). A guided connection issues
   # ISSUED_CREDENTIAL, which the fake then accepts as a registered bearer for the remaining
   # endpoints (registered mode).
@@ -306,6 +309,7 @@ class FakePlatform
   # held, and only on their own connection thread — a delay that also stalled this fake's accept
   # loop would postpone the result-path requests the test measures and prove nothing.
   attr_accessor :log_event_delay
+  def reset_results = requests_to("/api/runner/reset_results").map { |request| request[:body] }
   def last_enrollment = requests_to("/api/runner/enrollment").last
   def last_enrollment_preview = requests_to("/api/runner/enrollment_preview").last
   def last_readiness_report = requests_to("/api/runner/workspace_connections").last
@@ -455,6 +459,7 @@ class FakePlatform
     when "/api/runner/specification_generations" then specification_generation(request)
     when "/api/runner/specification_publications" then specification_publication(request)
     when "/api/runner/review_results" then review_result(request)
+    when "/api/runner/reset_results" then @reset_answer || [ 201, { accepted: true, state: "completed" } ]
     when "/api/runner/executor_questions" then executor_question(request)
     when %r{\A/api/runner/executor_questions/[^/]+/checkpoint\z} then executor_question_checkpoint
     when %r{\A/api/runner/executor_questions/(?<id>.+)\z} then executor_question_member(request)

@@ -122,6 +122,8 @@ require_relative "specrelay_runner/rework"
 require_relative "specrelay_runner/checkpoint"
 require_relative "specrelay_runner/resume"
 require_relative "specrelay_runner/execution"
+# The ticket-reset lane: retires one reset's recorded pull requests and branches.
+require_relative "specrelay_runner/ticket_reset"
 # MVP-0026: turning that recognized assignment into a generated specification package.
 # The whole lane lives under one namespace; see specification.rb for the pipeline order.
 require_relative "specrelay_runner/specification"

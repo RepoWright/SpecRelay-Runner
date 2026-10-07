@@ -558,9 +558,29 @@ module SpecrelayRunner
       # a specification nobody has verified.
       return package_preflight(config, client, payload, &released) if
         PackagePreflight::Assignment.preflight?(payload)
+      return ticket_reset(client, payload) if TicketReset.reset?(payload)
+      # Only an executable implementation assignment reaches the implementation lane. Anything
+      # else — a kind this build has never heard of included — is refused rather than executed.
+      return refuse_assignment(payload) unless Execution.implementation?(payload)
 
       announce_claim(payload)
       run_execution(config, client, payload, &released)
+    end
+
+    # One claimed ticket reset. It exits zero only when Platform accepted the report; a failed reset
+    # is still an accepted report, and Platform's state names what blocks it.
+    def ticket_reset(client, payload)
+      presenter.line "Claimed a reset of #{payload.dig('reset', 'ticket_key')}."
+      outcome = TicketReset.new(payload: payload, client: client, io: presenter, env: env).call
+      lane_result(outcome.message)
+      outcome.submitted? ? SUCCESS : RUN_FAILED
+    end
+
+    def refuse_assignment(payload)
+      kind = payload.is_a?(Hash) ? (payload["assignment_kind"] || payload["assignment_type"]) : nil
+      lane_result("Refusing an assignment this runner does not implement (#{kind.inspect}). " \
+                  "Upgrade the runner so it can execute it.")
+      RUN_FAILED
     end
 
     # MAPIAI-97 — one claimed live preview, held open for as long as a human is testing it.

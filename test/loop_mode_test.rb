@@ -649,7 +649,7 @@ class LoopModeTest < Minitest::Test
 
   def implementation_payload
     { "claim" => { "runner_execution_id" => "rex_8", "claim_policy_mode" => "all_eligible" },
-      "run" => { "id" => "run_8", "task_id" => "DEMO-8" },
+      "run" => { "id" => "run_8", "type" => "implementation", "task_id" => "DEMO-8" },
       "work_item" => { "issue_key" => "DEMO-8", "title" => "Add a totals row" } }
   end
 
