@@ -75,6 +75,31 @@ module SpecrelayRunner
     # must not restate an outcome it cannot see.
     RELEASE_ATTEMPTED_REFUSAL = :release_attempted_refusal
 
+    # How each waiting state is shown: its label, detail, colour and countdown label. Checking has
+    # no countdown, because nothing about a claim request in flight says when it will finish.
+    WAITING = {
+      checking: { label: "CHECKING FOR WORK", detail: "Checking for eligible work", tone: :blue },
+      idle: { label: "WAITING FOR WORK", detail: "No eligible work", tone: :cyan,
+              unit: "seconds until next check" },
+      retry: { label: "WAITING TO RETRY", detail: "Polling failed", tone: :amber, unit: "seconds until retry" }
+    }.freeze
+
+    # How a run's result is LABELLED, and nothing else: the disposition still alone decides
+    # whether the session continues, what it counts and how it exits. A falsy disposition is
+    # always a failure; a truthy one is success unless the lane's own outcome says the work did
+    # not complete.
+    SUCCESS = [ "[OK]", "SUCCESS", :green ].freeze
+    FAILURE = [ "[FAIL]", "FAILED", :red ].freeze
+    REFUSAL = [ "[STOP]", "REFUSED", :amber ].freeze
+    NOT_COMPLETED = {
+      awaiting_input: [ "[WAIT]", "AWAITING_INPUT", :amber ].freeze,
+      stale: [ "[STOP]", "STALE", :amber ].freeze,
+      PreviewExecution::STOPPED => [ "[STOP]", "STOPPED", :amber ].freeze,
+      PreviewExecution::FAILED_CLEAN => FAILURE,
+      PreviewExecution::FAILED_CLEANUP => FAILURE,
+      PreviewExecution::RELEASE_FAILED => FAILURE
+    }.freeze
+
     def self.call(**kwargs) = new(**kwargs).call
 
     # `claim` and `execute` are injected so this class owns the LOOP and nothing
@@ -82,7 +107,9 @@ module SpecrelayRunner
     # in the CLI, and a test can drive the loop without a process or a socket.
     #
     #   claim   -> PlatformClient::ClaimResult
-    #   execute -> truthy when the claimed run succeeded, or RELEASE_ATTEMPTED_REFUSAL
+    #   execute -> truthy when the claimed run succeeded, or RELEASE_ATTEMPTED_REFUSAL; it may
+    #              yield the facts its result frame shows ({ticket_key:, title:, message:,
+    #              outcome:}), each optional
     #
     # `presenter`, `clock`, and `sleeper` are the injection seams that make the
     # terminal behaviour testable: capability, time, and waiting are all explicit
@@ -207,7 +234,7 @@ module SpecrelayRunner
       # went, rather than in a retry of its own.
       return :stop if keep_connector_running == :stop
 
-      transient "checking for eligible work"
+      waiting :checking
       result = claim.call
       note_recovery
       result.claimed? ? run_claimed(result.payload) : idle(result)
@@ -244,7 +271,7 @@ module SpecrelayRunner
         @last_idle_reason = reason
         line "idle — #{reason}" unless presenter.transient?
       end
-      wait(poll_seconds, state: "no eligible work", until_label: "next check")
+      wait(poll_seconds, state: :idle, until_label: "next check")
     end
 
     # Platform's own explanation, so an unconnected runner is told that rather than
@@ -263,7 +290,8 @@ module SpecrelayRunner
       # heartbeat is the authoritative liveness signal, and a second one would let a watcher
       # look like it owned the run rather than being the process executing it.
       presence.pause
-      disposition = watching_for_stop { execute.call(payload) }
+      facts = {}
+      disposition = watching_for_stop { execute.call(payload) { |stated| facts = stated } }
       # Remembered separately: an operator who interrupts DURING an execution needs to be told
       # the run was allowed to finish, which is a materially different situation from an
       # interrupt while idle. Read from the OPERATOR's flag rather than the general one, because
@@ -271,13 +299,36 @@ module SpecrelayRunner
       @stopped_during_execution ||= @operator_stop
       resume_presence
       @executed += 1
-      # Read before the Boolean, because neither is a degree of failure: each is an outcome whose
-      # correct answer is to stop, whatever `--on-failure` says. Both symbols are truthy, so
-      # reading them afterwards would report them as successful runs.
+      decision = settle(disposition)
+      show_result(disposition, facts)
+      decision
+    end
+
+    # Read before the Boolean, because neither is a degree of failure: each is an outcome whose
+    # correct answer is to stop, whatever `--on-failure` says. Both symbols are truthy, so
+    # reading them afterwards would report them as successful runs.
+    def settle(disposition)
       return run_release_attempted_refusal if disposition == RELEASE_ATTEMPTED_REFUSAL
       return run_unreported_failure if disposition == FAILED
 
       disposition ? run_succeeded : run_failed
+    end
+
+    # The run's result, once, after the session's own lines about it and before anything else is
+    # polled. A row the lane did not state is left out rather than looked up.
+    def show_result(disposition, facts)
+      marker, word, tone = result_label(disposition, facts[:outcome])
+      key = facts[:ticket_key].to_s.strip
+      rows = [ "LAST RUN", key.empty? ? "#{marker} #{word}" : "#{marker} #{key} · #{word}",
+               facts[:title], facts[:message] ]
+      presenter.frame(rows.reject { |row| row.to_s.strip.empty? }, tone: tone, emphasis: 1)
+    end
+
+    def result_label(disposition, outcome)
+      return REFUSAL if disposition == RELEASE_ATTEMPTED_REFUSAL
+      return FAILURE if disposition == FAILED || !disposition
+
+      NOT_COMPLETED.fetch(outcome, SUCCESS)
     end
 
     # Ctrl-C during a long execution has to be ACKNOWLEDGED while the run is still
@@ -391,7 +442,7 @@ module SpecrelayRunner
       seconds = backoff_seconds
       line "polling failed — #{Redaction.redact(error.message)}"
       line "sleeping #{format_seconds(seconds)} until retry ##{@consecutive_errors}"
-      wait(seconds, state: "polling failed", until_label: "retry ##{@consecutive_errors}")
+      wait(seconds, state: :retry, until_label: "retry ##{@consecutive_errors}")
     end
 
     # Printed ONCE, when Platform answers again after a failed poll: an operator
@@ -438,7 +489,7 @@ module SpecrelayRunner
         # interval is due.
         return :stop if keep_presence_current == :stop
 
-        transient state, "; #{until_label} in #{format_seconds(remaining.ceil)}"
+        waiting state, remaining.ceil, until_label
         sleeper.call([ remaining, SLICE_SECONDS ].min)
       end
       @stop_requested ? :stop : :continue
@@ -510,18 +561,23 @@ module SpecrelayRunner
     # redirected stdout — "is it alive?" is exactly the question this answers.
     def line(message) = presenter.line("[loop] #{message}")
 
-    # What is true right now. One row, replaced in place, gone when it stops being
-    # true.
+    # What is true right now: a framed region, replaced in place, gone when it stops being true.
+    # The countdown is the remaining whole seconds the wait already computes.
     #
-    # A narrow terminal gets the most informative message that FITS, in this order:
-    # identity + state + countdown, then state + countdown, then the bare state. It
-    # loses detail rather than being handed a clipped half-truth — the identity was
-    # already named durably at start, and half a workspace key is worse than none.
-    # The presenter still clips, but only if even the bare state does not fit.
-    def transient(state, countdown = nil)
-      rows = [ "#{label} — #{state}#{countdown}", "#{state}#{countdown}", state ]
-      rows.shift if label.empty?
-      presenter.status(rows.find { |row| row.length <= presenter.columns - 2 } || rows.last)
+    # A terminal too small for the frame gets one compact row instead, the most informative one
+    # that FITS, in this order: identity + state + countdown, then state + countdown, then the
+    # bare state. It loses detail rather than being handed a clipped half-truth — the identity
+    # was already named durably at start, and half a workspace key is worse than none. The
+    # presenter still clips, but only if even the bare state does not fit.
+    def waiting(state, seconds = nil, until_label = nil)
+      shown = WAITING.fetch(state)
+      countdown = seconds && "; #{until_label} in #{format_seconds(seconds)}"
+      compact = [ "#{label} — #{shown[:label]}#{countdown}", "#{shown[:label]}#{countdown}", shown[:label] ]
+      compact.shift if label.empty?
+      rows = [ label, shown[:label], shown[:detail], seconds && [ seconds, shown[:unit] ], "Ctrl+C to stop" ]
+      rows = rows.reject { |row| row.nil? || row == "" }
+      presenter.panel(rows, tone: shown[:tone], emphasis: rows.index(shown[:label]),
+                            compact: compact.find { |row| row.length <= presenter.columns - 2 } || compact.last)
     end
 
     def announce_start

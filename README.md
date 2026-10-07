@@ -745,35 +745,64 @@ Foreground only, deliberately: no LaunchAgent, no daemonization, no supervisor.
 
 | | |
 |---|---|
-| **Transient** | True only *now*, worthless as history: polling, the countdown, a quiet executor. ONE reusable row, redrawn in place, erased when it stops being true. |
-| **Durable** | The record: the start block, a claimed task, real executor stdout/stderr, phase transitions, failures, backoff, recovery, results, the session summary. |
+| **Transient** | True only *now*, worthless as history: polling, the countdown, a quiet executor. Redrawn in place, erased when it stops being true. |
+| **Durable** | The record: the start block, a claimed task, real executor stdout/stderr, phase transitions, failures, backoff, recovery, each run's framed result, the session summary. |
 
 ```text
-[loop] started — polling every 10s, one run at a time, --on-failure continue
-[loop] press Ctrl-C to stop; an in-progress execution finishes first
-| tiny-demo (tiny-demo-workspace) — no eligible work; next check in 7s
+[loop] run completed — polling again immediately
+
+┌──────────────────────────────────────────────────────────┐
+│ LAST RUN                                                 │
+│ [OK] DEMO-1 · SUCCESS                                    │
+│ Add a totals row to the ledger view                      │
+│ Runner outcome: completed.                               │
+└──────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────┐
+│ tiny-demo (tiny-demo-workspace)                          │
+│ WAITING FOR WORK                                         │
+│ No eligible work                                         │
+│                          █  ███                          │
+│                         ██    █                          │
+│                          █  ███                          │
+│                          █  █                            │
+│                         ███ ███                          │
+│                 seconds until next check                 │
+│ Ctrl+C to stop                                           │
+└──────────────────────────────────────────────────────────┘
 ```
 
-That third row is the only one that moves; five idle polls add no history at all.
-The row is erased before **every** durable line and on every exit path — normal
+The waiting region is the only thing that moves; five idle polls add no history at
+all. It shows `CHECKING FOR WORK` (blue, no countdown), `WAITING FOR WORK` (cyan) or
+`WAITING TO RETRY` (amber). A terminal narrower than 61 columns or too short for the
+region gets one compact row instead (`WAITING FOR WORK; next check in 12s`).
+
+Each claimed run prints one result frame. Its label comes from the lane's own result:
+`[OK] SUCCESS`, `[WAIT] AWAITING_INPUT`, `[STOP] REFUSED`, `STALE` or `STOPPED`, and
+`[FAIL] FAILED`. A stale review or a failed or stopped preview start is never
+`[OK]`, even though it exits zero. The label never changes the exit code, the
+session totals or the `--on-failure` decision, and local completion does not mean
+Platform accepted the report.
+
+The region is erased before **every** durable line and on every exit path — normal
 stop, Ctrl-C, `SIGTERM`, a rejected credential, an exception on its way out — and
 all writes from the loop, the live executor stream, the lease heartbeat, and the
 execution go through one serialized boundary (`TerminalPresenter`), which is what
 keeps three threads from splitting a line.
 
-Every word on that row corresponds to a state the runner is really in. The runner
+Every word in that region corresponds to a state the runner is really in. The runner
 never displays `Thinking`, `Compiling`, or `Analyzing` unless a real executor line
 or a real runner phase produced it, and it never exposes model reasoning.
 
 **Rendering is a capability, not an assumption.** It needs an output terminal;
 redirected output (a pipe, a log file, CI) gets no carriage returns, spinner frames,
-or ANSI at all, and healthy idling there prints Platform's not-claimed reason once
-and again only when it changes.
+or ANSI at all: a result is plain lines, there is no countdown, and healthy idling
+prints Platform's not-claimed reason once and again only when it changes.
 
 When nothing was claimed either command reports the reason **Platform** returned, so
 a machine that is not connected (or not ready) is told to run `connect` rather than
-reading a refusal as a healthy idle — on the transient row in a terminal, as a line
-where there is no row to redraw.
+reading a refusal as a healthy idle — on the transient display in a terminal, as a
+line where there is nothing to redraw.
 
 ### Live executor output
 

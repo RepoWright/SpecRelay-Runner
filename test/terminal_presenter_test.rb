@@ -442,4 +442,223 @@ class TerminalPresenterTest < Minitest::Test
     def print(_bytes) = raise(IOError, "device not configured")
     def flush = nil
   end
+  # ---- framed results and the waiting region ------------------------------
+
+  FRAME_WIDTH = Presenter::FRAME_WIDTH
+
+  def region_presenter(columns: 100, lines: 40)
+    sink = RecordingTerminal.new(columns: columns, lines: lines)
+    [ Presenter.new(out: sink, transient: true), sink ]
+  end
+
+  def waiting_rows(seconds = 8)
+    [ "tiny-demo (tiny-demo-workspace)", "WAITING FOR WORK", "No eligible work",
+      [ seconds, "seconds until next check" ], "Ctrl+C to stop" ]
+  end
+
+  def show_waiting(presenter, seconds = 8, compact: "WAITING FOR WORK; next check in #{seconds}s")
+    presenter.panel(waiting_rows(seconds), tone: :cyan, emphasis: 1, compact: compact)
+  end
+
+  def test_a_result_frame_is_durable_left_aligned_and_bounded
+    presenter, sink = region_presenter
+    presenter.line("[loop] run completed")
+    presenter.frame([ "LAST RUN", "[OK] DEMO-1 · SUCCESS", "Runner outcome: completed." ],
+                    tone: :green, emphasis: 1)
+
+    framed = sink.screen.drop(1)
+    assert_equal "", framed.first, "one blank line separates a frame from what is above it"
+    box = framed.drop(1).reject(&:empty?)
+    assert_equal [ FRAME_WIDTH ], box.map(&:length).uniq, box.inspect
+    assert(box.all? { |row| row.start_with?("┌", "│", "└") }, "never centered or indented: #{box.inspect}")
+    assert_includes box[1], "│ LAST RUN"
+    assert_includes box[2], "[OK] DEMO-1 · SUCCESS"
+    assert sink.writes.last.end_with?("\n"), "a result is newline-terminated history"
+  end
+
+  def test_a_result_frame_names_its_state_in_text_as_well_as_colour
+    presenter, sink = region_presenter
+    presenter.frame([ "LAST RUN", "[FAIL] DEMO-2 · FAILED" ], tone: :red, emphasis: 1)
+
+    assert_includes sink.string, "\e[31m┌", "the border carries the colour"
+    assert_includes sink.string, "\e[1;31m[FAIL] DEMO-2 · FAILED\e[0m", "the label is emphasised"
+    assert_includes sink.screen.join("\n"), "[FAIL] DEMO-2 · FAILED", "the label reads without colour"
+  end
+
+  def test_a_long_summary_wraps_inside_the_frame_instead_of_widening_it
+    presenter, sink = region_presenter
+    presenter.frame([ "LAST RUN", "[FAIL] DEMO-3 · FAILED", "word " * 30 ], tone: :red, emphasis: 1)
+
+    box = sink.screen.reject(&:empty?)
+    assert_equal [ FRAME_WIDTH ], box.map(&:length).uniq, box.inspect
+    assert_equal 30, box.join.scan("word").length, "nothing of the summary is dropped"
+  end
+
+  def test_without_a_terminal_a_result_is_plain_lines
+    sink = StringIO.new
+    presenter = Presenter.new(out: sink)
+    presenter.frame([ "LAST RUN", "[WAIT] DEMO-4 · AWAITING_INPUT" ], tone: :amber, emphasis: 1)
+
+    assert_equal "LAST RUN\n[WAIT] DEMO-4 · AWAITING_INPUT\n", sink.string
+  end
+
+  def test_a_terminal_too_narrow_for_the_frame_prints_the_result_as_plain_lines
+    presenter, sink = region_presenter(columns: FRAME_WIDTH)
+    presenter.frame([ "LAST RUN", "[OK] DEMO-5 · SUCCESS" ], tone: :green, emphasis: 1)
+
+    assert_equal [ "LAST RUN", "[OK] DEMO-5 · SUCCESS" ], sink.durable_lines
+    refute_includes sink.string, "┌"
+  end
+
+  def test_the_waiting_region_is_bounded_with_centered_countdown_digits
+    presenter, sink = region_presenter
+    presenter.line("[loop] above")
+    show_waiting(presenter, 8)
+
+    assert_equal [ "[loop] above", "" ], sink.screen.first(2), "one blank line separates the region from what is above"
+    box = sink.regions.last
+    assert_equal [ FRAME_WIDTH ], box.map(&:length).uniq, box.inspect
+    assert_includes box[1], "tiny-demo (tiny-demo-workspace)"
+    assert_includes box[2], "WAITING FOR WORK"
+    digits = box[4, 5].map { |row| row[2...-2] }
+    assert(digits.all? { |row| row.include?("█") }, digits.inspect)
+    digits.each do |row|
+      left = row.length - row.lstrip.length
+      right = row.length - row.rstrip.length
+      assert_operator (left - right).abs, :<=, 1, "the digits are centered: #{row.inspect}"
+    end
+    assert_includes box[9], "seconds until next check"
+    assert_includes box[10], "Ctrl+C to stop"
+  end
+
+  def test_every_digit_of_a_multi_digit_countdown_is_drawn
+    { 8 => 3, 42 => 7, 300 => 11, 3600 => 15 }.each do |seconds, width|
+      presenter, sink = region_presenter
+      show_waiting(presenter, seconds)
+
+      ink = sink.regions.last[4].delete("│").strip
+      assert_equal width, ink.length, "#{seconds}: #{sink.regions.last.inspect}"
+    end
+  end
+
+  def test_redrawing_the_region_leaves_no_history_and_a_durable_line_replaces_it
+    presenter, sink = region_presenter
+    presenter.line("[loop] started")
+    [ 9, 8, 7 ].each { |seconds| show_waiting(presenter, seconds) }
+    presenter.line("[loop] executing — claimed DEMO-1")
+
+    assert_equal [ "[loop] started", "[loop] executing — claimed DEMO-1" ], sink.screen.reject(&:empty?)
+    assert_equal 3, sink.regions.length
+  end
+
+  def test_an_unchanged_region_is_not_redrawn
+    presenter, sink = region_presenter
+    2.times { show_waiting(presenter, 8) }
+
+    assert_equal 1, sink.regions.length
+  end
+
+  def test_clearing_and_finishing_erase_the_whole_region
+    presenter, sink = region_presenter
+    show_waiting(presenter)
+    presenter.clear_status
+    assert_empty sink.screen.reject(&:empty?)
+
+    show_waiting(presenter)
+    presenter.finish
+    assert_empty sink.screen.reject(&:empty?)
+    show_waiting(presenter)
+    assert_empty sink.screen.reject(&:empty?), "a finished presenter draws nothing"
+  end
+
+  def test_a_narrow_terminal_gets_the_compact_status_row
+    presenter, sink = region_presenter(columns: FRAME_WIDTH)
+    show_waiting(presenter)
+
+    assert_empty sink.regions
+    assert_equal [ "WAITING FOR WORK; next check in 8s" ], sink.transient_rows
+  end
+
+  def test_a_short_terminal_gets_the_compact_status_row
+    presenter, sink = region_presenter(lines: 12)
+    show_waiting(presenter)
+
+    assert_empty sink.regions
+    assert_equal [ "WAITING FOR WORK; next check in 8s" ], sink.transient_rows
+  end
+
+  def test_a_resize_clears_every_row_the_region_occupied
+    presenter, sink = region_presenter
+    presenter.line("[loop] started")
+    show_waiting(presenter, 9)
+    sink.columns = 40
+    show_waiting(presenter, 8)
+
+    assert_equal [ "[loop] started", "| WAITING FOR WORK; next check in 8s" ], sink.screen.reject(&:empty?)
+    sink.columns = 100
+    show_waiting(presenter, 7)
+    presenter.line("[loop] stopped")
+    assert_equal [ "[loop] started", "[loop] stopped" ], sink.screen.reject(&:empty?)
+  end
+
+  def test_a_status_row_that_a_narrowing_resize_wrapped_is_cleared_whole
+    presenter, sink = region_presenter
+    presenter.status("x" * 80)
+    sink.columns = 40
+    presenter.line("[loop] after")
+
+    assert_includes sink.writes[-2], "\e[J", "a wrapped row needs more than one row erased"
+  end
+
+  def test_a_non_utf8_terminal_gets_plain_frame_characters
+    sink = RecordingTerminal.new
+    sink.define_singleton_method(:external_encoding) { Encoding::US_ASCII }
+    presenter = Presenter.new(out: sink, transient: true)
+    show_waiting(presenter, 5)
+    presenter.frame([ "LAST RUN" ], tone: :green)
+
+    text = sink.string
+    refute_match(/[┌┐└┘─│█]/, text)
+    assert_includes text, "+#{'-' * (FRAME_WIDTH - 2)}+"
+    assert_includes text, "###"
+  end
+
+  def test_without_a_terminal_the_waiting_region_writes_nothing
+    sink = StringIO.new
+    presenter = Presenter.new(out: sink)
+    show_waiting(presenter)
+
+    assert_empty sink.string
+  end
+
+  def test_redaction_runs_inside_frames_and_the_region
+    presenter, sink = region_presenter
+    presenter.frame([ "LAST RUN", "token sk-live-LEAKME-0123456789" ], tone: :red)
+    presenter.panel([ "token sk-live-LEAKME-0123456789" ], tone: :amber, compact: "x")
+
+    refute_includes sink.string, "sk-live-LEAKME-0123456789"
+    assert_includes sink.string, "[REDACTED]"
+  end
+
+  def test_concurrent_durable_lines_never_split_a_frame_or_the_region
+    presenter, sink = region_presenter
+    writers = 4.times.map do |n|
+      Thread.new do
+        25.times do |i|
+          presenter.line("[executor] line #{n}-#{i}")
+          show_waiting(presenter, (i % 9) + 1)
+          presenter.frame([ "LAST RUN", "[OK] DEMO-#{n} · SUCCESS" ], tone: :green) if i == 12
+        end
+      end
+    end
+    writers.each(&:join)
+    presenter.clear_status
+
+    sink.writes.select { |write| write.include?("┌") }.each do |write|
+      assert_includes write, "┘", "a frame was split across writes: #{write.inspect}"
+    end
+    assert_equal 100, sink.screen.grep(/\A\[executor\] line/).length
+    assert_equal 4, sink.screen.count { |row| row.include?("LAST RUN") }
+    refute(sink.screen.any? { |row| row.include?("WAITING FOR WORK") }, "a cleared region left a row")
+  end
 end

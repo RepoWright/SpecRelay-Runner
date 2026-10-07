@@ -430,4 +430,81 @@ class PreviewSessionTest < Minitest::Test
     assert_equal "source_unavailable", client.results.first[:failure_kind]
     assert_equal [], @workspace.verbs
   end
+  # ---- the outcome a loop session frames ---------------------------------------------------
+
+  # The state the claim computed, read back without changing what `call` returns. A start that
+  # failed and was later cleaned up still reads as the failed start, not as the release after it.
+  def test_an_available_preview_released_on_stop_is_exposed_as_available
+    held, preview = held_session(FakeClient.new(after: "started"))
+
+    assert held, @io.string
+    assert_equal PreviewExecution::AVAILABLE, preview.outcome.state
+  end
+
+  def test_a_failed_start_cleaned_up_later_still_reads_as_the_failed_start
+    @workspace.fail!("up")
+    client = FakeClient.new(after: "failed")
+    held, preview = held_session(client)
+
+    assert held, @io.string
+    assert_equal "released", kinds(client).last
+    assert_equal PreviewExecution::FAILED_CLEANUP, preview.outcome.state
+    refute_nil preview.outcome.reason
+  end
+
+  def test_a_clean_failure_is_exposed_as_failed_and_still_returns_true
+    closed = FakeGitHubReader.new(URL_A => { "state" => "CLOSED", "headRefName" => "pr",
+                                             "headRefOid" => @head, "isCrossRepository" => false })
+    held, preview = held_session(FakeClient.new, github: closed)
+
+    assert held
+    assert_equal PreviewExecution::FAILED_CLEAN, preview.outcome.state
+    refute_nil preview.outcome.reason
+  end
+
+  # Ordered the way the existing stop-during-read example is: the read is released only after the
+  # beater has recorded the Stop.
+  def test_a_stop_before_availability_is_exposed_as_stopped_and_still_returns_true
+    reader = BlockingGitHubReader.new(open_pull_request)
+    @io = WatchingIo.new
+    claim = Thread.new { held_session(FakeClient.new(stop_at_once: true), github: reader) }
+    reader.entered.pop
+    await_line(@io, "no longer live")
+    reader.unblock
+    held, preview = claim.value
+
+    assert held, @io.string
+    assert_equal PreviewExecution::STOPPED, preview.outcome.state
+  end
+
+  def test_a_release_only_claim_exposes_its_release_state_and_still_returns_true
+    held, preview = held_session(FakeClient.new, release_payload)
+
+    assert held
+    assert_equal PreviewExecution::RELEASED, preview.outcome.state
+
+    @workspace.fail!("release")
+    held, preview = held_session(FakeClient.new, release_payload)
+
+    assert held, "a refused release is still an honest report"
+    assert_equal PreviewExecution::RELEASE_FAILED, preview.outcome.state
+    refute_nil preview.outcome.reason
+  end
+
+  def test_a_refused_assignment_exposes_no_outcome_and_still_returns_false
+    held, preview = held_session(FakeClient.new, payload("assignment_kind" => "run"))
+
+    refute held
+    assert_nil preview.outcome
+  end
+
+  PreviewExecution = SpecrelayRunner::PreviewExecution
+
+  def held_session(client, document = payload, github: FakeGitHubReader.new(URL_A => open_pull_request))
+    preview = SpecrelayRunner::PreviewSession.new(
+      payload: document, client: client, root: @workspace.root, io: @io, env: {},
+      heartbeat_seconds: 1, sleeper: Ticker.new, github: github
+    )
+    [ preview.call, preview ]
+  end
 end

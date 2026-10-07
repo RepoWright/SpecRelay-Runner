@@ -30,6 +30,11 @@ module SpecrelayRunner
 
     def self.call(**kwargs) = new(**kwargs).call
 
+    # What this claim's start computed, or a release-only claim's release; nil for a refused
+    # assignment. Read by a `loop` session to label its result, and never by `call` itself, so it
+    # cannot change what the claim returns or reports.
+    attr_reader :outcome
+
     def initialize(payload:, client:, root:, io:, env: ENV, heartbeat_seconds: HEARTBEAT_SECONDS,
                    sleeper: Kernel, github: PreviousAcceptedPackage::GitHub)
       @payload = payload
@@ -59,9 +64,9 @@ module SpecrelayRunner
       # nothing listening for Stop — so a healthy machine could lose a claim it was still holding,
       # and an operator's Stop went unheard until GitHub answered (CR-005 F1).
       beat
-      outcome = streaming { execution.start }
-      report(outcome)
-      outcome.cleanup_required? ? hold : true
+      @outcome = streaming { execution.start }
+      report(@outcome)
+      @outcome.cleanup_required? ? hold : true
     ensure
       @beat&.stop
     end
@@ -164,6 +169,9 @@ module SpecrelayRunner
 
     def release
       outcome = streaming { execution.release }
+      # Only a release-only claim has nothing recorded yet. A failed start that was cleaned up
+      # afterwards is still the failed start.
+      @outcome ||= outcome
       return false unless outcome.state == PreviewExecution::RELEASED || failed_release(outcome)
 
       submit(kind: "released")
