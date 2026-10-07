@@ -189,9 +189,10 @@ module SpecrelayRunner
     end
 
     # `session_id` names the admitted session this claim is for. A development-token caller has
-    # none and sends none.
+    # none and sends none. `capabilities` declares the lanes beyond the original ones this build
+    # executes, so Platform never offers one to a build that would not recognise it.
     def claim(runner_params, session_id: nil)
-      payload = { runner: runner_params }
+      payload = { runner: runner_params, capabilities: [ TicketReset::ASSIGNMENT_KIND ] }
       payload[:session_id] = session_id if session_id
       status, body = post_json("/api/runner/claim", payload)
       case status
@@ -270,6 +271,12 @@ module SpecrelayRunner
     # runner reach the wrong transition by posting the wrong body.
     def submit_preview_result(claim:, result:)
       status, body = post_json("/api/runner/preview_results", { claim: claim, result: result })
+      status == 201 ? body : raise_for(status, body)
+    end
+
+    # POST /api/runner/reset_results. One classified row per resource of the claimed ticket reset.
+    def submit_reset_result(claim:, result:)
+      status, body = post_json("/api/runner/reset_results", { claim: claim, result: result })
       status == 201 ? body : raise_for(status, body)
     end
 
