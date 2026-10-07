@@ -10,12 +10,13 @@ module SpecrelayRunner
   # Platform decides what is OWNED — it recorded every resource in the plan — and whether this
   # report completes the reset. This side reads the live remote state and mutates only:
   #
-  #   - an OPEN planned pull request, closed through {Review::Retirement}'s convergent close; and
+  #   - an OPEN planned pull request, closed through {Review::Retirement}'s convergent close unless
+  #     its head is a planned branch that moved past the recorded head; and
   #   - a planned branch whose remote head still equals the recorded head, deleted with that head
   #     as the push lease, so a branch that moved in between is refused by the remote itself.
   #
-  # A merged pull request, the default branch, a merged pull request's branch and a moved branch
-  # are preserved; anything it cannot read is `unverifiable` and preserved. A retry re-reads the
+  # A merged pull request, the default branch, a merged pull request's branch, a moved branch and
+  # its open pull request are preserved; anything it cannot read is `unverifiable` and preserved. A retry re-reads the
   # live state, so a closed pull request or a deleted branch comes back `already_retired` and no
   # close or delete is repeated. A claim whose lease Platform no longer confirms stops before its
   # next mutation and reports nothing.
@@ -117,12 +118,31 @@ module SpecrelayRunner
       return UNVERIFIABLE if live.error
       return MERGED if live.merged
       return ALREADY_RETIRED if live.state == Review::Retirement::CLOSED
-      return UNVERIFIABLE unless live.state == Review::Retirement::OPEN
+      return UNVERIFIABLE unless live.state == Review::Retirement::OPEN && recorded_head?(repository, url)
 
       closed = retirement.call
       return RETIRED if closed.ok?
 
       closed.failure_kind == Review::Retirement::PRODUCT_DECISION ? MERGED : OPEN
+    end
+
+    # An open pull request whose head branch is a planned branch row is closed only while its head
+    # is still the recorded one: new work pushed there since is not this reset's to retire. A pull
+    # request with no matching row closes on Platform's record of its URL alone.
+    def recorded_head?(repository, url)
+      result = run([ "gh", "pr", "view", url, "--repo", repository, "--json", "headRefName,headRefOid" ], Dir.tmpdir)
+      return false unless result.success?
+
+      head = JSON.parse(result.stdout.to_s)
+      return false unless head.is_a?(Hash)
+
+      row = branches.find do |candidate|
+        GithubRemote.slug(candidate["repository_url"].to_s)&.casecmp?(repository) &&
+          candidate["branch"] == head["headRefName"]
+      end
+      row.nil? || row["head_commit"].to_s == head["headRefOid"].to_s
+    rescue JSON::ParserError
+      false
     end
 
     def branch(row)

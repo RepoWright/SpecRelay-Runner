@@ -79,6 +79,27 @@ class TicketResetTest < Minitest::Test
     assert_equal moved, remote_sha(BRANCH)
   end
 
+  def test_an_open_pull_request_whose_head_moved_is_kept_open_with_its_branch
+    log = fake_gh(seed: [ pr(PR_URL, "OPEN") ])
+    moved = commit_on_remote(BRANCH)
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, run_reset(assignment), @io.string
+
+    assert_equal "unverifiable", reported["pull_requests"].first["classification"]
+    assert_equal "moved", reported["branches"].first["classification"]
+    assert_empty FakeGithub.pr_closes(log)
+    assert_equal moved, remote_sha(BRANCH)
+  end
+
+  def test_an_open_pull_request_without_a_planned_branch_closes_on_its_recorded_url
+    log = fake_gh(seed: [ pr(PR_URL, "OPEN", head: "elsewhere") ])
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, run_reset(assignment), @io.string
+
+    assert_equal "retired", reported["pull_requests"].first["classification"]
+    assert_equal [ "pr close #{PR_URL} --repo #{SLUG}" ], FakeGithub.pr_closes(log)
+  end
+
   # --- authority ---------------------------------------------------------------------------
 
   def test_a_claim_platform_already_ended_touches_nothing_and_reports_nothing
@@ -170,10 +191,10 @@ class TicketResetTest < Minitest::Test
                                     "GIT_SSH_COMMAND" => @shim })
   end
 
-  def pr(url, state, head: BRANCH) = { "url" => url, "state" => state, "headRefName" => head, "headRefOid" => "" }
+  def pr(url, state, head: BRANCH) = { "url" => url, "state" => state, "headRefName" => head, "headRefOid" => "live" }
 
   def fake_gh(seed:)
-    @gh_bin, log, = FakeGithub.gh_bin(seed: seed)
+    @gh_bin, log, = FakeGithub.gh_bin(seed: seed, bare: @bare)
     log
   end
 
