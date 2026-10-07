@@ -35,7 +35,6 @@ module SpecrelayRunner
     MAX_BYTES = 32_768
     MAX_ENTRIES = 50
     MAX_COMMANDS = 10
-    MAX_ARGUMENTS = 20
     MAX_ARGUMENT_LENGTH = 2_000
     KEY = "repositories"
     PATH = "path"
@@ -128,7 +127,6 @@ module SpecrelayRunner
       where = "#{FILENAME} entry #{position} command #{command}"
       return "#{where} must be an argv array, not a shell string" unless argv.is_a?(Array)
       return "#{where} names no program" if argv.empty?
-      return "#{where} lists #{argv.length} arguments; at most #{MAX_ARGUMENTS} are accepted" if argv.length > MAX_ARGUMENTS
 
       argv.each_with_index do |element, index|
         return "#{where} argument #{index + 1} must be a non-empty string" unless element.is_a?(String) && !element.strip.empty?
