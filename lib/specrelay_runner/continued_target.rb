@@ -103,6 +103,21 @@ module SpecrelayRunner
       place(planned, worktree_path)
     end
 
+    # Prove, WITHOUT changing anything, that a worktree an answered question already continued is
+    # still on every recorded head — the same identity, branch, remote and pull-request facts as
+    # {#materialize}, with local `HEAD` required to BE the recorded head instead of being reset to
+    # it. Its uncommitted changes are not refused here: they are the paused work, and the caller
+    # proves them against the recorded checkpoint BEFORE asking, so this never vouches for
+    # unrecorded edits.
+    def prove(worktree_path:, git: Review::Checkout::Git)
+      return Result.new(ok: true) if targets.empty?
+
+      planned = plan(worktree_path, false, git, holding: true)
+      return planned if planned.is_a?(Result)
+
+      Result.new(ok: true, head_commit: root_head(planned, worktree_path))
+    end
+
     private
 
     attr_reader :targets, :publication_branch, :noun, :pull_request_env
@@ -110,7 +125,7 @@ module SpecrelayRunner
     # Every target located and PROVED, before any of them is moved. All-or-nothing: the first
     # fact that fails refuses the whole continuation, and until this returns a plan nothing on
     # disk has changed.
-    def plan(worktree_path, created, git)
+    def plan(worktree_path, created, git, holding: false)
       seen = []
       planned = []
       targets.each do |repository|
@@ -119,7 +134,7 @@ module SpecrelayRunner
 
         observed = git.current_branch(root)
         placing = created && observed == ""
-        refusal = duplicate_refusal(repository, seen) || verify(repository, root, observed, placing, git)
+        refusal = duplicate_refusal(repository, seen) || verify(repository, root, observed, placing, git, holding)
         return refusal if refusal
 
         placement = placing ? placement_plan(repository, root) : :reset
@@ -135,14 +150,16 @@ module SpecrelayRunner
     # they are independent repositories with unrelated histories, and one shared commit would be
     # meaningless in the others.
     def place(planned, worktree_path)
-      root_head = nil
       planned.each do |repository, root, placement|
         refusal = put(repository, root, placement)
         return refusal if refusal
-
-        root_head = repository["head_commit"].to_s if same_directory?(root, worktree_path)
       end
-      Result.new(ok: true, head_commit: root_head)
+      Result.new(ok: true, head_commit: root_head(planned, worktree_path))
+    end
+
+    def root_head(planned, worktree_path)
+      root_repository, = planned.find { |_repository, root, _placement| same_directory?(root, worktree_path) }
+      root_repository && root_repository["head_commit"].to_s
     end
 
     # WHERE each recorded repository is. {Review::Checkout.resolve} is the one owner of that
@@ -175,17 +192,30 @@ module SpecrelayRunner
 
     # Every uncertainty is a refusal, and each one names the fact that failed so the operator can
     # act on it. The local checks come first, so an unusable, dirty or wrongly-branched checkout is
-    # refused without a network call.
-    def verify(repository, root, observed, placing, git)
+    # refused without a network call. A checkout {#prove} is `holding` must already be AT the head,
+    # since nothing will move it there, and its uncommitted work was proved by the caller.
+    def verify(repository, root, observed, placing, git, holding)
       key = repository["repository_key"]
       head = repository["head_commit"].to_s
-      return refuse("the checkout of '#{key}' has uncommitted changes; preserve or release it before retrying") unless clean?(root)
+      local = holding ? held_refusal(key, root, head) : dirty_refusal(key, root)
+      return local if local
 
       branch_refusal(key.to_s, repository) ||
         checkout_branch_refusal(key.to_s, repository, observed, placing) ||
         remote_refusal(repository, root, head, git) ||
         pull_request_refusal(repository, root) ||
         fetch_head(repository, root, head, git)
+    end
+
+    def dirty_refusal(key, root)
+      refuse("the checkout of '#{key}' has uncommitted changes; preserve or release it before retrying") unless clean?(root)
+    end
+
+    def held_refusal(key, root, head)
+      at = run(root, %w[rev-parse HEAD])
+      return nil if succeeded?(at) && at.stdout.to_s.strip.casecmp?(head)
+
+      refuse("'#{key}' is not at the #{noun} head #{head[0, 12]}; refusing to continue the recorded work on another commit")
     end
 
     # WHICH branch, before which commit.
