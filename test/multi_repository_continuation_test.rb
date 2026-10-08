@@ -73,12 +73,14 @@ class MultiRepositoryContinuationTest < Minitest::Test
   # `fixture_env` is the environment the double runs under on this host, installed behind the
   # approved bare name on the child PATH. The assignment itself is always the canonical fixture
   # profile, environment included.
-  def start(rework: nil, restart: nil, executor: nil, fixture_env: {}, seed: nil, fail_view_for: nil)
+  def start(rework: nil, restart: nil, executor: nil, fixture_env: {}, seed: nil, fail_view_for: nil, resume: nil)
     use_fixture(fixture_dir, executor || @built.executor,
                 env: { "FAKE_EXECUTOR_EDITED" => ".,component-a" }.merge(fixture_env))
     payload = claim_payload_for(task_id: TASK, root: @root,
                                 specification_repository: "component-c",
                                 publication: {}, rework: rework, restart: restart)
+    payload = payload.merge("resume" => resume) if resume
+    @platform&.stop
     @platform = FakePlatform.new(claim_payload: payload).start
     @gh_dir, @gh_log, = FakeGithub.gh_bin(fail_view_for: fail_view_for, urls: PR_URLS, bares: @bares,
                                           seed: seed || open_pull_requests)
@@ -341,6 +343,70 @@ class MultiRepositoryContinuationTest < Minitest::Test
     assert_equal "work in progress\n", File.read(File.join(task_workspace, "component-a", "app.txt"))
     refute_equal @recorded.fetch(WORKSPACE_SLUG), head_of(WORKSPACE_SLUG)
     assert_zero_external_effect(output)
+  end
+
+  # --- an answered question whose checkpoint names fewer repositories than the review --------
+  #
+  # The paused work is proved only where the checkpoint recorded it. A reviewed repository the
+  # checkpoint does not name holds no recorded work, so uncommitted edits there still refuse.
+
+  QUESTION = {
+    "questions" => [ { "prompt" => "Should the workspace note keep the round marker?" } ],
+    "continuation_context" => {
+      "progress" => "the workspace note is half edited", "changed_areas" => "workspace.txt",
+      "why_it_matters" => "the reviewer asked for one note", "next_step" => "finish the note",
+      "remaining_work" => "the second line", "do_not_repeat" => "the first line"
+    }
+  }.freeze
+
+  def test_an_answered_resume_refuses_a_dirty_reviewed_child_the_checkpoint_does_not_name
+    start(rework: { "repositories" => both_targets }, executor: asking_executor,
+          fixture_env: { "FAKE_EXECUTOR_QUESTION_JSON" => QUESTION.to_json })
+    @platform.release_question!
+    code, output = run_cli
+    assert_equal SpecrelayRunner::CLI::SUCCESS, code, output
+    checkpoint = @platform.executor_questions.first[:body]["checkpoint"]
+    assert_equal [ "." ], checkpoint["repositories"].map { |entry| entry["path"] }
+
+    child = File.join(task_workspace, "component-a", "app.txt")
+    File.write(child, "an edit nobody recorded\n")
+    answers = [ { "option" => "", "text" => "Keep the marker." } ]
+    start(rework: { "repositories" => both_targets }, executor: observing_executor,
+          resume: { "question_id" => "exq_fake", "questions" => QUESTION["questions"],
+                    "continuation_context" => QUESTION["continuation_context"], "answers" => answers,
+                    "checkpoint" => checkpoint.reject { |key, _| key == "payload" }
+                                              .merge("download_path" => "/api/runner/executor_questions/exq_fake/checkpoint") })
+    @platform.delivery_response = [ 200, { question: { id: "exq_fake", state: "RESUMED", answers: answers,
+                                                       deadline_at: "2026-08-13T12:00:00Z", remaining_seconds: 0 } } ]
+    @platform.checkpoint_payload = checkpoint["payload"]
+    code, output = run_cli
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, code, output
+    assert_includes output, "the checkout of 'component-a' has uncommitted changes"
+    assert_equal "an edit nobody recorded\n", File.read(child)
+    assert_empty @platform.delivery_acknowledgements, "the answered checkpoint must not be consumed"
+    assert_zero_external_effect(output)
+  end
+
+  # Edits the workspace repository only, reports only it, then asks and waits briefly.
+  def asking_executor
+    path = File.join(@scratch, "asking-executor")
+    File.write(path, DemoWorkspace.with_selection_reporter(<<~'RUBY', paths: %([ { "path" => ".", "commands" => [] } ])))
+      #!/usr/bin/env ruby
+      # frozen_string_literal: true
+      request = File.read(ARGV.last.to_s)[%r{`([^`]*/question-request\.json)`}, 1]
+      abort "[asking-executor] the prompt named no bridge" if request.nil?
+      File.write("workspace.txt", "#{File.read('workspace.txt')}interrupted\n")
+      SELECTION.call
+      File.write("#{request}.partial", ENV.fetch("FAKE_EXECUTOR_QUESTION_JSON"))
+      File.rename("#{request}.partial", request)
+      puts "[asking-executor] asked"
+      deadline = Time.now + 5
+      sleep 0.05 until Time.now > deadline || File.file?(File.join(File.dirname(request), "question-answer.json"))
+      exit 0
+    RUBY
+    FileUtils.chmod(0o755, path)
+    path
   end
 
   # --- MAPIAI-107 CR-001 F3: the reset itself failing --------------------------

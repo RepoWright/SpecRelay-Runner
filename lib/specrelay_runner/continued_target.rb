@@ -106,13 +106,14 @@ module SpecrelayRunner
     # Prove, WITHOUT changing anything, that a worktree an answered question already continued is
     # still on every recorded head — the same identity, branch, remote and pull-request facts as
     # {#materialize}, with local `HEAD` required to BE the recorded head instead of being reset to
-    # it. Its uncommitted changes are not refused here: they are the paused work, and the caller
-    # proves them against the recorded checkpoint BEFORE asking, so this never vouches for
-    # unrecorded edits.
-    def prove(worktree_path:, git: Review::Checkout::Git)
+    # it. Uncommitted changes in a checkout listed in `held` are not refused here: they are the
+    # paused work, and the caller proves them against the recorded checkpoint BEFORE asking. A
+    # reviewed checkout outside `held` has no recorded work, so it must still be clean — this
+    # never vouches for unrecorded edits.
+    def prove(worktree_path:, held:, git: Review::Checkout::Git)
       return Result.new(ok: true) if targets.empty?
 
-      planned = plan(worktree_path, false, git, holding: true)
+      planned = plan(worktree_path, false, git, holding: held)
       return planned if planned.is_a?(Result)
 
       Result.new(ok: true, head_commit: root_head(planned, worktree_path))
@@ -125,7 +126,7 @@ module SpecrelayRunner
     # Every target located and PROVED, before any of them is moved. All-or-nothing: the first
     # fact that fails refuses the whole continuation, and until this returns a plan nothing on
     # disk has changed.
-    def plan(worktree_path, created, git, holding: false)
+    def plan(worktree_path, created, git, holding: nil)
       seen = []
       planned = []
       targets.each do |repository|
@@ -192,12 +193,14 @@ module SpecrelayRunner
 
     # Every uncertainty is a refusal, and each one names the fact that failed so the operator can
     # act on it. The local checks come first, so an unusable, dirty or wrongly-branched checkout is
-    # refused without a network call. A checkout {#prove} is `holding` must already be AT the head,
-    # since nothing will move it there, and its uncommitted work was proved by the caller.
+    # refused without a network call. While {#prove} is `holding`, every checkout must already be
+    # AT the head, since nothing will move it there; only one among the held paths keeps its
+    # uncommitted work, which the caller proved against the checkpoint.
     def verify(repository, root, observed, placing, git, holding)
       key = repository["repository_key"]
       head = repository["head_commit"].to_s
-      local = holding ? held_refusal(key, root, head) : dirty_refusal(key, root)
+      local = (holding && held_refusal(key, root, head)) ||
+              (dirty_refusal(key, root) unless holding&.any? { |path| same_directory?(root, path) })
       return local if local
 
       branch_refusal(key.to_s, repository) ||

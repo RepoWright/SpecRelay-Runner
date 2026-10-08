@@ -106,7 +106,8 @@ module SpecrelayRunner
       proof = Checkpoint.verify(checkpoint, task_root: found.path, workspace: measuring)
       return Prepared.new(reason: proof.reason) unless proof.ok?
 
-      continued(found, target&.prove(worktree_path: found.path))
+      held = checkpoint["repositories"].to_a.map { |entry| File.join(found.path, entry["path"].to_s) }
+      continued(found, target&.prove(worktree_path: found.path, held: held))
     end
 
     # This machine has never seen the work. The task workspace is built by the PROJECT's own
