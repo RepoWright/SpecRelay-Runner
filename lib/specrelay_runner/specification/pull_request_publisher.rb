@@ -23,7 +23,9 @@ module SpecrelayRunner
       VERIFICATION_FAILED = "publication_verification_failed"
       MAX_BODY_FILES = 25
 
-      Result = Struct.new(:url, :draft, :reused, :failure_class, :message, keyword_init: true) do
+      # `created_at` is GitHub's own creation time for the pull request, or nil when GitHub did not
+      # report one. It is evidence for the ticket page, never a reason to fail publication.
+      Result = Struct.new(:url, :draft, :reused, :created_at, :failure_class, :message, keyword_init: true) do
         def ok? = failure_class.nil?
         def reused? = reused ? true : false
         def draft? = draft ? true : false
@@ -75,7 +77,7 @@ module SpecrelayRunner
       # is safe".
       def find_open_pull_request
         result = commands.gh([ "pr", "list", "--repo", slug, "--head", branch, "--state", "open",
-                               "--limit", "10", "--json", "url,state,headRefName,headRefOid,isDraft" ])
+                               "--limit", "10", "--json", "url,state,headRefName,headRefOid,isDraft,createdAt" ])
         return lookup_failure(result) unless result.success?
 
         entries = parse(result.stdout)
@@ -100,7 +102,8 @@ module SpecrelayRunner
         return refusal(*decisions.first) if match.nil?
 
         log("Reusing the existing draft pull request for #{branch}: #{match['url']}")
-        Result.new(url: match["url"], draft: match["isDraft"] == true, reused: true)
+        Result.new(url: match["url"], draft: match["isDraft"] == true, reused: true,
+                   created_at: created_at(match))
       end
 
       def decide(pull_request)
@@ -140,7 +143,26 @@ module SpecrelayRunner
         return failure(CREATION_FAILED, "gh pr create reported no pull-request URL") if url.nil?
 
         log("Opened a draft pull request for #{branch}: #{url}")
-        Result.new(url: url, draft: assignment.draft_pull_request?, reused: false)
+        Result.new(url: url, draft: assignment.draft_pull_request?, reused: false,
+                   created_at: read_created_at(url))
+      end
+
+      # `gh pr create` prints only the URL, so GitHub's creation time takes one more read. The pull
+      # request already exists by now, so a failed or unreadable answer leaves the time absent
+      # rather than failing a publication that succeeded.
+      def read_created_at(url)
+        viewed = commands.gh([ "pr", "view", url, "--repo", slug, "--json", "createdAt" ])
+        return nil unless viewed.success?
+
+        parsed = JSON.parse(viewed.stdout.to_s)
+        parsed.is_a?(Hash) ? created_at(parsed) : nil
+      rescue JSON::ParserError
+        nil
+      end
+
+      def created_at(pull_request)
+        value = pull_request["createdAt"].to_s
+        value.empty? ? nil : value
       end
 
       def title = "#{assignment.issue_key}: specification for review"

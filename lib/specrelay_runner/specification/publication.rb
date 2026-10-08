@@ -355,7 +355,7 @@ module SpecrelayRunner
           "reused_branch" => pushed.reused_branch?,
           "reused_pull_request" => opened.reused?,
           "files" => verified.map { |file| { "path" => file.repository_path, "sha256" => file.sha256 } }
-        )
+        ).merge(opened.created_at ? { "pull_request_created_at" => opened.created_at } : {})
       end
 
       def failure_payload(failure_class, message, pushed)

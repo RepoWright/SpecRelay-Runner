@@ -14,6 +14,10 @@ require "open3"
 module FakeGithub
   module_function
 
+  # GitHub's creation time for every pull request this fake opens, so a reported `createdAt` is
+  # one known value a test can compare against.
+  CREATED_AT = "2026-10-01T09:30:00Z"
+
   # Create a bare remote and register it as `origin` on the repository root.
   #
   # MAPIAI-84 — the url is ALWAYS the GitHub one, because the runner now reads a repository's
@@ -268,7 +272,8 @@ module FakeGithub
                                "baseRefName" => row.fetch("baseRefName", "main"),
                                "mergedAt" => merged_at,
                                "isDraft" => row.fetch("isDraft", true),
-                               "isCrossRepository" => row.fetch("isCrossRepository", false) })
+                               "isCrossRepository" => row.fetch("isCrossRepository", false),
+                               "createdAt" => row["createdAt"] })
           exit 0
         # MAPIAI-88: `gh pr close <url> --repo <slug>`. It flips the SAME state file `pr view`
         # reads, so "closed" is one observable fact rather than a scripted return value — which
@@ -301,6 +306,7 @@ module FakeGithub
           File.write(STATE, JSON.generate(prs + [ { "url" => created, "state" => "OPEN",
                                                     "headRefName" => head, "repo" => repo,
                                                     "isDraft" => ARGV.include?("--draft"),
+                                                    "createdAt" => #{CREATED_AT.inspect},
                                                     "headRefOid" => head_oid(head, repo) } ]))
           # "create_silent": creation succeeds but prints no URL, so the runner has to
           # fall back to a lookup. Real gh can be quiet under some output settings.

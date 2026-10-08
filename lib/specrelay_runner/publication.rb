@@ -52,9 +52,12 @@ module SpecrelayRunner
     #   publication_skipped_reason publication was NOT ATTEMPTED BY POLICY (read-only
     #                              repository) -> a normal, non-fatal outcome that
     #                              must not fail the run (review-001 finding 3).
+    #
+    # `pull_request_created_at` is GitHub's own creation time for `pull_request_url`, or nil when
+    # GitHub did not report one.
     Result = Struct.new(:id, :clone_url, :default_branch, :changed, :base_commit, :head_commit,
-                        :branch, :pull_request_url, :publication_error, :publication_skipped_reason,
-                        keyword_init: true)
+                        :branch, :pull_request_url, :pull_request_created_at, :publication_error,
+                        :publication_skipped_reason, keyword_init: true)
 
     def initialize(payload:, repository:, env: {}, io: $stdout, publish: true)
       @payload = payload
@@ -158,10 +161,11 @@ module SpecrelayRunner
       return blocked(result, pull_request.error) if pull_request.error
 
       result.pull_request_url = pull_request.url
+      result.pull_request_created_at = pull_request.created_at
       result
     end
 
-    Step = Struct.new(:head_commit, :url, :error, keyword_init: true)
+    Step = Struct.new(:head_commit, :url, :created_at, :error, keyword_init: true)
 
     # Commits the executor's output. `git add -A` then a commit with a stable,
     # task-identifying subject. On retry the tree is already clean, so the existing
@@ -258,7 +262,7 @@ module SpecrelayRunner
       # CR-001's guard refuse a pull request whose head WAS our commit (review-003).
       lookup = find_open_pull_request(slug, branch, result.head_commit)
       return Step.new(error: lookup.error) if lookup.error
-      return Step.new(url: lookup.url) if lookup.url
+      return Step.new(url: lookup.url, created_at: lookup.created_at) if lookup.url
 
       create_pull_request(slug, branch, result)
     end
@@ -266,7 +270,7 @@ module SpecrelayRunner
     # The outcome of asking GitHub whether a reusable pull request exists. `url` set
     # means reuse it; `error` set means we could not tell; both nil means there is
     # definitively none and creating is safe.
-    Lookup = Struct.new(:url, :error, keyword_init: true)
+    Lookup = Struct.new(:url, :created_at, :error, keyword_init: true)
 
     # Only an OPEN pull request on this exact branch may be reused.
     #
@@ -278,7 +282,7 @@ module SpecrelayRunner
     # choice CR-001 asks for.
     def find_open_pull_request(slug, branch, pushed_head)
       result = gh([ "pr", "list", "--repo", slug, "--head", branch, "--state", "open",
-                    "--limit", "10", "--json", "url,state,headRefName,headRefOid" ])
+                    "--limit", "10", "--json", "url,state,headRefName,headRefOid,createdAt" ])
       return Lookup.new(error: lookup_failure(result)) unless result.success?
 
       entries = parse_pull_requests(result.stdout)
@@ -320,7 +324,7 @@ module SpecrelayRunner
       end
 
       log("Reusing the existing open pull request for #{branch}: #{match['url']}")
-      Lookup.new(url: match["url"])
+      Lookup.new(url: match["url"], created_at: created_at(match))
     end
 
     # THE reuse decision. One enumerated predicate over the whole input space, replacing
@@ -441,7 +445,25 @@ module SpecrelayRunner
       return Step.new(error: "gh pr create reported no pull-request URL") if url.nil?
 
       log("Opened #{draft_pull_request? ? 'draft ' : ''}pull request for #{result.id}: #{url}")
-      Step.new(url: url)
+      Step.new(url: url, created_at: read_created_at(slug, url))
+    end
+
+    # `gh pr create` prints only the URL, so GitHub's creation time takes one more read. The pull
+    # request already exists by now, so a failed or unreadable answer leaves the time absent
+    # rather than failing a publication that succeeded.
+    def read_created_at(slug, url)
+      viewed = gh([ "pr", "view", url, "--repo", slug, "--json", "createdAt" ])
+      return nil unless viewed.success?
+
+      parsed = JSON.parse(viewed.stdout.to_s)
+      parsed.is_a?(Hash) ? created_at(parsed) : nil
+    rescue JSON::ParserError
+      nil
+    end
+
+    def created_at(pull_request)
+      value = pull_request["createdAt"].to_s
+      value.empty? ? nil : value
     end
 
     def pull_request_title = "#{task_id}: SpecRelay automated execution output"
