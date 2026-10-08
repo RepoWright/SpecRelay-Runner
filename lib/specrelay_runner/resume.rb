@@ -55,14 +55,21 @@ module SpecrelayRunner
     #
     # `download` is called only on the path that needs bytes, and BEFORE the task workspace is
     # built, so a transfer failure leaves this machine exactly as it found it.
-    def prepare(measuring:, creating:, download:)
+    #
+    # `target` is the reviewed {Rework} when the question was asked during a change-request round.
+    # Its heads and the recorded work are then proved in the one order both allow: a reused
+    # worktree is remeasured against the checkpoint FIRST, which is what makes its uncommitted
+    # changes acceptable to the target proof that follows; a created one is put on the reviewed
+    # heads first, because the checkpoint was recorded on them and is restored onto them. The
+    # returned worktree's base is then the reviewed root head, as an ordinary rework's is.
+    def prepare(measuring:, creating:, download:, target: nil)
       return Prepared.new(reason: NO_CHECKPOINT) if Array(checkpoint["repositories"]).empty?
 
       found = measuring.existing
-      return reuse(found, measuring) if found
+      return reuse(found, measuring, target) if found
 
       payload = download.call
-      restore(payload, creating: creating, measuring: measuring)
+      restore(payload, creating: creating, measuring: measuring, target: target)
     rescue PlatformClient::Error => e
       Prepared.new(reason: "the recorded checkpoint could not be downloaded: #{Redaction.redact(e.message)}")
     rescue Workspace::Error => e
@@ -92,9 +99,15 @@ module SpecrelayRunner
     # This machine still holds the work. `create` deliberately refuses an existing worktree with
     # uncommitted changes, which is the one state this path requires, so the worktree is READ and
     # remeasured rather than rebuilt.
-    def reuse(found, measuring)
+    #
+    # A reviewed target is proved only after that, and without moving anything: the worktree is
+    # the paused work, so it is never reset, stashed or rebuilt.
+    def reuse(found, measuring, target)
       proof = Checkpoint.verify(checkpoint, task_root: found.path, workspace: measuring)
-      proof.ok? ? Prepared.new(worktree: found) : Prepared.new(reason: proof.reason)
+      return Prepared.new(reason: proof.reason) unless proof.ok?
+
+      held = checkpoint["repositories"].to_a.map { |entry| File.join(found.path, entry["path"].to_s) }
+      continued(found, target&.prove(worktree_path: found.path, held: held))
     end
 
     # This machine has never seen the work. The task workspace is built by the PROJECT's own
@@ -107,11 +120,26 @@ module SpecrelayRunner
     # that way, and without this the continuation would refuse the environment it had just created.
     # `create` can also return an existing clean worktree, which this claim did not build and which
     # is therefore never placed.
-    def restore(payload, creating:, measuring:)
+    #
+    # A reviewed target is placed between the two, through the same all-or-nothing materialization
+    # an ordinary rework uses, so the restore finds each reviewed checkout clean at the head the
+    # work was recorded on.
+    def restore(payload, creating:, measuring:, target:)
       created = creating.create
+      placed = target&.materialize(worktree_path: created.path, created: created.created?)
+      return Prepared.new(reason: placed.reason) if placed && !placed.ok?
+
       restored = Checkpoint.restore(checkpoint, payload: payload, task_root: created.path,
                                                 workspace: measuring, created: created.created?)
-      restored.ok? ? Prepared.new(worktree: created) : Prepared.new(reason: restored.reason)
+      restored.ok? ? continued(created, placed) : Prepared.new(reason: restored.reason)
+    end
+
+    def continued(worktree, proof)
+      return Prepared.new(worktree: worktree) if proof.nil?
+      return Prepared.new(reason: proof.reason) unless proof.ok?
+
+      Prepared.new(worktree: Workspace::Info.new(path: worktree.path, created: worktree.created?,
+                                                 base_commit: proof.head_commit || worktree.base_commit))
     end
 
     def context_lines
