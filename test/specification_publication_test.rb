@@ -300,6 +300,37 @@ class SpecificationPublicationTest < Minitest::Test
     assert_includes git(@implementation_clone, "ls-tree", "--name-only", head), "implementation.rb"
   end
 
+  # A revision that drops the optional open-questions document. The ticket branch still carries
+  # the earlier package, so a publication that only ADDS the new files would leave the old
+  # document behind and the package would disagree with its own record. Only known package
+  # documents may go: execution reports and everything outside the package stay byte-identical.
+  def test_republishing_without_an_optional_document_removes_it_and_nothing_else
+    previous = seed_previous_package
+    kept = %W[#{PACKAGE}/execution-reports/001-initial/README.md implementation.rb]
+    before = kept.to_h { |path| [ path, git(@previous_clone, "rev-parse", "#{previous}:#{path}").strip ] }
+    start_platform
+    @platform.publication_response = [ 500, { error: "internal server error" } ]
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
+
+    head = FakeGithub.remote_branches(@bare)[BRANCH]
+    git(@previous_clone, "fetch", "-q", "origin", BRANCH)
+    assert_equal previous, git(@previous_clone, "rev-parse", "#{head}^").strip, "a fast-forward of the previous tip"
+    package = git(@previous_clone, "ls-tree", "-r", "--name-only", head, "--", PACKAGE).split("\n")
+                .reject { |path| path.start_with?("#{PACKAGE}/execution-reports/") }
+    assert_equal @package_files.map { |f| "#{PACKAGE}/#{f['path']}" }.sort, package.sort
+    kept.each { |path| assert_equal before[path], git(@previous_clone, "rev-parse", "#{head}:#{path}").strip }
+
+    @platform.publication_response = nil
+    @platform.offer_again!
+    @io = StringIO.new
+    assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
+
+    assert_equal head, FakeGithub.remote_branches(@bare)[BRANCH], "an unchanged republication must not commit"
+    assert_equal head, @platform.last_specification_publication["head_commit"]
+    assert_equal true, @platform.last_specification_publication["reused_branch"]
+  end
+
   # Criterion 4, one row per way a linked pull request can be unusable. Every one of them must
   # refuse BEFORE any git mutation, so each asserts that the remote is untouched.
   def test_a_closed_spec_pr_refuses_before_any_git_mutation
@@ -1052,6 +1083,31 @@ class SpecificationPublicationTest < Minitest::Test
     commit(@implementation_clone, "implementation work on the ticket branch")
     git(@implementation_clone, "push", "-q", "origin", BRANCH)
     git(@implementation_clone, "rev-parse", "HEAD").strip
+  end
+
+  # The ticket branch as an earlier publication and implementation round left it: a package WITH
+  # the optional open-questions document, an execution report inside the package folder, and
+  # implementation work outside it.
+  def seed_previous_package
+    @previous_clone = File.join(@temp, "previous-clone")
+    system("git", "clone", "-q", @bare, @previous_clone, exception: true)
+    git(@previous_clone, "config", "user.email", "test@specrelay.local")
+    git(@previous_clone, "config", "user.name", "SpecRelay Test")
+    git(@previous_clone, "checkout", "-q", "-b", BRANCH)
+    files = PACKAGE_CONTENTS.transform_keys { |name| "#{PACKAGE}/#{name}" }.merge(
+      "#{PACKAGE}/spec.md" => "# SR-700: Add an export button\n\nThe earlier revision.\n",
+      "#{PACKAGE}/analysis/open-questions.md" => "# Open questions\n\nOQ-1 is still open.\n",
+      "#{PACKAGE}/execution-reports/001-initial/README.md" => "# Execution report\n",
+      "implementation.rb" => "# shipped for this ticket\n"
+    )
+    files.each do |path, body|
+      FileUtils.mkdir_p(File.dirname(File.join(@previous_clone, path)))
+      File.write(File.join(@previous_clone, path), body)
+    end
+    git(@previous_clone, "add", ".")
+    commit(@previous_clone, "the earlier package and an implementation round")
+    git(@previous_clone, "push", "-q", "origin", BRANCH)
+    git(@previous_clone, "rev-parse", "HEAD").strip
   end
 
   # `--is-ancestor` answers through its exit status, which the `git` helper turns into an

@@ -13,14 +13,16 @@ module SpecrelayRunner
     # someone's branch under them, and a publication that ran `git add` would commit whatever
     # else happened to be staged. So this class builds the commit with plumbing instead:
     #
-    #   read-tree <base> -> hash-object each verified file -> update-index -> write-tree
-    #   -> commit-tree -> push <sha>:refs/heads/<branch>
+    #   read-tree <base> -> remove stale package documents -> hash-object each verified file
+    #   -> update-index -> write-tree -> commit-tree -> push <sha>:refs/heads/<branch>
     #
     # into a TEMPORARY index file. Nothing in that sequence reads or writes the working tree,
     # HEAD, or the repository's own index. It also gives criterion 3 for free: the tree is the
-    # base tree plus exactly the verified package files, so the commit cannot contain anything
-    # else — not because the runner was careful about staging, but because nothing else was ever
-    # added.
+    # base tree, minus every known package document in the package folder that this publication
+    # does not carry, plus exactly the verified package files. So the commit cannot contain
+    # anything else, and a revision that drops a document (the optional open questions) does not
+    # leave the earlier copy behind. Nothing else is ever removed: execution reports, any other
+    # file in the package folder, and every path outside it stay as the base has them.
     #
     # Idempotency is structural for the same reason. The base is the existing remote branch tip
     # when there is one, so a retry writes the SAME tree; an unchanged tree means no commit is
@@ -200,6 +202,11 @@ module SpecrelayRunner
         return failure(PUSH_FAILED, "git read-tree failed for #{base_commit}") unless
           commands.git([ "read-tree", base_commit ], extra_env: index).success?
 
+        stale_package_paths.each do |path|
+          return failure(PUSH_FAILED, "git update-index failed to remove #{path}") unless
+            commands.git([ "update-index", "--force-remove", "--", path ], extra_env: index).success?
+        end
+
         files.each do |file|
           blob = commands.git_value([ "hash-object", "-w", "--", file.absolute_path ])
           return failure(PUSH_FAILED, "git hash-object failed for #{file.repository_path}") unless
@@ -211,6 +218,13 @@ module SpecrelayRunner
 
         tree = commands.git_value([ "write-tree" ], extra_env: index)
         COMMIT_PATTERN.match?(tree.to_s) ? tree : failure(PUSH_FAILED, "git write-tree produced no tree")
+      end
+
+      # The known package documents this publication does not carry, under the assigned folder.
+      # Removing an absent path is a no-op, so an unchanged republication still writes the base tree.
+      def stale_package_paths
+        published = files.map(&:repository_path)
+        PackagePath::ALL_FILES.map { |name| "#{assignment.generated_package_path}/#{name}" } - published
       end
 
       def base_tree(commit) = commands.git_value([ "rev-parse", "#{commit}^{tree}" ])
