@@ -441,9 +441,11 @@ module SpecrelayRunner
       # MVP-0036 Stage 2a — a resume continues the DIRTY worktree its question was asked from, so
       # it reads and proves that worktree where an ordinary claim creates a clean one. A refusal
       # here stops before the provider, before the package, and before any external write.
+      # An answered question from a change-request round also continues the reviewed heads, and
+      # the resume proves them itself, in the only order the checkpoint allows.
       if @resume
         prepared = @resume.prepare(measuring: measuring_workspace(root), creating: creating_workspace(root),
-                                   download: -> { download_checkpoint })
+                                   download: -> { download_checkpoint }, target: @rework)
         return resume_refused(prepared.reason) unless prepared.ok?
       end
       worktree = prepared&.worktree || create_worktree(root)
@@ -453,7 +455,7 @@ module SpecrelayRunner
       # one proof ({ContinuedTarget}) and a claim is never both. A refusal here stops before the
       # provider, before the package, and before any external write.
       continued = @rework || @restart
-      if continued
+      if continued && !(@resume && @rework)
         continuation = continued.materialize(worktree_path: worktree.path, created: worktree.created?)
         return continuation_refused(continuation.reason) unless continuation.ok?
 
