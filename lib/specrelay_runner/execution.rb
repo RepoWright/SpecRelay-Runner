@@ -183,6 +183,11 @@ module SpecrelayRunner
       # (the exact QUALITY-0002 manual-test failure). Instead, surface precise,
       # secret-safe recovery guidance and exit non-zero cleanly.
       preflight_failure(e)
+    rescue PlatformClient::Error => e
+      # Only Platform's typed report rejection ends here; every other answer keeps its own ending.
+      raise unless e.report_rejected?
+
+      report_rejected(e)
     ensure
       # The log stream owns a timer thread, so it is stopped on EVERY exit path —
       # including the aborted/mismatch/preflight ones — before the heartbeater.
@@ -243,6 +248,20 @@ module SpecrelayRunner
       log("This run's task environment is kept.")
       Result.new(outcome: :aborted,
                  message: "Runner outcome: aborted (#{Heartbeater::UNCONFIRMED}); no report uploaded.")
+    end
+
+    # Platform read the report, could not import it, and already ended this attempt as failed. The
+    # report is not resent and nothing is rerun: the run is incomplete, and whatever was published
+    # is evidence rather than accepted work. Platform has not recorded a terminal result, so the
+    # task environment is kept.
+    def report_rejected(error)
+      log("Platform rejected the execution report for #{run['task_id']}: #{sanitized(error.message)}")
+      log("The run is incomplete and was not accepted; published pull requests are not accepted work.")
+      log("The report was not resent and this run's task environment is kept. To recover: cancel the " \
+          "run, apply Ticket Reset, then return the ticket to its trigger status.")
+      Result.new(outcome: :report_failed,
+                 message: "Runner outcome: report_failed (Platform rejected the execution report; " \
+                          "the run is incomplete and was not accepted).")
     end
 
     def preflight_failure(error)
