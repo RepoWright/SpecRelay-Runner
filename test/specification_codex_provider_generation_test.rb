@@ -180,6 +180,18 @@ class SpecificationCodexProviderGenerationTest < Minitest::Test
                  claude_runner.calls.fetch(0).stdin_data.sub(claude_instruction, codex_instruction)
   end
 
+  # Guidance only: Platform's package acceptance refuses a specification with several enumerated
+  # executable parts, so the prompt asks for one deliverable and routes oversized scope to a question.
+  def test_the_prompt_asks_for_one_deliverable_and_routes_oversized_scope_to_an_open_question
+    _documents, runner = generate({ "issue_key" => "SR-700" })
+    scope = runner.calls.fetch(0).stdin_data[/^SCOPE — .*?\n\n/m].to_s.split.join(" ")
+
+    assert_includes scope, "ONE bounded, complete deliverable"
+    assert_includes scope, "Proposed behavior"
+    assert_includes scope, "\"Slice 1\", \"Phase 2\""
+    assert_includes scope, "ONE blocking open question"
+  end
+
   def test_a_response_wrapped_in_prose_with_unrelated_braces_still_parses
     wrapped = <<~TEXT
       Sure, here is the package:
