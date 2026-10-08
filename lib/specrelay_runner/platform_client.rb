@@ -21,17 +21,27 @@ module SpecrelayRunner
     # READ the payload and REFUSED it — no retry of the same body can change that, so a caller
     # holding a local success must fail closed rather than report it (MVP-0027 review-001 P2-2).
     class Error < StandardError
-      attr_reader :status
+      # The one typed outcome a refusal carries: Platform could not import an execution report and
+      # has already ended the attempt as failed, so the run is incomplete and is not offered again.
+      REPORT_FAILED = "report_failed"
 
-      def initialize(message = nil, status: nil)
+      attr_reader :status, :outcome
+
+      def initialize(message = nil, status: nil, outcome: nil)
         super(message)
         @status = status
+        @outcome = outcome
       end
 
       # Platform answered and rejected the payload. Deliberately NOT true for 5xx: Platform
       # failing to process a request it accepted is closer to a transport fault than to a
       # refusal, and the same body may well be accepted on the next attempt.
       def refused? = (400..499).cover?(status.to_i)
+
+      # Platform rejected an execution report it could not import, and said so in the typed
+      # outcome rather than only in prose. Unlike every other refusal this one is not about the
+      # claim or the session: the attempt is over on Platform, and other work may still be claimed.
+      def report_rejected? = status.to_i == 422 && outcome == REPORT_FAILED
 
       # The request's fate is unknown: Platform never answered at all, or answered that it could
       # not process a request it had accepted. Asking again may still succeed, so a caller that
@@ -615,7 +625,8 @@ module SpecrelayRunner
       raise Unauthorized.new("Platform rejected the runner token (401)#{detail}", status: status) if status == 401
       raise NotFound.new("Platform found no such resource (404)#{detail}", status: status) if status == 404
 
-      raise RequestFailed.new("Platform request failed (#{status})#{detail}", status: status)
+      outcome = body["outcome"] if body.is_a?(Hash)
+      raise RequestFailed.new("Platform request failed (#{status})#{detail}", status: status, outcome: outcome)
     end
 
     # A refusal's reason arrives in one of two shapes: an authority refusal's single `error`, or a

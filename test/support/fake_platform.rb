@@ -57,6 +57,10 @@ class FakePlatform
   # a test can tell an accepted terminal result from a superseded, refused or unreachable one.
   attr_accessor :report_response, :generation_response
 
+  # A SEQUENCE of scripted execution-report answers, consumed one per upload, so one loop session
+  # can meet a rejected report and then an accepted one. Takes precedence over `report_response`.
+  attr_accessor :report_responses
+
   # Script the review-result endpoint's answer, so a test can model Platform's
   # strict validation refusing a submission the runner considered fine.
   attr_accessor :review_response
@@ -860,6 +864,7 @@ class FakePlatform
   end
 
   def report(request)
+    return report_responses.shift if report_responses&.any?
     return @report_response if @report_response
 
     status = request.dig(:body, "report", "files")&.any? ? 201 : 422
