@@ -32,8 +32,9 @@ module SpecrelayRunner
     end
 
     # Prove, without moving anything, that a worktree an answered question continued is still on
-    # every reviewed head.
-    def prove(worktree_path:, git: Review::Checkout::Git) = target.prove(worktree_path: worktree_path, git: git)
+    # every reviewed head; only the `held` checkouts may keep their recorded uncommitted work.
+    def prove(worktree_path:, held:, git: Review::Checkout::Git) =
+      target.prove(worktree_path: worktree_path, held: held, git: git)
 
     # The section the executor's prompt carries: which heads it is on, which pull requests it is
     # continuing, and every current finding — once. The previous report, the previous prompt and
