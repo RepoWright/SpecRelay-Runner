@@ -83,6 +83,7 @@ module SpecrelayRunner
         "head_commit" => nilify(repository[:head_commit]),
         "branch" => nilify(repository[:branch]),
         "pull_request_url" => nilify(repository[:pull_request_url]),
+        "pull_request_created_at" => nilify(repository[:pull_request_created_at]),
         "publication_error" => error && Redaction.redact(error.to_s),
         # Publication not attempted by policy. Reported separately from
         # publication_error so Platform does not treat a read-only repository as a

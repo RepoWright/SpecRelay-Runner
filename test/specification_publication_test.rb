@@ -50,6 +50,20 @@ class SpecificationPublicationTest < Minitest::Test
     assert_equal PR_URL, result["pull_request_url"]
     assert_equal true, result["pull_request_draft"]
     assert_match(/\A[0-9a-f]{40}\z/, result["head_commit"])
+    assert_equal FakeGithub::CREATED_AT, result["pull_request_created_at"]
+  end
+
+  # The pull request exists once `gh pr create` succeeds, so an unreadable creation time leaves
+  # the field out rather than failing the publication.
+  def test_an_unreadable_creation_time_is_omitted_and_does_not_fail_publication
+    start_platform(gh_mode: "view_fails")
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli, @io.string
+
+    result = @platform.last_specification_publication
+    assert_equal "published", result["outcome"], @io.string
+    assert_equal PR_URL, result["pull_request_url"]
+    refute result.key?("pull_request_created_at"), "an absent time is omitted, never invented"
   end
 
   def test_the_pushed_branch_exists_on_the_remote_at_the_reported_commit
@@ -186,6 +200,7 @@ class SpecificationPublicationTest < Minitest::Test
   # lifecycle, so a linked pull request whose head is some OTHER branch is not this ticket's
   # review object, and publishing onto it would give one ticket two Git identities.
   EXISTING_PR_URL = "https://github.com/SpecRelay/SpecRelay-Specs/pull/3"
+  EXISTING_PR_CREATED_AT = "2026-09-01T08:00:00Z"
   ANOTHER_BRANCH = "specrelay/spec/SR-700-a-second-identity"
   # The same case with a head branch shaped like a credential. A ref name is free text, and this
   # refusal travels to a Platform record, a run page and a log.
@@ -193,7 +208,8 @@ class SpecificationPublicationTest < Minitest::Test
 
   def existing_pr(state: "OPEN", base: "main", fork: false, branch: BRANCH)
     { "url" => EXISTING_PR_URL, "state" => state, "headRefName" => branch, "baseRefName" => base,
-      "isDraft" => true, "isCrossRepository" => fork, "headRefOid" => "live" }
+      "isDraft" => true, "isCrossRepository" => fork, "headRefOid" => "live",
+      "createdAt" => EXISTING_PR_CREATED_AT }
   end
 
   # Neither the ticket's branch nor the foreign one reached the remote. Asserted against BOTH
@@ -223,6 +239,8 @@ class SpecificationPublicationTest < Minitest::Test
     assert_equal BRANCH, result["branch"], "one ticket, one branch, in both lanes"
     assert_equal EXISTING_PR_URL, result["pull_request_url"]
     assert_equal true, result["reused_pull_request"]
+    assert_equal EXISTING_PR_CREATED_AT, result["pull_request_created_at"],
+                 "a reused pull request keeps the time GitHub opened it"
   end
 
   # The wrong-head-branch refusal. A pull request the Jira field links that sits on some other
@@ -384,12 +402,14 @@ class SpecificationPublicationTest < Minitest::Test
     refute_publication_branches
   end
 
-  # A first publication is unchanged: no `pr view` at all, and the branch Platform derived.
+  # A first publication inspects no existing pull request, and publishes on the branch Platform
+  # derived. Its only `pr view` reads the creation time of the pull request it just opened.
   def test_a_first_publication_asks_github_about_no_existing_pull_request
     start_platform
     run_cli
 
-    assert_equal 0, FakeGithub.pr_views(@gh_log)
+    views = FakeGithub.invocations(@gh_log).select { |line| line.start_with?("pr view") }
+    assert_equal [ "pr view #{PR_URL} --repo SpecRelay/SpecRelay-Specs --json createdAt" ], views
     assert_equal BRANCH, @platform.last_specification_publication["branch"]
   end
 

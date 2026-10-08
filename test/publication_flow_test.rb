@@ -343,6 +343,7 @@ class PublicationFlowTest < Minitest::Test
     assert_equal existing, repo["pull_request_url"], "the existing open pull request must be reused"
     assert_equal BRANCH, repo["branch"]
     assert_equal 0, FakeGithub.pr_creates(gh_log), "reuse must never create a second pull request"
+    assert_nil repo["pull_request_created_at"], "GitHub reported no creation time, so none is invented"
 
     # The commit really was created by this run, so the pre-commit head the guard used to
     # compare against genuinely differs from the pushed head.
@@ -350,6 +351,44 @@ class PublicationFlowTest < Minitest::Test
                  "the reported head must be the commit actually on the remote"
     refute_equal repo["base_commit"], repo["head_commit"],
                  "this scenario only bites when publication creates a commit"
+  end
+
+  # --- GitHub's own creation time -------------------------------------------
+
+  def test_a_created_pull_request_reports_githubs_creation_time
+    start
+    code, output = run_cli
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, code, output
+    assert_equal FakeGithub::CREATED_AT, repository_result["pull_request_created_at"]
+  end
+
+  # A reused pull request keeps the time GitHub opened it, not the time of this run.
+  def test_a_reused_pull_request_reports_its_original_creation_time
+    start
+    seed = [ { "url" => "https://github.com/SpecRelay/tiny-demo-workspace/pull/11", "state" => "OPEN",
+               "headRefName" => BRANCH, "headRefOid" => "live", "createdAt" => "2026-09-01T08:00:00Z" } ]
+    gh_dir, gh_log, = FakeGithub.gh_bin(mode: "ok", bare: @bare, seed: seed)
+
+    code, output = run_cli({}, gh_dir: gh_dir)
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, code, output
+    assert_equal "2026-09-01T08:00:00Z", repository_result["pull_request_created_at"]
+    assert_equal 0, FakeGithub.pr_views(gh_log), "the reuse lookup already carries the creation time"
+  end
+
+  def test_an_unreadable_creation_time_is_absent_and_does_not_fail_publication
+    start
+    gh_dir, gh_log, = FakeGithub.gh_bin(mode: "view_fails", bare: @bare)
+
+    code, output = run_cli({}, gh_dir: gh_dir)
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, code, output
+    repo = repository_result
+    assert_equal "https://github.com/SpecRelay/tiny-demo-workspace/pull/7", repo["pull_request_url"]
+    assert_nil repo["publication_error"]
+    assert_nil repo["pull_request_created_at"]
+    assert_equal 1, FakeGithub.pr_views(gh_log), "the creation time was asked for exactly once"
   end
 
   # --- CR-003: the reuse predicate, enumerated ------------------------------
