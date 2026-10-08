@@ -1231,7 +1231,9 @@ module SpecrelayRunner
           tested target (for a browser check, the URL and viewport); `PASS`, `FAIL` or `BLOCKED`;
           the numbered actions with what you observed; and any limitation.
         - For a UI scenario checked in a browser, save only the material states (for example a
-          validation error or a success) as `screenshots/<name>.png` or `.jpg`. A scenario without
+          validation error or a success) as `screenshots/<name>.png` or `.jpg`. Place each one with
+          a line containing only `![<short state>](screenshots/<name>.png)` directly after the
+          action or observation it shows; one scenario may place several. A scenario without
           UI needs no image: write `Browser check: NOT_APPLICABLE` and why. If no browser was
           available, mark the scenario `BLOCKED` and say so. Never invent a screenshot or a pass.
         - Write `index.json` last, as `{ "evidence_files": [ { "path": "scenarios/NN-short-name.md",
@@ -1239,9 +1241,8 @@ module SpecrelayRunner
           "viewport": "<width>x<height>", "scenario": "NN-short-name", "result": "<captured UI state>" } ] }`.
           Paths are relative to that directory; `scenario` is the scenario file name without `.md`.
           Only declared files are read.
-        - Do not link images from the Markdown, and never include credentials, tokens or private
-          reasoning. A scenario records what you observed; SpecRelay's own verification decides the
-          outcome.
+        - Never include credentials, tokens or private reasoning. A scenario records what you
+          observed; SpecRelay's own verification decides the outcome.
       MD
     end
 
