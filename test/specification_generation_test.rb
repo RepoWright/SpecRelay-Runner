@@ -310,6 +310,23 @@ class SpecificationGenerationTest < Minitest::Test
     assert generation.key?("open_questions")
   end
 
+  # The question bodies have to travel on this result or not at all: the control plane has no
+  # repository client, so the package it asks the decision from is one only a runner can read.
+  # Reported for every generation, so a reader never has to tell "no questions" from "an older
+  # runner that did not send them".
+  def test_the_reported_result_carries_each_unresolved_questions_whole_body
+    run_cli
+    generation = @platform.last_specification_generation
+
+    refute_empty generation["open_question_details"], "this ticket raises questions; the bodies must travel with them"
+    assert_equal generation["open_questions"].map { |label| label.split(":").first },
+                 generation["open_question_details"].map { |question| question["id"] }
+    generation["open_question_details"].each do |question|
+      assert_equal %w[id why_it_blocks decision_required consequence], question.keys
+      question.each_value { |value| refute_empty value.to_s }
+    end
+  end
+
   # The regression the LIVE evidence pass found and this suite originally missed. The real
   # Graphify wrappers print absolute paths; quoting their output verbatim put the operator's
   # home directory into a file destined for a shared specification repository, and the
