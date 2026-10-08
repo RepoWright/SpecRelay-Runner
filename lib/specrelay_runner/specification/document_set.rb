@@ -211,12 +211,13 @@ module SpecrelayRunner
       # external command returns Markdown and nothing else, so a structured side-channel
       # would be populated only by the built-in composer — and Platform's run page would then
       # show open questions for one provider and none for the other, which is worse than
-      # showing none at all. The `## OQ-nnn` heading and its `- Decision required:` bullet are
-      # part of the documented document contract (MVP-0028 remediation, defect 3), so parsing
-      # them is reading the contract, not guessing at prose — the decision, not "why it blocks",
-      # is the one field that actually distinguishes one question from another for a reader
-      # scanning a list. Absent the file, there are no questions — spec.md's own rule is to omit
-      # the file entirely rather than write an empty one.
+      # showing none at all. The `## OQ-nnn` heading and its three labelled bullets are part of
+      # the documented document contract, so parsing them is reading the contract, not guessing
+      # at prose. Each question is reported whole — its id, then why it blocks, the decision
+      # required and the consequence, one per line — because Platform posts this text to Jira for
+      # the operator to answer there, and a decision without its context or its last answer
+      # option is a different question. Absent the file, there are no questions — spec.md's own
+      # rule is to omit the file entirely rather than write an empty one.
       #
       # A RESOLVED entry (MVP-0028 decision D6) is excluded here: this list is what Platform
       # shows as what THIS run still needs a decision on, and a question the current ticket
@@ -233,11 +234,12 @@ module SpecrelayRunner
           fields = question_fields(body)
           next if resolved?(fields)
 
-          # `validate!` has already proven this body carries exactly one nonblank "Decision
-          # required" field before this is ever reached (see Generation, which validates before
+          # `validate!` has already proven this body carries exactly one nonblank occurrence of
+          # every required field before this is ever reached (see Generation, which validates before
           # reading `#open_questions` back out) — so there is no fallback branch here. A body that
-          # does not have one is a bug in validation, not a shape this method is asked to survive.
-          "#{id}: #{fields.fetch('decision required').first}"
+          # does not have them is a bug in validation, not a shape this method is asked to survive.
+          [ id, *REQUIRED_QUESTION_FIELDS.map { |label| "#{label.capitalize}: #{fields.fetch(label).first}" } ]
+            .join("\n")
         end
       end
 

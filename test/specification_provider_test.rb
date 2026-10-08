@@ -170,6 +170,26 @@ class SpecificationProviderTest < Minitest::Test
           generation.inspect
   end
 
+  # Platform receives each unresolved question whole, with a secret-shaped value inside it
+  # redacted and the legitimate text around it kept.
+  def test_an_unresolved_question_reaches_platform_whole_and_redacted
+    documents = valid_documents.merge(
+      "analysis/open-questions.md" => "# Open questions\n\n## OQ-001\n\n- Why it blocks: the ticket " \
+                                       "does not say.\n- Decision required: reuse api_key=sk-live-abcdef1234567890 " \
+                                       "for the nightly pull, or issue a new one?\n" \
+                                       "- Consequence: an implementer would guess.\n"
+    )
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, run_with(provider_stub(files: documents)), @io.string
+    question = @platform.last_specification_generation.fetch("open_questions").first
+    refute_includes question, "sk-live-abcdef1234567890"
+    assert_includes question, "[REDACTED]"
+    assert_includes question, "for the nightly pull, or issue a new one?"
+    assert question.start_with?("OQ-001\nWhy it blocks: the ticket does not say.\nDecision required: reuse "),
+           question
+    assert question.end_with?("\nConsequence: an implementer would guess."), question
+  end
+
   # A present `open-questions.md` with no "## OQ-nnn" heading contradicts its own existence and
   # is rejected before anything is written — the same fail-closed standard every other
   # structural gap in this boundary gets.
