@@ -453,7 +453,9 @@ module SpecrelayRunner
       # one proof ({ContinuedTarget}) and a claim is never both. A refusal here stops before the
       # provider, before the package, and before any external write.
       continued = @rework || @restart
-      if continued
+      # An answered question continues its verified checkpoint, including uncommitted edits.
+      # Its recorded correction or replacement head was placed before the question was asked.
+      if continued && !@resume
         continuation = continued.materialize(worktree_path: worktree.path, created: worktree.created?)
         return continuation_refused(continuation.reason) unless continuation.ok?
 

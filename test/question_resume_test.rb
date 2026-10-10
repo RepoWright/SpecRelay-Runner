@@ -201,6 +201,33 @@ class QuestionResumeTest < Minitest::Test
     assert_equal 1, @platform.requests_to("/api/runner/reports").size
   end
 
+  def test_answered_question_in_a_review_correction_preserves_checkpoint_edits
+    assert_resume_with_recorded_target("rework")
+  end
+
+  def test_answered_question_in_a_replacement_run_preserves_checkpoint_edits
+    assert_resume_with_recorded_target("restart")
+  end
+
+  def assert_resume_with_recorded_target(kind)
+    checkpoint = released_question_with_dirty_worktree
+    entry = checkpoint.fetch("repositories").fetch(0)
+    target = { "repository_key" => "tiny-demo-workspace",
+               "clone_url" => "https://github.com/SpecRelay/tiny-demo-workspace.git",
+               "branch" => TASK, "head_commit" => entry.fetch("base") }
+    restart_platform(resume_payload(checkpoint).merge(kind => { "repositories" => [target] }))
+    io = StringIO.new
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli(io), io.string
+    assert_includes io.string, "[resume-executor] applied edit"
+    diff = @platform.last_report[:body].dig("report", "files").find { |f| f["relative_path"] == "evidence/diff.txt" }
+    assert_includes Base64.strict_decode64(diff.fetch("content_base64")), "Hello Resumed Demo",
+                    "the provider continued the edit made before the question"
+    assert_equal 1, @platform.delivery_acknowledgements.size
+    assert_empty @platform.requests_to("/api/runner/claim_releases")
+    assert_equal 1, @platform.requests_to("/api/runner/reports").size
+  end
+
   # A05/A06 — the machine no longer holds what it recorded. No provider starts, only the fresh
   # claim is handed back, and the worktree is left exactly as it is.
   def test_a_changed_worktree_refuses_before_the_provider_and_releases_only_the_fresh_claim
