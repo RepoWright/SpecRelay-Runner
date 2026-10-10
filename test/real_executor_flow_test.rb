@@ -468,18 +468,15 @@ class RealExecutorFlowTest < Minitest::Test
 # --- a question Platform refused, corrected in the same session ------------
 
 REFUSAL = [ "continuation_context.progress is required" ].freeze
-QUESTION_ANSWERS = [ { "option" => "keep" } ].freeze
 
 def worktree_path = File.join(@root, ".runs", "worktrees", TASK)
 
-# The complete observed chain against the real Runner boundary: a changed worktree, one Platform
-# validation refusal, a corrected request from the SAME process, one result frame for the
-# refused turn and one final result. Exactly one terminal result and one contract-valid report
-# may follow, and only the final result is evidence.
-def test_a_question_refused_and_corrected_in_the_same_session_ends_in_one_valid_report
+# The observed chain against the real Runner boundary: a changed worktree, one Platform validation
+# refusal, and a corrected request from the SAME process. The corrected question is accepted and the
+# session released at once, so nothing is tested, reported or published.
+def test_a_question_refused_and_corrected_in_the_same_session_is_then_released
   start_platform(claude_payload)
   @platform.refuse_next_question!(REFUSAL)
-  @platform.answer_question!(QUESTION_ANSWERS)
   bin_dir, = FakeClaudeCli.build(run: :refused_question)
 
   exit_code = run_cli(claude_config, bin_dir: bin_dir)
@@ -491,19 +488,11 @@ def test_a_question_refused_and_corrected_in_the_same_session_ends_in_one_valid_
   assert_includes @io.string, REFUSAL.first
   assert_equal 2, @platform.question_submissions.size, "the refused turn and its correction"
   assert_empty @platform.capture_failures
-  assert_equal 1, @platform.delivery_acknowledgements.size
-  assert_equal 1, @platform.requests_to("/api/runner/reports").size
-  assert_equal "succeeded", @platform.last_terminal_result["outcome"]
-  manifest = YAML.safe_load(decode_file("manifest.yml"))
-  assert_equal [ "demo-app/index.html" ], manifest.dig("git", "changed_files")
-  assert_equal [ "." ], manifest["repository_verifications"].map { |row| row["repository_path"] }
-  assert_coherent(manifest)
-  stdout_log = decode_file("evidence/stdout.log")
-  assert_includes stdout_log, FakeClaudeCli::FINAL_RESULT
-  refute_includes stdout_log, FakeClaudeCli::INTERMEDIATE_RESULT
-  refute_includes @io.string, SpecrelayRunner::ClaudeStream::FAILURE_TWO_RESULTS
-  assert_equal 1, @platform.protocol_events.count { |event| event["event_type"] == "verification.started" }
-  assert_empty @platform.protocol_events.select { |event| event["event_type"].start_with?("publication.") }
+  assert_empty @platform.delivery_acknowledgements
+  assert_empty @platform.requests_to("/api/runner/reports")
+  assert_match(/awaiting_input/, @io.string)
+  assert_empty @platform.protocol_events.select { |event| event["event_type"].start_with?("verification.", "publication.") }
+  assert_path_exists worktree_path, "the dirty worktree is preserved"
 end
 
 # The refused turn is followed by the provider leaving. Nothing coherent can be reported about
@@ -529,22 +518,21 @@ def test_a_refused_question_followed_by_provider_exit_uploads_no_report
   assert_includes edited_heading, "Hello SpecRelay Demo"
 end
 
-# One refusal explains one intermediate result and no more. A sequence that outruns the
-# refusals this attempt recorded is still unusable output — but after a refused question it
-# ends the same way the exit above does, never as a report about an unproven result.
-def test_a_result_sequence_that_outruns_the_recorded_refusals_fails_closed_without_a_report
+# One refusal explains one intermediate result and no more. A sequence that outruns the refusals
+# this attempt recorded is unusable output, so it never becomes a report about an unproven result:
+# the corrected question the provider then asks is stored and the session released, exactly as any
+# accepted question is.
+def test_a_result_sequence_that_outruns_the_recorded_refusals_never_becomes_a_report
   start_platform(claude_payload)
   @platform.refuse_next_question!(REFUSAL)
-  @platform.answer_question!(QUESTION_ANSWERS)
   bin_dir, = FakeClaudeCli.build(run: :refused_question, refused_turn: :repeat)
 
   exit_code = run_cli(claude_config, bin_dir: bin_dir)
 
-  assert_equal SpecrelayRunner::CLI::RUN_FAILED, exit_code, @io.string
-  assert_equal 1, @platform.capture_failures.size
+  assert_equal SpecrelayRunner::CLI::SUCCESS, exit_code, @io.string
+  assert_equal 2, @platform.question_submissions.size
   assert_empty @platform.requests_to("/api/runner/reports")
-  assert_includes @io.string, SpecrelayRunner::ClaudeStream::FAILURE_TWO_RESULTS
-  assert_match(/input_capture_failed/, @io.string)
+  assert_match(/awaiting_input/, @io.string)
   assert_empty @platform.protocol_events.select { |event| event["event_type"].start_with?("verification.", "publication.") }
   assert_path_exists worktree_path, "the dirty worktree is preserved"
 end

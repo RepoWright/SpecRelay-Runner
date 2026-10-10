@@ -159,14 +159,8 @@ class FakePlatform
     @claimed = false
     @lease_signal = lease_signal
     @seen_sequences = []
-    # The answer window starts OPEN and stays open until a test plays the Product
-    # Owner, so a test that scripts nothing models a provider that is still waiting.
+    # An accepted question is released at once, exactly as Platform settles it.
     @question = nil
-    @question_answers = []
-    @question_settle_state = nil
-    @question_settle_after = 1
-    @question_polls = 0
-    @question_delivered = false
     @question_refusals = []
     @cleanup_targets = []
     @sessions = {}
@@ -241,21 +235,15 @@ class FakePlatform
   def capture_failures = executor_questions.select { |r| r[:body].to_h.key?("capture_failure") }
   def question_submissions = executor_questions.reject { |r| r[:body].to_h.key?("capture_failure") }
 
-  # F1 — the acknowledgement the runner sends once it has written the answers into the
-  # live session's bridge.
+  # The acknowledgement a resumed session sends once its provider has started.
   def delivery_acknowledgements
     requests.select { |r| r[:method] == "PATCH" && r[:path].start_with?("/api/runner/executor_questions/") }
   end
 
-  # What Platform durably believes right now. ANSWERED is reachable ONLY through the
-  # acknowledgement above, so a test cannot prove same-session delivery without the runner
-  # having reported it.
-  def question_state
-    @mutex.synchronize { @question_delivered ? "ANSWERED" : (@question_settle_state || "LIVE_WAIT") }
-  end
+  # An accepted batch is stored and released in one step, so the only state it is ever in here is
+  # the offline one a later resume continues from.
+  def question_state = "OFFLINE_WAIT"
 
-  # Play the Product Owner. The settlement lands on the Nth POLL rather than immediately, so the
-  # runner's waiting loop is exercised rather than short-circuited by the submission response.
   # Scripted answers to the pre-claim cancellation read, consumed one per request; with none left
   # Platform names no target, which is its answer for every Run it cannot prove.
   # The event types Platform's v1 ingest accepts: the enum of the checked-in
@@ -272,17 +260,6 @@ class FakePlatform
 
   def script_cleanup_targets(*answers) = @mutex.synchronize { @cleanup_targets.concat(answers) }
 
-  def answer_question!(answers, after_polls: 1) = settle_question("ANSWER_READY", answers, after_polls)
-  def release_question!(after_polls: 1) = settle_question("OFFLINE_WAIT", [], after_polls)
-
-  def settle_question(state, answers, after_polls)
-    @mutex.synchronize do
-      @question_settle_state = state
-      @question_answers = answers
-      @question_settle_after = after_polls
-    end
-  end
-
   # Script a refusal (a 4xx the provider may correct) or a fault (5xx / a body Platform never
   # sends), so a test can prove the runner tells the two apart.
   attr_accessor :question_response
@@ -295,10 +272,8 @@ class FakePlatform
     @mutex.synchronize { @question_refusals << [ 422, { accepted: false, errors: errors } ] }
   end
 
-  # F1: a held answer poll, so a test can put the provider's exit INSIDE the poll the runner is
-  # waiting on, and a scripted answer for the acknowledgement itself. The hold is called on this
-  # fake's accept thread before the poll is answered.
-  attr_accessor :question_poll_hold, :delivery_response
+  # A scripted answer for the resume acknowledgement.
+  attr_accessor :delivery_response
   # Called before the claim is answered, so a test can delay the response the way a slow network
   # or proxy does — after Platform has already granted the lease.
   attr_accessor :claim_hold
@@ -466,16 +441,14 @@ class FakePlatform
     when "/api/runner/reset_results" then @reset_answer || [ 201, { accepted: true, state: "completed" } ]
     when "/api/runner/executor_questions" then executor_question(request)
     when %r{\A/api/runner/executor_questions/[^/]+/checkpoint\z} then executor_question_checkpoint
-    when %r{\A/api/runner/executor_questions/(?<id>.+)\z} then executor_question_member(request)
+    when %r{\A/api/runner/executor_questions/[^/]+\z} then executor_question_member(request)
     else [ 404, { error: "not found" } ]
     end
   end
 
-  # The question bridge's endpoint. Deliberately dumb about the document schema
-  # (Platform's own specs cover that) but NOT dumb about the state it reports back: the runner
-  # branches on it to decide whether to keep the provider alive, hand it the answers, or end
-  # it, so a fake that always said LIVE_WAIT would let every one of those branches pass
-  # vacuously.
+  # The question bridge's endpoint. Deliberately dumb about the document schema (Platform's own
+  # specs cover that), but it answers with the state Platform settles an accepted batch in, because
+  # the runner ends the provider session on it.
   def executor_question(request)
     # The capture-failure body is answered BEFORE any scripted response: a test scripts a fault
     # to provoke the failure, and having that same script also reject the report of it would
@@ -491,13 +464,16 @@ class FakePlatform
     return @question_response if @question_response
 
     @mutex.synchronize { @question = request.dig(:body, "question").to_h }
-    question_body(201, "LIVE_WAIT", [])
+    question_body(201, question_state)
   end
 
-  def kept_execution_state = question_state == "OFFLINE_WAIT" ? "AWAITING_INPUT" : "INPUT_CAPTURE_FAILED"
+  # A batch that was accepted ended its attempt as awaiting input; without one, the attempt is a
+  # capture failure.
+  def kept_execution_state = asked_question ? "AWAITING_INPUT" : "INPUT_CAPTURE_FAILED"
 
+  # Platform answers only the delivery confirmation here: there is no poll by id.
   def executor_question_member(request)
-    request[:method] == "PATCH" ? confirm_delivery : executor_question_state
+    request[:method] == "PATCH" ? confirm_delivery : [ 404, { error: "not found" } ]
   end
 
   # The claim-bound download. The bytes travel base64-encoded exactly as they were submitted,
@@ -512,32 +488,13 @@ class FakePlatform
     [ 200, { payload: @checkpoint_payload } ]
   end
 
-  # The POLL. Every read moves the counter, so a settlement scheduled for the Nth poll happens
-  # while the runner is genuinely waiting.
-  def executor_question_state
-    question_poll_hold&.call
-    state, answers = @mutex.synchronize do
-      @question_polls += 1
-      settled = @question_settle_state && @question_polls >= @question_settle_after
-      [ settled ? @question_settle_state : "LIVE_WAIT", settled ? @question_answers : [] ]
-    end
-    question_body(200, state, answers)
-  end
-
-  # The delivery acknowledgement, with Platform's own compare-and-set: only an answer that was
-  # waiting to be delivered becomes ANSWERED, and a replay changes nothing.
   def confirm_delivery
     return @delivery_response if @delivery_response
 
-    @mutex.synchronize { @question_delivered = true if @question_settle_state == "ANSWER_READY" }
-    question_body(200, question_state, @question_answers)
+    question_body(200, question_state)
   end
 
-  def question_body(status, state, answers)
-    [ status, { contract_version: "mvp-0036",
-                question: { id: "exq_fake", state: state, deadline_at: "2026-08-13T12:00:00Z",
-                            remaining_seconds: state == "LIVE_WAIT" ? 600 : 0, answers: answers } } ]
-  end
+  def question_body(status, state) = [ status, { question: { id: "exq_fake", state: state } } ]
 
 
   # The specification-generation result endpoint. Deliberately dumb about domain

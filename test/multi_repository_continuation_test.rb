@@ -347,8 +347,8 @@ class MultiRepositoryContinuationTest < Minitest::Test
 
   # --- an answered question whose checkpoint names fewer repositories than the review --------
   #
-  # The paused work is proved only where the checkpoint recorded it. A reviewed repository the
-  # checkpoint does not name holds no recorded work, so uncommitted edits there still refuse.
+  # The paused work is restored only where the checkpoint recorded it. A repository the checkpoint
+  # does not name holds no recorded work, so uncommitted edits there refuse before anything moves.
 
   QUESTION = {
     "questions" => [ { "prompt" => "Should the workspace note keep the round marker?" } ],
@@ -362,7 +362,8 @@ class MultiRepositoryContinuationTest < Minitest::Test
   def test_an_answered_resume_refuses_a_dirty_reviewed_child_the_checkpoint_does_not_name
     start(rework: { "repositories" => both_targets }, executor: asking_executor,
           fixture_env: { "FAKE_EXECUTOR_QUESTION_JSON" => QUESTION.to_json })
-    @platform.release_question!
+    # The approved specification is published, as it is for a real run, so component-c is unchanged.
+    git(File.join(@root, "component-c"), "push", "-q", "origin", "HEAD:refs/heads/main")
     code, output = run_cli
     assert_equal SpecrelayRunner::CLI::SUCCESS, code, output
     checkpoint = @platform.executor_questions.first[:body]["checkpoint"]
@@ -376,13 +377,12 @@ class MultiRepositoryContinuationTest < Minitest::Test
                     "continuation_context" => QUESTION["continuation_context"], "answers" => answers,
                     "checkpoint" => checkpoint.reject { |key, _| key == "payload" }
                                               .merge("download_path" => "/api/runner/executor_questions/exq_fake/checkpoint") })
-    @platform.delivery_response = [ 200, { question: { id: "exq_fake", state: "RESUMED", answers: answers,
-                                                       deadline_at: "2026-08-13T12:00:00Z", remaining_seconds: 0 } } ]
+    @platform.delivery_response = [ 200, { question: { id: "exq_fake", state: "RESUMED", answers: answers } } ]
     @platform.checkpoint_payload = checkpoint["payload"]
     code, output = run_cli
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, code, output
-    assert_includes output, "the checkout of 'component-a' has uncommitted changes"
+    assert_includes output, "\"component-a\" has uncommitted changes that no checkpoint recorded"
     assert_equal "an edit nobody recorded\n", File.read(child)
     assert_empty @platform.delivery_acknowledgements, "the answered checkpoint must not be consumed"
     assert_zero_external_effect(output)

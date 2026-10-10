@@ -56,11 +56,10 @@ class QuestionResumeTest < Minitest::Test
   def released_question_with_dirty_worktree
     executor = DemoWorkspace.write_question_executor(@root)
     @platform = FakePlatform.new(claim_payload: question_payload(executor)).start
-    @platform.release_question!
     io = StringIO.new
     assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli(io), io.string
     assert_includes io.string, "[question-executor] edited before asking"
-    @platform.executor_questions.first[:body]["checkpoint"]
+    @platform.executor_questions.first[:body]["checkpoint"].tap { |checkpoint| @recorded_payload = checkpoint["payload"] }
   end
 
   # What the double asks and how it behaves are host-side controls installed behind the approved
@@ -73,10 +72,13 @@ class QuestionResumeTest < Minitest::Test
     claim_payload_for(task_id: TASK).merge("specification_package" => approved_package)
   end
 
-  # Committed ONCE, into the first machine, before anything clones it. Both phases and both
-  # machines then name the same commit: the second machine is a clone, so re-committing the
-  # package there would move its history past the base the checkpoint recorded.
-  def approved_package = @approved_package ||= specification_package_block(TASK, root: @root)
+  # Committed ONCE, into the first machine, and published as its default branch, as an approved
+  # specification is. Both phases and both machines then name the same commit.
+  def approved_package
+    @approved_package ||= specification_package_block(TASK, root: @root).tap do
+      git(@root, "push", "-q", "origin", "HEAD:refs/heads/main")
+    end
+  end
 
   # Phase two: the same run, claimed again, carrying the answers and the recorded checkpoint —
   # metadata and the one claim-bound download path, never the bytes.
@@ -90,16 +92,17 @@ class QuestionResumeTest < Minitest::Test
     )
   end
 
+  # Every resume downloads the recorded manifest, on the machine that asked as on any other.
   def restart_platform(payload, delivery: settled_resume("RESUMED"))
     @platform.stop
     @platform = FakePlatform.new(claim_payload: payload).start
     @platform.delivery_response = delivery
+    @platform.checkpoint_payload = @recorded_payload
   end
 
   def settled_resume(state)
     [ 200, { contract_version: "mvp-0036",
-             question: { id: "exq_fake", state: state, deadline_at: "2026-08-13T12:00:00Z",
-                         remaining_seconds: 0, answers: ANSWERS } } ]
+             question: { id: "exq_fake", state: state } } ]
   end
 
   # A SECOND machine: the same repository, cloned, carrying the same origin identity and the same
@@ -169,6 +172,13 @@ class QuestionResumeTest < Minitest::Test
     system("git", "-C", dir, *args, out: File::NULL, err: File::NULL) || raise("git #{args.join(' ')} failed")
   end
 
+  def git_output(dir, *args)
+    out, status = Open3.capture2e("git", "-C", dir, *args)
+    raise "git #{args.join(' ')} failed: #{out}" unless status.success?
+
+    out.strip
+  end
+
   # A04/A07 — the whole loop: measure at ask time, prove the same worktree at resume time, hand a
   # FRESH provider the complete public handoff, and tell Platform once that it arrived.
   def test_a_verified_resume_starts_a_fresh_session_with_the_answers_and_reports_them_delivered
@@ -178,9 +188,9 @@ class QuestionResumeTest < Minitest::Test
     entry = checkpoint["repositories"].fetch(0)
     assert_equal ".", entry["path"]
     assert_equal "SpecRelay/tiny-demo-workspace", entry["origin"]
-    assert_equal TASK, entry["branch"]
-    assert_match(/\A[0-9a-f]{40}\z/, entry["base"])
-    assert_match(/\A[0-9a-f]{40}\z/, entry["checkpoint_commit"])
+    assert_equal "refs/heads/main", entry["base_ref"]
+    assert_equal git_output(@bare, "rev-parse", "refs/heads/main"), entry["base_sha"]
+    assert_equal entry["snapshot_sha"], git_output(@bare, "rev-parse", entry["checkpoint_ref"])
     assert_match(/\A[0-9a-f]{64}\z/, entry["change_digest"])
     refute_includes checkpoint.reject { |key, _| key == "payload" }.to_json, @root,
                     "the checkpoint metadata carries no local path"
@@ -212,7 +222,7 @@ class QuestionResumeTest < Minitest::Test
     exit_code = run_cli(io)
 
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, exit_code, io.string
-    assert_includes io.string, "change_digest"
+    assert_includes io.string, "not the recorded work"
     refute_includes io.string, "[resume-executor]", "no provider was started"
     assert_equal 1, @platform.requests_to("/api/runner/claim_releases").size
     assert_empty @platform.delivery_acknowledgements, "an unproven resume is never acknowledged"
@@ -241,7 +251,6 @@ class QuestionResumeTest < Minitest::Test
     restart_platform(resume_payload(checkpoint,
                                     executor: DemoWorkspace.write_silent_resume_executor(@root),
                                     env: { "FAKE_EXECUTOR_RESUME_NEXT_QUESTION" => BATCH.to_json }))
-    @platform.release_question!
     io = StringIO.new
 
     assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli(io), io.string
@@ -339,7 +348,6 @@ class QuestionResumeTest < Minitest::Test
     checkpoint = released_question_with_dirty_worktree
     other = second_machine
     restart_platform(resume_payload(checkpoint, root: other))
-    @platform.checkpoint_payload = checkpoint["payload"]
     io = StringIO.new
 
     assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli_in(other, io), io.string
@@ -377,23 +385,26 @@ class QuestionResumeTest < Minitest::Test
                        "a failed transfer must not leave a task workspace behind"
   end
 
-  # Scenario 9 — the second machine is not at the recorded base. It refuses before the provider
-  # and leaves the target exactly as it found it.
-  def test_a_second_machine_that_is_not_at_the_recorded_base_refuses
+  # The second machine's clone has moved on. The work is restored on the recorded base
+  # the checkpoint carries, never silently moved onto whatever this clone holds now.
+  def test_a_second_machine_whose_clone_moved_on_restores_on_the_recorded_base
     checkpoint = released_question_with_dirty_worktree
     other = second_machine
     File.write(File.join(other, "demo-app", "index.html"), "<h1>Somewhere Else</h1>\n")
     git(other, "add", "-A")
     git(other, "-c", "user.email=t@e.test", "-c", "user.name=T", "commit", "-q", "-m", "moved on")
     restart_platform(resume_payload(checkpoint, root: other))
-    @platform.checkpoint_payload = checkpoint["payload"]
     io = StringIO.new
 
-    assert_equal SpecrelayRunner::CLI::RUN_FAILED, run_cli_in(other, io), io.string
+    assert_equal SpecrelayRunner::CLI::SUCCESS, run_cli_in(other, io), io.string
 
-    assert_includes io.string, "base commit"
-    refute_includes io.string, "[resume-executor]", "no provider was started"
-    assert_equal 1, @platform.requests_to("/api/runner/claim_releases").size
-    assert_empty @platform.requests_to("/api/runner/reports")
+    assert_includes io.string, "[resume-executor] applied edit"
+    assert_equal 1, @platform.delivery_acknowledgements.size
+    # Measured against the recorded base, the change set never mentions the moved-on commit; had
+    # the work landed on that commit, the diff would remove its heading.
+    diff = @platform.last_report[:body].dig("report", "files").find { |f| f["relative_path"] == "evidence/diff.txt" }
+    decoded = Base64.strict_decode64(diff.fetch("content_base64"))
+    assert_includes decoded, "Hello Resumed Demo"
+    refute_includes decoded, "Somewhere Else"
   end
 end

@@ -118,18 +118,19 @@ class AnsweredReworkResumeTest < Minitest::Test
   end
 
   # Phase one: the reviewed round is continued, its provider changes a tracked file, adds an
-  # untracked evidence note and asks. The session is released, so this machine keeps a dirty
-  # worktree at the reviewed head and Platform holds the checkpoint the runner recorded of it.
-  def asked_during_rework
+  # untracked evidence note and asks. Platform releases the session at once, so this machine keeps
+  # a dirty worktree at the reviewed head, the remote holds the checkpoint ref, and Platform holds
+  # only the manifest naming it.
+  def asked_during_rework(commit_first: false)
     use_fixture(fixture_dir, asking_executor,
-                env: { "FAKE_EXECUTOR_QUESTION_JSON" => BATCH.to_json })
+                env: { "FAKE_EXECUTOR_QUESTION_JSON" => BATCH.to_json,
+                       "ASKING_EXECUTOR_COMMIT_FIRST" => commit_first ? "1" : "" })
     start(rework_payload)
-    @platform.release_question!
     code, output = run_cli_in(@root)
     assert_equal SpecrelayRunner::CLI::SUCCESS, code, output
     assert_includes output, "[asking-executor] asked"
     checkpoint = @platform.executor_questions.first[:body]["checkpoint"]
-    assert_equal @reviewed_head, checkpoint["repositories"].fetch(0)["base"],
+    assert_equal @reviewed_head, checkpoint["repositories"].fetch(0)["base_sha"],
                  "the checkpoint of a rework round is recorded on the reviewed head"
     checkpoint
   end
@@ -138,10 +139,8 @@ class AnsweredReworkResumeTest < Minitest::Test
   def resume_answered(checkpoint, repository: reviewed_repository, checkpoint_block: checkpoint)
     use_fixture(fixture_dir, recording_executor)
     start(rework_payload(repository).merge("resume" => resume_block(checkpoint_block)))
-    @platform.delivery_response = [ 200, { question: { id: "exq_fake", state: "RESUMED",
-                                                       deadline_at: "2026-08-13T12:00:00Z",
-                                                       remaining_seconds: 0, answers: ANSWERS } } ]
-    @platform.checkpoint_payload = checkpoint["payload"]
+    @platform.delivery_response = [ 200, { question: { id: "exq_fake", state: "RESUMED" } } ]
+    @platform.checkpoint_payload = checkpoint_block["payload"]
   end
 
   # A fresh machine: cloned from the remote, holding no worktree for the branch.
@@ -165,11 +164,35 @@ class AnsweredReworkResumeTest < Minitest::Test
       git(path, "diff", "HEAD"), File.read(File.join(path, "evidence-note.md")) ]
   end
 
+  def checkpoint_ref_of(checkpoint) = checkpoint["repositories"].fetch(0)["checkpoint_ref"]
+
+  # The remote's checkpoint refs: what a refusal must keep and a consumed resume removes.
+  def remote_checkpoints
+    git(@bare, "for-each-ref", "--format=%(refname) %(objectname)", "refs/heads/runner-checkpoints/")
+  end
+
+  # A manifest re-sealed around one edited entry, so only the edited term is wrong.
+  def resealed(checkpoint)
+    entries = checkpoint["repositories"].map(&:dup)
+    yield entries.first
+    bytes = JSON.generate("format" => checkpoint["format"], "repositories" => entries)
+    checkpoint.merge("repositories" => entries, "byte_size" => bytes.bytesize,
+                     "digest" => Digest::SHA256.hexdigest(bytes), "payload" => Base64.strict_encode64(bytes))
+  end
+
   def assert_refused_before_provider(reason, path)
     before = snapshot(path)
+    refs = remote_checkpoints
     code, output = run_cli_in(@root)
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, code, output
     assert_includes output, reason
+    assert_refused_cleanly(reason)
+    assert_equal before, snapshot(path), "the worktree must be byte-identical"
+    assert_equal refs, remote_checkpoints, "a refusal keeps the checkpoint ref for the next attempt"
+    output
+  end
+
+  def assert_refused_cleanly(reason)
     refute_path_exists prompt_path, "no provider may start"
     releases = @platform.requests_to("/api/runner/claim_releases")
     assert_equal 1, releases.length, "the claim must be released so the run stays claimable"
@@ -177,8 +200,6 @@ class AnsweredReworkResumeTest < Minitest::Test
     assert_empty @platform.requests_to("/api/runner/reports"), "no report may be uploaded"
     assert_empty @platform.delivery_acknowledgements, "the answered checkpoint must not be consumed"
     assert_empty @platform.executor_questions
-    assert_equal before, snapshot(path), "the worktree must be byte-identical"
-    output
   end
 
   def git(dir, *args)
@@ -188,34 +209,84 @@ class AnsweredReworkResumeTest < Minitest::Test
     out
   end
 
+  # --- capture -------------------------------------------------------------
+
+  # The asking run pushes the snapshot to its own immutable ref on the verified
+  # origin, never to the task or pull-request branch, and Platform receives only the manifest.
+  def test_the_asking_run_pushes_one_checkpoint_ref_and_platform_stores_only_its_manifest
+    branch_before = git(@bare, "rev-parse", "refs/heads/#{BRANCH}").strip
+
+    checkpoint = asked_during_rework
+
+    entry = checkpoint["repositories"].fetch(0)
+    assert_equal SpecrelayRunner::Checkpoint::FORMAT, checkpoint["format"]
+    assert_match(%r{\Arefs/heads/runner-checkpoints/\h{8}-\h{4}-\h{4}-\h{4}-\h{12}\z}, entry["checkpoint_ref"])
+    assert_equal entry["snapshot_sha"], git(@bare, "rev-parse", entry["checkpoint_ref"]).strip
+    assert_equal [ entry["snapshot_sha"], @reviewed_head ],
+                 git(@bare, "rev-list", "--parents", "-n", "1", entry["snapshot_sha"]).split
+    assert_equal branch_before, git(@bare, "rev-parse", "refs/heads/#{BRANCH}").strip, "the PR branch moved"
+    manifest = JSON.parse(Base64.strict_decode64(checkpoint["payload"]))
+    assert_equal checkpoint["repositories"], manifest["repositories"], "Platform stores the manifest, not a pack"
+    assert_includes git(worktree_path, "status", "--porcelain", "--untracked-files=all"), "evidence-note.md"
+  end
+
   # --- same machine --------------------------------------------------------
 
-  def test_the_same_machine_continues_its_dirty_worktree_at_the_reviewed_head_without_resetting_it
+  # The machine that asked restores from the remote ref through the same procedure,
+  # and the consumed ref is removed once the delivery is confirmed.
+  def test_the_same_machine_restores_from_the_remote_ref_and_continues_with_the_answers
     checkpoint = asked_during_rework
     before = snapshot(worktree_path)
-    reflog = git(worktree_path, "reflog")
     resume_answered(checkpoint)
 
     code, output = run_cli_in(@root)
 
     assert_equal SpecrelayRunner::CLI::SUCCESS, code, output
-    # The provider started on exactly the worktree the question was asked from.
-    assert_equal before[0].strip, File.read(observed_head_path).strip
-    assert_equal before[1], File.read(observed_status_path)
-    assert_equal before[2], File.read(observed_diff_path)
-    assert_equal reflog, File.read(observed_reflog_path), "nothing moved HEAD before the provider started"
+    assert_equal @reviewed_head, File.read(observed_head_path).strip
+    assert_equal before[2], File.read(observed_diff_path), "the restored work is the recorded work"
+    assert_includes File.read(observed_status_path), "?? evidence-note.md"
     assert_includes output, "[recording-executor] started"
     assert_prompt_carries_change_request_and_answers
-    assert_equal 0, @platform.requests_to("/api/runner/executor_questions/exq_fake/checkpoint").size,
-                 "the same machine downloads nothing"
     assert_equal 1, @platform.delivery_acknowledgements.size
     assert_equal 1, @platform.requests_to("/api/runner/reports").size
     assert_equal 0, FakeGithub.pr_creates(@gh_log), "the reviewed pull request is reused"
+    assert_empty remote_checkpoints, "the consumed checkpoint ref is removed after delivery"
+  end
+
+  # A local commit on top of the reviewed head is part of the paused work: it is checkpointed on
+  # the reviewed head, and the resume continues from the reviewed head with its effect as dirty
+  # work. The pull request's branch never moves.
+  def test_a_local_commit_on_the_reviewed_branch_is_checkpointed_and_resumed_as_dirty_work
+    branch_before = git(@bare, "rev-parse", "refs/heads/#{BRANCH}").strip
+    checkpoint = asked_during_rework(commit_first: true)
+    refute_equal @reviewed_head, git(worktree_path, "rev-parse", "HEAD").strip, "the provider committed locally"
+    expected_diff = git(worktree_path, "diff", @reviewed_head)
+    resume_answered(checkpoint)
+
+    code, output = run_cli_in(@root)
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, code, output
+    assert_equal @reviewed_head, File.read(observed_head_path).strip
+    assert_equal expected_diff, File.read(observed_diff_path), "the local commit's effect is restored as dirty work"
+    assert_includes File.read(observed_status_path), "?? evidence-note.md"
+    assert_equal 1, @platform.delivery_acknowledgements.size
+    assert system("git", "-C", @bare, "merge-base", "--is-ancestor", branch_before, "refs/heads/#{BRANCH}"),
+           "the pull-request branch only ever moves forward, through publication"
+  end
+
+  # The same local commit, but the pull request moved: the resume refuses before the local branch
+  # is moved back to any base, so the local commit is still checked out.
+  def test_a_moved_pull_request_head_refuses_before_a_local_commit_on_the_reviewed_branch_is_moved
+    checkpoint = asked_during_rework(commit_first: true)
+    resume_answered(checkpoint)
+    publish_commit("<h1>Hello SpecRelay Demo</h1>\n<p>pushed later</p>\n", "moved on")
+
+    assert_refused_before_provider("moved", worktree_path)
   end
 
   # --- fresh machine -------------------------------------------------------
 
-  def test_a_fresh_machine_places_the_reviewed_head_restores_the_checkpoint_and_continues
+  def test_a_fresh_machine_places_the_reviewed_head_restores_the_remote_checkpoint_and_continues
     checkpoint = asked_during_rework
     expected_diff = git(worktree_path, "diff", "HEAD")
     other = second_machine
@@ -226,12 +297,13 @@ class AnsweredReworkResumeTest < Minitest::Test
     assert_equal SpecrelayRunner::CLI::SUCCESS, code, output
     assert_equal @reviewed_head, File.read(observed_head_path).strip
     assert_equal expected_diff, File.read(observed_diff_path), "the restored work is the recorded work"
-    assert_includes File.read(observed_status_path), "evidence-note.md"
+    assert_includes File.read(observed_status_path), "?? evidence-note.md"
     assert_includes output, "[recording-executor] started"
     assert_prompt_carries_change_request_and_answers
     assert_equal 1, @platform.requests_to("/api/runner/executor_questions/exq_fake/checkpoint").size
     assert_equal 1, @platform.delivery_acknowledgements.size
     assert_equal 1, @platform.requests_to("/api/runner/reports").size
+    assert_empty remote_checkpoints
   end
 
   def assert_prompt_carries_change_request_and_answers
@@ -269,16 +341,23 @@ class AnsweredReworkResumeTest < Minitest::Test
     File.write(File.join(worktree_path, "demo-app", "index.html"), "<h1>an edit nobody recorded</h1>\n")
     resume_answered(checkpoint)
 
-    assert_refused_before_provider("change_digest", worktree_path)
+    assert_refused_before_provider("not the recorded work", worktree_path)
   end
 
   def test_a_recorded_digest_that_does_not_match_refuses_and_keeps_the_worktree
     checkpoint = asked_during_rework
-    tampered = Marshal.load(Marshal.dump(checkpoint))
-    tampered["repositories"][0]["change_digest"] = "0" * 64
+    tampered = resealed(checkpoint) { |entry| entry["change_digest"] = "0" * 64 }
     resume_answered(checkpoint, checkpoint_block: tampered)
 
     assert_refused_before_provider("change_digest", worktree_path)
+  end
+
+  def test_a_moved_checkpoint_ref_refuses_and_keeps_the_worktree
+    checkpoint = asked_during_rework
+    git(@bare, "update-ref", checkpoint_ref_of(checkpoint), @reviewed_head)
+    resume_answered(checkpoint)
+
+    assert_refused_before_provider("moved", worktree_path)
   end
 
   def test_a_worktree_owned_by_another_run_refuses_and_keeps_it
@@ -306,23 +385,58 @@ class AnsweredReworkResumeTest < Minitest::Test
     assert_refused_before_provider("not to the reviewed branch", worktree_path)
   end
 
-  def test_an_invalid_checkpoint_payload_refuses_on_a_fresh_machine
+  def test_an_invalid_manifest_refuses_on_a_fresh_machine_before_the_reviewed_head_is_placed
     checkpoint = asked_during_rework
     other = second_machine
     resume_answered(checkpoint)
-    @platform.checkpoint_payload = Base64.strict_encode64("not the recorded package")
-    # The root checkout of this machine; the task workspace it builds did not exist before.
-    before = [ git(other, "rev-parse", "HEAD"), git(other, "status", "--porcelain", "--untracked-files=no") ]
+    @platform.checkpoint_payload = Base64.strict_encode64("not the recorded manifest")
+    refs = remote_checkpoints
 
     code, output = run_cli_in(other)
 
+    # The manifest is proved before the task workspace is built, so nothing was built at all.
     assert_equal SpecrelayRunner::CLI::RUN_FAILED, code, output
-    assert_includes output, "checkpoint payload"
-    refute_path_exists prompt_path, "no provider may start"
-    assert_equal 1, @platform.requests_to("/api/runner/claim_releases").size
-    assert_empty @platform.requests_to("/api/runner/reports")
-    assert_empty @platform.delivery_acknowledgements, "the answered checkpoint must not be consumed"
-    assert_equal before, [ git(other, "rev-parse", "HEAD"), git(other, "status", "--porcelain", "--untracked-files=no") ]
+    assert_includes output, "checkpoint manifest"
+    assert_refused_cleanly("checkpoint manifest")
+    refute_path_exists worktree_path(other)
+    refute system("git", "-C", other, "rev-parse", "--verify", "--quiet", "refs/heads/#{BRANCH}", out: File::NULL)
+    assert_equal refs, remote_checkpoints
+  end
+
+  def test_a_missing_checkpoint_ref_refuses_on_a_fresh_machine_before_placement
+    checkpoint = asked_during_rework
+    git(@bare, "update-ref", "-d", checkpoint_ref_of(checkpoint))
+    other = second_machine
+    resume_answered(checkpoint)
+
+    assert_refused_before_placement(other, "no longer exists")
+  end
+
+  # The pull request moved and the claim names the new head, but the work was recorded on the
+  # old one. The recorded base is compared with the reviewed head before the head is placed.
+  def test_a_checkpoint_base_other_than_the_reviewed_head_refuses_on_a_fresh_machine_before_placement
+    checkpoint = asked_during_rework
+    moved = publish_commit("<h1>Hello SpecRelay Demo</h1>\n<p>pushed later</p>\n", "moved on")
+    other = second_machine
+    resume_answered(checkpoint, repository: reviewed_repository(head_commit: moved))
+
+    assert_refused_before_placement(other, "refusing to continue the recorded work on another commit")
+  end
+
+  # A fresh machine's task workspace is built by the project command on the clone's own HEAD, on a
+  # new task branch. A refusal leaves it exactly there; fetched objects alone are allowed.
+  def assert_refused_before_placement(machine, reason)
+    built_on = git(machine, "rev-parse", "HEAD").strip
+    refs = remote_checkpoints
+    code, output = run_cli_in(machine)
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, code, output
+    assert_includes output, reason
+    assert_refused_cleanly(reason)
+    assert_equal built_on, git(machine, "rev-parse", "refs/heads/#{BRANCH}").strip, "the task branch must not move"
+    assert_equal built_on, git(worktree_path(machine), "rev-parse", "HEAD").strip
+    assert_equal "", git(worktree_path(machine), "status", "--porcelain", "--untracked-files=all")
+    assert_equal refs, remote_checkpoints
   end
 
   # --- probes --------------------------------------------------------------
@@ -338,6 +452,8 @@ class AnsweredReworkResumeTest < Minitest::Test
       abort "[asking-executor] the prompt named no bridge" if request.nil?
       file = "demo-app/index.html"
       File.write(file, File.read(file).sub("round one", "round one, interrupted"))
+      system("git", "commit", "-qam", "local work on the reviewed branch", exception: true) unless
+        ENV["ASKING_EXECUTOR_COMMIT_FIRST"].to_s.empty?
       File.write("evidence-note.md", "review evidence in progress\n")
       SELECTION.call
       File.write("#{request}.partial", ENV.fetch("FAKE_EXECUTOR_QUESTION_JSON"))
