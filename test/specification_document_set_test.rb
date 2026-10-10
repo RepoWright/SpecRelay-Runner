@@ -62,7 +62,11 @@ class SpecificationDocumentSetTest < Minitest::Test
     MD
     documents = DocumentSet.new(base_files.merge(PackagePath::OPEN_QUESTIONS_MD => open_questions_md))
 
-    assert_equal [ "OQ-001: should a repeat request return the cached result or re-run the operation?" ],
+    assert_equal [ "OQ-001\n" \
+                  "Why it blocks: the recorded inputs do not decide this, and guessing would put an " \
+                  "unreviewed product decision into the implementation.\n" \
+                  "Decision required: should a repeat request return the cached result or re-run the operation?\n" \
+                  "Consequence: without an answer, an implementer must choose arbitrarily." ],
                 documents.open_questions
   end
 
@@ -86,8 +90,12 @@ class SpecificationDocumentSetTest < Minitest::Test
     MD
     documents = DocumentSet.new(base_files.merge(PackagePath::OPEN_QUESTIONS_MD => open_questions_md))
 
-    assert_equal [ "OQ-001: what happens on a second identical request?",
-                  "OQ-002: what does the user see on failure?" ], documents.open_questions
+    assert_equal [ "OQ-001\nWhy it blocks: the recorded inputs do not decide this.\n" \
+                  "Decision required: what happens on a second identical request?\n" \
+                  "Consequence: an implementer must guess.",
+                  "OQ-002\nWhy it blocks: the recorded inputs do not decide this.\n" \
+                  "Decision required: what does the user see on failure?\n" \
+                  "Consequence: an implementer must guess." ], documents.open_questions
   end
 
   # A "Decision required" bullet whose value soft-wraps onto a continuation line still joins
@@ -105,8 +113,9 @@ class SpecificationDocumentSetTest < Minitest::Test
     MD
     documents = DocumentSet.new(base_files.merge(PackagePath::OPEN_QUESTIONS_MD => open_questions_md))
 
-    assert_equal [ "OQ-001: should a repeat request return the cached result or re-run the " \
-                  "operation end to end?" ], documents.open_questions
+    assert_equal [ "OQ-001\nWhy it blocks: a\n" \
+                  "Decision required: should a repeat request return the cached result or re-run the " \
+                  "operation end to end?\nConsequence: an implementer must guess." ], documents.open_questions
   end
 
   # ------------------------------------------------------------------ validate! on the new files
@@ -281,7 +290,31 @@ class SpecificationDocumentSetTest < Minitest::Test
     MD
     documents = DocumentSet.new(base_files.merge(PackagePath::OPEN_QUESTIONS_MD => open_questions_md))
 
-    assert_equal [ "OQ-002: what does the user see on failure?" ], documents.open_questions
+    assert_equal [ "OQ-002\nWhy it blocks: the recorded inputs do not decide this.\n" \
+                  "Decision required: what does the user see on failure?\n" \
+                  "Consequence: an implementer must guess." ], documents.open_questions
+    assert_includes documents.files[PackagePath::OPEN_QUESTIONS_MD], "- Status: resolved"
+  end
+
+  # A long decision listing its answer options keeps every option: the entry is the question as
+  # written, not a summary cut at a display length.
+  def test_open_questions_keeps_every_answer_option_of_a_long_decision
+    options = (1..8).map { |n| "(#{n}) keep the export behaviour described in option #{n} with its own column order" }
+    decision = "which export behaviour should ship? Options: #{options.join('; ')}; or (9) the final option."
+    assert_operator decision.length, :>=, 688
+    open_questions_md = <<~MD
+      # Open questions — SR-700
+
+      ## OQ-001
+
+      - Why it blocks: the recorded inputs do not decide this.
+      - Decision required: #{decision}
+      - Consequence: an implementer must guess.
+    MD
+    documents = DocumentSet.new(base_files.merge(PackagePath::OPEN_QUESTIONS_MD => open_questions_md))
+
+    assert_includes documents.open_questions.first, "Decision required: #{decision}\n"
+    assert documents.open_questions.first.end_with?("Consequence: an implementer must guess.")
   end
 
   def test_a_resolved_question_missing_its_own_required_field_is_rejected
@@ -579,7 +612,9 @@ class SpecificationDocumentSetTest < Minitest::Test
 
     documents = DocumentSet.validate!(files, issue_key: ISSUE)
 
-    assert_equal [ "OQ-001: what happens on a second identical request?" ], documents.open_questions
+    assert_equal [ "OQ-001\nWhy it blocks: the recorded inputs do not decide this.\n" \
+                  "Decision required: what happens on a second identical request?\n" \
+                  "Consequence: an implementer must guess." ], documents.open_questions
   end
 
   # Resolution changes which keys are recognized, never what a valid document must contain.

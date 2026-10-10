@@ -170,6 +170,27 @@ class SpecificationProviderTest < Minitest::Test
           generation.inspect
   end
 
+  # Platform receives each unresolved question complete — why it blocks, the decision and its
+  # consequence — redacted, with the text on both sides of a secret kept. A resolved entry stays
+  # in the file and out of the payload.
+  def test_the_reported_open_questions_are_the_complete_redacted_unresolved_entries
+    documents = valid_documents.merge(
+      "analysis/open-questions.md" => "# Open questions\n\n## OQ-001\n\n- Status: resolved\n" \
+                                       "- Decision: cache the result.\n- Source: Jira comment.\n\n" \
+                                       "## OQ-002\n\n- Why it blocks: the ticket does not say.\n" \
+                                       "- Decision required: call it with token=ghp_abcdefghijklmnop1234 then " \
+                                       "confirm the scope.\n- Consequence: an implementer would guess.\n"
+    )
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, run_with(provider_stub(files: documents)), @io.string
+    questions = @platform.last_specification_generation["open_questions"]
+    assert_equal 1, questions.length, questions.inspect
+    assert_equal "OQ-002\nWhy it blocks: the ticket does not say.\n" \
+                 "Decision required: call it with [REDACTED] then confirm the scope.\n" \
+                 "Consequence: an implementer would guess.", questions.first
+    assert_includes File.read(File.join(package_root, "analysis", "open-questions.md")), "- Status: resolved"
+  end
+
   # A present `open-questions.md` with no "## OQ-nnn" heading contradicts its own existence and
   # is rejected before anything is written — the same fail-closed standard every other
   # structural gap in this boundary gets.
