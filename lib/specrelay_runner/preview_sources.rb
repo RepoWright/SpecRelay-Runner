@@ -26,7 +26,7 @@ module SpecrelayRunner
     MAX_SOURCES = 100
     SHA = /\A[0-9a-f]{40}\z/
     PULL_REQUEST_URL = %r{\Ahttps://github\.com/([^/\s]+/[^/\s]+)/pull/\d+\z}
-    OPEN = "OPEN"
+    ELIGIBLE_STATES = %w[OPEN MERGED].freeze
 
     # The closed entry shape. Exactly these keys: an assignment carrying anything else is a
     # document this runner does not understand, and silently ignoring the extra field is how a
@@ -172,15 +172,18 @@ module SpecrelayRunner
       Result.new(ok: true, sources: sources)
     end
 
-    # WHAT GITHUB SAYS NOW, read once. A preview of a closed pull request would be a preview of
-    # work nobody can still review, and a cross-repository head is not this repository's code.
+    # WHAT GITHUB SAYS NOW, read once. An open or merged pull request is previewed at its own head,
+    # never the merge commit or the default branch; one closed unmerged is work nobody can still
+    # review, and a cross-repository head is not this repository's code.
     # Returns the two resolved facts, or the reason this entry is unusable.
     def observed(slug, url)
       answer = github.pull_request(root: root, slug: slug, url: url, env: env)
       return "SpecRelay could not read the pull request of #{quoted(slug)}" if answer.nil?
 
       state = answer["state"].to_s
-      return "the pull request of #{quoted(slug)} is #{state.downcase}, not open" unless state == OPEN
+      return "the pull request of #{quoted(slug)} reports no state" if state.empty?
+      return "the pull request of #{quoted(slug)} is #{state.downcase}, not open or merged" unless
+        ELIGIBLE_STATES.include?(state)
       return "the pull request of #{quoted(slug)} comes from a fork" if answer["isCrossRepository"]
 
       branch = answer["headRefName"].to_s

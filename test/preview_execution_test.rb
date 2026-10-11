@@ -151,6 +151,24 @@ class PreviewExecutionTest < Minitest::Test
     end
   end
 
+  # A merged pull request is rebuilt at its own head even after the default branch has moved on:
+  # the newer default-branch commit is never what the preview shows.
+  def test_a_merged_head_is_materialized_even_when_the_default_branch_has_advanced
+    path = File.join(root, "component-a")
+    File.write(File.join(path, "newer.txt"), "newer\n")
+    DemoWorkspace.git(path, "add", "-A")
+    DemoWorkspace.git(path, "commit", "-q", "-m", "newer default-branch work")
+    newer = DemoWorkspace.git(path, "rev-parse", "HEAD").to_s.strip
+
+    assert execution(answers: answers(state: "MERGED")).start.available?
+
+    placed = File.join(task_root, "component-a")
+    assert_equal @heads[URL_A], DemoWorkspace.git(placed, "rev-parse", "HEAD").to_s.strip
+    assert_equal TASK, DemoWorkspace.git(placed, "rev-parse", "--abbrev-ref", "HEAD").to_s.strip
+    refute system("git", "merge-base", "--is-ancestor", newer, "HEAD", chdir: placed, err: File::NULL)
+    refute File.exist?(File.join(placed, "newer.txt"))
+  end
+
   def test_the_available_document_is_the_closed_wire_shape_and_carries_no_operational_detail
     outcome = execution.start
 
@@ -171,13 +189,29 @@ class PreviewExecutionTest < Minitest::Test
     assert_equal [], @workspace.invocations
   end
 
+  # One bad source among valid ones refuses the whole attempt before anything is created.
   def test_a_source_refusal_is_clean_and_creates_nothing
-    outcome = execution(answers: answers(state: "CLOSED")).start
+    mixed = answers(state: "MERGED").merge(URL_B => answers(state: "CLOSED")[URL_B])
+    outcome = execution(answers: mixed).start
 
     assert_equal SpecrelayRunner::PreviewExecution::FAILED_CLEAN, outcome.state
     assert_equal "source_unavailable", outcome.failure_kind
-    assert_includes outcome.reason, "not open"
+    assert_includes outcome.reason, "is closed, not open or merged"
     assert_equal [], @workspace.invocations
+  end
+
+  # A merged head the fetch cannot reach is refused explicitly; the default branch is never placed
+  # in its stead and nothing is started.
+  def test_an_unreachable_merged_head_is_refused_without_falling_back_to_the_default_branch
+    absent = answers(state: "MERGED")
+    absent[URL_A] = absent[URL_A].merge("headRefOid" => "f" * 40)
+    outcome = execution(answers: absent).start
+
+    assert_equal SpecrelayRunner::PreviewExecution::FAILED_CLEANUP, outcome.state
+    assert_equal "worktree_failed", outcome.failure_kind
+    assert_includes outcome.reason, "does not contain head #{'f' * 12} after a fetch"
+    assert_equal %w[create], @workspace.verbs
+    assert_nil outcome.document
   end
 
   # The only evidence that downgrades a create failure to clean is the project-owned lifecycle

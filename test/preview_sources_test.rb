@@ -33,6 +33,8 @@ class PreviewSourcesTest < Minitest::Test
     { "state" => "OPEN", "headRefName" => branch, "headRefOid" => head, "isCrossRepository" => cross }
   end
 
+  def merged_pr(**fields) = open_pr(**fields).merge("state" => "MERGED")
+
   def entries(*pairs) = pairs.map { |repository, url| { "repository" => repository, "pull_request_url" => url } }
 
   def resolve(entries, answers)
@@ -53,6 +55,21 @@ class PreviewSourcesTest < Minitest::Test
                      "branch" => "feature-b", "head_commit" => HEAD_B } ], result.snapshot
     # Once each, and only about the pull requests it was assigned.
     assert_equal [ [ REPO_A, URL_A ], [ REPO_B, URL_B ] ], github.calls.map { |call| [ call[:slug], call[:url] ] }
+  end
+
+  # A merged pull request is previewed at its own implementation head — never the merge commit or
+  # the default branch — and yields exactly the snapshot an open one does.
+  def test_resolves_a_merged_pull_request_to_its_exact_head
+    result, github = resolve(entries([ REPO_A, URL_A ], [ REPO_B, URL_B ]),
+                             URL_A => merged_pr(branch: "feature-a", head: HEAD_A),
+                             URL_B => open_pr(branch: "feature-b", head: HEAD_B))
+
+    assert result.ok?, result.reason
+    assert_equal [ { "repository" => REPO_A, "pull_request_url" => URL_A,
+                     "branch" => "feature-a", "head_commit" => HEAD_A },
+                   { "repository" => REPO_B, "pull_request_url" => URL_B,
+                     "branch" => "feature-b", "head_commit" => HEAD_B } ], result.snapshot
+    assert_equal [ URL_A, URL_B ], github.calls.map { |call| call[:url] }
   end
 
   def test_a_head_that_moved_between_two_resolutions_is_simply_the_new_head
@@ -114,13 +131,32 @@ class PreviewSourcesTest < Minitest::Test
                       URL_B => { "state" => "CLOSED", "headRefName" => "b", "headRefOid" => HEAD_B })
 
     refute result.ok?
-    assert_includes result.reason, "is closed, not open"
+    assert_includes result.reason, "is closed, not open or merged"
     assert_empty result.sources
+  end
+
+  def test_an_unknown_or_missing_state_is_refused
+    { "LOCKED" => "is locked, not open or merged", "" => "reports no state",
+      nil => "reports no state" }.each do |state, expected|
+      result, = resolve(entries([ REPO_A, URL_A ]),
+                        URL_A => open_pr(branch: "feature-a", head: HEAD_A).merge("state" => state))
+
+      refute result.ok?, "expected #{state.inspect} to be refused"
+      assert_includes result.reason, expected
+    end
   end
 
   def test_a_fork_pull_request_is_refused
     result, = resolve(entries([ REPO_A, URL_A ]),
                       URL_A => open_pr(branch: "feature-a", head: HEAD_A, cross: true))
+
+    refute result.ok?
+    assert_includes result.reason, "comes from a fork"
+  end
+
+  def test_a_merged_fork_pull_request_is_refused
+    result, = resolve(entries([ REPO_A, URL_A ]),
+                      URL_A => merged_pr(branch: "feature-a", head: HEAD_A, cross: true))
 
     refute result.ok?
     assert_includes result.reason, "comes from a fork"
@@ -135,6 +171,13 @@ class PreviewSourcesTest < Minitest::Test
 
   def test_an_inexact_head_is_refused
     result, = resolve(entries([ REPO_A, URL_A ]), URL_A => open_pr(branch: "feature-a", head: "abc123"))
+
+    refute result.ok?
+    assert_includes result.reason, "no exact head commit"
+  end
+
+  def test_a_merged_pull_request_with_an_inexact_head_is_refused
+    result, = resolve(entries([ REPO_A, URL_A ]), URL_A => merged_pr(branch: "feature-a", head: "abc123"))
 
     refute result.ok?
     assert_includes result.reason, "no exact head commit"
