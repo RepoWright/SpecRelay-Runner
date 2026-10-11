@@ -203,16 +203,22 @@ module SpecrelayRunner
     def push_branch(branch)
       # Explicit refspec: push this worktree's HEAD to the Platform-assigned branch.
       # Never a force push, so a diverged remote branch fails closed instead of
-      # destroying someone else's work.
-      result = git([ "push", REMOTE, "HEAD:refs/heads/#{branch}" ])
+      # destroying someone else's work. The one exception is a Rebase run's push of an accepted
+      # pull-request branch, which rewrites that branch only while the remote still holds the
+      # accepted head ({Rebase.lease}); a remote that already holds this HEAD is up to date.
+      lease = Rebase.lease(payload, repository.id, branch)
+      result = git([ "push", *("--force-with-lease=refs/heads/#{branch}:#{lease}" if lease), REMOTE,
+                     "HEAD:refs/heads/#{branch}" ])
       return Step.new if result.success?
 
-      Step.new(error: push_error(result))
+      Step.new(error: push_error(result, lease))
     end
 
-    def push_error(result)
+    def push_error(result, lease = nil)
       text = combined(result)
-      return diverged_refusal if !result.timed_out? && text.match?(/non-fast-forward|fetch first|rejected/i)
+      rejected = !result.timed_out? && text.match?(/non-fast-forward|fetch first|rejected|stale info/i)
+      return lease_refusal(lease) if rejected && lease
+      return diverged_refusal if rejected
       if !result.timed_out? && text.match?(/authentication|permission denied|could not read Username/i)
         return "git push failed: authentication was refused on this runner host; " \
                "check the git credential setup where the runner executes, then release and re-run the task"
@@ -230,6 +236,14 @@ module SpecrelayRunner
         "Inspect the remote branch; if it is a stale SpecRelay attempt, delete it " \
         "(`git push origin --delete <branch>`), then release and re-run the task. " \
         "If it holds work you need, merge or rename it first"
+    end
+
+    # The remote branch is no longer the accepted head this Rebase run started from, so somebody
+    # else's work may be on it. Nothing is overwritten and nothing else is tried.
+    def lease_refusal(lease)
+      "git push rejected: the remote branch no longer holds the accepted head #{lease[0, 12]} this " \
+        "rebase started from, so it was not overwritten. Inspect the remote branch before starting " \
+        "another rebase"
     end
 
     # A single place that turns a failed CommandRunner result into a non-empty,

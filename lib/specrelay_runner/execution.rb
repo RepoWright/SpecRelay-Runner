@@ -2,6 +2,8 @@
 
 require "fileutils"
 require "tmpdir"
+# Its one consumer loads it, after `continued_target` and `publication`, which it is built on.
+require_relative "rebase"
 
 module SpecrelayRunner
   # Orchestrates ONE claimed run end to end on the developer machine (MVP-0010),
@@ -152,6 +154,9 @@ module SpecrelayRunner
       # request an abandoned run had already published. A run is never both this and a rework:
       # a replacement is new, so nothing has reviewed it.
       @restart = ContinuedTarget.for(payload, "restart")
+      # Nil unless this claim is a Rebase run moving the accepted package onto current main. Like a
+      # replacement, it is never a rework.
+      @rebase = Rebase.for(payload, env: env)
       # Nil unless this claim continues an answered offline question — on the machine that asked,
       # or on any other eligible one, which restores the recorded work first.
       @resume = Resume.for(payload)
@@ -293,6 +298,46 @@ module SpecrelayRunner
     def resume_refused(reason)
       refuse_before_provider(reason, "Refusing to resume #{run['task_id']}")
     end
+
+    def refused_continuation(root, worktree, reason)
+      @rebase ? rebase_refused(root, worktree, reason) : continuation_refused(reason)
+    end
+
+    # A Rebase run that cannot be rebased, or whose result is not a rebase, ENDS as failed with the
+    # reason in its failure details, rather than handing the claim back: the same package would be
+    # refused again, and a claimable run would keep the ticket busy. Nothing is published.
+    def rebase_refused(root, worktree, reason, executor_result = nil)
+      executor_result ||= Executor::Result.new(exit_code: nil, stdout: "", stderr: "", duration_seconds: 0,
+                                               timed_out: false, argv: [], launch_error: reason)
+      failed_report(root, worktree, executor_result,
+                    "Refusing to rebase #{run['task_id']}: #{reason}\nNothing was published.",
+                    classification: "rebase_refused")
+    end
+
+    # The accepted repositories rebased onto the main commits Platform stored for this run, and one
+    # progress line per repository. Nil, or the reason nothing could be rebased.
+    def rebase_onto_main(worktree)
+      bases = rebase_bases(worktree)
+      return bases if bases.is_a?(String)
+
+      failure = @rebase.apply(worktree.path, bases)
+      return failure if failure
+
+      @rebase.progress_lines.each { |line| emit("core.progress", line, phase: "core") }
+      nil
+    end
+
+    # Before verification: every accepted repository reported, on its branch and rebased.
+    def rebase_unproven(worktree, repositories)
+      bases = rebase_bases(worktree)
+      return bases if bases.is_a?(String)
+
+      reason = @rebase.unproven(worktree.path, bases, repositories)
+      @rebase.resolved_lines.each { |line| emit("core.progress", line, phase: "core") } if reason.nil?
+      reason
+    end
+
+    def rebase_bases(worktree) = @rebase_bases ||= recorded_initial_bases(worktree.path)
 
     def refuse_before_provider(reason, headline)
       safe = Redaction.redact(reason.to_s)
@@ -455,13 +500,19 @@ module SpecrelayRunner
       # worktree must hold that commit before anything else looks at it. One branch, because it is
       # one proof ({ContinuedTarget}) and a claim is never both. A refusal here stops before the
       # provider, before the package, and before any external write.
-      continued = @rework || @restart
-      if continued && !(@resume && @rework)
+      #
+      # A Rebase run proves its whole accepted package the same way, and then rebases it. Its
+      # refusal is terminal, because an unchanged package would only be refused again; an answered
+      # question of such a run already holds its rebased repositories, so it does neither.
+      continued = @rework || @restart || @rebase&.target
+      if continued && !(@resume && (@rework || @rebase))
         continuation = continued.materialize(worktree_path: worktree.path, created: worktree.created?)
-        return continuation_refused(continuation.reason) unless continuation.ok?
+        return refused_continuation(root, worktree, continuation.reason) unless continuation.ok?
 
         worktree = Workspace::Info.new(path: worktree.path, created: worktree.created?,
                                        base_commit: continuation.head_commit || worktree.base_commit)
+        unrebased = @rebase && rebase_onto_main(worktree)
+        return rebase_refused(root, worktree, unrebased) if unrebased
       end
 
       # The pinned package is verified and ANCHORED
@@ -551,6 +602,9 @@ module SpecrelayRunner
       return selection_refused(root, worktree, executor_result, selection.error) unless selection.ok?
 
       repositories = selection.repositories
+      if @rebase && (unproven = rebase_unproven(worktree, repositories))
+        return rebase_refused(root, worktree, unproven, executor_result)
+      end
       changes = combined_changes(repositories, changes)
 
       emit("verification.started", "Verifying #{repositories.length} changed repository(ies) for #{run['task_id']}",
@@ -865,7 +919,8 @@ module SpecrelayRunner
         proof = @rework.prove(worktree_path: worktree.path, held: held)
         return Checkpoint.refuse_capture(proof.reason) unless proof.ok?
       end
-      Checkpoint.capture(task_root: worktree.path, reviewed: Array(payload.dig("rework", "repositories")))
+      reviewed = @rebase ? @rebase.unrebased_targets(worktree.path) : Array(payload.dig("rework", "repositories"))
+      Checkpoint.capture(task_root: worktree.path, reviewed: reviewed)
     end
 
     # The provider started. A resumed session tells Platform its handoff arrived, and only once
@@ -1187,7 +1242,8 @@ module SpecrelayRunner
 
         #{question_lines(bridge_path)}
       MD
-      "#{preamble}\n\n---\n\n#{payload.dig('specification_package', 'handoff_prompt')}#{rework_prompt}#{resume_prompt}"
+      "#{preamble}\n\n---\n\n#{payload.dig('specification_package', 'handoff_prompt')}#{rework_prompt}#{resume_prompt}" \
+        "#{@rebase&.prompt_section}"
     end
 
     # MAPIAI-84/MAPIAI-93 — the ONE way the executor's repository choice AND its verification

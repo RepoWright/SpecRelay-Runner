@@ -49,7 +49,7 @@ module SpecrelayRunner
     # What each caller's target is called in a refusal. It is the only thing that differs between
     # them here, and it matters: an operator reading "not to the reviewed branch" about a restart
     # would go looking for a review that does not exist.
-    NOUNS = { "rework" => "reviewed", "restart" => "recorded" }.freeze
+    NOUNS = { "rework" => "reviewed", "restart" => "recorded", "rebase" => "accepted" }.freeze
 
     # A reviewed pull request's own address, which names the repository it belongs to.
     PULL_REQUEST_URL = %r{\Ahttps://github\.com/([^/\s]+/[^/\s]+)/pull/\d+\z}i
@@ -73,11 +73,15 @@ module SpecrelayRunner
           pull_request_env: key == "rework" ? env : nil)
     end
 
-    def initialize(targets, publication_branch = nil, noun: "recorded", pull_request_env: nil)
+    # `every_blocker` is a Rebase run's preflight (see {Rebase}): one refusal still refuses the
+    # whole set, but every target is inspected first, so the refusal names each blocked pull
+    # request at once instead of the first one alone.
+    def initialize(targets, publication_branch = nil, noun: "recorded", pull_request_env: nil, every_blocker: false)
       @targets = targets
       @publication_branch = publication_branch.to_s
       @noun = noun
       @pull_request_env = pull_request_env
+      @every_blocker = every_blocker
     end
 
     # Put every recorded repository in this task workspace on its own recorded head, or refuse.
@@ -128,30 +132,51 @@ module SpecrelayRunner
 
     private
 
-    attr_reader :targets, :publication_branch, :noun, :pull_request_env
+    attr_reader :targets, :publication_branch, :noun, :pull_request_env, :every_blocker
 
-    # Every target located and PROVED, before any of them is moved. All-or-nothing: the first
-    # fact that fails refuses the whole continuation, and until this returns a plan nothing on
-    # disk has changed.
+    # Every target located and PROVED, before any of them is moved. All-or-nothing: a fact that
+    # fails refuses the whole continuation, and until this returns a plan nothing on disk has
+    # changed. Ordinarily the first refusal is the answer; with `every_blocker` the remaining
+    # targets are still inspected and every refusal is returned as one.
     def plan(worktree_path, created, git, holding: nil, bases: {})
       seen = []
       planned = []
+      blockers = []
       targets.each do |repository|
-        root = resolve(repository, worktree_path, git)
-        return root if root.is_a?(Result)
-
-        observed = git.current_branch(root)
-        placing = created && observed == ""
-        refusal = duplicate_refusal(repository, seen) || verify(repository, root, observed, placing, git, holding)
-        return refusal if refusal
-
-        placement = placing ? placement_plan(repository, root) : :reset
-        return placement if placement.is_a?(Result)
-
-        seen << Review::Checkout.identity(repository["clone_url"])
-        planned << [ repository, root, placement ]
+        step = plan_one(repository, worktree_path, created, git, holding, seen)
+        if !step.is_a?(Result) then planned << step
+        elsif every_blocker then blockers << blocker_line(repository, step.reason)
+        else return step
+        end
       end
+      return every_blocker_refusal(blockers) if blockers.any?
+
       base_refusal(planned, bases, worktree_path) || planned
+    end
+
+    def plan_one(repository, worktree_path, created, git, holding, seen)
+      root = resolve(repository, worktree_path, git)
+      return root if root.is_a?(Result)
+
+      observed = git.current_branch(root)
+      placing = created && observed == ""
+      refusal = duplicate_refusal(repository, seen) || verify(repository, root, observed, placing, git, holding)
+      return refusal if refusal
+
+      placement = placing ? placement_plan(repository, root) : :reset
+      return placement if placement.is_a?(Result)
+
+      seen << Review::Checkout.identity(repository["clone_url"])
+      [ repository, root, placement ]
+    end
+
+    # One line per blocked pull request: its repository, its address and the precise reason.
+    def blocker_line(repository, reason)
+      "- #{repository['repository_key']} #{repository['pull_request_url']}: #{reason}"
+    end
+
+    def every_blocker_refusal(blockers)
+      refuse("#{blockers.length} of #{targets.length} #{noun} pull requests block this run:\n#{blockers.join("\n")}")
     end
 
     # The mutation, once the whole set has passed. Each repository moves to its OWN recorded head:
