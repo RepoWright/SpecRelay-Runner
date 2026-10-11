@@ -56,7 +56,7 @@ module SpecrelayRunner
 
       # An attempt that ended WELL, whether or not it finished the work (MVP-0036 CR-001 F4).
       #
-      # A released answer window is an approved pause, not a failure: the question is durable,
+      # A released question is an approved pause, not a failure: the question is durable,
       # the machine is free, and the operator has simply not decided yet. Reported as a failed
       # run it would make a `--on-failure stop` loop shut the machine down every time the AI
       # asked something — the opposite of the outcome this MVP exists to deliver.
@@ -441,9 +441,12 @@ module SpecrelayRunner
       # MVP-0036 Stage 2a — a resume continues the DIRTY worktree its question was asked from, so
       # it reads and proves that worktree where an ordinary claim creates a clean one. A refusal
       # here stops before the provider, before the package, and before any external write.
+      # An answered question from a change-request round also continues the reviewed heads, and
+      # the resume proves them itself, in the only order the checkpoint allows.
       if @resume
         prepared = @resume.prepare(measuring: measuring_workspace(root), creating: creating_workspace(root),
-                                   download: -> { download_checkpoint })
+                                   download: -> { download_checkpoint }, branch: run["canonical_branch"],
+                                   target: @rework)
         return resume_refused(prepared.reason) unless prepared.ok?
       end
       worktree = prepared&.worktree || create_worktree(root)
@@ -453,7 +456,7 @@ module SpecrelayRunner
       # one proof ({ContinuedTarget}) and a claim is never both. A refusal here stops before the
       # provider, before the package, and before any external write.
       continued = @rework || @restart
-      if continued
+      if continued && !(@resume && @rework)
         continuation = continued.materialize(worktree_path: worktree.path, created: worktree.created?)
         return continuation_refused(continuation.reason) unless continuation.ok?
 
@@ -777,7 +780,7 @@ module SpecrelayRunner
     # and an environment whose owner changed under a retry could not be continued or released.
     def run_identity = run["id"].to_s
 
-    # The recorded package, from the one claim-bound path Platform put in the assignment.
+    # The recorded manifest, from the one claim-bound path Platform put in the assignment.
     def download_checkpoint
       client.executor_question_checkpoint(claim: claim, path: @resume.download_path)
             .to_h["payload"]
@@ -808,7 +811,7 @@ module SpecrelayRunner
       # can never appear in the diff the executor is measured on. It is built before the decoder,
       # which reads its refusal count.
       @bridge = QuestionBridge.new(client: client, claim: claim, staging_dir: staging, io: io,
-                                   capture: -> { capture_checkpoint(root, worktree, staging) },
+                                   capture: -> { capture_checkpoint(worktree) },
                                    resume_question_id: @resume&.question_id).start
       @provider_stream = provider_stream(worktree)
       # Scenario evidence lives beside the selection document in STAGING for the same reason: it
@@ -819,7 +822,7 @@ module SpecrelayRunner
                        .run(prompt_text(worktree.path, @bridge.path, RepositorySelection.path(staging),
                                         @scenario_evidence_dir),
                             on_output: (@provider_stream || @log_stream).sink,
-                            on_start: -> { @bridge.confirm_resume },
+                            on_start: -> { confirm_resume(worktree) },
                             stop_check: -> { @bridge.stop_provider? || !stop_reason.nil? })
       decoded(result)
     ensure
@@ -850,22 +853,30 @@ module SpecrelayRunner
       Executor::Result.new(**result.to_h, stdout: @provider_stream.final_text)
     end
 
-    # The portable checkpoint of everything the provider has changed, taken at the instant it
-    # pauses. It reads the executor's OWN repository selection — the same document publication
-    # reads — and verifies it through the same rules, so a question is never stored describing
-    # repositories this runner could not prove.
+    # The checkpoint of everything the provider has changed, taken at the instant it pauses: every
+    # repository in the task workspace, whatever the executor selected, because a selection may
+    # omit a changed repository and its work would be lost.
     #
-    # A refusal here reaches the provider, which may correct its selection and ask again while
-    # its session is alive.
-    def capture_checkpoint(root, worktree, staging)
-      reported = RepositorySelection.read(staging)
-      return Checkpoint.refuse_capture(reported.error) unless reported.ok?
+    # A reviewed repository's base is its reviewed head, so the review is proved first — identity,
+    # branch, remote and pull-request head — exactly as an answered resume proves it again later.
+    def capture_checkpoint(worktree)
+      if @rework
+        held = ContainedRepositories.discover(worktree.path).roots.to_a
+        proof = @rework.prove(worktree_path: worktree.path, held: held)
+        return Checkpoint.refuse_capture(proof.reason) unless proof.ok?
+      end
+      Checkpoint.capture(task_root: worktree.path, reviewed: Array(payload.dig("rework", "repositories")))
+    end
 
-      measuring = measuring_workspace(root)
-      selection = measuring.select(worktree.path, reported.entries.map(&:path), require_change: false)
-      return Checkpoint.refuse_capture(selection.error) unless selection.ok?
+    # The provider started. A resumed session tells Platform its handoff arrived, and only once
+    # Platform records that are the consumed checkpoint refs removed — best effort, because a ref
+    # that cannot be removed is an orphan nothing will resume, not a reason to stop the task.
+    def confirm_resume(worktree)
+      @bridge.confirm_resume
+      return if @resume.nil? || @bridge.failed?
 
-      Checkpoint.capture(repositories: selection.repositories, workspace: measuring)
+      orphans = Checkpoint.discard(@resume.checkpoint, task_root: worktree.path)
+      log("Could not remove the consumed checkpoint refs: #{orphans.join(', ')}") if orphans.any?
     end
 
     # MVP-0036 — the two honest endings for a provider that paused on a question. Neither runs
@@ -1284,12 +1295,10 @@ module SpecrelayRunner
           and is a reserved key. The whole document must fit within #{contract['max_document_bytes']} bytes.
         - `continuation_context` requires: #{fields.map { |name, description| "`#{name}` (#{description})" }.join(', ')}.
           It is PUBLIC: no local paths, credentials, or your own reasoning.
-        - Write the repository selection above FIRST and keep it current: SpecRelay checkpoints
-          exactly the repositories it names so another machine can continue this work, and a
-          question whose selection is missing, stale or unverifiable is refused rather than stored.
-        - Then wait for `#{File.join(bridge_path, QuestionBridge::ANSWER)}` and continue with its
-          `answers`, or for `#{File.join(bridge_path, QuestionBridge::ERROR)}`, which you may correct
-          and re-submit. If neither appears, your session was released; stop.
+        - SpecRelay checkpoints every changed repository so a later session can continue this work,
+          then ends this session. The answers go to that later session, not to this one.
+        - If `#{File.join(bridge_path, QuestionBridge::ERROR)}` appears instead, correct the request
+          and re-submit it.
       MD
     end
 

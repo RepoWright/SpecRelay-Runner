@@ -7,12 +7,15 @@ module SpecrelayRunner
   # The SpecRelay-owned local question bridge (MVP-0036 Stage 1).
   #
   # Platform cannot click a provider's private question dialog, and this runner never scrapes
-  # one: the contract is three files in an attempt-local directory OUTSIDE the worktree, so it
+  # one: the contract is two files in an attempt-local directory OUTSIDE the worktree, so it
   # can never reach the diff, and it is the ONLY thing the provider is told about.
   #
   #   question-request.json — the provider writes its batch here, then blocks;
-  #   question-answer.json  — the accepted answers appear here, and the SAME session continues;
   #   question-error.json   — a refusal, so the same session can correct and try again.
+  #
+  # An accepted batch is never answered in the session that asked it. Platform stores it and
+  # releases the attempt at once, so this session ends and a FRESH one continues from the recorded
+  # checkpoint once the Product Owner has answered.
   #
   # The bridge holds no credential. This object runs in the Runner PARENT, which owns the
   # Platform client, the lease and the heartbeat; the provider only reads and writes files.
@@ -24,38 +27,26 @@ module SpecrelayRunner
   class QuestionBridge
     DIRECTORY = "question-bridge"
     REQUEST = "question-request.json"
-    ANSWER = "question-answer.json"
     ERROR = "question-error.json"
 
     MAX_REQUEST_BYTES = 64 * 1024
     # How often the parent looks for a request the provider just wrote. Short, because the
     # provider is blocked from the moment it writes.
     WATCH_SECONDS = 0.25
-    # How often Platform is asked whether the batch has been settled. Deliberately much slower:
-    # the answer comes from a human reading a page, and a quarter-second poll would send
-    # thousands of requests across a fifteen-minute window to learn nothing.
-    ANSWER_POLL_SECONDS = 2.0
 
-    LIVE_WAIT = "LIVE_WAIT"
-    # The Product Owner answered and Platform is holding the batch for THIS session. It becomes
-    # ANSWERED only when the acknowledgement below reports that the answers were handed over.
-    ANSWER_READY = "ANSWER_READY"
-    # The one state that means this session's delivery is what Platform recorded. Anything else
-    # coming back from the acknowledgement is some OTHER ending that won (CR-003 F1).
-    ANSWERED = "ANSWERED"
+    # The state Platform settles an accepted batch in, which ends this session.
     OFFLINE_WAIT = "OFFLINE_WAIT"
     # The one state that means a FRESH session received an offline batch's answers.
     RESUMED = "RESUMED"
 
-    PROVIDER_EXITED = "the provider exited while its question was still waiting for an answer"
-    ANSWER_UNDELIVERED = "the provider exited before its answers could be handed back to it"
+    NOT_RELEASED = "Platform accepted the question without releasing this session"
     DELIVERY_UNCONFIRMED = "Platform did not confirm that the answers reached this session"
 
-    # `capture` is asked for this machine's portable checkpoint at the instant the provider pauses
-    # — not when the bridge starts — because the provider changes files right up to that moment,
-    # and a later resume has to land on exactly the state it left. It answers with a package or
-    # with ONE reason, and a reason is returned to the provider rather than stored: a batch whose
-    # work could not be captured is one nothing could ever continue.
+    # `capture` is asked for this machine's checkpoint at the instant the provider pauses — not
+    # when the bridge starts — because the provider changes files right up to that moment, and a
+    # later resume has to land on exactly the state it left. It answers with a manifest or with ONE
+    # reason. A reason ends the session through the input-capture failure path: nothing the provider
+    # could correct makes an unpushable or unresolvable checkpoint continuable.
     #
     # There is no default: a batch stored without a package could never be continued, so Platform
     # refuses one, and a bridge that could not name how to capture has nothing to submit.
@@ -80,7 +71,6 @@ module SpecrelayRunner
       @failure_reason = nil
       @should_stop = false
       @thread = nil
-      @awaiting_verdict = false
       @resume_confirmed = false
       @refusals = 0
     end
@@ -93,41 +83,32 @@ module SpecrelayRunner
       self
     end
 
-    # Called once the provider process has ended, on every path.
-    #
-    # A batch Platform ACCEPTED and nobody settled is the provider exiting mid-question
-    # (CR-001 F1). Recording it here — the moment the child is known to be gone — is what keeps
-    # that ending on the question lifecycle instead of falling through to the ordinary
-    # failed-report path, where a non-zero exit would be blamed on the task and a zero exit
-    # would run tests and upload a report for work that stopped on an unanswered decision.
+    # Called once the provider process has ended, on every path. A submission in flight is
+    # finished first, so its ending is recorded before the attempt is classified.
     def stop
       @mutex.synchronize { @should_stop = true }
       @thread&.join
       @thread = nil
-      record(:failed, PROVIDER_EXITED) if awaiting_verdict?
     end
 
     # The provider must be ended. True for BOTH endings, because both leave a process blocked
-    # on an answer that will never arrive: Platform released the session, or the bridge cannot
-    # recover. Read by CommandRunner's stop check, which owns the bounded TERM-then-KILL grace.
+    # on a question this session will never be answered: Platform released the session, or the
+    # bridge cannot recover. Read by CommandRunner's stop check, which owns the bounded
+    # TERM-then-KILL grace.
     def stop_provider? = !outcome.nil?
 
-    # Platform closed the answer window. The question and its context are durable.
+    # Platform stored the question and released this session. The question and its context are
+    # durable.
     def released? = outcome == :released
 
-    # This session could not carry the question through: nothing became durable, the provider
-    # exited while its batch was unsettled, or an accepted answer could not be handed back. A
-    # durable question — and, since CR-002, possibly a durable ANSWER — may well exist; what
-    # failed is this session's part in it. The runner reports that; PLATFORM decides what the
-    # attempt becomes, and the dirty worktree is preserved either way.
+    # This session could not carry the question through: its work could not be checkpointed,
+    # nothing became durable, or Platform did not release it. What failed is this session's part;
+    # the runner reports that, PLATFORM decides what the attempt becomes, and the dirty worktree is
+    # preserved either way.
     def failed? = outcome == :failed
 
     def outcome = @mutex.synchronize { @outcome }
     def failure_reason = @mutex.synchronize { @failure_reason }
-
-    # A batch Platform accepted that nobody has settled yet. True only between the accepted
-    # submission and the answer or release that ends it.
-    def awaiting_verdict? = @mutex.synchronize { @awaiting_verdict && @outcome.nil? }
 
     # How many question turns this bridge has refused back to the same provider process —
     # Platform's refusals and its own two local checks alike, because each one ends a turn the
@@ -148,8 +129,8 @@ module SpecrelayRunner
     # is held across the call, so the second caller waits for the answer instead of racing it.
     #
     # Anything other than RESUMED means something else won — a cancellation, or another machine —
-    # so the provider is stopped exactly as an unconfirmed live delivery stops it. Continuing on
-    # answers Platform does not record as delivered is the one outcome that must not happen.
+    # so the provider is stopped. Continuing on answers Platform does not record as delivered is
+    # the one outcome that must not happen.
     def confirm_resume
       @resume_gate.synchronize do
         next if @resume_question_id.nil? || @resume_confirmed
@@ -200,11 +181,10 @@ module SpecrelayRunner
     end
 
     # The request is consumed FIRST so a refusal the provider corrects arrives as a new request
-    # rather than being re-read forever, and any previous verdict is cleared with it — a
-    # provider asking a SECOND batch must never find the first batch's answers already waiting.
+    # rather than being re-read forever, and any previous refusal is cleared with it.
     def consume_request
       raw = File.read(request_path)
-      [ REQUEST, ANSWER, ERROR ].each { |name| FileUtils.rm_f(File.join(path, name)) }
+      [ REQUEST, ERROR ].each { |name| FileUtils.rm_f(File.join(path, name)) }
       raw
     end
 
@@ -226,70 +206,35 @@ module SpecrelayRunner
       return if stopping? || outcome
 
       captured = capture.call
-      return refuse(captured.error) unless captured.ok?
+      return record(:failed, Redaction.redact(captured.error)) unless captured.ok?
 
       body = client.submit_executor_question(claim: claim, question: document,
                                              checkpoint: captured.checkpoint)
-      await(body.to_h["question"].to_h)
+      settled(body.to_h["question"].to_h)
     rescue PlatformClient::Error => e
       # A refusal is Platform having READ the request and declined it, so the same session may
-      # correct and retry. Anything else — a transport fault or a 5xx — leaves the question's
-      # fate unknown, and re-sending a batch that may already be durable is exactly what the
-      # one-open-batch rule exists to prevent. Fail closed.
-      return refuse(Redaction.redact(e.message)) if e.respond_to?(:refused?) && e.refused?
+      # correct and retry, and no stored question names the refs this capture pushed. Anything
+      # else — a transport fault or a 5xx — leaves the question's fate unknown, and re-sending a
+      # batch that may already be durable is exactly what the one-open-batch rule exists to
+      # prevent. Fail closed, and keep the refs: the question they belong to may exist.
+      return record(:failed, Redaction.redact(e.message)) unless e.respond_to?(:refused?) && e.refused?
 
-      record(:failed, Redaction.redact(e.message))
+      withdraw(captured)
+      refuse(Redaction.redact(e.message))
     end
 
-    # Poll Platform until it settles the batch. Platform owns the deadline; this never decides
-    # that the window has passed, it only reads what Platform decided.
-    def await(question)
-      public_id = question["id"].to_s
+    def withdraw(captured)
+      orphans = Checkpoint.withdraw(captured)
+      log("[question] these checkpoint refs could not be removed: #{orphans.join(', ')}") if orphans.any?
+    end
+
+    # Platform releases an accepted batch at once. Anything else is not a state this session may
+    # continue in, so it ends closed rather than waiting for an answer that never comes here.
+    def settled(question)
       state = question["state"].to_s
-      @mutex.synchronize { @awaiting_verdict = true }
-      until stopping?
-        return deliver(question) if state == ANSWER_READY
-        return record(:released, nil) if state == OFFLINE_WAIT
+      return record(:released, nil) if state == OFFLINE_WAIT
 
-        sleep ANSWER_POLL_SECONDS
-        break if stopping?
-
-        question = client.executor_question(claim: claim, public_id: public_id).to_h["question"].to_h
-        state = question["state"].to_s
-      end
-    rescue PlatformClient::Error => e
-      record(:failed, Redaction.redact(e.message))
-    end
-
-    # The answers reach the SAME session, exactly once: written to a temporary name and renamed
-    # into place, so a provider polling for the file never reads a half-written document.
-    #
-    # Platform is told only AFTER that write, and only while the session that asked is still
-    # running (CR-002 F1). "The Product Owner answered" and "the provider received it" are two
-    # different facts separated by a process boundary, and this parent is the only thing that
-    # can report the second one.
-    def deliver(question)
-      write(ANSWER, { "answers" => question["answers"] })
-      return record(:failed, ANSWER_UNDELIVERED) if stopping?
-
-      settled = client.confirm_executor_question_delivery(claim: claim, public_id: question["id"])
-                      .to_h["question"].to_h
-      return unconfirmed(settled) unless delivered?(question, settled)
-
-      @mutex.synchronize { @awaiting_verdict = false }
-      log("[question] answers delivered to the waiting provider session")
-    rescue PlatformClient::Error => e
-      # Fail closed, exactly as an unknown submission outcome does. An unacknowledged delivery
-      # would leave Platform holding an answer it cannot say was handed over, on a run that
-      # carried on and finished; ending the session here keeps that answer durable for Stage 2.
-      record(:failed, Redaction.redact(e.message))
-    end
-
-    # Platform ANSWERING is not Platform agreeing (CR-003 F1). A cancellation, a release or the
-    # deadline may have won this batch while the answers were being written, and the response
-    # says which — so only THIS batch, reported ANSWERED, is a delivery this session may act on.
-    def delivered?(asked, settled)
-      settled["id"].to_s == asked["id"].to_s && settled["state"].to_s == ANSWERED
+      record(:failed, "#{NOT_RELEASED} (#{question['id']} is #{state})")
     end
 
     # Something else ended the batch. The provider is stopped and the attempt fails closed: it
@@ -316,7 +261,6 @@ module SpecrelayRunner
       @mutex.synchronize do
         @outcome ||= outcome
         @failure_reason ||= reason
-        @awaiting_verdict = false
       end
       log("[question] the provider session is ending: #{reason || 'Platform released it'}")
     end

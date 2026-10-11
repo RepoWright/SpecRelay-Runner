@@ -5,32 +5,25 @@ module SpecrelayRunner
   #
   # An ordinary claim carries no `resume` block and this is `nil`, so the first-execution path is
   # untouched. When Platform does send one, the provider that asked the question is long gone and
-  # its session cannot be recreated — what survives is the recorded work, and this machine has to
-  # be holding exactly it before anything continues.
+  # its session cannot be recreated — what survives is the recorded work, held as checkpoint refs on
+  # each changed repository's own origin, and this machine has to be holding exactly it before
+  # anything continues.
   #
-  # Two ways that happens, and only two:
+  # ONE way that happens, on whichever machine claims the run: the manifest is downloaded and
+  # proved, the task workspace is found or built, and {Checkpoint.restore} fetches every recorded
+  # ref and reconstructs the work there. A worktree this machine still has is only a destination;
+  # its files are never the source of what continues.
   #
-  #   1. this machine still has the worktree the question was asked from, and it REMEASURES to
-  #      the recorded checkpoint. Nothing is downloaded and nothing is reapplied — the files are
-  #      already the recorded ones;
-  #   2. this machine has no worktree for the branch, so it downloads the recorded package,
-  #      builds the task workspace through the project's own command, restores every recorded
-  #      repository into it, and remeasures.
-  #
-  # Anything else refuses before a provider starts: a worktree that is not what was recorded, a
-  # package that is not the recorded one, a target that is not clean at the recorded base. The
-  # answers, the package and every local file stay exactly as they are, so another eligible
-  # machine — or this one, once its worktree is released — can try again.
+  # Anything else refuses before a provider starts, with the answers, the refs and every local file
+  # exactly as they were, so another eligible machine — or this one — can try again.
   #
   # The fresh session is then handed the complete public handoff: the questions, the Product
   # Owner's answers, and the continuation context. It receives nothing else, because nothing else
   # was ever stored.
   #
-  # A sibling of {Rework}, and deliberately not a mode of it: that one continues a REVIEWED head
-  # by resetting a clean worktree onto it, and this one continues UNCOMMITTED work.
+  # A sibling of {Rework}, and deliberately not a mode of it: that one continues a REVIEWED head,
+  # and this one continues UNCOMMITTED work on top of it.
   class Resume
-    NO_CHECKPOINT = "no portable checkpoint was recorded when the question was asked"
-
     Prepared = Struct.new(:worktree, :reason, keyword_init: true) do
       def ok? = !worktree.nil?
     end
@@ -47,22 +40,35 @@ module SpecrelayRunner
     # The batch Platform settles once the fresh session has it.
     def question_id = block["question_id"].to_s
 
-    # The claim-bound path the recorded package is downloaded from. Platform derives it; this
+    # The claim-bound path the recorded manifest is downloaded from. Platform derives it; this
     # never constructs one.
-    def download_path = checkpoint["download_path"].to_s
+    def download_path = block["checkpoint"].to_h["download_path"].to_s
+
+    # The closed manifest metadata, without the download path the assignment adds to it.
+    def checkpoint = block["checkpoint"].to_h.except("download_path")
 
     # The verified worktree, or the refusal that stops this claim before any provider starts.
     #
-    # `download` is called only on the path that needs bytes, and BEFORE the task workspace is
-    # built, so a transfer failure leaves this machine exactly as it found it.
-    def prepare(measuring:, creating:, download:)
-      return Prepared.new(reason: NO_CHECKPOINT) if Array(checkpoint["repositories"]).empty?
-
-      found = measuring.existing
-      return reuse(found, measuring) if found
-
+    # The manifest is downloaded and proved BEFORE the task workspace is built, so a transfer
+    # failure or a manifest that is not the recorded one leaves this machine as it found it.
+    #
+    # `target` is the reviewed {Rework} when the question was asked during a change-request round.
+    # It is proved after every checkpoint entry and before anything is placed: a workspace this
+    # claim built is put on the reviewed heads, and one it found is proved in place, because its
+    # reviewed checkouts may already hold the recorded work. Either way the recorded base of a
+    # reviewed repository must BE its reviewed head.
+    def prepare(measuring:, creating:, download:, branch:, target: nil)
       payload = download.call
-      restore(payload, creating: creating, measuring: measuring)
+      checked = Checkpoint.check(checkpoint, payload: payload)
+      return Prepared.new(reason: checked.reason) unless checked.ok?
+
+      worktree = measuring.existing || creating.create
+      proof = nil
+      restored = Checkpoint.restore(checkpoint, payload: payload, task_root: worktree.path, branch: branch,
+                                                created: worktree.created?) do
+        proof = target && target_proof(target, worktree)
+      end
+      restored.ok? ? continued(worktree, proof) : Prepared.new(reason: restored.reason)
     rescue PlatformClient::Error => e
       Prepared.new(reason: "the recorded checkpoint could not be downloaded: #{Redaction.redact(e.message)}")
     rescue Workspace::Error => e
@@ -87,31 +93,22 @@ module SpecrelayRunner
 
     attr_reader :block
 
-    def checkpoint = block["checkpoint"].to_h
+    def target_proof(target, worktree)
+      return target.materialize(worktree_path: worktree.path, created: true, recorded_bases: recorded_bases) if
+        worktree.created?
 
-    # This machine still holds the work. `create` deliberately refuses an existing worktree with
-    # uncommitted changes, which is the one state this path requires, so the worktree is READ and
-    # remeasured rather than rebuilt.
-    def reuse(found, measuring)
-      proof = Checkpoint.verify(checkpoint, task_root: found.path, workspace: measuring)
-      proof.ok? ? Prepared.new(worktree: found) : Prepared.new(reason: proof.reason)
+      held = recorded_bases.keys.map { |path| File.join(worktree.path, path) }
+      target.prove(worktree_path: worktree.path, held: held, recorded_bases: recorded_bases)
     end
 
-    # This machine has never seen the work. The task workspace is built by the PROJECT's own
-    # command — the same one an ordinary first execution uses — and the recorded repositories are
-    # restored into it, each proven clean at its recorded base first.
-    #
-    # Whether that command really BUILT the environment travels with the restore, because it is
-    # the only thing that says a checkout it left detached is this claim's own and holds nothing:
-    # a project whose task environment is several independent repositories prepares its components
-    # that way, and without this the continuation would refuse the environment it had just created.
-    # `create` can also return an existing clean worktree, which this claim did not build and which
-    # is therefore never placed.
-    def restore(payload, creating:, measuring:)
-      created = creating.create
-      restored = Checkpoint.restore(checkpoint, payload: payload, task_root: created.path,
-                                                workspace: measuring, created: created.created?)
-      restored.ok? ? Prepared.new(worktree: created) : Prepared.new(reason: restored.reason)
+    # Each recorded repository's path in the task workspace, with the base its work was recorded on.
+    def recorded_bases = checkpoint["repositories"].to_a.to_h { |entry| [ entry["path"].to_s, entry["base_sha"].to_s ] }
+
+    # The report's base commit is the task-workspace repository's: its reviewed head, else its
+    # recorded base when the checkpoint moved it there, else where the workspace already stood.
+    def continued(worktree, proof)
+      base = proof&.head_commit || recorded_bases["."] || worktree.base_commit
+      Prepared.new(worktree: Workspace::Info.new(path: worktree.path, created: worktree.created?, base_commit: base))
     end
 
     def context_lines

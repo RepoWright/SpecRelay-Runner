@@ -420,8 +420,7 @@ def base_claim_payload(task_id:, worktree_create_command: nil, root: nil,
         "remaining_work" => "the work still remaining",
         "do_not_repeat" => "the work that must not be repeated"
       },
-      "reserved_option_key" => "other",
-      "wait_seconds" => 600
+      "reserved_option_key" => "other"
     },
     # MVP-0035: Platform assigns the round, so `round_number` travels with the label rather than
     # being a constant the runner holds.

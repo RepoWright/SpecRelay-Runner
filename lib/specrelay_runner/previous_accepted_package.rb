@@ -103,7 +103,9 @@ module SpecrelayRunner
       end
     end
 
-    # `[branch, commit]` from `ls-remote --symref origin HEAD`, or nil when either is absent.
+    # `[branch, commit]` from `ls-remote --symref origin HEAD`, or nil when either is absent. Also
+    # the base of a checkpointed repository that has no upstream, so both read the default branch
+    # the same way.
     def self.default_branch_tip(root, git)
       result = git.run(root, [ "ls-remote", "--symref", Review::Checkout::Git::REMOTE, "HEAD" ])
       return nil unless result&.exit_code.to_i&.zero?
@@ -120,7 +122,7 @@ module SpecrelayRunner
     rescue SystemCallError
       "."
     end
-    private_class_method :default_branch_tip, :relative
+    private_class_method :relative
 
     # The record, in the task root's own git directory, that the run owning this environment has
     # placed it. The provider only ever starts after placement, so only a placed environment can
