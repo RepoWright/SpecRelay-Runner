@@ -188,7 +188,9 @@ class QuestionResumeTest < Minitest::Test
     entry = checkpoint["repositories"].fetch(0)
     assert_equal ".", entry["path"]
     assert_equal "SpecRelay/tiny-demo-workspace", entry["origin"]
-    assert_equal "refs/heads/main", entry["base_ref"]
+    # The workspace repository carries the approved specification, so its base is the specification
+    # head placement decided, named by the task branch it was placed on.
+    assert_equal "refs/heads/#{TASK}", entry["base_ref"]
     assert_equal git_output(@bare, "rev-parse", "refs/heads/main"), entry["base_sha"]
     assert_equal entry["snapshot_sha"], git_output(@bare, "rev-parse", entry["checkpoint_ref"])
     assert_match(/\A[0-9a-f]{64}\z/, entry["change_digest"])

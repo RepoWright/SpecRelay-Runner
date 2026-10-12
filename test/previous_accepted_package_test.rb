@@ -2,6 +2,7 @@
 
 require_relative "test_helper"
 require "open3"
+require "yaml"
 
 # MAPIAI-87 proof for continuing an IMPLEMENTATION run from the ticket's previous accepted
 # package, against a real project-owned task workspace, real independent git repositories, real
@@ -252,7 +253,7 @@ class PreviousAcceptedPackageTest < Minitest::Test
     @config_path = write_config
   end
 
-  def write_config
+  def write_config(root = @root)
     path = File.join(Dir.mktmpdir("cfg"), "runner.yml")
     File.write(path, <<~YAML)
       platform:
@@ -264,7 +265,7 @@ class PreviousAcceptedPackageTest < Minitest::Test
         claim_policy:
           mode: all_eligible
       workspace_roots:
-        tiny-demo-workspace: #{@root}
+        tiny-demo-workspace: #{root}
     YAML
     path
   end
@@ -552,6 +553,75 @@ class PreviousAcceptedPackageTest < Minitest::Test
     refute_path_exists File.join(task_root, "leftover.txt")
     refute_path_exists File.join(task_root, "upstream.txt")
     ([ "." ] + MultiRepositoryWorkspace::COMPONENTS).each { |name| assert_equal TASK, branch_of(task_root, name) }
+  end
+
+  # Each authority's own branch: the stored default branch for the workspace repository, the
+  # accepted pull request's branch, and the task branch for the approved specification head.
+  def decided(task_root, heads)
+    heads.map do |name, commit|
+      { repository: slug_for(name), path: File.realpath(repo_path(task_root, name)), commit: commit,
+        ref: name == "." ? "refs/heads/main" : "refs/heads/#{TASK}" }
+    end.sort_by { |base| base[:repository] }
+  end
+
+  # Scenarios 2–3 for a question's checkpoint: the decision that placed every contained repository
+  # is also its checkpoint base — the accepted heads, the approved specification head, and each
+  # other repository's stored base — whichever entry point placed it, and never a default-branch
+  # tip that moved on afterwards.
+  def test_the_decided_heads_of_every_contained_repository_are_its_checkpoint_bases
+    task_root = create_task_workspace
+    anchor = specification_anchor(task_root)
+    bases = resolved_bases(task_root)
+    stored_root = bases.find { |base| base["repository"] == @root_slug }["commit"]
+    advance_remote_main(".")
+    advance_remote_main("component-a")
+
+    placed = materializer.materialize(task_root: task_root, specification: anchor, initial_bases: bases)
+    reconciled = materializer.reconcile(task_root: task_root, specification: anchor, initial_bases: bases)
+
+    expected = decided(task_root, "." => stored_root, "component-a" => @heads.fetch("component-a"),
+                                  "component-b" => @heads.fetch("component-b"), "component-c" => anchor[:head])
+    [ placed, reconciled ].each do |result|
+      assert result.ok?, result.reason
+      assert_equal expected, result.bases.sort_by { |base| base[:repository] }
+    end
+  end
+
+  # A resumed question's restored repository keeps the base its work was recorded on. That base
+  # must BE the head this owner decides; the restored work is never placed over, and every other
+  # repository is placed as usual.
+  def test_a_restored_repository_keeps_its_recorded_base_and_its_work
+    task_root = create_task_workspace
+    bases = resolved_bases(task_root)
+    restored = File.join(task_root, "component-a")
+    DemoWorkspace.git(restored, "fetch", "-q", "origin", TASK)
+    DemoWorkspace.git(restored, "reset", "-q", "--hard", @heads.fetch("component-a"))
+    File.write(File.join(restored, "app.txt"), "restored work\n")
+    recorded = [ recorded_entry("component-a", @heads.fetch("component-a")) ]
+
+    result = materializer.materialize(task_root: task_root, initial_bases: bases, recorded: recorded)
+
+    assert result.ok?, result.reason
+    assert_equal "restored work\n", File.read(File.join(restored, "app.txt"))
+    assert_equal @heads.fetch("component-b"), head_of(task_root, "component-b")
+    assert_includes result.bases, decided(task_root, "component-a" => @heads.fetch("component-a")).first
+  end
+
+  def test_a_recorded_base_that_is_not_the_decided_head_refuses_before_placement
+    task_root = create_task_workspace
+    bases = resolved_bases(task_root)
+    before = heads_of(task_root)
+    recorded = [ recorded_entry("component-a", remote_main("component-a")) ]
+
+    result = materializer.materialize(task_root: task_root, initial_bases: bases, recorded: recorded)
+
+    refute result.ok?
+    assert_match(/"component-a" was recorded on #{remote_main('component-a')[0, 12]}, not on the accepted head/, result.reason)
+    assert_equal before, heads_of(task_root), "nothing was placed"
+  end
+
+  def recorded_entry(name, base)
+    { "path" => name, "origin" => slug_for(name), "base_sha" => base, "base_ref" => "refs/heads/#{TASK}" }
   end
 
   def test_the_resolved_set_names_every_contained_repository_at_its_remote_default_branch_tip
@@ -909,5 +979,299 @@ class PreviousAcceptedPackageTest < Minitest::Test
     observed.first.each_value { |branch, _head| assert_equal TASK, branch }
     assert_equal @heads.fetch("component-b"), observed.first.fetch("component-b").last
     assert core_started?
+  end
+
+  # --- a question on the accepted continuation --------------------------------------------------
+
+  QUESTION = {
+    "questions" => [ { "prompt" => "Which component owns the total?" } ],
+    "continuation_context" => {
+      "progress" => "the first edit landed", "changed_areas" => "component-a/app.txt",
+      "why_it_matters" => "ownership decides where the rule lives", "next_step" => "apply the rule",
+      "remaining_work" => "the rule and its tests", "do_not_repeat" => "the first edit"
+    }
+  }.freeze
+
+  def question_submissions = @platform.question_submissions
+  def checkpoint_entries(submission) = submission[:body]["checkpoint"]["repositories"].to_h { |e| [ e["path"], e ] }
+
+  # Changes every kind of file in the workspace repository, an accepted repository and the
+  # specification repository, then asks. A resumed session records what it was handed, outside
+  # the task workspace, changes one more file and asks again.
+  def question_executor
+    path = File.join(Dir.mktmpdir("specrelay-question-"), "question-executor")
+    @clones << File.dirname(path)
+    File.write(path, <<~'RUBY')
+      #!/usr/bin/env ruby
+      # frozen_string_literal: true
+      require "yaml"
+      prompt = File.read(ARGV.last.to_s)
+      request = prompt[%r{`([^`]*/question-request\.json)`}, 1]
+      abort "[question-executor] the prompt named no bridge" if request.nil?
+
+      if prompt.include?("## Answers to your earlier questions")
+        File.write(ENV.fetch("FAKE_OBSERVED"), YAML.dump(%w[. component-a component-b component-c].to_h do |repo|
+          [ repo, { "branch" => `git -C #{repo} branch --show-current`.strip, "head" => `git -C #{repo} rev-parse HEAD`.strip,
+                    "accepted" => File.file?(File.join(repo, "accepted.txt")),
+                    "status" => `git -C #{repo} status --porcelain --untracked-files=all`.lines.map(&:strip).sort } ]
+        end))
+        File.write("component-a/app.txt", "#{File.read('component-a/app.txt')}resumed by the provider\n")
+        puts "[question-executor] resumed and asking again"
+      else
+        File.write("workspace.txt", "#{File.read('workspace.txt')}interrupted\n")
+        File.write("component-a/app.txt", "#{File.read('component-a/app.txt')}interrupted\n")
+        File.binwrite("component-a/logo.bin", "\x00\x01\xFF".b)
+        File.chmod(0o755, "component-a/app.txt")
+        File.delete("component-a/bin/revert-it")
+        File.write("component-c/app.txt", "#{File.read('component-c/app.txt')}interrupted\n")
+        puts "[question-executor] edited before asking"
+      end
+      File.write("#{request}.partial", ENV.fetch("FAKE_EXECUTOR_QUESTION_JSON"))
+      File.rename("#{request}.partial", request)
+      deadline = Time.now + 20
+      sleep 0.05 until Time.now > deadline
+    RUBY
+    FileUtils.chmod(0o755, path)
+    path
+  end
+
+  # Placement's stored set is the remote default branches as they were; every origin then moves
+  # on, so its advertised tip is in no placed checkout's history — the observed incident.
+  def ask_on_an_advanced_main(gh_dir)
+    start(continuation_block: continuation)
+    use_fixture(fixture_dir, question_executor, env: { "FAKE_EXECUTOR_QUESTION_JSON" => QUESTION.to_json })
+    @platform.initial_bases = ([ "." ] + MultiRepositoryWorkspace::COMPONENTS).map do |name|
+      { "repository" => slug_for(name), "default_branch" => "main", "commit" => remote_main(name) }
+    end
+    [ ".", "component-a", "component-c" ].each { |name| advance_remote_main(name) }
+    run_cli(gh_dir)
+  end
+
+  # The observed chain, closed at its first link: an accepted continuation asks after the origin's
+  # main moved on, and the question is checkpointed on the bases placement decided — the stored
+  # base, the accepted head and the approved specification head — instead of failing capture.
+  def test_a_question_after_main_moved_is_checkpointed_on_the_decided_bases
+    gh_dir, = gh_bin
+
+    code, output = ask_on_an_advanced_main(gh_dir)
+
+    assert_equal 0, code, output
+    assert_includes output, "[question-executor] edited before asking"
+    assert_match(/awaiting_input/, output)
+    assert_empty @platform.capture_failures, output
+    entries = checkpoint_entries(question_submissions.first)
+    assert_equal %w[. component-a component-c], entries.keys.sort
+    assert_equal @platform.initial_bases.find { |b| b["repository"] == @root_slug }["commit"], entries["."]["base_sha"]
+    assert_equal @heads.fetch("component-a"), entries["component-a"]["base_sha"]
+    assert_equal @payload.dig("specification_package", "head_sha"), entries["component-c"]["base_sha"]
+    entries.each do |name, entry|
+      files = DemoWorkspace.git(bare_of(name), "ls-tree", "-r", "--name-only", entry["snapshot_sha"])
+      refute_includes files, "upstream.txt", "#{name}'s checkpoint imported its origin's later commits"
+    end
+    assert_empty @platform.requests_to("/api/runner/reports")
+  end
+
+  # Scenario 5 — the answered question continues on a machine that never held the work. The fresh
+  # workspace gets the recorded work on its recorded bases, the untouched accepted repository at
+  # its accepted head, and the session's next question is checkpointed on the same bases.
+  def test_a_fresh_machine_restores_the_accepted_work_and_asks_again_on_the_same_bases
+    gh_dir, = gh_bin
+    DemoWorkspace.git(File.join(@root, "component-c"), "push", "-q", "origin", "HEAD:refs/heads/spec-#{TASK}")
+    code, output = ask_on_an_advanced_main(gh_dir)
+    assert_equal 0, code, output
+    first = question_submissions.first[:body]["checkpoint"]
+    stored = @platform.initial_bases
+
+    second = second_machine
+    observed = File.join(Dir.mktmpdir("specrelay-observed-"), "observed.yml")
+    @clones << File.dirname(observed)
+    use_fixture(fixture_dir, question_executor,
+                env: { "FAKE_EXECUTOR_QUESTION_JSON" => QUESTION.to_json, "FAKE_OBSERVED" => observed })
+    resume_on(second, first, stored)
+    code, output = run_cli(gh_dir)
+
+    assert_equal 0, code, output
+    assert_includes output, "[question-executor] resumed and asking again"
+    handed = YAML.safe_load(File.read(observed))
+    first_entries = first["repositories"].to_h { |entry| [ entry["path"], entry ] }
+    first_entries.each do |name, entry|
+      assert_equal [ TASK, entry["base_sha"] ], handed.fetch(name).values_at("branch", "head")
+    end
+    assert_equal [ TASK, @heads.fetch("component-b"), [] ], handed.fetch("component-b").values_at("branch", "head", "status")
+    assert handed.fetch("component-a")["accepted"], "the accepted code is in the fresh workspace"
+    assert handed.fetch("component-b")["accepted"]
+    assert_equal [ "?? logo.bin", "D bin/revert-it", "M app.txt" ], handed.fetch("component-a")["status"]
+    assert_equal 0o755, File.stat(File.join(MultiRepositoryWorkspace.task_workspace(second, TASK), "component-a", "app.txt")).mode & 0o777
+    again = checkpoint_entries(question_submissions.first)
+    assert_equal first_entries.transform_values { |e| e["base_sha"] }, again.transform_values { |e| e["base_sha"] }
+    assert_empty @platform.capture_failures, output
+  end
+
+  # A machine holding the same project, answered by the SAME remotes the first one pushed to.
+  def second_machine
+    second = File.join(Dir.mktmpdir("specrelay-accepted-second-"), "workspace")
+    @clones << File.dirname(second)
+    clone_from(bare_of("."), second, "multi-demo-workspace")
+    MultiRepositoryWorkspace.write_project_command(second, MultiRepositoryWorkspace::COMPONENTS)
+    MultiRepositoryWorkspace::COMPONENTS.each { |name| clone_from(bare_of(name), File.join(second, name), name) }
+    second
+  end
+
+  def clone_from(bare, target, name)
+    system("git", "clone", "-q", bare, target, exception: true)
+    { "user.email" => "runner@example.test", "user.name" => "Runner Test", "commit.gpgsign" => "false" }
+      .each { |key, value| DemoWorkspace.git(target, "config", key, value) }
+    DemoWorkspace.git(target, "remote", "set-url", "origin", "git@github.com:SpecRelay/#{name}.git")
+    FakeGithub.serve_locally(target, bare)
+  end
+
+  # The same run claimed again with the answers and the recorded manifest, and the stored set
+  # Platform answers every later attempt with.
+  def resume_on(root, checkpoint, stored)
+    @platform.stop
+    payload = @payload.merge(
+      "resume" => { "question_id" => "exq_fake",
+                    "checkpoint" => checkpoint.except("payload")
+                                              .merge("download_path" => "/api/runner/executor_questions/exq_fake/checkpoint"),
+                    "continuation_context" => QUESTION["continuation_context"], "questions" => QUESTION["questions"],
+                    "answers" => [ { "text" => "component-a owns it." } ] }
+    )
+    @platform = FakePlatform.new(claim_payload: payload).start
+    @platform.checkpoint_payload = checkpoint["payload"]
+    @platform.delivery_response = [ 200, { question: { id: "exq_fake", state: "RESUMED" } } ]
+    @platform.initial_bases = stored
+    @config_path = write_config(root)
+  end
+
+  # --- a resumed checkpoint is proved against the decided inputs before it is placed -------------
+
+  # The answered checkpoint with component-a's work re-recorded on the accepted head's PARENT — the
+  # earlier main commit a pre-correction capture could choose — and every other term valid: the
+  # ref exists, the snapshot's sole parent is that base and the digest matches.
+  def recorded_on_the_earlier_main(checkpoint)
+    entries = Marshal.load(Marshal.dump(checkpoint["repositories"]))
+    entry = entries.find { |row| row["path"] == "component-a" }
+    repo = File.join(MultiRepositoryWorkspace.task_workspace(@root, TASK), "component-a")
+    earlier = DemoWorkspace.git(repo, "rev-parse", "#{@heads.fetch('component-a')}^").strip
+    tree = DemoWorkspace.git(repo, "rev-parse", "#{entry['snapshot_sha']}^{tree}").strip
+    snapshot = DemoWorkspace.git(repo, "commit-tree", tree, "-p", earlier, "-m", "checkpoint on the earlier main").strip
+    ref = "refs/heads/runner-checkpoints/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+    DemoWorkspace.git(repo, "push", "-q", "origin", "#{snapshot}:#{ref}")
+    entry.merge!("base_sha" => earlier, "base_ref" => "refs/heads/main", "snapshot_sha" => snapshot,
+                 "checkpoint_ref" => ref,
+                 "change_digest" => SpecrelayRunner::Checkpoint.change_digest(repo, earlier, tree))
+    sealed = SpecrelayRunner::Checkpoint.seal(entries)
+    raise sealed.error unless sealed.ok?
+
+    [ sealed.checkpoint, earlier ]
+  end
+
+  # Every branch, HEAD, index, status and working-tree byte of each repository in a task workspace.
+  def destination_state(task_root)
+    ([ "." ] + MultiRepositoryWorkspace::COMPONENTS).to_h do |name|
+      dir = repo_path(task_root, name)
+      files = Dir.glob("**/*", File::FNM_DOTMATCH, base: dir).reject { |e| e == ".git" || e.start_with?(".git/") || e.end_with?("/.") }
+      [ name, [ DemoWorkspace.git(dir, "branch", "--show-current"), DemoWorkspace.git(dir, "rev-parse", "HEAD"),
+                DemoWorkspace.git(dir, "ls-files", "--stage"),
+                DemoWorkspace.git(dir, "status", "--porcelain", "--untracked-files=all", "--ignored"),
+                files.sort.map { |e| full = File.join(dir, e); File.file?(full) ? [ e, File.stat(full).mode, File.binread(full) ] : [ e ] } ] ]
+    end
+  end
+
+  # The resumed run, with the destination recorded at the moment `Checkpoint.restore` is entered:
+  # after the workspace was created or found and before any checkpoint placement could begin.
+  def resume_observing_restore(gh_dir)
+    observe = method(:destination_state)
+    entered = []
+    original = SpecrelayRunner::Checkpoint.method(:restore)
+    SpecrelayRunner::Checkpoint.define_singleton_method(:restore) do |*args, **kwargs, &block|
+      entered << observe.call(kwargs.fetch(:task_root))
+      original.call(*args, **kwargs, &block)
+    end
+    code, output = run_cli(gh_dir)
+    [ code, output, entered ]
+  ensure
+    SpecrelayRunner::Checkpoint.define_singleton_method(:restore, original)
+  end
+
+  # Nothing past the refusal: no provider, no acknowledged delivery, no question, report or
+  # publication, and no release of the task environment.
+  def assert_refused_before_anything_ran(destination_root, output)
+    refute_includes output, "[question-executor] resumed"
+    refute @platform.protocol_events.any? { |event| event["event_type"] == "core.started" }
+    assert_empty @platform.delivery_acknowledgements
+    assert_empty @platform.executor_questions
+    assert_empty @platform.requests_to("/api/runner/reports")
+    log = File.join(destination_root, ".runs", "worktree.log")
+    refute_match(/^release /, File.exist?(log) ? File.read(log) : "", "the task environment was released")
+  end
+
+  def asked_once(gh_dir)
+    DemoWorkspace.git(File.join(@root, "component-c"), "push", "-q", "origin", "HEAD:refs/heads/spec-#{TASK}")
+    code, output = ask_on_an_advanced_main(gh_dir)
+    assert_equal 0, code, output
+    [ question_submissions.first[:body]["checkpoint"], @platform.initial_bases ]
+  end
+
+  # A fresh machine: the checkpoint's base disagrees with the accepted head, so the resume refuses
+  # with every repository exactly as the workspace was built.
+  def test_a_checkpoint_on_another_base_is_refused_before_a_fresh_machine_places_it
+    gh_dir, = gh_bin
+    checkpoint, stored = asked_once(gh_dir)
+    mismatched, earlier = recorded_on_the_earlier_main(checkpoint)
+    second = second_machine
+    resume_on(second, mismatched, stored)
+
+    code, output, entered = resume_observing_restore(gh_dir)
+
+    refute_equal 0, code, output
+    assert_match(/"component-a" was recorded on #{earlier[0, 12]}, not on the accepted head/, output)
+    assert_equal 1, entered.length, output
+    assert_equal entered.first, destination_state(MultiRepositoryWorkspace.task_workspace(second, TASK)),
+                 "the refused checkpoint changed the fresh workspace"
+    assert_refused_before_anything_ran(second, output)
+  end
+
+  # The machine that asked: its task workspace still holds the work, and a refused checkpoint
+  # neither resets it onto the other base nor rewrites a file.
+  def test_a_checkpoint_on_another_base_is_refused_before_the_asking_machine_places_it
+    gh_dir, = gh_bin
+    checkpoint, stored = asked_once(gh_dir)
+    mismatched, earlier = recorded_on_the_earlier_main(checkpoint)
+    task_root = MultiRepositoryWorkspace.task_workspace(@root, TASK)
+    resume_on(@root, mismatched, stored)
+
+    code, output, entered = resume_observing_restore(gh_dir)
+
+    refute_equal 0, code, output
+    assert_match(/"component-a" was recorded on #{earlier[0, 12]}, not on the accepted head/, output)
+    assert_equal 1, entered.length, output
+    assert_equal entered.first, destination_state(task_root), "the refused checkpoint changed the asking workspace"
+    assert_equal @heads.fetch("component-a"), head_of(task_root, "component-a")
+    assert_refused_before_anything_ran(@root, output)
+  end
+
+  # Inputs the resume cannot fully decide — a stored set missing a contained repository, or naming
+  # one this workspace does not hold — refuse at the same boundary, before any placement.
+  def test_an_incomplete_or_foreign_stored_set_is_refused_before_a_resume_places_anything
+    gh_dir, = gh_bin
+    checkpoint, stored = asked_once(gh_dir)
+    {
+      "no initial base is stored for the contained repository" =>
+        stored.reject { |base| base["repository"] == @root_slug },
+      "is not a repository of the prepared task workspace" =>
+        stored + [ { "repository" => "SpecRelay/elsewhere", "default_branch" => "main", "commit" => "0" * 40 } ]
+    }.each do |reason, set|
+      second = second_machine
+      resume_on(second, checkpoint, set)
+
+      code, output, entered = resume_observing_restore(gh_dir)
+
+      refute_equal 0, code, "#{reason}: #{output}"
+      assert_includes output, reason
+      assert_equal 1, entered.length, output
+      assert_equal entered.first, destination_state(MultiRepositoryWorkspace.task_workspace(second, TASK)), reason
+      assert_refused_before_anything_ran(second, output)
+    end
   end
 end

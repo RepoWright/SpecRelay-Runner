@@ -57,7 +57,12 @@ module SpecrelayRunner
     # claim built is put on the reviewed heads, and one it found is proved in place, because its
     # reviewed checkouts may already hold the recorded work. Either way the recorded base of a
     # reviewed repository must BE its reviewed head.
-    def prepare(measuring:, creating:, download:, branch:, target: nil)
+    #
+    # `inputs` is the same step for an ORDINARY continuation: called with the workspace at that
+    # point, it answers whether the run's own inputs agree with every recorded base, placing only
+    # the repositories the checkpoint does not record. A disagreement refuses before any recorded
+    # work is placed.
+    def prepare(measuring:, creating:, download:, branch:, target: nil, inputs: nil)
       payload = download.call
       checked = Checkpoint.check(checkpoint, payload: payload)
       return Prepared.new(reason: checked.reason) unless checked.ok?
@@ -66,9 +71,9 @@ module SpecrelayRunner
       proof = nil
       restored = Checkpoint.restore(checkpoint, payload: payload, task_root: worktree.path, branch: branch,
                                                 created: worktree.created?) do
-        proof = target && target_proof(target, worktree)
+        proof = target ? target_proof(target, worktree) : inputs&.call(worktree)
       end
-      restored.ok? ? continued(worktree, proof) : Prepared.new(reason: restored.reason)
+      restored.ok? ? continued(worktree, target && proof) : Prepared.new(reason: restored.reason)
     rescue PlatformClient::Error => e
       Prepared.new(reason: "the recorded checkpoint could not be downloaded: #{Redaction.redact(e.message)}")
     rescue Workspace::Error => e

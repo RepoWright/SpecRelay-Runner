@@ -73,15 +73,24 @@ module SpecrelayRunner
     # stored. `reviewed` are the claim's reviewed targets, whose exact heads are their bases; the
     # caller has already proved them against their pull requests.
     #
+    # `decided`, when given, is the base placement DECIDED for every contained repository
+    # ({PreviousAcceptedPackage::Result#bases}), and then no base is read from an origin at all:
+    # the set must name each contained repository exactly once, by its own identity.
+    #
     # The manifest is sealed and checked against the contract's bounds BEFORE anything is pushed.
     # All or nothing: when one push fails, the refs this capture created are removed, and any that
     # cannot be removed are named as orphans.
-    def capture(task_root:, reviewed: [], id: SecureRandom.uuid)
+    def capture(task_root:, reviewed: [], decided: nil, id: SecureRandom.uuid)
       contained = ContainedRepositories.discover(task_root)
       return refuse_capture(contained.error) unless contained.ok?
 
-      bases = reviewed_bases(reviewed, task_root)
+      bases = decided_bases(decided, contained, task_root)
       return refuse_capture(bases) if bases.is_a?(String)
+
+      heads = reviewed_bases(reviewed, task_root)
+      return refuse_capture(heads) if heads.is_a?(String)
+
+      bases = bases.merge(heads)
 
       snapshots = []
       contained.roots.each do |root|
@@ -119,8 +128,8 @@ module SpecrelayRunner
     #
     # Every entry is proved first — its ref, its snapshot's parent and digest, and its destination
     # checkout — and every repository the manifest does not name must be clean. The block, when
-    # given, is the caller's own proof for the claim's reviewed targets; it runs after all of
-    # these and before any repository is placed. Objects fetched during the proof may remain; no
+    # given, is the caller's own proof that the recorded bases are the claim's inputs; it runs
+    # after all of these and before any repository is placed. Objects fetched during the proof may remain; no
     # ref, HEAD, index or file changes until the whole set has passed.
     #
     # `created` says THIS attempt built the task workspace, so a clean checkout in it holds nothing
@@ -173,6 +182,30 @@ module SpecrelayRunner
       end
     end
 
+    # The decided base of every contained repository, keyed like {reviewed_bases}, or the reason the
+    # set cannot be trusted. A missing, repeated or foreign entry, or one whose checkout declares
+    # another identity, refuses: guessing a base for it is how a snapshot drops commits.
+    def decided_bases(decided, contained, task_root)
+      return {} if decided.nil?
+
+      bases = Array(decided).each_with_object({}) do |base, acc|
+        root = real(base[:path])
+        subject = quoted(base[:repository])
+        return "the base decided for #{subject} is malformed" unless
+          COMMIT_SHA.match?(base[:commit].to_s) && base[:ref].to_s.start_with?("refs/heads/")
+        return "the base decided for #{subject} is not a repository of the task workspace" unless contained.roots.include?(root)
+
+        local = quoted(relative(task_root, root))
+        return "two bases were decided for #{local}" if acc.key?(root)
+        return "the origin of #{local} is not #{subject}, the repository its base was decided for" unless
+          GithubRemote.slug(capture_git(root, %w[remote get-url origin])).to_s.casecmp?(base[:repository].to_s)
+
+        acc[root] = [ base[:commit], base[:ref] ]
+      end
+      missing = contained.roots.find { |root| !bases.key?(root) }
+      missing ? "no base was decided for #{quoted(relative(task_root, missing))}" : bases
+    end
+
     # `[root, entry]` for a changed repository, nil for an unchanged one, or the reason this
     # repository cannot be checkpointed — which refuses the whole question, because silently
     # omitting a changed repository would lose its work.
@@ -189,8 +222,8 @@ module SpecrelayRunner
       return "could not read the working tree of #{quoted(relative)}" if tree.nil?
       return nil if unchanged?(root, tree, base_sha)
       # The snapshot's tree replaces everything on its base, so a base this checkout does not
-      # descend from would silently revert the origin's commits that never reached it.
-      return "#{quoted(relative)} does not contain its origin's #{base_ref} at #{base_sha[0, 12]}; a checkpoint " \
+      # descend from would silently revert the base's commits that never reached it.
+      return "#{quoted(relative)} does not contain its base #{base_ref} at #{base_sha[0, 12]}; a checkpoint " \
              "on that base would drop those commits" unless ancestor?(root, base_sha, "HEAD")
 
       entry(root, relative, origin, [ base_sha, base_ref ], tree, ref)
