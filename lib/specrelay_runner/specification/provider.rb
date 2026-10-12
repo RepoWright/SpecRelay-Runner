@@ -201,6 +201,14 @@ module SpecrelayRunner
             "Dependencies and assumptions", Analysis. Each needs real content under it — a heading
             with nothing under it is rejected.
 
+            SCOPE — spec.md specifies ONE bounded, complete deliverable. Never split Proposed
+            behavior into enumerated executable parts: a sub-heading there must not begin with a
+            numbered label such as "Slice 1", "Phase 2", "Part B", "Stage II" or "1.", whatever
+            the label word. Unnumbered sub-headings that organise one deliverable are fine. Platform
+            refuses to approve a specification with two or more such headings. When the request
+            cannot fit one deliverable, record ONE blocking open question asking the Product Owner
+            to reduce the scope or split the ticket, instead of planning several parts.
+
             #{PackagePath::INPUT_EVIDENCE_MD} — one compact `##` entry per SUPPORTING input (a Jam
             recording, screenshot, Confluence page, log, attachment, external link, or linked Jira
             issue) named in the evidence below — never the ticket's own description or comments,
