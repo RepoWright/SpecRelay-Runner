@@ -42,7 +42,11 @@ module SpecrelayRunner
   # thing. What this DOES check is that the branch Publication was assigned is the recorded one,
   # because those two facts reach the runner separately.
   class ContinuedTarget
-    Result = Struct.new(:ok, :reason, :head_commit, keyword_init: true) do
+    # `invalid` is a refusal that PROVES the target can no longer be continued — the package
+    # contradicts itself, or GitHub or the remote branch established that the pull request moved
+    # or is no longer an open one of this repository. A refusal without it only failed to prove
+    # the target: a remote or pull request that could not be read, or local checkout state.
+    Result = Struct.new(:ok, :reason, :head_commit, :invalid, keyword_init: true) do
       def ok? = ok
     end
 
@@ -50,6 +54,10 @@ module SpecrelayRunner
     # them here, and it matters: an operator reading "not to the reviewed branch" about a restart
     # would go looking for a review that does not exist.
     NOUNS = { "rework" => "reviewed", "restart" => "recorded", "rebase" => "accepted" }.freeze
+
+    # The `holding` of {#prove_remote}: no checkout's local state is asked about.
+    ANYWHERE = :anywhere
+    private_constant :ANYWHERE
 
     # A reviewed pull request's own address, which names the repository it belongs to.
     PULL_REQUEST_URL = %r{\Ahttps://github\.com/([^/\s]+/[^/\s]+)/pull/\d+\z}i
@@ -130,6 +138,30 @@ module SpecrelayRunner
       Result.new(ok: true, head_commit: root_head(planned, worktree_path))
     end
 
+    # {#prove} without its local half: every identity, branch, remote-head and pull-request fact,
+    # changing nothing, while each checkout's own HEAD and uncommitted work are left to the
+    # answered question's checkpoint — a Rebase run's asking session may already have rebased them
+    # onto main, so their HEAD is no longer the recorded head.
+    def prove_remote(worktree_path:, git: Review::Checkout::Git)
+      return Result.new(ok: true) if targets.empty?
+
+      planned = plan(worktree_path, false, git, holding: ANYWHERE)
+      planned.is_a?(Result) ? planned : Result.new(ok: true)
+    end
+
+    # Each continued repository already in main, as `[root, commit]`: where it is in this task
+    # workspace and the exact recorded commit it continues. Unresolvable ones are absent, because
+    # placement has already refused them.
+    def already_in_main(worktree_path, git: Review::Checkout::Git)
+      targets.select { |repository| in_main?(repository) }.filter_map do |repository|
+        root = Review::Checkout.resolve(repository, worktree_path, git).root
+        root && [ root, repository["head_commit"].to_s ]
+      end
+    end
+
+    # The keys of the continued repositories already in main, which the executor must report again.
+    def in_main_keys = targets.select { |repository| in_main?(repository) }.map { |repository| repository["repository_key"] }
+
     private
 
     attr_reader :targets, :publication_branch, :noun, :pull_request_env, :every_blocker
@@ -141,15 +173,15 @@ module SpecrelayRunner
     def plan(worktree_path, created, git, holding: nil, bases: {})
       seen = []
       planned = []
-      blockers = []
+      refused = []
       targets.each do |repository|
         step = plan_one(repository, worktree_path, created, git, holding, seen)
         if !step.is_a?(Result) then planned << step
-        elsif every_blocker then blockers << blocker_line(repository, step.reason)
+        elsif every_blocker then refused << [ repository, step ]
         else return step
         end
       end
-      return every_blocker_refusal(blockers) if blockers.any?
+      return every_blocker_refusal(refused) if refused.any?
 
       base_refusal(planned, bases, worktree_path) || planned
     end
@@ -172,11 +204,15 @@ module SpecrelayRunner
 
     # One line per blocked pull request: its repository, its address and the precise reason.
     def blocker_line(repository, reason)
-      "- #{repository['repository_key']} #{repository['pull_request_url']}: #{reason}"
+      "- #{repository['repository_key']} #{repository['pull_request_url']}: #{reason.to_s.chomp('.')}"
     end
 
-    def every_blocker_refusal(blockers)
-      refuse("#{blockers.length} of #{targets.length} #{noun} pull requests block this run:\n#{blockers.join("\n")}")
+    # Each line also ends in a separator, so the list still reads where its line breaks are not kept.
+    # The set is proved invalid when any one blocker is, and every blocker is still named.
+    def every_blocker_refusal(refused)
+      lines = refused.map { |repository, step| blocker_line(repository, step.reason) }
+      Result.new(ok: false, invalid: refused.any? { |_repository, step| step.invalid },
+                 reason: "#{refused.length} of #{targets.length} #{noun} pull requests block this run:\n#{lines.join(";\n")}")
     end
 
     # The mutation, once the whole set has passed. Each repository moves to its OWN recorded head:
@@ -202,7 +238,7 @@ module SpecrelayRunner
     # identity against, and that is refused here rather than reported as a remote mismatch.
     def resolve(repository, worktree_path, git)
       key = repository["repository_key"].to_s
-      return refuse("the #{noun} repository '#{key}' records no remote to prove identity against") if
+      return invalid("the #{noun} repository '#{key}' records no remote to prove identity against") if
         Review::Checkout.identity(repository["clone_url"]).empty?
 
       resolution = Review::Checkout.resolve(repository, worktree_path, git)
@@ -220,7 +256,7 @@ module SpecrelayRunner
     def duplicate_refusal(repository, seen)
       return nil unless seen.include?(Review::Checkout.identity(repository["clone_url"]))
 
-      refuse("this claim names the #{noun} repository '#{repository['repository_key']}' twice")
+      invalid("this claim names the #{noun} repository '#{repository['repository_key']}' twice")
     end
 
     # Each recorded path that IS a planned target — located among the plan, never searched for —
@@ -242,19 +278,33 @@ module SpecrelayRunner
     # refused without a network call. While {#prove} is `holding`, every checkout must already be
     # AT the head, since nothing will move it there; only one among the held paths keeps its
     # uncommitted work and any local commits on the head, which the caller proves against the
-    # checkpoint.
+    # checkpoint. {#prove_remote} asks none of the local questions.
     def verify(repository, root, observed, placing, git, holding)
       key = repository["repository_key"]
       head = repository["head_commit"].to_s
-      held = holding&.any? { |path| same_directory?(root, path) }
-      local = (holding && held_refusal(key, root, head, held)) || (dirty_refusal(key, root) unless held)
+      local = local_refusal(key, root, head, holding) unless holding == ANYWHERE
       return local if local
 
       branch_refusal(key.to_s, repository) ||
         checkout_branch_refusal(key.to_s, repository, observed, placing) ||
-        remote_refusal(repository, root, head, git) ||
-        pull_request_refusal(repository, root) ||
+        live_refusal(repository, root, head, git) ||
         fetch_head(repository, root, head, git)
+    end
+
+    # The remote branch and the pull request prove a head only while they are the publication
+    # target. A repository already in main continues its recorded main commit, and the branch and
+    # pull request it names are history that still hold the head it replaced, so neither is asked.
+    def live_refusal(repository, root, head, git)
+      return nil if in_main?(repository)
+
+      remote_refusal(repository, root, head, git) || pull_request_refusal(repository, root)
+    end
+
+    def in_main?(repository) = repository["already_in_main"] == true
+
+    def local_refusal(key, root, head, holding)
+      held = holding&.any? { |path| same_directory?(root, path) }
+      (holding && held_refusal(key, root, head, held)) || (dirty_refusal(key, root) unless held)
     end
 
     def dirty_refusal(key, root)
@@ -282,7 +332,7 @@ module SpecrelayRunner
     def branch_refusal(key, repository)
       return nil if publication_branch == repository["branch"].to_s
 
-      refuse("this claim publishes '#{key}' to '#{publication_branch}', " \
+      invalid("this claim publishes '#{key}' to '#{publication_branch}', " \
              "not to the #{noun} branch '#{repository['branch']}'")
     end
 
@@ -326,9 +376,9 @@ module SpecrelayRunner
       observed = git.remote_head(root, repository["branch"].to_s)
       return refuse("could not read the remote head of '#{key}'; refusing to start from a head it cannot confirm") if observed.nil?
       return nil if observed.casecmp?(head)
-      return refuse("the #{noun} branch of '#{key}' no longer exists on the remote") if observed.empty?
+      return invalid("the #{noun} branch of '#{key}' no longer exists on the remote") if observed.empty?
 
-      refuse("the pull-request head of '#{key}' moved from #{head[0, 12]} to #{observed[0, 12]}")
+      invalid("the pull-request head of '#{key}' moved from #{head[0, 12]} to #{observed[0, 12]}")
     end
 
     def fetch_head(repository, root, head, git)
@@ -349,7 +399,7 @@ module SpecrelayRunner
       url = repository["pull_request_url"].to_s
       slug = url[PULL_REQUEST_URL, 1].to_s
       subject = "the #{noun} pull request of '#{repository['repository_key']}'"
-      return refuse("#{subject} is not a pull request of the recorded repository") unless
+      return invalid("#{subject} is not a pull request of the recorded repository") unless
         "github.com/#{slug.downcase}" == Review::Checkout.identity(repository["clone_url"])
 
       observed = PreviousAcceptedPackage::GitHub.pull_request(root: root, slug: slug, url: url, env: pull_request_env)
@@ -362,14 +412,14 @@ module SpecrelayRunner
     def pull_request_mismatch(subject, observed, repository, url)
       head = repository["head_commit"].to_s
       state = observed["state"].to_s
-      return refuse("#{subject} is not a pull request of the recorded repository") unless observed["url"].to_s.casecmp?(url)
-      return refuse("#{subject} is #{state.downcase}, not open") unless state == "OPEN"
-      return refuse("#{subject} comes from a fork") unless observed["isCrossRepository"] == false
-      return refuse("#{subject} is on branch '#{observed['headRefName']}', not '#{repository['branch']}'") unless
+      return invalid("#{subject} is not a pull request of the recorded repository") unless observed["url"].to_s.casecmp?(url)
+      return invalid("#{subject} is #{state.downcase}, not open") unless state == "OPEN"
+      return invalid("#{subject} comes from a fork") unless observed["isCrossRepository"] == false
+      return invalid("#{subject} is on branch '#{observed['headRefName']}', not '#{repository['branch']}'") unless
         observed["headRefName"].to_s == repository["branch"].to_s
       return nil if observed["headRefOid"].to_s.casecmp?(head)
 
-      refuse("#{subject} is at #{observed['headRefOid'].to_s[0, 12]}, not the #{noun} head #{head[0, 12]}")
+      invalid("#{subject} is at #{observed['headRefOid'].to_s[0, 12]}, not the #{noun} head #{head[0, 12]}")
     end
 
     # HOW a checkout being placed gets the recorded branch, without moving any existing ref.
@@ -447,5 +497,6 @@ module SpecrelayRunner
     end
 
     def refuse(reason) = Result.new(ok: false, reason: reason)
+    def invalid(reason) = Result.new(ok: false, reason: reason, invalid: true)
   end
 end

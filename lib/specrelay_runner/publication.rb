@@ -70,6 +70,21 @@ module SpecrelayRunner
     # Publishes this repository and returns its one Result.
     def call = publish
 
+    # This repository's Result, refused for +reason+ without a commit, a push or any other git step.
+    def withhold(reason) = blocked(unpublished, reason)
+
+    # The Result of a repository whose final code is already its recorded main +commit+: unchanged,
+    # at that exact commit, and with nothing to publish — no commit, push or pull request, whatever
+    # the policy or the outcome. Platform admits it only from its own record of that commit.
+    def unnecessary(commit)
+      log("Nothing to publish for #{repository.id}: its final code is already in main at #{commit.to_s[0, 12]}.")
+      unpublished.tap do |result|
+        result.changed = false
+        result.base_commit = commit
+        result.head_commit = commit
+      end
+    end
+
     private
 
     attr_reader :payload, :repository, :env, :io
@@ -96,13 +111,7 @@ module SpecrelayRunner
     def changed_files = Array(repository.changed_files)
 
     def publish
-      # Every repository that reaches publication is one the executor changed and the runner
-      # verified, so `changed` is true by construction rather than by measurement here.
-      result = Result.new(id: repository.id.to_s, clone_url: repository.clone_url,
-                          default_branch: repository.default_branch, changed: true,
-                          base_commit: repository.base_commit, head_commit: nil, branch: nil,
-                          pull_request_url: nil, publication_error: nil,
-                          publication_skipped_reason: nil)
+      result = unpublished
       return result unless publish?
       return skipped(result) unless policy_assigned? && writable?
 
@@ -111,6 +120,17 @@ module SpecrelayRunner
       return blocked(result, default_branch_refusal(branch)) if default_branch?(branch)
 
       publish_changed(result, branch)
+    end
+
+    # Every repository that reaches publication is one the executor changed and the runner
+    # verified, so `changed` is true by construction rather than by measurement here. The one
+    # unchanged repository that reaches this class never publishes: see {#unnecessary}.
+    def unpublished
+      Result.new(id: repository.id.to_s, clone_url: repository.clone_url,
+                 default_branch: repository.default_branch, changed: true,
+                 base_commit: repository.base_commit, head_commit: nil, branch: nil,
+                 pull_request_url: nil, publication_error: nil,
+                 publication_skipped_reason: nil)
     end
 
     # Policy never asked for this repository to be published — read-only access, or a Platform

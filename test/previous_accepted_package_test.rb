@@ -393,6 +393,27 @@ class PreviousAcceptedPackageTest < Minitest::Test
     ACCEPTED.each { |component| refute_path_exists File.join(task_root, component, ACCEPTED_FILE) }
   end
 
+  # An ordinary continuation places a repository already in main at that commit and carries it
+  # forward from the package: the executor need not list it, and nothing is published for it.
+  def test_an_untouched_repository_already_in_main_is_placed_at_main_and_needs_no_selection_entry
+    main = DemoWorkspace.git(File.join(@root, "component-b"), "rev-parse", "HEAD").strip
+    block = continuation(components: [ "component-a" ])
+    block["implementation_pull_requests"] << accepted_row("component-b", "head_commit" => main, "already_in_main" => true)
+    gh_dir, gh_log, = gh_bin
+    start(continuation_block: block)
+
+    code, output = run_cli(gh_dir)
+
+    assert_equal SpecrelayRunner::CLI::SUCCESS, code, output
+    assert_equal [ "SpecRelay/component-a" ], @platform.last_terminal_result["repositories"].map { |repo| repo["id"] }
+    assert_equal main, DemoWorkspace.git(File.join(@root, "component-b"), "rev-parse", "refs/heads/#{TASK}").strip,
+                 "its canonical branch was placed at main"
+    assert_equal @heads.fetch("component-b"),
+                 DemoWorkspace.git(@bares.fetch("SpecRelay/component-b"), "rev-parse", "refs/heads/#{TASK}").strip,
+                 "its historical branch was not pushed"
+    assert_equal 0, FakeGithub.pr_creates(gh_log)
+  end
+
   # CR-001 F1 at the execution boundary — the continuation field is authority, so an absent or
   # open-shaped one stops the attempt before the task workspace is even created. Reading it as
   # "no previous implementation" would build a workspace on the default branch and hand the

@@ -594,6 +594,9 @@ module SpecrelayRunner
       SPECIFICATION = { "reference" => :url, "digest" => :sha256 }.freeze
       PULL_REQUEST = { "repository" => :text, "clone_url" => :url, "branch" => :text,
                        "head_commit" => :commit, "pull_request_url" => :url }.freeze
+      # The one optional entry field: present only on a repository already in main, and then only
+      # as `true`. Its `head_commit` is that main commit and its pull request is history.
+      IN_MAIN = "already_in_main"
 
       module_function
 
@@ -665,8 +668,9 @@ module SpecrelayRunner
         entries.each_with_index do |entry, index|
           where = "#{KEY}.implementation_pull_requests[#{index}]"
           return "#{where} is a #{entry.class} rather than an object" unless entry.is_a?(Hash)
+          return "#{where}.#{IN_MAIN} is not true" if entry.key?(IN_MAIN) && entry[IN_MAIN] != true
 
-          reason = closed(where, entry, PULL_REQUEST)
+          reason = closed(where, entry.except(IN_MAIN), PULL_REQUEST)
           return reason if reason
         end
         nil

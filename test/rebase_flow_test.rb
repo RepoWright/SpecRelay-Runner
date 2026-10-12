@@ -153,6 +153,133 @@ class RebaseFlowTest < Minitest::Test
     assert_remote_heads_unchanged
   end
 
+  # The answer reaches a FRESH session, which is handed the rebase again: the repository the asking
+  # session left unrebased is rebased once more and its conflict listed, the rebased one is kept.
+  def test_an_answered_conflict_question_resumes_with_the_rebase_and_completes_it
+    mains, checkpoint, asked = asked_about_a_conflict
+    # The workspace repository is already rebased, so its HEAD is no longer the accepted head.
+    refute_equal @accepted.fetch(ROOT_SLUG), task_checkouts.first.first.strip
+
+    start(executor: resolving_executor, executor_env: selecting(".", "component-a"), resume: checkpoint)
+    code, output = run_cli
+    assert_equal SpecrelayRunner::CLI::SUCCESS, code, output
+
+    prompt = File.read(prompt_path)
+    assert_includes prompt, "## Answers to your earlier questions"
+    assert_includes prompt, "## Rebase onto main"
+    assert_includes prompt, "`#{CHILD_SLUG}` (#{PR_URLS.fetch(CHILD_SLUG)}), main commit `#{mains.fetch(CHILD_SLUG)}`: " \
+                            "conflicts in `accepted.txt`."
+    assert_includes prompt, "`#{ROOT_SLUG}` (#{PR_URLS.fetch(ROOT_SLUG)}), main commit `#{mains.fetch(ROOT_SLUG)}`: " \
+                            "already rebased"
+    assert(asked.any? { |line| line.include?("Rebase of #{CHILD_SLUG}") && line.include?("handed to the executor") })
+    assert(progress.any? { |line| line.include?("Rebase of #{CHILD_SLUG}") && line.include?("conflicting paths resolved") },
+           progress.inspect)
+    assert_equal "succeeded", @platform.last_terminal_result["outcome"], output
+    [ ROOT_SLUG, CHILD_SLUG ].each do |slug|
+      assert ancestor?(slug, mains.fetch(slug), remote_head(slug)), "#{slug} descends from its main commit"
+      assert_equal PR_URLS.fetch(slug), results.find { |repo| repo["id"] == slug }["pull_request_url"]
+    end
+    assert_equal "resolved\n", git(@bares.fetch(CHILD_SLUG), "show", "#{remote_head(CHILD_SLUG)}:accepted.txt")
+    assert_equal "accepted round\n", git(@bares.fetch(ROOT_SLUG), "show", "#{remote_head(ROOT_SLUG)}:accepted.txt"),
+                 "the asking session's rebased work is what was published"
+    assert_empty @platform.requests_to("/api/runner/claim_releases"), "every accepted pull request still held"
+    assert_equal 2, verification_results.length
+  end
+
+  # A machine that never saw the asking session builds the workspace again: every accepted
+  # repository is put back on its accepted head before the checkpoint restores the rebased one, so
+  # the repository left unrebased is rebased from its accepted work, never from main.
+  def test_an_answered_conflict_question_resumes_in_a_rebuilt_workspace_without_losing_accepted_work
+    mains, checkpoint, = asked_about_a_conflict
+    release_task_workspace
+
+    start(executor: resolving_executor, executor_env: selecting(".", "component-a"), resume: checkpoint)
+    code, output = run_cli
+    assert_equal SpecrelayRunner::CLI::SUCCESS, code, output
+
+    assert_equal 2, File.read(@built.worktree_log).scan(/^create /).length, "the workspace was built again"
+    prompt = File.read(prompt_path)
+    assert_includes prompt, "`#{CHILD_SLUG}` (#{PR_URLS.fetch(CHILD_SLUG)}), main commit `#{mains.fetch(CHILD_SLUG)}`: " \
+                            "conflicts in `accepted.txt`."
+    assert_includes prompt, "`#{ROOT_SLUG}` (#{PR_URLS.fetch(ROOT_SLUG)}), main commit `#{mains.fetch(ROOT_SLUG)}`: " \
+                            "already rebased"
+    assert_equal "succeeded", @platform.last_terminal_result["outcome"], output
+    [ ROOT_SLUG, CHILD_SLUG ].each do |slug|
+      assert ancestor?(slug, mains.fetch(slug), remote_head(slug)), "#{slug} descends from its main commit"
+    end
+    assert_equal "accepted round\n", git(@bares.fetch(ROOT_SLUG), "show", "#{remote_head(ROOT_SLUG)}:accepted.txt")
+    assert_equal "resolved\n", git(@bares.fetch(CHILD_SLUG), "show", "#{remote_head(CHILD_SLUG)}:accepted.txt")
+  end
+
+  # GitHub moved while the question waited: the workspace the asking session left is proved
+  # against every accepted pull request and remote branch again before its checkpoint is placed.
+  # A target proved invalid ends the run failed; one that could not be proved is retried.
+  def test_a_pull_request_merged_while_the_question_waited_ends_the_run_failed
+    _mains, checkpoint, = asked_about_a_conflict
+
+    failure = assert_resume_refused(checkpoint, terminal: true, seed: pull_requests_with(CHILD_SLUG => "MERGED"))
+    assert_includes failure, "1 of 2 accepted pull requests block this run"
+    assert_includes failure, "the accepted pull request of '#{CHILD_SLUG}' is merged, not open"
+    assert_match(/\nNothing was published\.\z/, failure)
+  end
+
+  def test_a_pull_request_branch_moved_while_the_question_waited_ends_the_run_failed
+    _mains, checkpoint, = asked_about_a_conflict
+    moved = commit_on(CHILD_SLUG, BRANCH, "late.txt", "somebody else\n")
+
+    failure = assert_resume_refused(checkpoint, terminal: true)
+    assert_includes failure, "the pull-request head of '#{CHILD_SLUG}' moved from " \
+                             "#{@accepted.fetch(CHILD_SLUG)[0, 12]} to #{moved[0, 12]}"
+  end
+
+  def test_every_invalid_pull_request_found_while_the_question_waited_is_named
+    _mains, checkpoint, = asked_about_a_conflict
+    commit_on(CHILD_SLUG, BRANCH, "late.txt", "somebody else\n")
+
+    failure = assert_resume_refused(checkpoint, terminal: true, seed: pull_requests_with(ROOT_SLUG => "CLOSED"))
+    assert_includes failure, "2 of 2 accepted pull requests block this run"
+    assert_includes failure, "- #{ROOT_SLUG} #{PR_URLS.fetch(ROOT_SLUG)}: the accepted pull request of '#{ROOT_SLUG}' is closed, not open"
+    assert_includes failure, "- #{CHILD_SLUG} #{PR_URLS.fetch(CHILD_SLUG)}: the pull-request head of '#{CHILD_SLUG}' moved"
+  end
+
+  # One proved-invalid pull request ends the run, and the one that could not be read is named too.
+  def test_an_invalid_and_an_unreadable_pull_request_end_the_run_failed_naming_both
+    _mains, checkpoint, = asked_about_a_conflict
+
+    failure = assert_resume_refused(checkpoint, terminal: true, fail_view_for: ROOT_SLUG,
+                                                seed: pull_requests_with(CHILD_SLUG => "MERGED"))
+    assert_includes failure, "2 of 2 accepted pull requests block this run"
+    assert_includes failure, "- #{ROOT_SLUG} #{PR_URLS.fetch(ROOT_SLUG)}: SpecRelay could not read the accepted pull request"
+    assert_includes failure, "- #{CHILD_SLUG} #{PR_URLS.fetch(CHILD_SLUG)}: the accepted pull request of '#{CHILD_SLUG}' is merged"
+  end
+
+  def test_a_pull_request_that_cannot_be_inspected_keeps_the_resume_retryable
+    _mains, checkpoint, = asked_about_a_conflict
+
+    reason = assert_resume_refused(checkpoint, terminal: false, fail_view_for: ROOT_SLUG)
+    assert_includes reason, "SpecRelay could not read the accepted pull request of '#{ROOT_SLUG}'"
+  end
+
+  # A remote-head query killed at its timeout has no exit status and no output; it established
+  # nothing, so no branch is taken to be gone and the run is not ended.
+  def test_a_remote_head_query_that_times_out_keeps_the_resume_retryable
+    _mains, checkpoint, = asked_about_a_conflict
+
+    reason = with_remote_heads_timing_out { assert_resume_refused(checkpoint, terminal: false) }
+    assert_includes reason, "could not read the remote head of '#{ROOT_SLUG}'"
+    assert_includes reason, "could not read the remote head of '#{CHILD_SLUG}'"
+    refute_includes reason, "no longer exists"
+    assert_empty @platform.requests_to("/api/runner/reports"), "no terminal failure was submitted"
+  end
+
+  def test_a_checkpoint_that_cannot_be_downloaded_keeps_the_resume_retryable
+    _mains, checkpoint, = asked_about_a_conflict
+
+    reason = assert_resume_refused(checkpoint, terminal: false,
+                                               checkpoint_response: [ 503, { error: "storage is unavailable" } ])
+    assert_includes reason, "the recorded checkpoint could not be downloaded"
+  end
+
   # --- preflight ----------------------------------------------------------------
 
   def test_every_blocked_pull_request_is_named_and_nothing_is_rebased_or_pushed
@@ -173,6 +300,9 @@ class RebaseFlowTest < Minitest::Test
     assert_includes failure, "- #{CHILD_SLUG} #{PR_URLS.fetch(CHILD_SLUG)}: the pull-request head of '#{CHILD_SLUG}' moved " \
                              "from #{@accepted.fetch(CHILD_SLUG)[0, 12]} to #{moved[0, 12]}"
     assert_includes failure, "- #{OTHER_SLUG} #{PR_URLS.fetch(OTHER_SLUG)}: SpecRelay could not read the accepted pull request"
+    # Separated, so the list still reads where its line breaks are collapsed.
+    assert_includes failure, "is closed, not open;\n"
+    assert_match(/cannot confirm\.\nNothing was published\.\z/, failure)
     assert_preflight_stopped
     assert_equal moved, remote_head(CHILD_SLUG)
   end
@@ -222,6 +352,20 @@ class RebaseFlowTest < Minitest::Test
     assert_equal 1, push_attempts(output, CHILD_SLUG), "no other push followed the refusal"
   end
 
+  def test_a_refused_lease_stops_every_later_push_of_the_package
+    advance_main_everywhere
+    start(executor: interfering_executor(ROOT_SLUG), executor_env: selecting(".", "component-a"))
+    _code, output = run_cli
+
+    assert_equal "failed", @platform.last_terminal_result["outcome"], output
+    root = results.find { |repo| repo["id"] == ROOT_SLUG }
+    child = results.find { |repo| repo["id"] == CHILD_SLUG }
+    assert_includes root["publication_error"], "no longer holds the accepted head"
+    assert_includes child["publication_error"], "not pushed: publishing #{ROOT_SLUG} failed"
+    assert_equal File.read(interference_path).strip, remote_head(ROOT_SLUG), "the moved branch was not overwritten"
+    assert_equal @accepted.fetch(CHILD_SLUG), remote_head(CHILD_SLUG), "no push followed the refusal"
+  end
+
   def test_a_marker_on_a_rework_round_is_inert
     payload = { "rebase" => true, "previous_accepted_package" => package_block([ ROOT_SLUG ]),
                 "rework" => { "repositories" => [] } }
@@ -250,6 +394,174 @@ class RebaseFlowTest < Minitest::Test
     assert_equal before, git(@bares.fetch(ROOT_SLUG), "rev-parse", "refs/heads/main").strip
   end
 
+  # --- repositories already in main ------------------------------------------------
+
+  def test_a_repository_main_already_holds_is_verified_reported_and_kept_at_main_without_a_push
+    advance_main_everywhere
+    main = commit_on(CHILD_SLUG, "main", "accepted.txt", "accepted round\n")
+    start(executor_env: recording_child_head)
+    code, output = run_cli
+    assert_equal SpecrelayRunner::CLI::SUCCESS, code, output
+
+    assert_in_main(result_for(CHILD_SLUG), main)
+    assert_equal main, File.read(verified_path).strip, "verified at the main commit"
+    assert_equal main, child_branch_head, "no artificial commit"
+    assert_equal @accepted.fetch(CHILD_SLUG), remote_head(CHILD_SLUG), "nothing was pushed for it"
+    root = result_for(ROOT_SLUG)
+    assert root["changed"]
+    assert_equal remote_head(ROOT_SLUG), root["head_commit"]
+    assert_equal PR_URLS.fetch(ROOT_SLUG), root["pull_request_url"]
+    assert_equal 0, FakeGithub.pr_creates(@gh_log)
+    assert_includes output, "Nothing to publish for #{CHILD_SLUG}"
+  end
+
+  def test_a_package_entirely_in_main_publishes_nothing_and_succeeds
+    mains = [ ROOT_SLUG, CHILD_SLUG ].to_h { |slug| [ slug, commit_on(slug, "main", "accepted.txt", "accepted round\n") ] }
+    start(executor_env: selecting(".", "component-a"))
+    code, output = run_cli
+    assert_equal SpecrelayRunner::CLI::SUCCESS, code, output
+
+    mains.each { |slug, main| assert_in_main(result_for(slug), main) }
+    assert_equal 2, verification_results.length, "both repositories were verified"
+    assert_remote_heads_unchanged
+    assert_equal 0, FakeGithub.pr_creates(@gh_log)
+  end
+
+  def test_a_historical_repository_moves_to_the_new_main_without_a_lease_or_a_pull_request_read
+    old_main = git(@bares.fetch(CHILD_SLUG), "rev-parse", "refs/heads/main").strip
+    mains = advance_main_everywhere
+    start(slugs: [ ROOT_SLUG ], extra: [ historical_row(old_main) ], executor_env: selecting(".", "component-a"))
+    code, output = run_cli
+    assert_equal SpecrelayRunner::CLI::SUCCESS, code, output
+
+    assert_in_main(result_for(CHILD_SLUG), mains.fetch(CHILD_SLUG))
+    assert_equal @accepted.fetch(CHILD_SLUG), remote_head(CHILD_SLUG), "its branch keeps the head it replaced"
+    refute(FakeGithub.invocations(@gh_log).any? { |line| line.include?(PR_URLS.fetch(CHILD_SLUG)) },
+           "a historical pull request is never read")
+    payload = { "rebase" => true, "previous_accepted_package" => package_block([ ROOT_SLUG ], extra: [ historical_row(old_main) ]) }
+    assert_nil SpecrelayRunner::Rebase.lease(payload, CHILD_SLUG, BRANCH), "a historical branch is never leased"
+    assert_equal @accepted.fetch(ROOT_SLUG), SpecrelayRunner::Rebase.lease(payload, ROOT_SLUG, BRANCH)
+  end
+
+  def test_a_change_to_a_historical_repository_is_pushed_plainly_and_refused_when_its_branch_diverged
+    old_main = git(@bares.fetch(CHILD_SLUG), "rev-parse", "refs/heads/main").strip
+    advance_main_everywhere
+    start(slugs: [ ROOT_SLUG ], extra: [ historical_row(old_main) ],
+          executor_env: selecting(".", "component-a").merge("FAKE_EXECUTOR_EDITED" => "component-a"))
+    _code, output = run_cli
+
+    assert_equal "failed", @platform.last_terminal_result["outcome"], output
+    assert_includes result_for(CHILD_SLUG)["publication_error"], "has diverged and SpecRelay never force-pushes"
+    assert_equal @accepted.fetch(CHILD_SLUG), remote_head(CHILD_SLUG), "the historical branch was not overwritten"
+  end
+
+  def test_a_clean_descendant_holding_mains_tree_is_moved_to_main_before_verification
+    advance_main_everywhere
+    main = commit_on(CHILD_SLUG, "main", "accepted.txt", "accepted round\n")
+    start(executor: no_op_commits, executor_env: recording_child_head)
+    code, output = run_cli
+    assert_equal SpecrelayRunner::CLI::SUCCESS, code, output
+
+    descendant = File.read(descendant_path).strip
+    assert_equal [ "component-a: final code is already in main #{main[0, 12]}; moved there from " \
+                   "#{descendant[0, 12]}, whose commits change nothing" ], moved_lines
+    assert_equal main, File.read(verified_path).strip, "verification ran at the main commit"
+    assert_in_main(result_for(CHILD_SLUG), main)
+    assert_equal main, child_branch_head
+    assert_equal @accepted.fetch(CHILD_SLUG), remote_head(CHILD_SLUG)
+  end
+
+  def test_a_dirty_descendant_is_not_moved_and_is_published_as_a_change
+    advance_main_everywhere
+    commit_on(CHILD_SLUG, "main", "accepted.txt", "accepted round\n")
+    start(executor: no_op_commits(%(File.write("dirty.txt", "left behind\\n"))), executor_env: selecting(".", "component-a"))
+    code, output = run_cli
+    assert_equal SpecrelayRunner::CLI::SUCCESS, code, output
+
+    assert_empty moved_lines
+    child = result_for(CHILD_SLUG)
+    assert child["changed"]
+    assert ancestor?(CHILD_SLUG, File.read(descendant_path).strip, child["head_commit"]), "the descendant was kept"
+  end
+
+  def test_a_descendant_that_changes_content_is_not_moved
+    advance_main_everywhere
+    commit_on(CHILD_SLUG, "main", "accepted.txt", "accepted round\n")
+    change = %(File.write("accepted.txt", "changed again\\n")
+               system("git", "-c", "user.name=X", "-c", "user.email=x@example.test", "-c", "commit.gpgsign=false",
+                      "commit", "-qam", "change", exception: true))
+    start(executor: no_op_commits(change), executor_env: selecting(".", "component-a"))
+    code, output = run_cli
+    assert_equal SpecrelayRunner::CLI::SUCCESS, code, output
+
+    assert_empty moved_lines
+    assert result_for(CHILD_SLUG)["changed"]
+  end
+
+  def test_a_tree_equal_descendant_on_another_branch_is_not_moved
+    advance_main_everywhere
+    commit_on(CHILD_SLUG, "main", "accepted.txt", "accepted round\n")
+    start(executor: no_op_commits(%(system("git", "checkout", "-q", "-b", "elsewhere", exception: true))),
+          executor_env: selecting(".", "component-a"))
+    code, output = run_cli
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, code, output
+    assert_equal "repository_selection_refused", @platform.last_terminal_result.dig("core", "error_classification")
+    assert_includes report_failure, "is not on the run's canonical branch"
+    assert_empty moved_lines
+    assert_equal File.read(descendant_path).strip, child_branch_head
+    assert_remote_heads_unchanged
+  end
+
+  def test_a_commit_with_mains_tree_that_does_not_descend_from_main_is_not_moved
+    advance_main_everywhere
+    main = commit_on(CHILD_SLUG, "main", "accepted.txt", "accepted round\n")
+    accepted = @accepted.fetch(CHILD_SLUG)
+    diverged = executor("diverging") { <<~RUBY }
+      Dir.chdir("component-a") do
+        tree = `git rev-parse HEAD^{tree}`.strip
+        commit = `git -c user.name=X -c user.email=x@example.test commit-tree \#{tree} -p #{accepted} -m diverged`.strip
+        system("git", "reset", "-q", "--hard", commit, exception: true)
+        File.write(#{descendant_path.inspect}, commit)
+      end
+    RUBY
+    start(executor: diverged, executor_env: selecting(".", "component-a"))
+    code, output = run_cli
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, code, output
+    assert_empty moved_lines
+    refute_equal main, child_branch_head
+    assert_remote_heads_unchanged
+  end
+
+  def test_an_unanswered_tree_query_never_authorizes_the_move
+    advance_main_everywhere
+    main = commit_on(CHILD_SLUG, "main", "accepted.txt", "accepted round\n")
+    start(executor: no_op_commits, executor_env: selecting(".", "component-a"))
+    _code, output = with_command_failing(->(argv) { argv.last == "HEAD^{tree}" }) { run_cli }
+
+    assert_empty moved_lines, output
+    refute_equal main, child_branch_head
+    refute(results.to_a.any? { |repo| repo["id"] == CHILD_SLUG && repo["changed"] == false }, "never reported in main")
+  end
+
+  def test_a_move_that_does_not_land_refuses_before_verification
+    advance_main_everywhere
+    main = commit_on(CHILD_SLUG, "main", "accepted.txt", "accepted round\n")
+    start(executor: no_op_commits, executor_env: selecting(".", "component-a"))
+    code, output = with_command_failing(->(argv) { argv.include?("--keep") }) { run_cli }
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, code, output
+    assert_equal "repository_selection_refused", @platform.last_terminal_result.dig("core", "error_classification")
+    descendant = File.read(descendant_path).strip
+    assert_includes report_failure, "component-a could not be moved from #{descendant[0, 12]} to its main commit #{main[0, 12]}"
+    assert_equal descendant, child_branch_head, "the descendant stays where it was"
+    assert_empty verification_results, "nothing was verified"
+    assert_empty results
+    assert_remote_heads_unchanged
+    assert_equal 0, FakeGithub.pr_creates(@gh_log)
+  end
+
   # --- harness ---------------------------------------------------------------------
 
   QUESTION = {
@@ -261,17 +573,132 @@ class RebaseFlowTest < Minitest::Test
     }
   }.freeze
 
+  # `resume` is an answered question's recorded checkpoint, which the claim then continues.
   def start(slugs: [ ROOT_SLUG, CHILD_SLUG ], executor: nil, executor_env: {}, seed: nil, fail_view_for: nil,
-            extra: [])
+            extra: [], resume: nil)
     use_fixture(fixture_dir, executor || @built.executor, env: executor_env)
     payload = claim_payload_for(task_id: TASK, root: @root, specification_repository: "component-c",
                                 publication: {})
     payload = payload.merge("rebase" => true, "previous_accepted_package" => package_block(slugs, extra: extra))
+    payload = payload.merge("resume" => resume_block(resume)) if resume
     @platform&.stop
     @platform = FakePlatform.new(claim_payload: payload).start
+    if resume
+      @platform.delivery_response = [ 200, { question: { id: "exq_fake", state: "RESUMED" } } ]
+      @platform.checkpoint_payload = resume["payload"]
+    end
     @gh_dir, @gh_log, = FakeGithub.gh_bin(fail_view_for: fail_view_for, urls: PR_URLS, bares: @bares,
                                           seed: seed || open_pull_requests(*slugs))
     @config_path = write_config
+  end
+
+  # A run that rebased the workspace repository cleanly, hit a conflict in component-a and asked
+  # about it: each repository's main commit, the stored checkpoint and the progress lines so far.
+  def asked_about_a_conflict
+    mains = advance_main_everywhere
+    commit_on(CHILD_SLUG, "main", "accepted.txt", "fixed on main\n")
+    mains[CHILD_SLUG] = git(@bares.fetch(CHILD_SLUG), "rev-parse", "refs/heads/main").strip
+    git(File.join(@root, "component-c"), "push", "-q", "origin", "HEAD:refs/heads/main")
+    start(executor: asking_executor, executor_env: selecting(".", "component-a").merge("FAKE_EXECUTOR_QUESTION_JSON" => QUESTION.to_json))
+    code, output = run_cli
+    assert_equal SpecrelayRunner::CLI::SUCCESS, code, output
+    [ mains, @platform.executor_questions.first[:body]["checkpoint"], progress ]
+  end
+
+  # Resumes +checkpoint+ with +github+ as GitHub's view and +checkpoint_response+ as Platform's
+  # answer to its download, and proves the refusal changed nothing: no checkpoint placed, no branch
+  # moved, nothing rebased, no executor started and nothing published. A `terminal` refusal ends the
+  # run failed through the Rebase report and returns its failure details; any other releases the
+  # claim for a retry and returns its reason.
+  def assert_resume_refused(checkpoint, terminal:, checkpoint_response: nil, **github)
+    before = task_checkouts
+    refs = checkpoint_refs
+    remote = [ ROOT_SLUG, CHILD_SLUG ].to_h { |slug| [ slug, remote_head(slug) ] }
+    FileUtils.rm_f(prompt_path)
+    start(executor: resolving_executor, executor_env: selecting(".", "component-a"), resume: checkpoint, **github)
+    @platform.checkpoint_response = checkpoint_response if checkpoint_response
+    code, output = run_cli
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, code, output
+    assert_equal refs, checkpoint_refs, "the recorded checkpoint is kept"
+    assert_empty @platform.requests_to("/api/runner/initial_repository_bases"), "nothing was rebased"
+    refute_path_exists prompt_path, "no executor started"
+    assert_empty @platform.delivery_acknowledgements, "the answers were not consumed"
+    assert_equal remote, [ ROOT_SLUG, CHILD_SLUG ].to_h { |slug| [ slug, remote_head(slug) ] }, "nothing was published"
+    assert_equal 0, FakeGithub.pr_creates(@gh_log)
+    releases = @platform.requests_to("/api/runner/claim_releases")
+    return retryable_refusal(releases, before) unless terminal
+
+    assert_empty releases, "the run is not left claimable"
+    assert_equal "failed", @platform.last_terminal_result["outcome"], output
+    assert_equal "rebase_refused", @platform.last_terminal_result.dig("core", "error_classification")
+    # The failed report reads the workspace as the refusal left it: the workspace repository still
+    # on its rebased head with nothing restored over it. Only then is the ENDED run's environment
+    # released, as every ended run's is; its recorded work stays on the checkpoint refs above.
+    manifest = YAML.safe_load(report_file("manifest.yml"))
+    assert_equal before.first.first.strip, manifest.dig("worktree_identity", "head_commit"), "no checkpoint was placed"
+    assert_empty manifest.dig("git", "changed_files"), "no recorded work was written into the workspace"
+    assert_equal 1, File.read(@built.worktree_log).scan(/^release #{TASK} /).length, "the ended run's environment was released"
+    report_failure
+  end
+
+  def retryable_refusal(releases, before)
+    assert_equal before, task_checkouts, "no checkpoint was placed and no branch moved"
+    assert_equal 1, releases.length, "the claim is released, with the checkpoint kept for the next attempt"
+    assert_empty @platform.requests_to("/api/runner/reports"), "nothing was reported"
+    releases.first[:body]["reason"].to_s
+  end
+
+  # Every query for the pull-request branch's remote head ends as one killed at its timeout: no
+  # exit status and no output. The checkpoint's own ref queries, every other command and every git
+  # this test runs itself are real, so the refusal is the target proof's.
+  def with_remote_heads_timing_out
+    timed_out = SpecrelayRunner::CommandRunner::Result.new(exit_code: nil, stdout: "", stderr: "",
+                                                           duration_seconds: 120, timed_out: true)
+    singleton = SpecrelayRunner::CommandRunner.singleton_class
+    singleton.send(:alias_method, :run_without_timeout, :run)
+    singleton.send(:define_method, :run) do |argv, **kwargs|
+      next timed_out if argv.include?("ls-remote") && argv.last == "refs/heads/#{BRANCH}"
+
+      send(:run_without_timeout, argv, **kwargs)
+    end
+    yield
+  ensure
+    singleton.send(:alias_method, :run, :run_without_timeout)
+    singleton.send(:remove_method, :run_without_timeout)
+  end
+
+  # The asking session's checkouts — commit, branch and every change — which a refusal keeps.
+  def task_checkouts
+    worktree = File.join(@root, ".runs", "worktrees", TASK)
+    [ worktree, File.join(worktree, "component-a") ].map do |path|
+      [ git(path, "rev-parse", "HEAD"), git(path, "symbolic-ref", "--short", "HEAD"),
+        git(path, "status", "--porcelain", "--untracked-files=all") ]
+    end
+  end
+
+  def checkpoint_refs = git(@bares.fetch(ROOT_SLUG), "for-each-ref", "refs/heads/runner-checkpoints/")
+
+  def pull_requests_with(states)
+    open_pull_requests(ROOT_SLUG, CHILD_SLUG).map { |row| row.merge("state" => states.fetch(row["repo"], "OPEN")) }
+  end
+
+  # What a machine that never saw the asking session holds: no task workspace and no task branch.
+  def release_task_workspace
+    worktree = File.join(@root, ".runs", "worktrees", TASK)
+    MultiRepositoryWorkspace::COMPONENTS.each do |name|
+      git(File.join(@root, name), "worktree", "remove", "--force", File.join(worktree, name))
+      git(File.join(@root, name), "branch", "-D", BRANCH)
+    end
+    git(@root, "worktree", "remove", "--force", worktree)
+    git(@root, "branch", "-D", BRANCH)
+  end
+
+  def resume_block(checkpoint)
+    { "question_id" => "exq_fake", "continuation_context" => QUESTION["continuation_context"],
+      "questions" => QUESTION["questions"], "answers" => [ { "option" => "", "text" => "Keep the accepted side." } ],
+      "checkpoint" => checkpoint.except("payload")
+                                .merge("download_path" => "/api/runner/executor_questions/exq_fake/checkpoint") }
   end
 
   def package_block(slugs, extra: [])
@@ -395,6 +822,71 @@ class RebaseFlowTest < Minitest::Test
 
   def prompt_path = File.join(@scratch, "prompt.txt")
   def interference_path = File.join(@scratch, "interference.txt")
+  def verified_path = File.join(@scratch, "verified-head.txt")
+  def descendant_path = File.join(@scratch, "descendant.txt")
+  # component-a's canonical branch, which outlives the released task environment.
+  def child_branch_head = git(File.join(@root, "component-a"), "rev-parse", "refs/heads/#{BRANCH}").strip
+  def result_for(slug) = results.find { |repo| repo["id"] == slug }
+  def moved_lines = progress.select { |line| line.include?("moved there from") }
+
+  # Both repositories selected; component-a's verification records the commit it ran at.
+  def recording_child_head
+    selecting(".", "component-a").merge(
+      "FAKE_EXECUTOR_COMMANDS" => { "." => [ [ "git", "status", "--short" ] ],
+                                    "component-a" => [ [ "sh", "-c", "git rev-parse HEAD > #{verified_path}" ] ] }.to_json
+    )
+  end
+
+  # An accepted row whose code was already in main at +head+.
+  def historical_row(head)
+    { "repository" => CHILD_SLUG, "clone_url" => "https://github.com/#{CHILD_SLUG}", "branch" => BRANCH,
+      "head_commit" => head, "pull_request_url" => PR_URLS.fetch(CHILD_SLUG), "already_in_main" => true }
+  end
+
+  def assert_in_main(result, main)
+    refute_nil result
+    assert_equal false, result["changed"]
+    assert_equal [ main, main ], result.values_at("base_commit", "head_commit")
+    assert_nil result["branch"]
+    assert_nil result["pull_request_url"]
+    assert_nil result["publication_error"]
+  end
+
+  # Every in-process command +matcher+ selects fails with a non-zero exit; the executor's own git
+  # and every git this test runs itself are real.
+  def with_command_failing(matcher)
+    failed = SpecrelayRunner::CommandRunner::Result.new(exit_code: 1, stdout: "", stderr: "simulated failure",
+                                                        duration_seconds: 0, timed_out: false)
+    singleton = SpecrelayRunner::CommandRunner.singleton_class
+    singleton.send(:alias_method, :run_unfailed, :run)
+    singleton.send(:define_method, :run) do |argv, **kwargs|
+      next failed if matcher.call(argv)
+
+      send(:run_unfailed, argv, **kwargs)
+    end
+    yield
+  ensure
+    singleton.send(:alias_method, :run, :run_unfailed)
+    singleton.send(:remove_method, :run_unfailed)
+  end
+
+  # Commits to component-a and then undoes it, leaving a clean descendant with main's tree, then
+  # runs +extra+ inside component-a.
+  def no_op_commits(extra = "")
+    executor("no-op-commits") { <<~RUBY }
+      Dir.chdir("component-a") do
+        commit = ->(*args) { system("git", "-c", "user.name=X", "-c", "user.email=x@example.test",
+                                    "-c", "commit.gpgsign=false", *args, exception: true) }
+        File.write("scratch.txt", "nets nothing\\n")
+        system("git", "add", "scratch.txt", exception: true)
+        commit.call("commit", "-qm", "add")
+        system("git", "rm", "-q", "scratch.txt", exception: true)
+        commit.call("commit", "-qm", "remove")
+        File.write(#{descendant_path.inspect}, `git rev-parse HEAD`)
+        #{extra}
+      end
+    RUBY
+  end
 
   def observing_executor
     executor("observing") { "" }
@@ -435,12 +927,12 @@ class RebaseFlowTest < Minitest::Test
     RUBY
   end
 
-  # Somebody pushes to component-a's pull-request branch after preflight.
-  def interfering_executor
+  # Somebody pushes to +slug+'s pull-request branch after preflight.
+  def interfering_executor(slug = CHILD_SLUG)
     path = interference_path
     executor("interfering") { <<~RUBY }
       clone = Dir.mktmpdir("interfering-")
-      system("git", "clone", "-q", #{@bares.fetch(CHILD_SLUG).inspect}, clone, exception: true)
+      system("git", "clone", "-q", #{@bares.fetch(slug).inspect}, clone, exception: true)
       Dir.chdir(clone) do
         system("git", "checkout", "-q", #{BRANCH.inspect}, exception: true)
         File.write("late.txt", "somebody else\\n")
