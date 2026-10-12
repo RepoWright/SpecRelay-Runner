@@ -264,10 +264,11 @@ module SpecrelayRunner
         # tree — the whole freshness boundary is this single bounded call.
         #
         # Returns the sha, "" when the branch is gone, and nil when the question could not be
-        # answered at all.
+        # answered at all. Only a query that SUCCEEDED can say a branch is gone: a timed-out or
+        # signalled one has no exit status, and reading that as 0 would turn it into one.
         def remote_head(root, branch)
           result = run(root, [ "ls-remote", "--heads", REMOTE, "refs/heads/#{branch}" ])
-          return nil if result.nil? || !result.exit_code.to_i.zero?
+          return nil unless result&.success?
 
           result.stdout.to_s.each_line.first.to_s.split(/\s+/).first.to_s
         end

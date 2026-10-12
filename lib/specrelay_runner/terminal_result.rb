@@ -67,10 +67,10 @@ module SpecrelayRunner
     # Platform validates all of this before it will call the run successful. `publication_error` is
     # redacted client-side too (Platform re-redacts on ingest).
     #
-    # Every item here is a repository the executor CHANGED and the runner verified, so `changed` is
-    # always true. It stays in the shape as an explicit, validated assertion rather than being
-    # dropped, because Platform refuses a row that claims otherwise — which is what stops an
-    # unchanged repository from appearing in an implementation-publication result at all.
+    # Every item here is a repository the runner verified: one the executor CHANGED, with `changed`
+    # true, or one whose final code is already its recorded main commit, with `changed` false and
+    # nothing published. It stays in the shape as an explicit, validated assertion, because Platform
+    # refuses any unchanged row its own records do not name as already in main at that commit.
     def repository_result(repository)
       error = repository[:publication_error]
       skipped = repository[:publication_skipped_reason]

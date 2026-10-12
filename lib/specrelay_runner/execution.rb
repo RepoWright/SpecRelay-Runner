@@ -2,6 +2,8 @@
 
 require "fileutils"
 require "tmpdir"
+# Its one consumer loads it, after `continued_target` and `publication`, which it is built on.
+require_relative "rebase"
 
 module SpecrelayRunner
   # Orchestrates ONE claimed run end to end on the developer machine (MVP-0010),
@@ -152,6 +154,9 @@ module SpecrelayRunner
       # request an abandoned run had already published. A run is never both this and a rework:
       # a replacement is new, so nothing has reviewed it.
       @restart = ContinuedTarget.for(payload, "restart")
+      # Nil unless this claim is a Rebase run moving the accepted package onto current main. Like a
+      # replacement, it is never a rework.
+      @rebase = Rebase.for(payload, env: env)
       # Nil unless this claim continues an answered offline question — on the machine that asked,
       # or on any other eligible one, which restores the recorded work first.
       @resume = Resume.for(payload)
@@ -292,6 +297,183 @@ module SpecrelayRunner
     # so this machine — or another eligible one — can try again.
     def resume_refused(reason)
       refuse_before_provider(reason, "Refusing to resume #{run['task_id']}")
+    end
+
+    # A resumed Rebase run whose accepted package the target proof established INVALID ends failed
+    # with every blocker, as its first preflight does: the same package would only be refused
+    # again. Every other refusal — a checkpoint that could not be fetched or restored, a pull
+    # request or remote that could not be read — keeps the retry any resume has. The refusal came
+    # before the checkpoint placed anything, so the report reads the workspace exactly as it was.
+    def refused_resume(root, reason)
+      worktree = @rebase&.invalidated? && measuring_workspace(root).existing
+      worktree ? rebase_refused(root, worktree, reason) : resume_refused(reason)
+    end
+
+    def refused_continuation(root, worktree, reason)
+      @rebase ? rebase_refused(root, worktree, reason) : continuation_refused(reason)
+    end
+
+    # A Rebase run that cannot be rebased, or whose result is not a rebase, ENDS as failed with the
+    # reason in its failure details, rather than handing the claim back: the same package would be
+    # refused again, and a claimable run would keep the ticket busy. Nothing is published.
+    def rebase_refused(root, worktree, reason, executor_result = nil)
+      executor_result ||= Executor::Result.new(exit_code: nil, stdout: "", stderr: "", duration_seconds: 0,
+                                               timed_out: false, argv: [], launch_error: reason)
+      failed_report(root, worktree, executor_result,
+                    "Refusing to rebase #{run['task_id']}: #{reason.to_s.chomp('.')}.\nNothing was published.",
+                    classification: "rebase_refused")
+    end
+
+    # The accepted repositories rebased onto the main commits Platform stored for this run, and one
+    # progress line per repository. Nil, or the reason nothing could be rebased. A resumed session
+    # rebases again only what the asking one left unrebased; that one already emitted the lines.
+    def rebase_onto_main(worktree)
+      bases = rebase_bases(worktree)
+      return bases if bases.is_a?(String)
+
+      failure = @rebase.apply(worktree.path, bases, resumed: !@resume.nil?)
+      return failure if failure
+
+      @rebase.progress_lines.each { |line| emit("core.progress", line, phase: "core") } unless @resume
+      nil
+    end
+
+    # Before verification: every accepted repository reported, on its branch and rebased.
+    def rebase_unproven(worktree, repositories)
+      bases = rebase_bases(worktree)
+      return bases if bases.is_a?(String)
+
+      reason = @rebase.unproven(worktree.path, bases, repositories)
+      @rebase.resolved_lines.each { |line| emit("core.progress", line, phase: "core") } if reason.nil?
+      reason
+    end
+
+    def rebase_bases(worktree) = @rebase_bases ||= recorded_initial_bases(worktree.path)
+
+    # Every repository this run continues whose final code may be its recorded main commit, as
+    # `[root, commit]`: each accepted repository of a Rebase at the main commit stored for it, and
+    # each continued repository already in main at its recorded commit. An ordinary continuation
+    # needs none, because Platform carries an untouched repository forward from its package.
+    def in_main_candidates(worktree)
+      if @rebase
+        bases = rebase_bases(worktree)
+        return bases.is_a?(String) ? [] : @rebase.main_commits(worktree.path, bases)
+      end
+
+      Array(continued&.already_in_main(worktree.path))
+    end
+
+    # The rework or restart target this claim continues, or nil.
+    def continued = ContinuedTarget.for(payload, @rework ? "rework" : "restart")
+
+    # The candidates whose final code IS their recorded commit, as `[root, commit]`, or the reason
+    # the one guarded move below did not land. Every other candidate is left exactly as it is, for
+    # the ordinary path to measure.
+    def already_in_main(worktree)
+      in_main_candidates(worktree).each_with_object([]) do |(root, commit), level|
+        outcome = level_with(worktree, root, commit)
+        return outcome if outcome.is_a?(String)
+
+        level << [ root, commit ] if outcome
+      end
+    end
+
+    # True when +root+ is clean at +commit+. A clean checkout on the canonical branch whose HEAD
+    # descends from +commit+ with the identical tree is first moved there with `reset --keep`, which
+    # changes no file, so selection, verification, the drift check and the report all see that exact
+    # commit rather than an equivalent one. The commits it leaves net no change and are reachable
+    # only through the reflog until the environment is released. A git question that could not be
+    # answered is never proof, so it leaves the repository to the ordinary path.
+    def level_with(worktree, root, commit)
+      head = git_value(root, %w[rev-parse HEAD])
+      return false if head.nil? || git_value(root, %w[status --porcelain], blank: true) != ""
+      return true if head.casecmp?(commit)
+      return false unless tree_equal_descendant?(root, commit)
+
+      subject = relative_label(worktree, root)
+      unless git_ok?(root, [ "reset", "--quiet", "--keep", commit ]) && git_value(root, %w[rev-parse HEAD])&.casecmp?(commit)
+        return "#{subject} could not be moved from #{head[0, 12]} to its main commit #{commit[0, 12]}, " \
+               "whose code it already holds"
+      end
+
+      emit("core.progress", "#{subject}: final code is already in main #{commit[0, 12]}; moved there from " \
+                            "#{head[0, 12]}, whose commits change nothing", phase: "core")
+      true
+    end
+
+    # On the canonical branch, descending from +commit+, and holding exactly its tree — each asked
+    # separately, and each unanswered question a no.
+    def tree_equal_descendant?(root, commit)
+      return false unless git_value(root, %w[symbolic-ref --quiet --short HEAD]) == run["canonical_branch"].to_s
+      return false unless git_ok?(root, [ "merge-base", "--is-ancestor", commit, "HEAD" ])
+
+      trees = [ "#{commit}^{tree}", "HEAD^{tree}" ].map { |ref| git_value(root, [ "rev-parse", ref ]) }
+      trees.none?(&:nil?) && trees.uniq.length == 1
+    end
+
+    # The executor's selection, measured. The whole list is first asked of the workspace's one
+    # selection rule with no change required, so a repeated entry, or two spellings of one
+    # repository, is refused before the list is split or any command is mapped to it. Then each
+    # repository already in main is kept at its exact commit with no change, and every other one
+    # must show a change.
+    def select_repositories(root, worktree, reported)
+      measuring = measuring_workspace(root)
+      whole = measuring.select(worktree.path, reported.entries.map(&:path), require_change: false)
+      return whole unless whole.ok?
+
+      unlisted = unlisted_in_main(worktree, whole.repositories)
+      return Workspace::Selection.new(repositories: [], error: unlisted) if unlisted
+
+      level, others = whole.repositories.partition { |repository| in_main_commit(repository) }
+      changed = measuring.select(worktree.path, others.map(&:relative_path))
+      changed.ok? ? Workspace::Selection.new(repositories: changed.repositories + level) : changed
+    end
+
+    # A rework or restart continues every repository already in main, changed in this round or not,
+    # so each must be in the executor's selection with the verification it chose for this round.
+    # The first one left out is the refusal: nothing carries it forward from an older package, and
+    # nothing gives it a verification nobody chose. A Rebase keeps its own rule that the executor
+    # reports every accepted repository.
+    def unlisted_in_main(worktree, selected)
+      return nil if @rebase
+
+      root, = in_main_candidates(worktree).find do |candidate, _commit|
+        selected.none? { |repository| Review::Checkout.same_directory?(candidate, repository.path) }
+      end
+      root && "the repository selection leaves out '#{relative_label(worktree, root)}', a continued repository " \
+              "already in main; list it with its verification commands, or \"commands\": [] when none applies"
+    end
+
+    # The recorded commit +repository+ was selected at because it is already in main, or nil.
+    def in_main_commit(repository)
+      @in_main.to_a.find { |root, _commit| Review::Checkout.same_directory?(root, repository.path) }&.last
+    end
+
+    def relative_label(worktree, root)
+      base = File.realpath(worktree.path)
+      resolved = File.realpath(root)
+      resolved == base ? "." : resolved.delete_prefix("#{base}#{File::SEPARATOR}")
+    rescue SystemCallError
+      root.to_s
+    end
+
+    # A git query's trimmed output, or nil when it did not run, timed out or failed. Empty output is
+    # nil too unless +blank+ is asked for, because only some questions have "nothing" as an answer.
+    def git_value(root, args, blank: false)
+      result = git_in(root, args)
+      return nil unless result&.success?
+
+      value = result.stdout.to_s.strip
+      value.empty? && !blank ? nil : value
+    end
+
+    def git_ok?(root, args) = git_in(root, args)&.success? == true
+
+    def git_in(root, args)
+      CommandRunner.run([ "git", "-C", root.to_s, *args ], chdir: root.to_s,
+                        timeout_seconds: Review::Checkout::Git::TIMEOUT_SECONDS)
+    rescue SystemCallError
+      nil
     end
 
     def refuse_before_provider(reason, headline)
@@ -446,8 +628,8 @@ module SpecrelayRunner
       if @resume
         prepared = @resume.prepare(measuring: measuring_workspace(root), creating: creating_workspace(root),
                                    download: -> { download_checkpoint }, branch: run["canonical_branch"],
-                                   target: @rework)
-        return resume_refused(prepared.reason) unless prepared.ok?
+                                   target: @rework || @rebase)
+        return refused_resume(root, prepared.reason) unless prepared.ok?
       end
       worktree = prepared&.worktree || create_worktree(root)
 
@@ -455,14 +637,21 @@ module SpecrelayRunner
       # worktree must hold that commit before anything else looks at it. One branch, because it is
       # one proof ({ContinuedTarget}) and a claim is never both. A refusal here stops before the
       # provider, before the package, and before any external write.
-      continued = @rework || @restart
-      if continued && !(@resume && @rework)
+      #
+      # A Rebase run proves its whole accepted package the same way, and then rebases it. Its
+      # refusal is terminal, because an unchanged package would only be refused again; an answered
+      # question of such a run was placed by the resume above, and its fresh session is still
+      # handed the rebase.
+      continued = @rework || @restart || @rebase&.target
+      if continued && !(@resume && (@rework || @rebase))
         continuation = continued.materialize(worktree_path: worktree.path, created: worktree.created?)
-        return continuation_refused(continuation.reason) unless continuation.ok?
+        return refused_continuation(root, worktree, continuation.reason) unless continuation.ok?
 
         worktree = Workspace::Info.new(path: worktree.path, created: worktree.created?,
                                        base_commit: continuation.head_commit || worktree.base_commit)
       end
+      unrebased = @rebase && rebase_onto_main(worktree)
+      return rebase_refused(root, worktree, unrebased) if unrebased
 
       # The pinned package is verified and ANCHORED
       # to the contained repository and commit it belongs to. It sits here, after any recorded
@@ -533,6 +722,11 @@ module SpecrelayRunner
                                    "the #{provider} executor produced unusable output: #{unreadable}")
       end
 
+      # A repository whose final code is already its recorded main commit is selected, verified,
+      # reported and continued AT that commit, so it is put there before anything measures it.
+      @in_main = already_in_main(worktree)
+      return selection_refused(root, worktree, executor_result, @in_main) if @in_main.is_a?(String)
+
       changes = measuring_workspace(root).capture_changes(worktree.path)
       # An unmeasurable worktree is NOT an unchanged one. Reporting `changed: false`
       # here would advance Jira announcing "no code changes" while the executor's diff
@@ -547,10 +741,13 @@ module SpecrelayRunner
       reported = RepositorySelection.read(staging)
       return selection_refused(root, worktree, executor_result, reported.error) unless reported.ok?
 
-      selection = measuring_workspace(root).select(worktree.path, reported.entries.map(&:path))
+      selection = select_repositories(root, worktree, reported)
       return selection_refused(root, worktree, executor_result, selection.error) unless selection.ok?
 
       repositories = selection.repositories
+      if @rebase && (unproven = rebase_unproven(worktree, repositories))
+        return rebase_refused(root, worktree, unproven, executor_result)
+      end
       changes = combined_changes(repositories, changes)
 
       emit("verification.started", "Verifying #{repositories.length} changed repository(ies) for #{run['task_id']}",
@@ -584,12 +781,15 @@ module SpecrelayRunner
     # at a time. {RepositoryVerification} owns the commands and the outcome; the lease check
     # between repositories stays here, with every other stop check in this class, so a cancelled
     # claim ends through the one owner rather than through a second rule inside verification.
+    #
+    # Every selected repository is one of the executor's own entries, and the selection has already
+    # refused two entries for one repository, so each path names exactly one command list.
     def verify_repositories(repositories, reported)
       commands = reported.entries.to_h { |entry| [ entry.path, entry.commands ] }
       repositories.map do |repository|
         check_stop!
         RepositoryVerification.call(repository: repository,
-                                    commands: commands.fetch(repository.relative_path, []), env: env)
+                                    commands: commands.fetch(repository.relative_path), env: env)
       end
     end
 
@@ -608,7 +808,7 @@ module SpecrelayRunner
     # Nothing is adopted, remeasured into the package, or retried. The whole answer is whether the
     # attempt may proceed.
     def verification_drift(root, worktree, reported, verified)
-      current = measuring_workspace(root).select(worktree.path, reported.entries.map(&:path))
+      current = select_repositories(root, worktree, reported)
       unless current.ok?
         return "the selected repositories could not be re-verified after verification ran: #{current.error}"
       end
@@ -722,19 +922,34 @@ module SpecrelayRunner
     # publication_error on the repository result, which Platform validates and refuses
     # to treat as success — so an incomplete publication blocks the run instead of
     # silently passing.
+    #
+    # A repository already in main is reported at its recorded commit with nothing published,
+    # whatever the outcome or the policy, and is never withheld: it has no push to stop.
     def publish(repositories, status)
       publishing = status == ReportBundle::STATUS_SUCCEEDED
       publications = repositories.map do |repository|
-        Publication.new(payload: payload, repository: repository, env: env, io: io, publish: publishing)
+        [ Publication.new(payload: payload, repository: repository, env: env, io: io, publish: publishing),
+          in_main_commit(repository) ]
       end
-      return publications.map(&:call) unless publishing && expected?(repositories)
+      unless publishing && expected?(repositories.reject { |repository| in_main_commit(repository) })
+        return publications.map { |publication, commit| commit ? publication.unnecessary(commit) : publication.call }
+      end
 
       emit("publication.started", "Publishing repository output for #{run['task_id']}", phase: "publication")
-      results = publications.map(&:call)
+      results = publications.each_with_object([]) do |(publication, commit), done|
+        done << (commit ? publication.unnecessary(commit) : withheld(done, publication) || publication.call)
+      end
       emit("publication.completed", publication_summary(results), phase: "publication",
            published_branch: results.map(&:branch).compact.first,
            pull_request_url: results.map(&:pull_request_url).compact.first)
       results
+    end
+
+    # A Rebase run stops publishing at its first refused repository: its package is rebased whole,
+    # so no further accepted branch is rewritten once one could not be.
+    def withheld(published, publication)
+      refused = @rebase && published.find(&:publication_error)
+      publication.withhold("not pushed: publishing #{refused.id} failed, so this rebase publishes nothing more") if refused
     end
 
     # Publication is expected to do real work — and so deserves its events — when the executor
@@ -865,7 +1080,9 @@ module SpecrelayRunner
         proof = @rework.prove(worktree_path: worktree.path, held: held)
         return Checkpoint.refuse_capture(proof.reason) unless proof.ok?
       end
-      Checkpoint.capture(task_root: worktree.path, reviewed: Array(payload.dig("rework", "repositories")))
+      @rebase&.resolved_lines&.each { |line| emit("core.progress", line, phase: "core") }
+      reviewed = @rebase ? @rebase.unrebased_targets(worktree.path) : Array(payload.dig("rework", "repositories"))
+      Checkpoint.capture(task_root: worktree.path, reviewed: reviewed)
     end
 
     # The provider started. A resumed session tells Platform its handoff arrived, and only once
@@ -1187,7 +1404,8 @@ module SpecrelayRunner
 
         #{question_lines(bridge_path)}
       MD
-      "#{preamble}\n\n---\n\n#{payload.dig('specification_package', 'handoff_prompt')}#{rework_prompt}#{resume_prompt}"
+      "#{preamble}\n\n---\n\n#{payload.dig('specification_package', 'handoff_prompt')}#{rework_prompt}#{resume_prompt}" \
+        "#{@rebase&.prompt_section}"
     end
 
     # MAPIAI-84/MAPIAI-93 — the ONE way the executor's repository choice AND its verification
@@ -1231,7 +1449,20 @@ module SpecrelayRunner
         - SpecRelay verifies every entry, re-runs every command you report against your final files,
           and publishes one draft pull request per repository. Its own result decides the outcome:
           an entry it cannot verify or a repository whose verification fails is not published.
+        #{continued_in_main_line}
       MD
+    end
+
+    # A rework or restart continues each repository already in main, so it must be reported even
+    # when this round changes nothing there: it is verified again now, and an omitted one refuses
+    # the round instead of passing with a verification nobody chose.
+    def continued_in_main_line
+      keys = @rebase ? [] : Array(continued&.in_main_keys)
+      return "" if keys.empty?
+
+      "- Exception: this round also continues #{keys.join(', ')}, already in main. List each of them even if you " \
+        "change nothing there, with the verification relevant to it now, or `\"commands\": []` when none applies; " \
+        "leaving one out refuses the round."
     end
 
     # MVP-0036 Stage 2a — the answered batch, appended once after the unchanged approved package.
