@@ -338,6 +338,12 @@ not be reached for, and a report that could not be built all keep the environmen
 no release. The terminal result an implementation run submits therefore always says cleanup
 has not yet succeeded.
 
+A question whose work could not be saved ends the run. When Platform records the capture
+failure, it stops the run as failed: no machine claims it again and no cleanup is offered for its
+environment. The unsaved changes exist only there, so inspect and preserve them before you release
+the environment yourself. If Platform could not be told, the runner says so and promises nothing
+about the run.
+
 #### What a fresh environment contains
 
 A new environment starts from the project's current heads, never from a leftover task branch.
@@ -357,6 +363,10 @@ Before the provider or final analysis runs, the runner places the run's approved
 Every repository is checked before the first one is placed. A missing, ambiguous or unsafe
 repository or package, an unavailable commit, a byte mismatch or a failed placement refuses
 before the provider and before anything is published.
+
+The placed commits are also the bases of any question the provider asks: its checkpoint is taken
+on them, never on a default-branch tip that moved on afterwards. A resumed question proves that
+every recorded base is still the commit its inputs decide before it restores any work.
 
 Final preparation, after placement and before any evidence is gathered or the provider starts,
 runs the project's own `bin/graph-check`. Allocation may already have built a graph for the

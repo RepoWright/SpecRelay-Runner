@@ -34,6 +34,8 @@ module SpecrelayRunner
     # The one Platform execution state this runner reads back rather than assumes: the answer
     # window closed and the attempt paused (MVP-0036 CR-002 F2).
     PLATFORM_AWAITING_INPUT = "AWAITING_INPUT"
+    # The state in which Platform records a capture failure, which stops the run with it.
+    PLATFORM_INPUT_CAPTURE_FAILED = "INPUT_CAPTURE_FAILED"
 
     Result = Struct.new(:outcome, :message, :reported_status, :release_attempted, :run_ended,
                         keyword_init: true) do
@@ -166,6 +168,9 @@ module SpecrelayRunner
       # CONTEXT materialized only into a task workspace this attempt had to create.
       @continuation = PreviousAcceptedPackage.read(payload, env: env)
       @bridge = nil
+      # The commit placement decided for every contained repository: a question's checkpoint
+      # base. Nil on a continued lane, whose reviewed targets keep their own rule.
+      @checkpoint_bases = nil
       @controls = ProtocolControls.new(env: env)
       @emitter = EventEmitter.new(client: client, run_id: @run.fetch("id"), attempt_id: @claim)
     end
@@ -575,24 +580,38 @@ module SpecrelayRunner
     # A created environment, and a reused one this run never placed, are PLACED at the decided
     # commits; a reused one this run already placed is RECONCILED to them, keeping its newer work.
     # A retry after any refused attempt is therefore verified, and an environment built from local
-    # checkouts never passes as this run's work. A resume keeps its own rule: only an environment
-    # it had to create receives the package and the specification.
+    # checkouts never passes as this run's work. A resume decides the same commits; the
+    # repositories its checkpoint restored keep their recorded work and must have been recorded on
+    # exactly those commits.
+    #
+    # The decided commits are kept as the bases of any question this session asks.
     def place_inputs(worktree)
       placer = @continuation.package ||
                PreviousAcceptedPackage.for_specification(run["canonical_branch"], env: env)
-      anchor = @package.anchor
-      if @resume
-        return worktree.created? ? placer.materialize(task_root: worktree.path, specification: anchor) :
-                                   PreviousAcceptedPackage::Result.new(ok: true, repositories: [])
-      end
-
       bases = recorded_initial_bases(worktree.path)
       return PreviousAcceptedPackage::Result.new(ok: false, reason: bases) if bases.is_a?(String)
 
-      inputs = { task_root: worktree.path, specification: anchor, initial_bases: bases }
-      return placer.reconcile(**inputs) if !worktree.created? && PreviousAcceptedPackage.placed?(worktree.path)
+      inputs = { task_root: worktree.path, specification: @package.anchor, initial_bases: bases,
+                 recorded: Array(@resume&.checkpoint.to_h["repositories"]) }
+      reused = !worktree.created? && PreviousAcceptedPackage.placed?(worktree.path)
+      placed = reused ? placer.reconcile(**inputs) : placer.materialize(**inputs)
+      @checkpoint_bases = placed.bases
+      placed
+    end
 
-      placer.materialize(**inputs)
+    # An ordinary resume's inputs, decided and proved against the checkpoint before its recorded
+    # work is placed ({Resume#prepare}). The package pins the specification commit, so it is
+    # answerable before placement; one that cannot be verified refuses the resume there.
+    def resumed_inputs(worktree, staging)
+      package = specification_package(worktree, staging)
+      return PreviousAcceptedPackage::Result.new(ok: false, reason: package.failure) unless package.ok?
+
+      place_inputs(worktree)
+    end
+
+    # Verified once per attempt: its documents are delivered read-only into staging.
+    def specification_package(worktree, staging)
+      @package ||= SpecificationPackage.call(payload: payload, staging_dir: staging, task_root: worktree.path)
     end
 
     # The set Platform STORED for this run, never the one this machine just resolved: the first
@@ -620,29 +639,29 @@ module SpecrelayRunner
       emit("attempt.started", "Runner #{runner_name} started an attempt for #{run['task_id']}", phase: "attempt")
 
       emit("workspace.preparing", "Preparing worktree for #{run['task_id']}", phase: "workspace")
+      # A rework and a replacement restart both continue an exact recorded head; a claim is never
+      # both. A Rebase run proves its whole accepted package the same way.
+      continued = @rework || @restart || @rebase&.target
       # MVP-0036 Stage 2a — a resume continues the DIRTY worktree its question was asked from, so
       # it reads and proves that worktree where an ordinary claim creates a clean one. A refusal
       # here stops before the provider, before the package, and before any external write.
       # An answered question from a change-request round also continues the reviewed heads, and
-      # the resume proves them itself, in the only order the checkpoint allows.
+      # an ordinary one continues the run's own inputs; the resume proves either itself, in the
+      # only order the checkpoint allows.
       if @resume
         prepared = @resume.prepare(measuring: measuring_workspace(root), creating: creating_workspace(root),
                                    download: -> { download_checkpoint }, branch: run["canonical_branch"],
-                                   target: @rework || @rebase)
+                                   target: @rework || @rebase,
+                                   inputs: continued ? nil : ->(found) { resumed_inputs(found, staging) })
         return refused_resume(root, prepared.reason) unless prepared.ok?
       end
       worktree = prepared&.worktree || create_worktree(root)
 
-      # MVP-0035 rework and MVP-0036 Stage 2b restart both continue an exact recorded head, so the
-      # worktree must hold that commit before anything else looks at it. One branch, because it is
-      # one proof ({ContinuedTarget}) and a claim is never both. A refusal here stops before the
-      # provider, before the package, and before any external write.
-      #
-      # A Rebase run proves its whole accepted package the same way, and then rebases it. Its
-      # refusal is terminal, because an unchanged package would only be refused again; an answered
-      # question of such a run was placed by the resume above, and its fresh session is still
-      # handed the rebase.
-      continued = @rework || @restart || @rebase&.target
+      # The worktree must hold a continued run's recorded head before anything else looks at it.
+      # A refusal here stops before the provider, before the package, and before any external
+      # write. A Rebase run's refusal is terminal, because an unchanged package would only be
+      # refused again; an answered question of such a run was placed by the resume above, and its
+      # fresh session is still handed the rebase.
       if continued && !(@resume && (@rework || @rebase))
         continuation = continued.materialize(worktree_path: worktree.path, created: worktree.created?)
         return refused_continuation(root, worktree, continuation.reason) unless continuation.ok?
@@ -660,15 +679,14 @@ module SpecrelayRunner
       # refusals; and the owner that chooses a head for the fresh inputs below has to know what the
       # specification requires in order to pick a commit that satisfies both. The check reads the
       # pinned COMMIT rather than the working tree, so it is answerable at this point.
-      @package = SpecificationPackage.call(payload: payload, staging_dir: staging,
-                                           task_root: worktree.path)
+      specification_package(worktree, staging)
       return package_refused(root, worktree, @package.failure) unless @package.ok?
 
-      unless continued
+      unless continued || @resume
         # The ticket's PREVIOUS accepted implementation, the approved specification and, for every
         # other repository, the run's stored initial base — one owner decides each repository's
         # commit. Same-run authority wins: a rework or restart target is handled above and never
-        # reaches here.
+        # reaches here. A resume decided them before its checkpoint was placed.
         placed = place_inputs(worktree)
         return continuation_refused(placed.reason) unless placed.ok?
       end
@@ -1074,6 +1092,7 @@ module SpecrelayRunner
     #
     # A reviewed repository's base is its reviewed head, so the review is proved first — identity,
     # branch, remote and pull-request head — exactly as an answered resume proves it again later.
+    # Every other repository's base is the commit {#place_inputs} decided for it.
     def capture_checkpoint(worktree)
       if @rework
         held = ContainedRepositories.discover(worktree.path).roots.to_a
@@ -1082,7 +1101,7 @@ module SpecrelayRunner
       end
       @rebase&.resolved_lines&.each { |line| emit("core.progress", line, phase: "core") }
       reviewed = @rebase ? @rebase.unrebased_targets(worktree.path) : Array(payload.dig("rework", "repositories"))
-      Checkpoint.capture(task_root: worktree.path, reviewed: reviewed)
+      Checkpoint.capture(task_root: worktree.path, reviewed: reviewed, decided: @checkpoint_bases)
     end
 
     # The provider started. A resumed session tells Platform its handoff arrived, and only once
@@ -1112,8 +1131,8 @@ module SpecrelayRunner
                  message: "Runner outcome: awaiting_input (question durable; no report uploaded).")
     end
 
-    # Reported to Platform rather than left to a lapsing lease, so the attempt ends as a
-    # distinct recoverable failure and the machine is freed now.
+    # Reported to Platform rather than left to a lapsing lease, so the attempt and its run end as a
+    # failure now and the machine is freed. Nothing restarts that run: its unsaved work stays here.
     #
     # PLATFORM classifies the ending, not this runner (CR-002 F2). There is a real interval in
     # which the Product Owner's release has already won and the provider exits before the next
@@ -1124,17 +1143,22 @@ module SpecrelayRunner
     # as handled. A failure to REPORT the failure is still an honest non-zero exit: Platform
     # reclaims the lapsed lease.
     def input_capture_failure(reason)
-      response = client.report_input_capture_failure(claim: claim, reason: reason)
-      return released_session if response.to_h.dig("execution", "state") == PLATFORM_AWAITING_INPUT
+      state = client.report_input_capture_failure(claim: claim, reason: reason).to_h.dig("execution", "state")
+      return released_session if state == PLATFORM_AWAITING_INPUT
 
-      capture_failed(reason)
+      capture_failed(reason, recorded: state == PLATFORM_INPUT_CAPTURE_FAILED)
     rescue PlatformClient::Error => e
-      capture_failed(e.message)
+      capture_failed(e.message, recorded: false)
     end
 
-    def capture_failed(reason)
+    # Says only what is known: a failure Platform recorded stopped the run; one it did not record
+    # proves nothing about the run. Either way this machine keeps the unsaved work.
+    def capture_failed(reason, recorded:)
       log("Could not capture the provider's question for #{run['task_id']}: #{Redaction.redact(reason)}")
-      log("Nothing was tested, reported, published, or written to Jira. Your changes are still in the worktree.")
+      log(recorded ? "Platform stopped #{run['task_id']} as failed; it is not retried automatically." :
+                     "Platform did not record this failure.")
+      log("Nothing was tested, reported, published, or written to Jira.")
+      log("The provider's unsaved changes stay in the task workspace; preserve them before releasing it.")
       Result.new(outcome: :input_capture_failed,
                  message: "Runner outcome: input_capture_failed (#{Redaction.redact(reason)}).")
     end

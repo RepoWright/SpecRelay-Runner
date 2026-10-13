@@ -379,6 +379,84 @@ class PortableCheckpointTest < Minitest::Test
     assert_empty checkpoint_refs("component-a")
   end
 
+  # ------------------------------------------------------------------ decided bases
+
+  # What placement decided for every contained repository: the exact commit each one was put on
+  # before the provider started, never what its origin advertises when the question is asked.
+  def decided_bases
+    [ ".", *COMPONENTS ].map do |name|
+      { repository: MultiRepositoryWorkspace.slug(name), path: File.realpath(path(name)),
+        commit: head(path(name)), ref: "refs/heads/#{TASK}" }
+    end
+  end
+
+  def capture_on(bases) = SpecrelayRunner::Checkpoint.capture(task_root: @task, decided: bases, id: ID)
+
+  # Scenario 1 — every origin moved on after placement, so its advertised tip is in no checkout's
+  # history. The decided bases still capture the work, each snapshot on exactly its decided commit
+  # and carrying none of the origins' later commits.
+  def test_decided_bases_capture_the_work_although_every_origin_moved_on
+    bases = decided_bases
+    provider_changes
+    [ ".", *COMPONENTS ].each { |name| advance_remote(name) }
+    before = state(@task)
+
+    result = capture_on(bases)
+
+    assert result.ok?, result.error
+    assert_equal %w[component-b component-c component-d], result.checkpoint["repositories"].map { |e| e["path"] }
+    result.checkpoint["repositories"].each do |entry|
+      decided = bases.find { |base| base[:repository] == entry["origin"] }
+      assert_equal decided[:commit], entry["base_sha"]
+      assert_equal "refs/heads/#{TASK}", entry["base_ref"]
+      assert_equal [ entry["snapshot_sha"], decided[:commit] ],
+                   git(path(entry["path"]), "rev-list", "--parents", "-n", "1", entry["snapshot_sha"]).split
+      refute_includes git(path(entry["path"]), "ls-tree", "-r", "--name-only", entry["snapshot_sha"]), "elsewhere.txt"
+    end
+    assert_equal before, state(@task), "capture changed the asking worktree"
+  end
+
+  # Scenario 4 — authority that is incomplete, ambiguous, foreign, unreachable or not in the
+  # checkout's history refuses the WHOLE capture: no ref is pushed anywhere and every branch, HEAD,
+  # index and file is exactly as it was.
+  def test_unusable_decided_bases_refuse_before_any_ref_is_pushed
+    provider_changes
+    foreign = File.realpath(File.join(@built.root, "component-b"))
+    elsewhere = advance_and_fetch("component-b")
+    {
+      "no base was decided for" => ->(bases) { bases.reject { |b| b[:repository] == "SpecRelay/component-b" } },
+      "two bases were decided" => ->(bases) { bases + [ bases.last ] },
+      "is not a repository of the task workspace" => ->(bases) { bases.map { |b| b[:repository] == "SpecRelay/component-b" ? b.merge(path: foreign) : b } },
+      "is not \"SpecRelay/component-a\"" => ->(bases) { bases.map { |b| b[:repository] == "SpecRelay/component-b" ? b.merge(repository: "SpecRelay/component-a") : b } },
+      "is malformed" => ->(bases) { bases.map { |b| b[:repository] == "SpecRelay/component-b" ? b.merge(ref: "main") : b } },
+      "could not fetch the base" => ->(bases) { bases.map { |b| b[:repository] == "SpecRelay/component-b" ? b.merge(commit: "1" * 40) : b } },
+      "does not contain" => ->(bases) { bases.map { |b| b[:repository] == "SpecRelay/component-b" ? b.merge(commit: elsewhere) : b } }
+    }.each do |reason, edit|
+      before = state(@task)
+
+      result = capture_on(edit.call(decided_bases_before_changes))
+
+      refute result.ok?, reason
+      assert_includes result.error, reason
+      assert_equal before, state(@task), "a refused capture (#{reason}) changed the asking worktree"
+      [ ".", *COMPONENTS ].each { |name| assert_empty checkpoint_refs(name), "#{reason}: #{name} received a ref" }
+    end
+  end
+
+  # The decided set as placement left it, so refusal cases share one valid starting point.
+  def decided_bases_before_changes
+    @decided_bases_before_changes ||= decided_bases.map do |base|
+      base[:repository] == "SpecRelay/component-b" ? base.merge(commit: git(base[:path], "rev-parse", "HEAD~1").strip) : base
+    end
+  end
+
+  # A commit the checkout holds as an object but not in its history: its origin's newer tip.
+  def advance_and_fetch(name)
+    advance_remote(name)
+    git(path(name), "fetch", "-q", "origin", "main")
+    git(path(name), "rev-parse", "FETCH_HEAD").strip
+  end
+
   # The manifest is checked against the contract's bounds before anything is pushed, so a field
   # Platform would refuse never leaves a ref behind on any remote.
   def test_a_manifest_field_beyond_the_contract_bound_refuses_before_any_ref_is_pushed

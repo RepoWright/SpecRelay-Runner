@@ -28,7 +28,9 @@ module SpecrelayRunner
   # Its nested {Input} owns the assignment field itself, for BOTH lanes — see there for why
   # absence and an explicit null are different documents.
   class PreviousAcceptedPackage
-    Result = Struct.new(:ok, :reason, :repositories, keyword_init: true) do
+    # `bases` is the commit decided for every repository the plan covered, with the task branch it
+    # was placed on — the base a question's checkpoint must be taken on ({Checkpoint.capture}).
+    Result = Struct.new(:ok, :reason, :repositories, :bases, keyword_init: true) do
       def ok? = ok
     end
 
@@ -160,8 +162,12 @@ module SpecrelayRunner
     # is decided and placed — the accepted head, else the approved specification head, else the
     # repository's stored base, and the environment is recorded as placed ({placed?}). Without it
     # (the specification lane) only the first two are.
-    def materialize(task_root:, specification: nil, initial_bases: nil)
-      act(task_root, specification: specification, initial_bases: initial_bases) do |plans|
+    #
+    # `recorded` are the entries of a checkpoint a resume has just restored. Each must have been
+    # recorded on exactly the head decided for its repository; that repository holds the restored
+    # work, so it is neither required to be clean nor placed again.
+    def materialize(task_root:, specification: nil, initial_bases: nil, recorded: [])
+      act(task_root, specification: specification, initial_bases: initial_bases, recorded: recorded) do |plans|
         placed = place(plans)
         next placed unless placed.ok? && initial_bases
         next placed if self.class.record_placement(task_root, git: git)
@@ -175,8 +181,8 @@ module SpecrelayRunner
     #
     # A reused environment is never re-seeded to satisfy the specification: this run's own work is
     # in it, so an incompatibility is REPORTED rather than repaired.
-    def reconcile(task_root:, specification: nil, initial_bases: nil)
-      act(task_root, specification: specification, initial_bases: initial_bases) { |plans| advance(plans) }
+    def reconcile(task_root:, specification: nil, initial_bases: nil, recorded: [])
+      act(task_root, specification: specification, initial_bases: initial_bases, recorded: recorded) { |plans| advance(plans) }
     end
 
     private
@@ -188,7 +194,7 @@ module SpecrelayRunner
     # decides what a repository's head must be when it carries both the approved specification and
     # accepted code. An explicit null accepted-code block is still a decision: there is no code to
     # honour, so the specification alone determines that repository's head.
-    def act(task_root, specification: nil, initial_bases: nil)
+    def act(task_root, specification: nil, initial_bases: nil, recorded: [])
       targets = read_targets
       return refuse(targets) if targets.is_a?(String)
       return Result.new(ok: true, repositories: []) if targets.empty? && specification.nil? && initial_bases.nil?
@@ -196,7 +202,8 @@ module SpecrelayRunner
       contained = ContainedRepositories.discover(task_root, git: git)
       return refuse(contained.error) unless contained.ok?
 
-      plans = targets.empty? ? [] : plan(targets, contained)
+      restored = recorded.to_h { |entry| [ entry["origin"].to_s.downcase, entry ] }
+      plans = targets.empty? ? [] : plan(targets, contained, restored)
       return refuse(plans) if plans.is_a?(String)
 
       plans = with_specification(plans, specification, contained)
@@ -204,9 +211,42 @@ module SpecrelayRunner
 
       plans = with_initial_bases(plans, initial_bases, contained) unless initial_bases.nil?
       return refuse(plans) if plans.is_a?(String)
-      return Result.new(ok: true, repositories: []) if plans.empty?
+      return Result.new(ok: true, repositories: [], bases: []) if plans.empty?
 
-      yield(plans)
+      disagreement = recorded_disagreement(plans, restored)
+      return refuse(disagreement) if disagreement
+
+      acted = yield(plans.reject { |plan| restored.key?(plan[:repository].to_s.downcase) })
+      return acted unless acted.ok?
+
+      Result.new(ok: true, repositories: acted.repositories, bases: decided_bases(plans, restored))
+    end
+
+    # The restored repository whose checkpoint was recorded on any commit but the head decided for
+    # it, or one no input of this run decides, refuses: that work was taken on another base.
+    def recorded_disagreement(plans, restored)
+      restored.each do |identity, entry|
+        decided = plans.find { |plan| plan[:repository].to_s.casecmp?(identity) }
+        return "the checkpoint names #{quoted(entry['origin'])}, which no input of this run decides" if decided.nil?
+        next if entry["base_sha"] == decided[:head]
+
+        return "the checkpoint of #{quoted(entry['path'])} was recorded on #{entry['base_sha'].to_s[0, 12]}, not on " \
+               "#{decided[:head_is]} #{decided[:head][0, 12]}"
+      end
+      nil
+    end
+
+    # Every planned repository at its decided head, named by the branch its authority names — the
+    # accepted pull request's branch or the stored default branch — else the task branch it was
+    # placed on. A restored one keeps the base and branch its work was recorded on, which
+    # {#recorded_disagreement} proved to be that head.
+    def decided_bases(plans, restored)
+      plans.map do |plan|
+        named = plan[:branch].to_s if [ ACCEPTED_HEAD, INITIAL_BASE ].include?(plan[:head_is])
+        ref = restored.dig(plan[:repository].to_s.downcase, "base_ref") ||
+              "refs/heads/#{named.to_s.empty? ? canonical_branch : named}"
+        { repository: plan[:repository], path: plan[:path], commit: plan[:head], ref: ref }
+      end
     end
 
     # The compatibility decision, for the one repository that holds both inputs.
@@ -284,7 +324,7 @@ module SpecrelayRunner
         refusal = fetch_head(target, paths.first, INITIAL_BASE)
         return refusal if refusal
 
-        target.merge(path: paths.first, head_is: INITIAL_BASE)
+        target.merge(path: paths.first, head_is: INITIAL_BASE, branch: base["default_branch"])
       end
       plans + added
     end
@@ -405,14 +445,14 @@ module SpecrelayRunner
     # Every target resolved and PROVED before any of them is moved. All-or-nothing: a workspace
     # with one repository placed and another refused is a half-reconstructed base no executor may
     # start from.
-    def plan(targets, contained)
+    def plan(targets, contained, restored)
       plans = []
       targets.each do |target|
         path = contained.resolve(target[:identity])
         return "no repository in the prepared task workspace is #{quoted(target[:repository])}" if path == :missing
         return "the prepared task workspace holds two checkouts of #{quoted(target[:repository])}" if path == :duplicate
 
-        refusal = verify(target, path)
+        refusal = verify(target, path, restored.key?(target[:identity]))
         return refusal if refusal
 
         plans << target.merge(path: path, head_is: ACCEPTED_HEAD)
@@ -421,10 +461,11 @@ module SpecrelayRunner
     end
 
     # The order is deliberate: the local facts first, so an unusable or dirty workspace is refused
-    # without a network call, then GitHub's own answer, then the object itself.
-    def verify(target, path)
+    # without a network call, then GitHub's own answer, then the object itself. A restored checkout
+    # is dirty with exactly its recorded work, which the checkpoint restore has already proved.
+    def verify(target, path, restored = false)
       return "the checkout of #{quoted(target[:repository])} has uncommitted changes; " \
-             "release the task workspace before retrying" unless clean?(path)
+             "release the task workspace before retrying" unless restored || clean?(path)
 
       pull_request_refusal(target, path) || fetch_head(target, path)
     end

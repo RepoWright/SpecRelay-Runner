@@ -71,16 +71,18 @@ class QuestionBridgeTest < Minitest::Test
 
   # The loop, driven over REAL claim-once executions: each iteration runs the whole CLI path, so
   # the loop reacts to the runner's own classification rather than to a stubbed boolean.
-  def loop_over_real_runs(iterations:)
-    io = StringIO.new
+  #
+  # `offer_again` re-offers the run each time, as Platform does for a paused one; without it the
+  # run is claimed once, as Platform does for one it has stopped.
+  def loop_over_real_runs(iterations:, on_failure: SpecrelayRunner::LoopRunner::ON_FAILURE_STOP, offer_again: true, io: StringIO.new)
     runs = 0
     status = SpecrelayRunner::LoopRunner.call(
       out: io, err: io, install_signals: false, max_iterations: iterations, poll_seconds: 0,
-      on_failure: SpecrelayRunner::LoopRunner::ON_FAILURE_STOP, sleeper: ->(_seconds) { },
+      on_failure: on_failure, sleeper: ->(_seconds) { },
       claim: -> { SpecrelayRunner::PlatformClient::ClaimResult.new(claimed: true, payload: {}) },
       execute: lambda do |_payload|
         runs += 1
-        @platform.offer_again!
+        @platform.offer_again! if offer_again
         run_cli(io) == SpecrelayRunner::CLI::SUCCESS
       end
     )
@@ -324,6 +326,64 @@ end
 
     assert_equal SpecrelayRunner::LoopRunner::OK, status
     assert_equal 2, runs, "a handled pause must not end the session under --on-failure stop"
+  end
+
+  STOPPED = "Platform stopped #{TASK} as failed; it is not retried automatically."
+  KEPT = "The provider's unsaved changes stay in the task workspace; preserve them before releasing it."
+  def worktree_file = File.join(@root, ".runs", "worktrees", TASK, "demo-app", "index.html")
+
+  # Scenario 12 — a capture failure Platform recorded is stated as what it is: the attempt failed,
+  # the run is stopped rather than retried, and the unsaved work is still on this machine. Later
+  # polls and a restarted runner leave that work exactly where it is.
+  def test_a_recorded_capture_failure_says_the_run_stopped_and_the_work_is_kept
+    @platform.claim_payload = payload(env: { "FAKE_EXECUTOR_QUESTION_EDIT_FIRST" => "1" })
+    @platform.question_response = [ 500, { error: "platform is unwell" } ]
+    io = StringIO.new
+
+    exit_code = run_cli(io)
+    @platform.offer_no_work!
+    later = Array.new(2) { StringIO.new.then { |out| [ run_cli(out), out.string ] } }
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, exit_code, io.string
+    assert_includes io.string, STOPPED
+    assert_includes io.string, KEPT
+    assert_includes io.string, "Nothing was tested, reported, published, or written to Jira."
+    assert_equal [ SpecrelayRunner::CLI::SUCCESS ] * 2, later.map(&:first)
+    later.each { |_code, out| refute_includes out, "Claimed run", "the stopped run was claimed again" }
+    assert_includes File.read(worktree_file), "Hello Interrupted Demo", "the unsaved work was discarded"
+    assert_empty @platform.requests_to("/api/runner/reports")
+  end
+
+  # A failure Platform did not record proves nothing about the run, so nothing is promised about it.
+  def test_an_unrecorded_capture_failure_promises_nothing_about_the_run
+    @platform.question_response = [ 500, { error: "platform is unwell" } ]
+    original = @platform.method(:executor_question)
+    @platform.define_singleton_method(:executor_question) do |request|
+      request[:body].to_h.key?("capture_failure") ? [ 503, { error: "unavailable" } ] : original.call(request)
+    end
+    io = StringIO.new
+
+    exit_code = run_cli(io)
+
+    assert_equal SpecrelayRunner::CLI::RUN_FAILED, exit_code, io.string
+    assert_includes io.string, "Platform did not record this failure."
+    refute_includes io.string, STOPPED
+    assert_includes io.string, KEPT
+  end
+
+  # `--on-failure continue` polls on after the failure, and the stopped run is not handed out again.
+  def test_a_capture_failure_lets_a_continue_policy_loop_poll_on_without_the_stopped_run
+    @platform.question_response = [ 500, { error: "platform is unwell" } ]
+    io = StringIO.new
+
+    status, runs = loop_over_real_runs(iterations: 2, on_failure: SpecrelayRunner::LoopRunner::ON_FAILURE_CONTINUE,
+                                       offer_again: false, io: io)
+
+    assert_equal SpecrelayRunner::LoopRunner::FAILED, status, "the session still reports the failure it saw"
+    assert_equal 2, runs, io.string
+    assert_includes io.string, "continuing to poll (--on-failure continue)"
+    assert_equal 1, @platform.capture_failures.size
+    assert_equal 1, io.string.scan("Claimed run #{TASK}").size, "the stopped run was claimed again"
   end
 
   def test_a_capture_failure_still_stops_a_stop_policy_loop

@@ -152,6 +152,25 @@ class ExactEnvironmentInputsTest < Minitest::Test
                  "taking the specification head must not lose the accepted code"
   end
 
+  # The head this owner chose is also the base a question's checkpoint is taken on: the compatible
+  # descendant when the specification only adds the package, the accepted head when it already
+  # carries it — never a commit chosen again later.
+  def test_the_chosen_head_is_the_decided_checkpoint_base
+    write("app/main.rb", "puts :two\n")
+    accepted_head = commit("accepted implementation")
+    spec_head = commit_package
+    descendant = accepted(accepted_head).materialize(task_root: @task_root, specification: specification(spec_head))
+    write("app/main.rb", "puts :three\n")
+    carrying = commit("accepted again on top of the package")
+    kept = accepted(carrying).materialize(task_root: @task_root, specification: specification(spec_head))
+
+    assert descendant.ok?, descendant.reason
+    assert kept.ok?, kept.reason
+    expected = ->(commit) { [ { repository: "SpecRelay/product", path: File.realpath(@repo), commit: commit, ref: "refs/heads/#{BRANCH}" } ] }
+    assert_equal expected.call(spec_head), descendant.bases
+    assert_equal expected.call(carrying), kept.bases, "an accepted head already carrying the package is kept"
+  end
+
   def test_one_head_satisfying_both_needs_no_choice
     both = commit_package
 
