@@ -35,7 +35,6 @@ module SpecrelayRunner
     SCREENSHOT_PATH = %r{\Ascreenshots/[a-z0-9][a-z0-9-]*\.(?:png|jpe?g)\z}
     IMAGE_SIGNATURES = [ "\x89PNG\r\n\x1A\n".b, "\xFF\xD8\xFF".b ].freeze
     SCENARIO_INDEX_MAX_BYTES = 32_768
-    SCENARIO_MAX_ENTRIES = 40
     SCENARIO_MAX_FILE_BYTES = 5_000_000
     SCENARIO_MAX_TEXT = 200
     SCREENSHOT_FIELDS = %w[viewport scenario result].freeze
@@ -269,10 +268,7 @@ module SpecrelayRunner
         return scenario_note(notes, "#{SCENARIO_INDEX} must be an object with evidence_files and screenshots lists")
       end
 
-      declared = index["evidence_files"].size + index.fetch("screenshots", []).size
-      return index if declared <= SCENARIO_MAX_ENTRIES
-
-      scenario_note(notes, "#{SCENARIO_INDEX} declares #{declared} entries; at most #{SCENARIO_MAX_ENTRIES} are read")
+      index
     rescue JSON::ParserError, EncodingError
       scenario_note(notes, "#{SCENARIO_INDEX} is not valid JSON")
     end
