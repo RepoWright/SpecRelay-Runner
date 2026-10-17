@@ -116,6 +116,24 @@ class ScenarioEvidenceTest < Minitest::Test
     assert_match(/Scenario evidence limitation: evidence_files\[0\] /, readme(report))
   end
 
+  def test_a_valid_index_above_forty_entries_keeps_all_declared_images
+    write("scenarios/01-sign-in.md", SCENARIO)
+    shots = 106.times.map do |index|
+      path = "screenshots/01-score-#{index}.png"
+      write(path, PNG)
+      shot(path)
+    end
+    write_index(evidence: [ { "path" => "scenarios/01-sign-in.md" } ], screenshots: shots)
+
+    report = bundle
+
+    assert_equal shots, manifest(report)["screenshots"]
+    assert_equal SCENARIO.b, uploaded(report)["scenarios/01-sign-in.md"]
+    assert_equal PNG, uploaded(report)[shots.first["path"]]
+    assert_equal PNG, uploaded(report)[shots.last["path"]]
+    refute_includes readme(report), "Scenario evidence limitation"
+  end
+
   def test_a_missing_index_is_a_stated_limitation_rather_than_silence
     write("scenarios/01-sign-in.md", SCENARIO)
 
