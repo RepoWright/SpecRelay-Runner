@@ -316,6 +316,11 @@ class RealExecutorFlowTest < Minitest::Test
     assert_includes argv.last, "Approved spec for #{TASK}"
     assert_includes argv.last, "Run every command in the foreground and wait for it"
     assert_includes argv.last, "background job and no scheduled wakeup"
+    assert_includes argv.last, "JPEG (.jpg) at quality 65"
+    assert_includes argv.last, "strictly smaller than 200,000 bytes"
+    assert_includes argv.last, "before any agent image read"
+    assert_includes argv.last, "text, numbers, status and tested result remain readable"
+    assert_includes argv.last, "report evidence as blocked"
 
     # The profile's environment reached the child: no background work, no scheduler, and room for
     # a long verification command to finish in the foreground.

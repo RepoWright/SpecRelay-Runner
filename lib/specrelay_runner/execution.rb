@@ -1424,6 +1424,8 @@ module SpecrelayRunner
 
         #{selection_lines(selection_path)}
 
+        #{EvidenceImageInstructions}
+
         #{scenario_evidence_lines(scenario_dir)}
 
         #{question_lines(bridge_path)}
@@ -1516,13 +1518,13 @@ module SpecrelayRunner
           tested target (for a browser check, the URL and viewport); `PASS`, `FAIL` or `BLOCKED`;
           the numbered actions with what you observed; and any limitation.
         - For a UI scenario checked in a browser, save only the material states (for example a
-          validation error or a success) as `screenshots/<name>.png` or `.jpg`. Place each one with
-          a line containing only `![<short state>](screenshots/<name>.png)` directly after the
+          validation error or a success) as `screenshots/<name>.jpg`. Place each one with
+          a line containing only `![<short state>](screenshots/<name>.jpg)` directly after the
           action or observation it shows; one scenario may place several. A scenario without
           UI needs no image: write `Browser check: NOT_APPLICABLE` and why. If no browser was
           available, mark the scenario `BLOCKED` and say so. Never invent a screenshot or a pass.
         - Write `index.json` last, as `{ "evidence_files": [ { "path": "scenarios/NN-short-name.md",
-          "description": "<one line>" } ], "screenshots": [ { "path": "screenshots/<name>.png",
+          "description": "<one line>" } ], "screenshots": [ { "path": "screenshots/<name>.jpg",
           "viewport": "<width>x<height>", "scenario": "NN-short-name", "result": "<captured UI state>" } ] }`.
           Paths are relative to that directory; `scenario` is the scenario file name without `.md`.
           Only declared files are read.

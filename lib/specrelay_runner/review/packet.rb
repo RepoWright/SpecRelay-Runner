@@ -21,7 +21,7 @@ module SpecrelayRunner
 
       # The complete prompt text handed to one fresh provider process.
       def prompt
-        [ instructions, limits_section, ticket_section, specification_section, change_section,
+        [ instructions, EvidenceImageInstructions, limits_section, ticket_section, specification_section, change_section,
           evidence_section, continuation_section ].compact.join("\n\n")
       end
 
