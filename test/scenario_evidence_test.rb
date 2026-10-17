@@ -208,7 +208,7 @@ class ScenarioEvidenceTest < Minitest::Test
                              env: { "TEST_TOKEN" => FakePlatform::EXPECTED_TOKEN, "PATH" => fixture_path(executor) })
 
     prompt = File.read(prompt_path).gsub(/\s+/, " ")
-    assert_includes prompt, "a line containing only `![<short state>](screenshots/<name>.png)` directly after the " \
+    assert_includes prompt, "a line containing only `![<short state>](screenshots/<name>.jpg)` directly after the " \
                             "action or observation it shows"
     refute_includes prompt, "Do not link images"
     assert_includes prompt, "Never invent a screenshot or a pass."

@@ -593,6 +593,11 @@ class ReviewFlowTest < Minitest::Test
     prompt = File.read(capture)
     assert_includes prompt, "#{BASE}..#{pinned_head}"
     assert_includes prompt, "You are a FRESH process"
+    assert_includes prompt, "JPEG (.jpg) at quality 65"
+    assert_includes prompt, "strictly smaller than 200,000 bytes"
+    assert_includes prompt, "before any agent image read"
+    assert_includes prompt, "text, numbers, status and tested result remain readable"
+    assert_includes prompt, "report evidence as blocked"
     refute_includes prompt, "--resume"
     refute_includes prompt, "session"
   end

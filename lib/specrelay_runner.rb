@@ -82,6 +82,7 @@ require_relative "specrelay_runner/terminal_result"
 require_relative "specrelay_runner/specification_package"
 # MVP-0033: the REVIEWER role. Loaded before `rework` and `execution`, which reuse its read-only
 # git seam to prove a reviewed head is still the one the remote shows.
+require_relative "specrelay_runner/evidence_image_instructions"
 require_relative "specrelay_runner/review"
 # MVP-0035 / MVP-0036 Stage 2b: proving a worktree holds the exact recorded head, and the change
 # request that is one of the two reasons to require it. `continued_target` first — `rework` is
