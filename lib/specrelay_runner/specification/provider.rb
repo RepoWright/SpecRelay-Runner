@@ -201,6 +201,15 @@ module SpecrelayRunner
             "Dependencies and assumptions", Analysis. Each needs real content under it — a heading
             with nothing under it is rejected.
 
+            ONE DELIVERABLE — spec.md describes one bounded, complete deliverable: no slices, phases,
+            stages, or any ordered set of separately executable parts. "Proposed behavior" and
+            "Acceptance criteria" each appear exactly once and contain no headings of any level;
+            group content inside them with paragraphs, lists, tables, or bold labels. Checkpoints,
+            review corrections, and final validation of that same deliverable belong under
+            "Validation expectations". If the ticket's scope cannot fit one bounded deliverable,
+            write no multi-part plan: record ONE open question asking the Product Owner to reduce
+            the scope. Platform refuses a specification that breaks this structure.
+
             #{PackagePath::INPUT_EVIDENCE_MD} — one compact `##` entry per SUPPORTING input (a Jam
             recording, screenshot, Confluence page, log, attachment, external link, or linked Jira
             issue) named in the evidence below — never the ticket's own description or comments,

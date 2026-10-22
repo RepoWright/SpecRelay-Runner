@@ -180,6 +180,20 @@ class SpecificationCodexProviderGenerationTest < Minitest::Test
                  claude_runner.calls.fetch(0).stdin_data.sub(claude_instruction, codex_instruction)
   end
 
+  # One bounded deliverable. The two sections the guidance names must be the generation gate's own
+  # required spec.md sections, so the prompt cannot point at a section the gate does not know.
+  def test_the_prompt_asks_for_one_deliverable_and_routes_oversized_scope_to_an_open_question
+    _documents, runner = generate({ "issue_key" => "SR-700", "title" => "Add an export button" })
+    section = runner.calls.fetch(0).stdin_data[/ONE DELIVERABLE.*?\n\n/m].to_s
+
+    executable = [ "Proposed behavior", "Acceptance criteria" ]
+    assert_empty executable - SpecrelayRunner::Specification::DocumentSet::REQUIRED_SECTIONS.fetch("spec.md")
+    executable.each { |name| assert_includes section, name }
+    assert_match(/no\s+slices,\s+phases/, section)
+    assert_match(/Validation\s+expectations/, section)
+    assert_match(/ONE\s+open\s+question/, section)
+  end
+
   def test_a_response_wrapped_in_prose_with_unrelated_braces_still_parses
     wrapped = <<~TEXT
       Sure, here is the package:
